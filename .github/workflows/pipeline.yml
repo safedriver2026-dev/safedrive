@@ -1,64 +1,37 @@
-name: Fluxo de Automacao SafeDriver
+name: SafeDriver Engine Pipeline
 
 on:
   schedule:
-    - cron: '0 3 1 * *' # Roda todo dia 1º do mes as 03:00 AM (Horario de Brasilia)
-  workflow_dispatch:     
+    # Executa automaticamente nos dias 1 e 15 de cada mes a meia-noite
+    - cron: '0 0 1,15 * *'
+  workflow_dispatch: 
 
 jobs:
-  ia-e-processamento:
-    name: Motor de Inteligencia Artificial e ETL
+  processar_dados:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write 
-    
+
     steps:
-      - name: 1. Sincronizando Codigo do Repositorio
-        uses: actions/checkout@v4
+      - name: Checkout do Repositorio
+        uses: actions/checkout@v3
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v4
         with:
-          fetch-depth: 0
+          python-version: '3.11'
 
-      - name: 2. Preparando Ambiente Python (Versao 3.10)
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+      - name: Instalar Dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pygeohash openpyxl requests firebase-admin
 
-      - name: 3. Instalando Bibliotecas e Dependencias
-        run: pip install -r requirements.txt
-
-      - name: 4. Executando IA e Sincronizando com Firestore
+      - name: Executar Motor SafeDriver
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
-        run: python motor_safedriver.py
-
-      - name: 5. Atualizando Base de Dados Publica (GitHub Data Lake)
         run: |
-        
-          git config --global user.name "SafeDriver Bot"
-          git config --global user.email "bot@safedriver.ai"
-          
-          git pull origin main --rebase
-          
-         
-          git add dados_publicos_safedriver.csv
-          
-          
-          git commit -m "📊 Base de dados atualizada pela IA [Automático]" || exit 0
-          
-         
-          git push origin main
+          python motor_safedriver.py
 
-   
-      - name: Notificacao de Sucesso
-        if: success()
-        run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{"content": "✅ **SafeDriver Engine:** O processamento mensal foi concluído com sucesso! Os dados da SSP-SP foram treinados, o App e BI já estão atualizados."}' \
-          https://discord.com/api/webhooks/1477788121931321386/PBhoPC4Tf8Bw6ds2aIH4CiyXnBCsSxRbIpSTsfM5cGjhq05zffehyf4RXcBeiHjaa2LO
-
-      - name: Notificacao de Falha
-        if: failure()
-        run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{"content": "❌ **SafeDriver Engine:** Ocorreu um erro na execução da pipeline. Verifique os logs no GitHub Actions para manutenção."}' \
-          https://discord.com/api/webhooks/1477788506184093716/TxGyA95IIfOI04GDYCcf0mD1FXi6VHWK7fd53-FVuqNZRistLZZq37Mawy-XdeWJe5wu
+      - name: Salvar Dados Analiticos
+        uses: actions/upload-artifact@v3
+        with:
+          name: relatorio-powerbi
+          path: dados_publicos_safedriver.csv
