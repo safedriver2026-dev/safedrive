@@ -8,7 +8,7 @@ from firebase_admin import credentials, firestore
 
 class SafeDriverEngine:
     """
-Pipeline de ETL e previsão para dados da segurança publica SSP
+    Engine de Processamento Preditivo para Seguranca Publica com Observabilidade via Discord.
     """
     def __init__(self):
         self.db = self._iniciar_persistencia()
@@ -19,14 +19,12 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
             'LATITUDE', 'LONGITUDE'
         ]
 
-        # Naturezas criminais definidas no escopo do projeto
         self.naturezas_alvo = [
             'FURTO DE VEICULO', 'FURTO DE CARGA', 
             'EXTORSAO MEDIANTE A SEQUESTRO', 'ROUBO DE VEICULO', 
             'ROUBO DE CARGA', 'LATROCINIO'
         ]
 
-        # Filtros espaciais
         self.tipos_validos = ['VIA PUBLICA', 'RODOVIA/ESTRADA']
         self.subtipos_validos = [
             'VIA PUBLICA', 'TRANSEUNTE', 'ACOSTAMENTO', 'AREA DE DESCANSO',
@@ -38,7 +36,6 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
             'VEICULO EM MOVIMENTO'
         ]
 
-     
         self.pesos_legais = {
             'FURTO': 1.0, 
             'ROUBO': 2.5, 
@@ -46,12 +43,33 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
             'LATROCINIO': 5.0 
         }
 
+    def _notificar_discord(self, mensagem, tipo="sucesso"):
+        """Envia um relatorio operacional para o canal do Discord baseado no tipo de evento."""
+        if tipo == "erro":
+            webhook_url = os.environ.get('DISCORD_ERRO')
+            prefixo = "[SafeDriver Falha Critica]"
+        else:
+            webhook_url = os.environ.get('DISCORD_SUCESSO')
+            prefixo = "[SafeDriver Operacao Concluida]"
+
+        if not webhook_url:
+            print(f"[Aviso] Variavel do Discord ({tipo}) nao configurada. Notificacao ignorada.")
+            return
+            
+        try:
+            payload = {"content": f"**{prefixo}**\n{mensagem}"}
+            requests.post(webhook_url, json=payload, timeout=10)
+        except Exception as e:
+            print(f"[Erro] Falha ao enviar alerta para o Discord ({tipo}): {e}")
+
     def _iniciar_persistencia(self):
         print("[Log] Inicializando conexao com o Firebase...")
         secret_json = os.environ.get('FIREBASE_JSON')
         
         if not secret_json:
-            print("[Erro] Variavel de ambiente FIREBASE_JSON nao localizada. Persistencia em nuvem abortada.")
+            msg_erro = "Variavel FIREBASE_JSON nao localizada. O upload para o banco foi abortado."
+            print(f"[Erro Critico] {msg_erro}")
+            self._notificar_discord(f"[FALHA DE AMBIENTE] {msg_erro}", tipo="erro")
             return None
             
         try:
@@ -61,7 +79,9 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
             print("[Sucesso] Conexao com Firestore estabelecida com exito.")
             return firestore.client()
         except Exception as e:
-            print(f"[Erro] Falha ao autenticar credenciais do Firebase: {e}")
+            msg_erro = f"Falha ao decodificar chave do Firebase. Verifique a formatacao do JSON no GitHub. Detalhes: {e}"
+            print(f"[Erro Critico] {msg_erro}")
+            self._notificar_discord(f"[FALHA DE CREDENCIAL] {msg_erro}", tipo="erro")
             return None
 
     def _classificar_vetor_risco(self, row):
@@ -88,32 +108,27 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
         try:
             r = requests.get(url, timeout=120)
             df = pd.read_excel(io.BytesIO(r.content))
-            
-            # Padronizacao inicial de cabecalhos
             df.columns = [str(c).strip().upper().replace('Í', 'I').replace('Â', 'A').replace('É', 'E').replace('Ç', 'C') for c in df.columns]
 
             if 'NATUREZA_APURADA' not in df.columns:
-                print("[Alerta] Formato atipico detectado no cabecalho. Aplicando correcao de leitura...")
                 df = pd.read_excel(io.BytesIO(r.content), skiprows=1)
                 df.columns = [str(c).strip().upper().replace('Í', 'I').replace('Â', 'A').replace('É', 'E').replace('Ç', 'C') for c in df.columns]
                 
         except Exception as e:
-            print(f"[Erro] Interrupcao na extracao de dados da SSP-SP: {e}")
+            self._notificar_discord(f"[FALHA DE EXTRACAO] Nao foi possivel baixar a planilha da SSP: {e}", tipo="erro")
             return
 
         colunas_presentes = [c for c in self.colunas_alvo if c in df.columns]
         if 'NATUREZA_APURADA' not in colunas_presentes:
-            print(f"[Erro] Estrutura de dados incompativel. Colunas detectadas: {list(df.columns)}")
+            self._notificar_discord("[FALHA DE ESTRUTURA] Colunas essenciais estao ausentes na planilha da SSP.", tipo="erro")
             return
 
         df = df[colunas_presentes]
 
-        # Tratamento de caracteres especiais 
         df['NATUREZA_APURADA'] = df['NATUREZA_APURADA'].str.upper().str.replace('Í', 'I').str.replace('Ã', 'A')
         df['DESCR_TIPOLOCAL'] = df['DESCR_TIPOLOCAL'].str.upper().str.replace('Ú', 'U')
         df['DESCR_SUBTIPOLOCAL'] = df['DESCR_SUBTIPOLOCAL'].str.upper().str.replace('Ê', 'E').str.replace('Á', 'A').str.replace('Í', 'I').str.replace('Ç', 'C')
 
-        # Aplicacao de filtros de dominio
         mask = (
             (df['NATUREZA_APURADA'].isin([n.replace('Í', 'I').replace('Ã', 'A') for n in self.naturezas_alvo])) &
             (df['DESCR_TIPOLOCAL'].isin([t.replace('Ú', 'U') for t in self.tipos_validos])) &
@@ -123,10 +138,11 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
         df = df[mask].dropna(subset=['LATITUDE', 'LONGITUDE'])
 
         if df.empty:
-            print("[Alerta] Nenhum registro atendeu aos criterios de filtro estipulados.")
+            msg = "A planilha foi processada, mas nenhum registro atendeu aos criterios dos filtros. O banco de dados nao recebeu atualizacoes neste ciclo."
+            print(f"[Alerta] {msg}")
+            self._notificar_discord(f"[ALERTA DE NEGOCIO] {msg}", tipo="erro")
             return
 
-        # Computacao do risco e indexacao geoespacial
         df[['PERFIL', 'PESO_LEGAL']] = df.apply(self._classificar_vetor_risco, axis=1)
         df['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
 
@@ -136,17 +152,12 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
         }).reset_index()
         grid.columns = ['GEOHASH', 'PERFIL', 'SEVERIDADE', 'VOLUME']
 
-        # Normalizacao e definicao do piso de risco
         grid['SCORE_RISCO'] = (grid['SEVERIDADE'] * 0.8 + 0.5).clip(0.5, 10.0).round(2)
 
-        # Exportacao para camada analitica
         df.to_csv("dados_publicos_safedriver.csv", index=False)
-        print("[Sucesso] Arquivo de dados CSV exportado para consumo no Power BI.")
+        print("[Sucesso] Arquivo analitico CSV exportado.")
 
-        # Integracao operacional com Firebase
         if self.db is not None:
-            print(f"[Log] Iniciando gravacao em lote no Firestore. Total de areas processadas: {len(grid)}")
-            
             try:
                 batch = self.db.batch()
                 contador = 0
@@ -174,11 +185,13 @@ Pipeline de ETL e previsão para dados da segurança publica SSP
                 if contador > 0:
                     batch.commit()
                 
-                print("[Sucesso] Sincronizacao de dados com o Firestore concluida perfeitamente.")
+                msg_sucesso = f"ETL finalizado sem erros operacionais. {len(grid)} zonas de risco foram atualizadas no Firestore e o arquivo CSV de analise foi gerado."
+                print(msg_sucesso)
+                self._notificar_discord(msg_sucesso, tipo="sucesso")
             except Exception as e:
-                print(f"[Erro] Falha critica durante escrita no banco de dados: {e}")
-        else:
-            print("[Aviso] A rotina de gravacao no Firestore foi suprimida devido a falhas de autenticacao.")
+                msg_erro = f"Falha de transacao ao gravar dados no Firestore: {e}"
+                print(f"[Erro Critico] {msg_erro}")
+                self._notificar_discord(f"[ERRO DE GRAVACAO] {msg_erro}", tipo="erro")
 
 if __name__ == "__main__":
     SafeDriverEngine().executar_pipeline()
