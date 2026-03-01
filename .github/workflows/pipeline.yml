@@ -3,30 +3,47 @@ name: SafeDriver Production Pipeline
 on:
   schedule:
     - cron: '0 3 1 * *' # Roda todo dia 1 às 03:00 AM
-  workflow_dispatch:      # Permite rodar clicando no botão
+  workflow_dispatch:      # Botão manual
 
 jobs:
   run-ai-engine:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Código
-        uses: actions/checkout@v3
+      - name: 1. Checkout Código
+        uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v4
+      - name: 2. Configurar Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Instalar Bibliotecas
+      - name: 3. Instalar Bibliotecas
         run: pip install -r requirements.txt
 
-      - name: Executar Motor e Upload Firestore
+      - name: 4. Executar Motor e Upload Firestore
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
         run: python motor_safedriver.py
 
-      - name: Disponibilizar Parquet para Power BI
-        uses: actions/upload-artifact@v3
+      - name: 5. Disponibilizar Parquet para Power BI
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
           name: SafeDriver-Data-Warehouse
           path: safedriver_full_history.parquet
+
+      # NOTIFICAÇÃO SE DER CERTO (WEBHOOK 1)
+      - name: Notificar Sucesso no Discord
+        if: success()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "✅ **SafeDriver Engine:** Pipeline concluída com sucesso! IA treinada e Firestore atualizado. O arquivo Parquet já está disponível para o Power BI."}' \
+          https://discord.com/api/webhooks/1477788121931321386/PBhoPC4Tf8Bw6ds2aIH4CiyXnBCsSxRbIpSTsfM5cGjhq05zffehyf4RXcBeiHjaa2LO
+
+      # NOTIFICAÇÃO SE DER ERRADO (WEBHOOK 2)
+      - name: Notificar Erro no Discord
+        if: failure()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "❌ **SafeDriver Engine:** A pipeline falhou! Verifique os logs no GitHub Actions para entender o erro."}' \
+          https://discord.com/api/webhooks/1477788506184093716/TxGyA95IIfOI04GDYCcf0mD1FXi6VHWK7fd53-FVuqNZRistLZZq37Mawy-XdeWJe5wu
