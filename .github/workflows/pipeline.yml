@@ -1,0 +1,32 @@
+name: SafeDriver Production Pipeline
+
+on:
+  schedule:
+    - cron: '0 3 1 * *' # Roda todo dia 1 às 03:00 AM
+  workflow_dispatch:      # Permite rodar clicando no botão
+
+jobs:
+  run-ai-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Código
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Instalar Bibliotecas
+        run: pip install -r requirements.txt
+
+      - name: Executar Motor e Upload Firestore
+        env:
+          FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
+        run: python motor_safedriver.py
+
+      - name: Disponibilizar Parquet para Power BI
+        uses: actions/upload-artifact@v3
+        with:
+          name: SafeDriver-Data-Warehouse
+          path: safedriver_full_history.parquet
