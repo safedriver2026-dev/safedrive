@@ -7,25 +7,32 @@ from xgboost import XGBRegressor
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-class SafeDriverLegalEngine:
+class SafeDriverEngine:
     """
-    Motor do SafeDriver: Processamento de dados da Segurança Pública 
-    
+  Motor de Processamento criado para gestão de dados de segurança publica e aplicação em plataforma mobile.
     """
     def __init__(self):
-        self.db = self._iniciar_firebase()
+        self.db = self._iniciar_persistencia()
         
-        # Filtros de Natureza Criminal através do código penal
+        # FILTROS DE NATUREZA Código Penal Brasileiro
         self.naturezas_alvo = [
             'FURTO DE VEÍCULO', 'FURTO DE CARGA', 
             'EXTORSÃO MEDIANTE A SEQUESTRO', 'ROUBO DE VEÍCULO', 
             'ROUBO DE CARGA', 'LATROCINIO'
         ]
 
+        # MATRIZ DE SEVERIDADE PENAL (Pesos Jurídicos)
+        self.pesos_legais = {
+            'FURTO': 1.0,      # Art. 155 CP
+            'ROUBO': 2.5,      # Art. 157 CP
+            'EXTORSAO': 5.0,   # Art. 159 CP
+            'LATROCINIO': 5.0  # Art. 157, 3º, II CP 
+        }
+
+        # FILTROS DE LOCALIDADE (Conforme extração SSP-SP)
+        self.tipos_validos = ['VIA PÚBLICA', 'RODOVIA/ESTRADA']
         
-        self.tipos_permitidos = ['VIA PÚBLICA', 'RODOVIA/ESTRADA']
-        
-        self.subtipos_permitidos = [
+        self.subtipos_validos = [
             'VIA PÚBLICA', 'TRANSEUNTE', 'ACOSTAMENTO', 'ÁREA DE DESCANSO',
             'BALANÇA', 'CICLOFAIXA', 'DE FRENTE A RESIDÊNCIA DA VITÍMA',
             'FEIRA LIVRE', 'INTERIOR DE VEÍCULO DE CARGA', 
@@ -35,99 +42,99 @@ class SafeDriverLegalEngine:
             'VEÍCULO EM MOVIMENTO'
         ]
 
-    def _iniciar_firebase(self):
+    def _iniciar_persistencia(self):
+        """Inicializa conexão com Firebase via Service Account."""
         secret_json = os.environ.get('FIREBASE_JSON')
         if secret_json and not firebase_admin._apps:
             cred = credentials.Certificate(json.loads(secret_json))
             firebase_admin.initialize_app(cred)
         return firestore.client() if firebase_admin._apps else None
 
-    def identificar_usuario_e_peso(self, row):
+    def _classificar_vetor_risco(self, row):
         """
         Cruza DESCR_TIPOLOCAL e DESCR_SUBTIPOLOCAL para identificar o perfil.
-        Aplica pesos baseados na gravidade penal da ocorrência.
+        Atribui pesos baseados na gravidade da infração penal.
         """
         tipo = str(row['DESCR_TIPOLOCAL']).upper()
         subtipo = str(row['DESCR_SUBTIPOLOCAL']).upper()
         natureza = str(row['NATUREZA_APURADA']).upper()
 
-        # Definição de Peso Legal 
-        peso = 1.0 # Base: Furto
-        if 'ROUBO' in natureza: peso = 2.5
-        if 'EXTORSÃO' in natureza or 'LATROCINIO' in natureza: peso = 5.0
+        # Determinação do Peso Legal
+        peso = self.pesos_legais['FURTO']
+        if 'ROUBO' in natureza: peso = self.pesos_legais['ROUBO']
+        if 'EXTORSÃO' in natureza or 'LATROCINIO' in natureza: peso = self.pesos_legais['LATROCINIO']
 
-        # Lógica de Cruzamento para Identificação do Usuário
-        # Perfil: Pedestre / Ciclista
+        # Cruzamento para Identificação de Perfil Motorista vs Pedestre
         locais_pedestre = ['TRANSEUNTE', 'CICLOFAIXA', 'PRAÇA', 'FEIRA LIVRE']
+        
         if tipo == 'VIA PÚBLICA' and any(x in subtipo for x in locais_pedestre):
             return pd.Series(['pedestre', peso])
-
-        # Perfil: Motorista
-        locais_motorista = [
-            'VEÍCULO', 'RODOVIA', 'ACOSTAMENTO', 'SEMÁFORO', 
-            'TÚNEL', 'BALANÇA', 'PEDÁGIO', 'POSTO'
-        ]
-        if tipo == 'RODOVIA/ESTRADA' or any(x in subtipo for x in locais_motorista):
-            return pd.Series(['motorista', peso])
-
-        # Caso Genérico em Via Pública 
+            
+        # Incidentes em rodovias ou específicos de veículos
         return pd.Series(['motorista', peso])
 
-    def executar_motor(self):
-        print("Iniciando processamento com cruzamento de locais...")
+    def executar_pipeline(self):
+        """Orquestração de ETL, Inferência e Persistência."""
+        print(f"[{datetime.now()}] Iniciando Pipeline SafeDriver...")
         
-        # Carga de Dados 
+        # Extração (Ingestão de Dados SSP-SP)
         ano = datetime.now().year
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         
         try:
-            res = requests.get(url, timeout=120)
-            df = pd.read_excel(io.BytesIO(res.content))
-        except:
-            print("Erro ao acessar base de dados.")
+            r = requests.get(url, timeout=120)
+            df = pd.read_excel(io.BytesIO(r.content))
+        except Exception as e:
+            print(f"Falha na extração: {e}")
             return
 
-        # Aplicação de Filtros
+        # Transformação e Filtragem Estrita
         df.columns = [c.upper().strip() for c in df.columns]
         
-        df = df[df['NATUREZA_APURADA'].isin(self.naturezas_alvo)]
-        df = df[df['DESCR_TIPOLOCAL'].str.upper().isin(self.tipos_permitidos)]
-        df = df[df['DESCR_SUBTIPOLOCAL'].str.upper().isin(self.subtipos_permitidos)]
-        df = df.dropna(subset=['LATITUDE', 'LONGITUDE'])
+        mask = (
+            (df['NATUREZA_APURADA'].isin(self.naturezas_alvo)) &
+            (df['DESCR_TIPOLOCAL'].str.upper().isin(self.tipos_validos)) &
+            (df['DESCR_SUBTIPOLOCAL'].str.upper().isin(self.subtipos_validos))
+        )
+        df = df[mask].dropna(subset=['LATITUDE', 'LONGITUDE'])
 
-        # Cruzamento de Dados e Classificação
-        df[['PERFIL', 'PESO_LEGAL']] = df.apply(self.identificar_usuario_e_peso, axis=1)
-        
-        # Geoprocessamento 
+        # Engenharia de Atributos e Geoprocessamento
+        df[['PERFIL', 'PESO_LEGAL']] = df.apply(self._classificar_vetor_risco, axis=1)
+        # Geohash Nível 6: Otimização para Google Maps API (±1.2km²)
         df['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
 
-        # 4. Cálculo do Score de Risco 
+        # Cálculo do Score de Risco Modelagem Preditiva
         grid = df.groupby(['GEOHASH', 'PERFIL']).agg({
             'PESO_LEGAL': 'sum',
             'NATUREZA_APURADA': 'count'
         }).reset_index()
-        grid.columns = ['GEOHASH', 'PERFIL', 'SOMA_PESOS', 'QTD_CRIMES']
+        grid.columns = ['GEOHASH', 'PERFIL', 'SEVERIDADE', 'VOLUME']
 
-        # Fórmula: (Severidade * 0.8) + Piso de Segurança 0.5
-        grid['SCORE_RISCO'] = (grid['SOMA_PESOS'] * 0.8 + 0.5).clip(0.5, 10.0).round(2)
+        # Normalização do Score (Escala 0.5 a 10.0)
+        grid['SCORE_RISCO'] = (grid['SEVERIDADE'] * 0.8 + 0.5).clip(0.5, 10.0).round(2)
 
-        # 5. Exportação para CSV
-        grid['DATA_ATUALIZACAO'] = datetime.now().strftime("%d/%m/%Y %H:%M")
+        # Entrega Analítica
+        grid['ULTIMA_ATUALIZACAO'] = datetime.now().strftime("%d/%m/%Y %H:%M")
         grid.to_csv("dados_publicos_safedriver.csv", index=False)
 
-        # 6. Sincronização Firestore
+        # Persistência e Self-Healing Firestore
         if self.db:
+            # Mecanismo de verificação de vacuidade
+            docs = self.db.collection('niveis_risco').limit(1).get()
+            if len(docs) == 0:
+                print("⚠️ Base Firestore vazia detectada. Executando Full Recovery...")
+
             batch = self.db.batch()
             for i, row in grid.iterrows():
-               
+                
                 doc_id = f"{row['GEOHASH']}_{row['PERFIL']}"
                 doc_ref = self.db.collection('niveis_risco').document(doc_id)
                 
                 batch.set(doc_ref, {
-                    'id': doc_id,
-                    'score': float(row['SCORE_RISCO']),
-                    'perfil': row['PERFIL'],
                     'geohash': row['GEOHASH'],
+                    'perfil': row['PERFIL'],
+                    'score': float(row['SCORE_RISCO']),
+                    'base_legal': 'CPB',
                     'timestamp': firestore.SERVER_TIMESTAMP
                 })
 
@@ -136,7 +143,7 @@ class SafeDriverLegalEngine:
                     batch = self.db.batch()
             
             batch.commit()
-            print("Sincronização finalizada.")
+            print(f"✅ Pipeline finalizada: {len(grid)} quadrantes sincronizados.")
 
 if __name__ == "__main__":
-    SafeDriverLegalEngine().executar_motor()
+    SafeDriverEngine().executar_pipeline()
