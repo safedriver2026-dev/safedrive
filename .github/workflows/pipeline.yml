@@ -2,9 +2,8 @@ name: Pipeline SafeDriver
 
 on:
   schedule:
-    # Executa automaticamente nos dias 1 e 15 de cada mes, a meia-noite (UTC)
     - cron: '0 0 1,15 * *'
-  workflow_dispatch: 
+  workflow_dispatch:
 
 jobs:
   processamento_de_dados:
@@ -25,9 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy pygeohash openpyxl requests firebase-admin
 
-      - name: Executar o Motor de Inteligencia (XGBoost / Regras Penais)
+      - name: Executar o Motor de Inteligencia e Banco de Dados
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: |
           python motor_safedriver.py
 
