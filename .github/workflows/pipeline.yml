@@ -1,37 +1,38 @@
-name: SafeDriver Engine Pipeline
+name: Pipeline SafeDriver
 
 on:
   schedule:
-    # Executa automaticamente nos dias 1 e 15 de cada mes a meia-noite
+    # Executa automaticamente nos dias 1 e 15 de cada mes, a meia-noite
     - cron: '0 0 1,15 * *'
   workflow_dispatch: 
 
 jobs:
-  processar_dados:
+  processamento_de_dados:
+    name: Processamento de Dados da SSP-SP
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout do Repositorio
+      - name: Clonar o Repositorio do Projeto
         uses: actions/checkout@v3
 
-      - name: Configurar Python 3.11
+      - name: Configurar o Ambiente Python (Versao 3.11)
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Instalar Dependencias
+      - name: Instalar as Bibliotecas e Dependencias
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy pygeohash openpyxl requests firebase-admin
 
-      - name: Executar Motor SafeDriver
+      - name: Executar o Motor de Inteligencia (XGBoost)
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
         run: |
           python motor_safedriver.py
 
-      - name: Salvar Dados Analiticos
+      - name: Exportar Base de Dados Limpa para o Power BI
         uses: actions/upload-artifact@v3
         with:
-          name: relatorio-powerbi
+          name: base-analitica-powerbi
           path: dados_publicos_safedriver.csv
