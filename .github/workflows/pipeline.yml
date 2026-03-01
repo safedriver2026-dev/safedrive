@@ -1,49 +1,49 @@
-name: SafeDriver Production Pipeline
+name: Fluxo de Produção SafeDriver
 
 on:
   schedule:
     - cron: '0 3 1 * *' # Roda todo dia 1 às 03:00 AM
-  workflow_dispatch:      # Botão manual
+  workflow_dispatch:      # Botão para rodar manualmente
 
 jobs:
-  run-ai-engine:
+  executar-motor-ia:
+    name: Processamento da Inteligência Artificial
     runs-on: ubuntu-latest
     steps:
-      - name: 1. Checkout Código
+      - name: 1. Baixando Código do Repositório
         uses: actions/checkout@v4
 
-      - name: 2. Configurar Python
+      - name: 2. Instalando Ambiente Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: 3. Instalar Bibliotecas
+      - name: 3. Instalando Dependências do Sistema
         run: pip install -r requirements.txt
 
-      - name: 4. Executar Motor e Upload Firestore
+      - name: 4. Executando IA e Atualizando Firestore
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
         run: python motor_safedriver.py
 
-      - name: 5. Disponibilizar Parquet para Power BI
+      - name: 5. Gerando Arquivo para o Power BI
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: SafeDriver-Data-Warehouse
+          name: Dados-Historicos-SafeDriver
           path: safedriver_full_history.parquet
 
-      # NOTIFICAÇÃO SE DER CERTO (WEBHOOK 1)
-      - name: Notificar Sucesso no Discord
+      # NOTIFICAÇÕES NO DISCORD
+      - name: Aviso de Sucesso no Discord
         if: success()
         run: |
           curl -H "Content-Type: application/json" \
-          -d '{"content": "✅ **SafeDriver Engine:** Pipeline concluída com sucesso! IA treinada e Firestore atualizado. O arquivo Parquet já está disponível para o Power BI."}' \
+          -d '{"content": "✅ **SafeDriver:** O motor rodou com sucesso!"}' \
           https://discord.com/api/webhooks/1477788121931321386/PBhoPC4Tf8Bw6ds2aIH4CiyXnBCsSxRbIpSTsfM5cGjhq05zffehyf4RXcBeiHjaa2LO
 
-      # NOTIFICAÇÃO SE DER ERRADO (WEBHOOK 2)
-      - name: Notificar Erro no Discord
+      - name: Aviso de Erro no Discord
         if: failure()
         run: |
           curl -H "Content-Type: application/json" \
-          -d '{"content": "❌ **SafeDriver Engine:** A pipeline falhou! Verifique os logs no GitHub Actions para entender o erro."}' \
+          -d '{"content": "❌ **SafeDriver:** Ops! Ocorreu um erro no processamento da ferramenta."}' \
           https://discord.com/api/webhooks/1477788506184093716/TxGyA95IIfOI04GDYCcf0mD1FXi6VHWK7fd53-FVuqNZRistLZZq37Mawy-XdeWJe5wu
