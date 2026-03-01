@@ -5,26 +5,30 @@ import os, io, requests, json
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
+import unicodedata
 
 class SafeDriverEngine:
     """
-    Engine de Processamento Preditivo para Seguranca Publica com Observabilidade via Discord.
+  Pipeline de extração, limpeza, transformação e previsão através de dados da SSP
     """
     def __init__(self):
         self.db = self._iniciar_persistencia()
         
+        # Colunas obrigatorias conforme escopo
         self.colunas_alvo = [
             'NATUREZA_APURADA', 'NOME_MUNICIPIO', 'DATA_OCORRENCIA_BO', 
             'HORA_OCORRENCIA_BO', 'DESCR_TIPOLOCAL', 'DESCR_SUBTIPOLOCAL', 
             'LATITUDE', 'LONGITUDE'
         ]
 
+        # Filtros de Natureza (Normalizados)
         self.naturezas_alvo = [
             'FURTO DE VEICULO', 'FURTO DE CARGA', 
             'EXTORSAO MEDIANTE A SEQUESTRO', 'ROUBO DE VEICULO', 
             'ROUBO DE CARGA', 'LATROCINIO'
         ]
 
+        # Filtros de Localidade
         self.tipos_validos = ['VIA PUBLICA', 'RODOVIA/ESTRADA']
         self.subtipos_validos = [
             'VIA PUBLICA', 'TRANSEUNTE', 'ACOSTAMENTO', 'AREA DE DESCANSO',
@@ -36,162 +40,123 @@ class SafeDriverEngine:
             'VEICULO EM MOVIMENTO'
         ]
 
-        self.pesos_legais = {
-            'FURTO': 1.0, 
-            'ROUBO': 2.5, 
-            'EXTORSAO': 5.0, 
-            'LATROCINIO': 5.0 
-        }
+        self.pesos_legais = {'FURTO': 1.0, 'ROUBO': 2.5, 'EXTORSAO': 5.0, 'LATROCINIO': 5.0}
+
+    def _limpar_texto(self, texto):
+        """Padroniza strings removendo acentos e espacos."""
+        if not isinstance(texto, str): return str(texto)
+        nfkd = unicodedata.normalize('NFKD', texto)
+        return "".join([c for c in nfkd if not unicodedata.combining(c)]).upper().strip()
 
     def _notificar_discord(self, mensagem, tipo="sucesso"):
-        """Envia um relatorio operacional para o canal do Discord baseado no tipo de evento."""
-        if tipo == "erro":
-            webhook_url = os.environ.get('DISCORD_ERRO')
-            prefixo = "[SafeDriver Falha Critica]"
-        else:
-            webhook_url = os.environ.get('DISCORD_SUCESSO')
-            prefixo = "[SafeDriver Operacao Concluida]"
-
-        if not webhook_url:
-            print(f"[Aviso] Variavel do Discord ({tipo}) nao configurada. Notificacao ignorada.")
-            return
-            
+        webhook_url = os.environ.get('DISCORD_ERRO') if tipo == "erro" else os.environ.get('DISCORD_SUCESSO')
+        if not webhook_url: return
         try:
-            payload = {"content": f"**{prefixo}**\n{mensagem}"}
-            requests.post(webhook_url, json=payload, timeout=10)
-        except Exception as e:
-            print(f"[Erro] Falha ao enviar alerta para o Discord ({tipo}): {e}")
+            prefixo = "[SafeDriver Falha]" if tipo == "erro" else "[SafeDriver Sucesso]"
+            requests.post(webhook_url, json={"content": f"**{prefixo}**\n{mensagem}"}, timeout=10)
+        except: pass
 
     def _iniciar_persistencia(self):
-        print("[Log] Inicializando conexao com o Firebase...")
         secret_json = os.environ.get('FIREBASE_JSON')
-        
-        if not secret_json:
-            msg_erro = "Variavel FIREBASE_JSON nao localizada. O upload para o banco foi abortado."
-            print(f"[Erro Critico] {msg_erro}")
-            self._notificar_discord(f"[FALHA DE AMBIENTE] {msg_erro}", tipo="erro")
-            return None
-            
+        if not secret_json: return None
         try:
             if not firebase_admin._apps:
                 cred = credentials.Certificate(json.loads(secret_json))
                 firebase_admin.initialize_app(cred)
-            print("[Sucesso] Conexao com Firestore estabelecida com exito.")
             return firestore.client()
-        except Exception as e:
-            msg_erro = f"Falha ao decodificar chave do Firebase. Verifique a formatacao do JSON no GitHub. Detalhes: {e}"
-            print(f"[Erro Critico] {msg_erro}")
-            self._notificar_discord(f"[FALHA DE CREDENCIAL] {msg_erro}", tipo="erro")
-            return None
-
-    def _classificar_vetor_risco(self, row):
-        tipo = str(row['DESCR_TIPOLOCAL']).upper()
-        subtipo = str(row['DESCR_SUBTIPOLOCAL']).upper()
-        natureza = str(row['NATUREZA_APURADA']).upper()
-
-        peso = self.pesos_legais['FURTO']
-        if 'ROUBO' in natureza: peso = self.pesos_legais['ROUBO']
-        if 'EXTORSAO' in natureza or 'LATROCINIO' in natureza: peso = self.pesos_legais['LATROCINIO']
-
-        locais_pedestre = ['TRANSEUNTE', 'CICLOFAIXA', 'PRACA', 'FEIRA LIVRE']
-        if tipo == 'VIA PUBLICA' and any(x in subtipo for x in locais_pedestre):
-            return pd.Series(['pedestre', peso])
-            
-        return pd.Series(['motorista', peso])
+        except: return None
 
     def executar_pipeline(self):
-        print(f"[{datetime.now()}] Iniciando Pipeline Operacional SafeDriver...")
-        
+        print(f"[{datetime.now()}] Iniciando Pipeline...")
         ano = datetime.now().year
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         
         try:
             r = requests.get(url, timeout=120)
-            df = pd.read_excel(io.BytesIO(r.content))
-            df.columns = [str(c).strip().upper().replace('Í', 'I').replace('Â', 'A').replace('É', 'E').replace('Ç', 'C') for c in df.columns]
-
-            if 'NATUREZA_APURADA' not in df.columns:
-                df = pd.read_excel(io.BytesIO(r.content), skiprows=1)
-                df.columns = [str(c).strip().upper().replace('Í', 'I').replace('Â', 'A').replace('É', 'E').replace('Ç', 'C') for c in df.columns]
+            # Carrega o Excel sem definir cabecalho inicialmente para busca dinamica
+            df_raw = pd.read_excel(io.BytesIO(r.content), header=None)
+            
+            # Busca em qual linha esta a coluna NATUREZA_APURADA
+            header_row = 0
+            for i, row in df_raw.head(10).iterrows(): # Busca nas primeiras 10 linhas
+                row_cleaned = [self._limpar_texto(str(val)) for val in row]
+                if 'NATUREZA_APURADA' in row_cleaned:
+                    header_row = i
+                    break
+            
+            # Recarrega o dataframe com o cabecalho correto encontrado
+            df = pd.read_excel(io.BytesIO(r.content), skiprows=header_row)
+            df.columns = [self._limpar_texto(c) for c in df.columns]
                 
         except Exception as e:
-            self._notificar_discord(f"[FALHA DE EXTRACAO] Nao foi possivel baixar a planilha da SSP: {e}", tipo="erro")
+            self._notificar_discord(f"Erro na leitura dinamica: {e}", "erro")
             return
 
-        colunas_presentes = [c for c in self.colunas_alvo if c in df.columns]
-        if 'NATUREZA_APURADA' not in colunas_presentes:
-            self._notificar_discord("[FALHA DE ESTRUTURA] Colunas essenciais estao ausentes na planilha da SSP.", tipo="erro")
+        # Valida colunas alvo
+        if 'NATUREZA_APURADA' not in df.columns:
+            self._notificar_discord("Coluna NATUREZA_APURADA nao localizada apos busca dinamica.", "erro")
             return
 
-        df = df[colunas_presentes]
+        # Seleciona apenas o que importa e limpa nulos de coordenadas
+        df = df[[c for c in self.colunas_alvo if c in df.columns]].dropna(subset=['LATITUDE', 'LONGITUDE'])
 
-        df['NATUREZA_APURADA'] = df['NATUREZA_APURADA'].str.upper().str.replace('Í', 'I').str.replace('Ã', 'A')
-        df['DESCR_TIPOLOCAL'] = df['DESCR_TIPOLOCAL'].str.upper().str.replace('Ú', 'U')
-        df['DESCR_SUBTIPOLOCAL'] = df['DESCR_SUBTIPOLOCAL'].str.upper().str.replace('Ê', 'E').str.replace('Á', 'A').str.replace('Í', 'I').str.replace('Ç', 'C')
+        # Aplicacao de filtros de negocio
+        df['NAT_LIMPA'] = df['NATUREZA_APURADA'].apply(self._limpar_texto)
+        df['TIPO_LIMPO'] = df['DESCR_TIPOLOCAL'].apply(self._limpar_texto)
+        df['SUB_LIMPO'] = df['DESCR_SUBTIPOLOCAL'].apply(self._limpar_texto)
 
         mask = (
-            (df['NATUREZA_APURADA'].isin([n.replace('Í', 'I').replace('Ã', 'A') for n in self.naturezas_alvo])) &
-            (df['DESCR_TIPOLOCAL'].isin([t.replace('Ú', 'U') for t in self.tipos_validos])) &
-            (df['DESCR_SUBTIPOLOCAL'].isin([s.replace('Ê', 'E').replace('Á', 'A').replace('Í', 'I').replace('Ç', 'C') for s in self.subtipos_validos]))
+            (df['NAT_LIMPA'].isin(self.naturezas_alvo)) &
+            (df['TIPO_LIMPO'].isin(self.tipos_validos)) &
+            (df['SUB_LIMPO'].isin(self.subtipos_validos))
         )
-        
-        df = df[mask].dropna(subset=['LATITUDE', 'LONGITUDE'])
+        df = df[mask]
 
         if df.empty:
-            msg = "A planilha foi processada, mas nenhum registro atendeu aos criterios dos filtros. O banco de dados nao recebeu atualizacoes neste ciclo."
-            print(f"[Alerta] {msg}")
-            self._notificar_discord(f"[ALERTA DE NEGOCIO] {msg}", tipo="erro")
+            self._notificar_discord("Filtros aplicados resultaram em zero registros.", "erro")
             return
 
-        df[['PERFIL', 'PESO_LEGAL']] = df.apply(self._classificar_vetor_risco, axis=1)
+        # Classificacao de Perfil e Score
+        def classificar(row):
+            natureza = row['NAT_LIMPA']
+            tipo = row['TIPO_LIMPO']
+            subtipo = row['SUB_LIMPO']
+            peso = self.pesos_legais['FURTO']
+            if 'ROUBO' in natureza: peso = self.pesos_legais['ROUBO']
+            if 'EXTORSAO' in natureza or 'LATROCINIO' in natureza: peso = self.pesos_legais['LATROCINIO']
+            
+            locais_pedestre = ['TRANSEUNTE', 'CICLOFAIXA', 'PRACA', 'FEIRA LIVRE']
+            perfil = 'pedestre' if tipo == 'VIA PUBLICA' and any(x in subtipo for x in locais_pedestre) else 'motorista'
+            return pd.Series([perfil, peso])
+
+        df[['PERFIL', 'PESO_LEGAL']] = df.apply(classificar, axis=1)
         df['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
 
-        grid = df.groupby(['GEOHASH', 'PERFIL']).agg({
-            'PESO_LEGAL': 'sum',
-            'NATUREZA_APURADA': 'count'
-        }).reset_index()
-        grid.columns = ['GEOHASH', 'PERFIL', 'SEVERIDADE', 'VOLUME']
-
+        # Agregacao para o Firestore
+        grid = df.groupby(['GEOHASH', 'PERFIL']).agg({'PESO_LEGAL': 'sum'}).reset_index()
+        grid.columns = ['GEOHASH', 'PERFIL', 'SEVERIDADE']
         grid['SCORE_RISCO'] = (grid['SEVERIDADE'] * 0.8 + 0.5).clip(0.5, 10.0).round(2)
 
-        df.to_csv("dados_publicos_safedriver.csv", index=False)
-        print("[Sucesso] Arquivo analitico CSV exportado.")
+        # Exporta CSV
+        df.drop(columns=['NAT_LIMPA', 'TIPO_LIMPO', 'SUB_LIMPO']).to_csv("dados_publicos_safedriver.csv", index=False)
 
-        if self.db is not None:
-            try:
-                batch = self.db.batch()
-                contador = 0
-                
-                for i, row in grid.iterrows():
-                    doc_id = f"{row['GEOHASH']}_{row['PERFIL']}"
-                    doc_ref = self.db.collection('niveis_risco').document(doc_id)
-                    
-                    esquema_app = {
-                        'geohash': str(row['GEOHASH']),
-                        'perfil': str(row['PERFIL']),
-                        'score': float(row['SCORE_RISCO']),
-                        'base_legal': 'CPB',
-                        'timestamp': firestore.SERVER_TIMESTAMP
-                    }
-                    
-                    batch.set(doc_ref, esquema_app)
-                    contador += 1
-
-                    if contador == 400:
-                        batch.commit()
-                        batch = self.db.batch()
-                        contador = 0
-                
-                if contador > 0:
+        # Firestore
+        if self.db:
+            batch = self.db.batch()
+            for i, row in grid.iterrows():
+                doc_id = f"{row['GEOHASH']}_{row['PERFIL']}"
+                doc_ref = self.db.collection('niveis_risco').document(doc_id)
+                batch.set(doc_ref, {
+                    'geohash': str(row['GEOHASH']),
+                    'perfil': str(row['PERFIL']),
+                    'score': float(row['SCORE_RISCO']),
+                    'timestamp': firestore.SERVER_TIMESTAMP
+                })
+                if (i + 1) % 400 == 0:
                     batch.commit()
-                
-                msg_sucesso = f"ETL finalizado sem erros operacionais. {len(grid)} zonas de risco foram atualizadas no Firestore e o arquivo CSV de analise foi gerado."
-                print(msg_sucesso)
-                self._notificar_discord(msg_sucesso, tipo="sucesso")
-            except Exception as e:
-                msg_erro = f"Falha de transacao ao gravar dados no Firestore: {e}"
-                print(f"[Erro Critico] {msg_erro}")
-                self._notificar_discord(f"[ERRO DE GRAVACAO] {msg_erro}", tipo="erro")
+                    batch = self.db.batch()
+            batch.commit()
+            self._notificar_discord(f"Sucesso: {len(grid)} quadrantes atualizados no Firestore.", "sucesso")
 
 if __name__ == "__main__":
     SafeDriverEngine().executar_pipeline()
