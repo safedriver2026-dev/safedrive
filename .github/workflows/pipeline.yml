@@ -53,7 +53,7 @@ jobs:
         if: success()
         run: |
           curl -X POST -H "Content-Type: application/json" \
-          -d '{"content": "✅ **SafeDriver Engine:** O processamento mensal foi concluído com sucesso! Os dados da SSP-SP foram treinados e o Power BI já pode ser atualizado."}' \
+          -d '{"content": "✅ **SafeDriver Engine:** O processamento mensal foi concluído com sucesso! Os dados da SSP-SP foram treinados, o App e BI já estão atualizados."}' \
           https://discord.com/api/webhooks/1477788121931321386/PBhoPC4Tf8Bw6ds2aIH4CiyXnBCsSxRbIpSTsfM5cGjhq05zffehyf4RXcBeiHjaa2LO
 
       - name: Notificacao de Falha
