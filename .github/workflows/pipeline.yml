@@ -2,7 +2,7 @@ name: Pipeline SafeDriver
 
 on:
   schedule:
-    # Executa automaticamente nos dias 1 e 15 de cada mes, a meia-noite
+    # Executa automaticamente nos dias 1 e 15 de cada mes, a meia-noite (UTC)
     - cron: '0 0 1,15 * *'
   workflow_dispatch: 
 
@@ -13,10 +13,10 @@ jobs:
 
     steps:
       - name: Clonar o Repositorio do Projeto
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configurar o Ambiente Python (Versao 3.11)
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -25,14 +25,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy pygeohash openpyxl requests firebase-admin
 
-      - name: Executar o Motor de Inteligencia (XGBoost)
+      - name: Executar o Motor de Inteligencia (XGBoost / Regras Penais)
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
         run: |
           python motor_safedriver.py
 
       - name: Exportar Base de Dados Limpa para o Power BI
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: base-analitica-powerbi
           path: dados_publicos_safedriver.csv
