@@ -1,0 +1,10 @@
+pandas
+numpy
+pygeohash
+xgboost
+scikit-learn
+holidays
+requests
+openpyxl
+firebase-admin
+pyarrow
