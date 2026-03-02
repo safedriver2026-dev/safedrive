@@ -1,4 +1,4 @@
-name: Pipeline do SafeDriver
+name: Atualização de Dados SafeDriver
 
 on:
   schedule:
@@ -7,11 +7,11 @@ on:
 
 jobs:
   telemetria_safedriver:
-    name: Inteligencia de Mobilidade Segura
+    name: Processar Mapas de Segurança
     runs-on: ubuntu-latest
 
     steps:
-      - name: Clonar Repositorio
+      - name: Checkout do Código
         uses: actions/checkout@v4
 
       - name: Configurar Python 3.11
@@ -24,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy pygeohash openpyxl requests firebase-admin
 
-      - name: Executar Motor de Telemetria (Multi-Perfil)
+      - name: Executar Motor SafeDriver
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
@@ -32,8 +32,8 @@ jobs:
         run: |
           python motor_safedriver.py
 
-      - name: Disponibilizar Base para o Power BI
+      - name: Salvar Dados para Power BI
         uses: actions/upload-artifact@v4
         with:
-          name: base-powerbi
+          name: base-analitica-bi
           path: dados_publicos_safedriver.csv
