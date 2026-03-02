@@ -9,15 +9,23 @@ import unicodedata
 
 class SafeDriverEngine:
     """
-    Engine SafeDriver - Versao de Alta Resiliencia.
-    Varredura completa de cabecalho para evitar erros de leitura da SSP-SP.
+ Pipeline para tratamento e previsão de dados da SSP
     """
     def __init__(self):
         self.db = self._iniciar_persistencia()
         
-      
+        # Filtros de Natureza e Localidade
         self.naturezas_alvo = ['FURTO DE VEICULO', 'FURTO DE CARGA', 'EXTORSAO MEDIANTE A SEQUESTRO', 'ROUBO DE VEICULO', 'ROUBO DE CARGA', 'LATROCINIO']
-        self.subtipos_validos = ['VIA PUBLICA', 'TRANSEUNTE', 'ACOSTAMENTO', 'AREA DE DESCANSO', 'BALANCA', 'CICLOFAIXA', 'DE FRENTE A RESIDENCIA DA VITIMA', 'FEIRA LIVRE', 'INTERIOR DE VEICULO DE CARGA', 'INTERIOR DE VEICULO DE PARTICULAR', 'POSTO DE AUXILIO', 'POSTO DE FISCALIZACAO', 'POSTO POLICIAL', 'PRACA', 'PRACA DE PEDAGIO', 'SEMAFORO', 'TUNEL/VIADUTO/PONTE', 'VEICULO EM MOVIMENTO']
+        self.subtipos_validos = [
+            'VIA PUBLICA', 'TRANSEUNTE', 'ACOSTAMENTO', 'AREA DE DESCANSO',
+            'BALANCA', 'CICLOFAIXA', 'DE FRENTE A RESIDENCIA DA VITIMA',
+            'FEIRA LIVRE', 'INTERIOR DE VEICULO DE CARGA', 
+            'INTERIOR DE VEICULO DE PARTICULAR', 'POSTO DE AUXILIO',
+            'POSTO DE FISCALIZACAO', 'POSTO POLICIAL', 'PRACA',
+            'PRACA DE PEDAGIO', 'SEMAFORO', 'TUNEL/VIADUTO/PONTE',
+            'VEICULO EM MOVIMENTO'
+        ]
+        self.tipos_validos = ['VIA PUBLICA', 'RODOVIA/ESTRADA']
         
         self.pesos_legais = {'FURTO': 1.0, 'ROUBO': 2.5, 'EXTORSAO': 5.0, 'LATROCINIO': 5.0}
 
@@ -44,48 +52,59 @@ class SafeDriverEngine:
         except: return None
 
     def executar_pipeline(self):
-        print(f"[{datetime.now()}] Iniciando Pipeline...")
+        print(f"[{datetime.now()}] Iniciando Varredura Global de Abas...")
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{datetime.now().year}.xlsx"
         
         try:
             r = requests.get(url, timeout=120)
-         
-            df = pd.read_excel(io.BytesIO(r.content))
-            
-          
-            df.columns = [self._limpar_texto(str(c)) for c in df.columns]
+            excel_file = pd.ExcelFile(io.BytesIO(r.content))
+            df_final = pd.DataFrame()
 
-         
-            if 'NATUREZA_APURADA' not in df.columns:
-                print("Tentando localizar cabecalho na linha 1...")
-                new_header = df.iloc[0] 
-                df = df[1:] 
-                df.columns = [self._limpar_texto(str(c)) for c in new_header]
+            for sheet_name in excel_file.sheet_names:
+                print(f"Analisando aba: {sheet_name}")
+                df_raw = excel_file.parse(sheet_name, header=None)
+                
+                found_row = -1
+               
+                for i in range(min(len(df_raw), 50)):
+                    linha_limpa = [self._limpar_texto(str(val)) for val in df_raw.iloc[i].values]
+                    if 'NATUREZA_APURADA' in linha_limpa:
+                        found_row = i
+                        break
+                
+                if found_row != -1:
+                    df_sheet = excel_file.parse(sheet_name, skiprows=found_row)
+                    df_sheet.columns = [self._limpar_texto(str(c)) for c in df_sheet.columns]
+                    
+                   
+                    if 'NATUREZA_APURADA' in df_sheet.columns:
+                        df_final = pd.concat([df_final, df_sheet], ignore_index=True)
+
+            if df_final.empty:
+                self._notificar_discord("Nenhuma aba continha a coluna NATUREZA_APURADA.", "erro")
+                return
 
         except Exception as e:
-            self._notificar_discord(f"Falha na leitura do Excel: {e}", "erro")
+            self._notificar_discord(f"Erro critico na leitura: {e}", "erro")
             return
 
-   
-        if 'NATUREZA_APURADA' not in df.columns:
-        
-            colunas_lidas = ", ".join(list(df.columns)[:5])
-            self._notificar_discord(f"ERRO: NATUREZA_APURADA nao encontrada. Primeiras colunas lidas: {colunas_lidas}", "erro")
+        # Processamento e Filtros
+        df_final = df_final.dropna(subset=['LATITUDE', 'LONGITUDE'])
+        df_final['NAT_LIMPA'] = df_final['NATUREZA_APURADA'].apply(self._limpar_texto)
+        df_final['SUB_LIMPO'] = df_final['DESCR_SUBTIPOLOCAL'].apply(self._limpar_texto) if 'DESCR_SUBTIPOLOCAL' in df_final.columns else ""
+        df_final['TIPO_LIMPO'] = df_final['DESCR_TIPOLOCAL'].apply(self._limpar_texto) if 'DESCR_TIPOLOCAL' in df_final.columns else ""
+
+        mask = (
+            (df_final['NAT_LIMPA'].isin(self.naturezas_alvo)) & 
+            (df_final['SUB_LIMPO'].isin(self.subtipos_validos))
+        )
+        df_final = df_final[mask]
+
+        if df_final.empty:
+            self._notificar_discord("Busca concluida: Nenhum crime valido encontrado nas abas.", "erro")
             return
 
-   
-        df = df.dropna(subset=['LATITUDE', 'LONGITUDE'])
-        df['NAT_LIMPA'] = df['NATUREZA_APURADA'].apply(self._limpar_texto)
-        df['SUB_LIMPO'] = df['DESCR_SUBTIPOLOCAL'].apply(self._limpar_texto) if 'DESCR_SUBTIPOLOCAL' in df.columns else ""
-
-        mask = (df['NAT_LIMPA'].isin(self.naturezas_alvo)) & (df['SUB_LIMPO'].isin(self.subtipos_validos))
-        df = df[mask]
-
-        if df.empty:
-            self._notificar_discord("Nenhum dado encontrado apos os filtros.", "erro")
-            return
-
-      
+        # Calculo de Risco
         def calcular(row):
             nat, sub = row['NAT_LIMPA'], row['SUB_LIMPO']
             peso = self.pesos_legais['FURTO']
@@ -96,16 +115,15 @@ class SafeDriverEngine:
             perfil = 'pedestre' if any(x in sub for x in locais_pedestre) else 'motorista'
             return pd.Series([perfil, peso])
 
-        df[['PERFIL', 'PESO_LEGAL']] = df.apply(calcular, axis=1)
-        df['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
+        df_final[['PERFIL', 'PESO_LEGAL']] = df_final.apply(calcular, axis=1)
+        df_final['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df_final['LATITUDE'], df_final['LONGITUDE'])]
 
-
-        grid = df.groupby(['GEOHASH', 'PERFIL']).agg({'PESO_LEGAL': 'sum'}).reset_index()
+        grid = df_final.groupby(['GEOHASH', 'PERFIL']).agg({'PESO_LEGAL': 'sum'}).reset_index()
         grid.columns = ['GEOHASH', 'PERFIL', 'SEVERIDADE']
         grid['SCORE_RISCO'] = (grid['SEVERIDADE'] * 0.8 + 0.5).clip(0.5, 10.0).round(2)
 
- 
-        df.to_csv("dados_publicos_safedriver.csv", index=False)
+        # Persistencia
+        df_final.to_csv("dados_publicos_safedriver.csv", index=False)
         if self.db:
             batch = self.db.batch()
             for i, row in grid.iterrows():
@@ -118,7 +136,7 @@ class SafeDriverEngine:
                     batch.commit()
                     batch = self.db.batch()
             batch.commit()
-            self._notificar_discord(f"Sucesso: {len(grid)} pontos atualizados no Firestore.", "sucesso")
+            self._notificar_discord(f"Sucesso: {len(grid)} quadrantes processados em todas as abas.", "sucesso")
 
 if __name__ == "__main__":
     SafeDriverEngine().executar_pipeline()
