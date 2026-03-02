@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  telemetria_multi_modal:
-    name: Inteligencia de Dados (Padrao Google Maps)
+  telemetria_safedriver:
+    name: Inteligencia de Mobilidade Segura
     runs-on: ubuntu-latest
 
     steps:
@@ -24,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy pygeohash openpyxl requests firebase-admin
 
-      - name: Executar Motor Multi-Modal
+      - name: Executar Motor de Telemetria (Multi-Perfil)
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
@@ -32,7 +32,7 @@ jobs:
         run: |
           python motor_safedriver.py
 
-      - name: Salvar Artefato (Power BI)
+      - name: Disponibilizar Base para o Power BI
         uses: actions/upload-artifact@v4
         with:
           name: base-powerbi
