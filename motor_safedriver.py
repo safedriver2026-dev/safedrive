@@ -9,12 +9,11 @@ import unicodedata
 
 class SafeDriverEngine:
     """
- Pipeline para tratamento e previsão de dados da SSP
+Pipeline para tratamento de dados e previsões dados da SSP
     """
     def __init__(self):
         self.db = self._iniciar_persistencia()
         
-        # Filtros de Natureza e Localidade
         self.naturezas_alvo = ['FURTO DE VEICULO', 'FURTO DE CARGA', 'EXTORSAO MEDIANTE A SEQUESTRO', 'ROUBO DE VEICULO', 'ROUBO DE CARGA', 'LATROCINIO']
         self.subtipos_validos = [
             'VIA PUBLICA', 'TRANSEUNTE', 'ACOSTAMENTO', 'AREA DE DESCANSO',
@@ -61,11 +60,8 @@ class SafeDriverEngine:
             df_final = pd.DataFrame()
 
             for sheet_name in excel_file.sheet_names:
-                print(f"Analisando aba: {sheet_name}")
                 df_raw = excel_file.parse(sheet_name, header=None)
-                
                 found_row = -1
-               
                 for i in range(min(len(df_raw), 50)):
                     linha_limpa = [self._limpar_texto(str(val)) for val in df_raw.iloc[i].values]
                     if 'NATUREZA_APURADA' in linha_limpa:
@@ -75,54 +71,52 @@ class SafeDriverEngine:
                 if found_row != -1:
                     df_sheet = excel_file.parse(sheet_name, skiprows=found_row)
                     df_sheet.columns = [self._limpar_texto(str(c)) for c in df_sheet.columns]
-                    
-                   
                     if 'NATUREZA_APURADA' in df_sheet.columns:
                         df_final = pd.concat([df_final, df_sheet], ignore_index=True)
 
             if df_final.empty:
-                self._notificar_discord("Nenhuma aba continha a coluna NATUREZA_APURADA.", "erro")
+                self._notificar_discord("Nenhuma aba valida encontrada.", "erro")
                 return
 
         except Exception as e:
-            self._notificar_discord(f"Erro critico na leitura: {e}", "erro")
+            self._notificar_discord(f"Erro na leitura: {e}", "erro")
             return
 
-        # Processamento e Filtros
+        
+        df_final['LATITUDE'] = pd.to_numeric(df_final['LATITUDE'], errors='coerce')
+        df_final['LONGITUDE'] = pd.to_numeric(df_final['LONGITUDE'], errors='coerce')
+        
+        # Remove linhas que nao possuem coordenadas validas
         df_final = df_final.dropna(subset=['LATITUDE', 'LONGITUDE'])
+   
+
         df_final['NAT_LIMPA'] = df_final['NATUREZA_APURADA'].apply(self._limpar_texto)
         df_final['SUB_LIMPO'] = df_final['DESCR_SUBTIPOLOCAL'].apply(self._limpar_texto) if 'DESCR_SUBTIPOLOCAL' in df_final.columns else ""
-        df_final['TIPO_LIMPO'] = df_final['DESCR_TIPOLOCAL'].apply(self._limpar_texto) if 'DESCR_TIPOLOCAL' in df_final.columns else ""
 
-        mask = (
-            (df_final['NAT_LIMPA'].isin(self.naturezas_alvo)) & 
-            (df_final['SUB_LIMPO'].isin(self.subtipos_validos))
-        )
+        mask = (df_final['NAT_LIMPA'].isin(self.naturezas_alvo)) & (df_final['SUB_LIMPO'].isin(self.subtipos_validos))
         df_final = df_final[mask]
 
         if df_final.empty:
-            self._notificar_discord("Busca concluida: Nenhum crime valido encontrado nas abas.", "erro")
+            self._notificar_discord("Filtros aplicados resultaram em base vazia.", "erro")
             return
 
-        # Calculo de Risco
         def calcular(row):
             nat, sub = row['NAT_LIMPA'], row['SUB_LIMPO']
             peso = self.pesos_legais['FURTO']
             if 'ROUBO' in nat: peso = self.pesos_legais['ROUBO']
             if 'EXTORSAO' in nat or 'LATROCINIO' in nat: peso = self.pesos_legais['LATROCINIO']
-            
-            locais_pedestre = ['TRANSEUNTE', 'CICLOFAIXA', 'PRACA', 'FEIRA LIVRE']
-            perfil = 'pedestre' if any(x in sub for x in locais_pedestre) else 'motorista'
+            perfil = 'pedestre' if any(x in sub for x in ['TRANSEUNTE', 'PRACA', 'CICLOFAIXA']) else 'motorista'
             return pd.Series([perfil, peso])
 
         df_final[['PERFIL', 'PESO_LEGAL']] = df_final.apply(calcular, axis=1)
+        
+        
         df_final['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df_final['LATITUDE'], df_final['LONGITUDE'])]
 
         grid = df_final.groupby(['GEOHASH', 'PERFIL']).agg({'PESO_LEGAL': 'sum'}).reset_index()
         grid.columns = ['GEOHASH', 'PERFIL', 'SEVERIDADE']
         grid['SCORE_RISCO'] = (grid['SEVERIDADE'] * 0.8 + 0.5).clip(0.5, 10.0).round(2)
 
-        # Persistencia
         df_final.to_csv("dados_publicos_safedriver.csv", index=False)
         if self.db:
             batch = self.db.batch()
@@ -136,7 +130,7 @@ class SafeDriverEngine:
                     batch.commit()
                     batch = self.db.batch()
             batch.commit()
-            self._notificar_discord(f"Sucesso: {len(grid)} quadrantes processados em todas as abas.", "sucesso")
+            self._notificar_discord(f"Sucesso: {len(grid)} zonas de risco processadas.", "sucesso")
 
 if __name__ == "__main__":
     SafeDriverEngine().executar_pipeline()
