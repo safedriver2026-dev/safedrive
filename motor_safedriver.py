@@ -9,13 +9,13 @@ import unicodedata
 
 class SafeDriverEngine:
     """
-PIPELINE DE EXTRAÇÃO, LIMPEZA E PREVISÃO DE DADOS DA SSP
+    SafeDriver Core V3.0 - Multi-Modal Intelligence.
+    Padrao Google Maps: Pe, Bicicleta, Onibus, Moto e Carro.
     """
     def __init__(self):
         self.db = self._iniciar_persistencia()
         
-        
-        self.tipos_alvo = [self._limpar_texto(t) for t in ['Via Pública', 'Rodovia/Estrada']]
+      
         self.subtipos_alvo = [self._limpar_texto(s) for s in [
             'Via Pública', 'Transeunte', 'Acostamento', 'Área de Descanso', 'Balança', 
             'Ciclofaixa', 'De Frente a Residência da Vitíma', 'Feira Livre', 
@@ -24,38 +24,38 @@ PIPELINE DE EXTRAÇÃO, LIMPEZA E PREVISÃO DE DADOS DA SSP
             'Praça de Pedágio', 'Semáforo', 'Túnel/Viaduto/Ponte', 'Veículo em Movimento'
         ]]
 
-        self.pesos = {'FURTO': 1.0, 'ROUBO': 2.5, 'EXTORSAO': 5.0, 'LATROCINIO': 5.0}
-
     def _limpar_texto(self, texto):
         if not isinstance(texto, str): return str(texto)
         nfkd = unicodedata.normalize('NFKD', texto)
         return "".join([c for c in nfkd if not unicodedata.combining(c)]).upper().strip()
 
     def _categorizar_crime(self, nat):
-     
         n = self._limpar_texto(nat)
-        if 'FURTO' in n and 'VEICULO' in n: return 'FURTO DE VEICULO'
-        if 'FURTO' in n and 'CARGA' in n: return 'FURTO DE CARGA'
-        if 'ROUBO' in n and 'VEICULO' in n: return 'ROUBO DE VEICULO'
-        if 'ROUBO' in n and 'CARGA' in n: return 'ROUBO DE CARGA'
-        if 'EXTORSAO' in n and 'SEQUESTRO' in n: return 'EXTORSAO/SEQUESTRO'
-        if 'LATROCINIO' in n: return 'LATROCINIO'
-        return None
+        if 'FURTO' in n and 'VEICULO' in n: return 'FURTO VEICULO', 1.0
+        if 'FURTO' in n and 'CARGA' in n: return 'FURTO CARGA', 1.2
+        if 'ROUBO' in n and 'VEICULO' in n: return 'ROUBO VEICULO', 3.0
+        if 'ROUBO' in n and 'CARGA' in n: return 'ROUBO CARGA', 3.5
+        if 'EXTORSAO' in n and 'SEQUESTRO' in n: return 'SEQUESTRO', 5.0
+        if 'LATROCINIO' in n: return 'LATROCINIO', 5.0
+        if 'ROUBO' in n and 'OUTROS' in n: return 'ROUBO RUA', 2.0
+        if 'FURTO' in n and 'OUTROS' in n: return 'FURTO RUA', 0.8
+        return None, 0
 
     def _notificar_discord(self, titulo, campos, tipo="sucesso"):
         webhook_url = os.environ.get('DISCORD_ERRO') if tipo == "erro" else os.environ.get('DISCORD_SUCESSO')
         if not webhook_url: return
-        cor = 0x3498db if tipo == "sucesso" else 0xe74c3c # Azul para Mobilidade
+        cor = 0x3498db if tipo == "sucesso" else 0xe74c3c 
         
         embed = {
-            "username": "SafeDriver AI Intelligence",
+            "username": "SafeDriver Navigation AI",
             "avatar_url": "https://cdn-icons-png.flaticon.com/512/3064/3064155.png",
             "embeds": [{
                 "title": f"🧭 {titulo}",
+                "description": "Sincronização de Telemetria Multi-Modal (Padrão Google Maps).",
                 "color": cor,
                 "fields": [{"name": k, "value": str(v), "inline": True} for k, v in campos.items()],
-                "footer": {"text": "SafeDriver Intelligence • Mobilidade Segura"},
-                "thumbnail": {"url": "https://cdn-icons-png.flaticon.com/512/854/854878.png"}
+                "footer": {"text": "SafeDriver Core • Inteligência em Mobilidade"},
+                "thumbnail": {"url": "https://cdn-icons-png.flaticon.com/512/235/235861.png"}
             }]
         }
         try: requests.post(webhook_url, json=embed, timeout=10)
@@ -78,56 +78,56 @@ PIPELINE DE EXTRAÇÃO, LIMPEZA E PREVISÃO DE DADOS DA SSP
         try:
             r = requests.get(url, timeout=120)
             excel = pd.ExcelFile(io.BytesIO(r.content))
-            df_bruto = pd.DataFrame()
+            df_total = pd.DataFrame()
 
             for sheet in excel.sheet_names:
-                temp = excel.parse(sheet, header=None)
-                found = -1
-                for i in range(min(len(temp), 50)):
-                    if 'NATUREZA_APURADA' in [self._limpar_texto(str(v)) for v in temp.iloc[i].values]:
-                        found = i; break
-                if found != -1:
-                    sheet_df = excel.parse(sheet, skiprows=found)
+                df_raw = excel.parse(sheet, header=None)
+                h_idx = -1
+                for i in range(min(len(df_raw), 50)):
+                    if 'NATUREZA_APURADA' in [self._limpar_texto(str(v)) for v in df_raw.iloc[i].values]:
+                        h_idx = i; break
+                if h_idx != -1:
+                    sheet_df = excel.parse(sheet, skiprows=h_idx)
                     sheet_df.columns = [self._limpar_texto(str(c)) for c in sheet_df.columns]
-                    df_bruto = pd.concat([df_bruto, sheet_df], ignore_index=True)
+                    df_total = pd.concat([df_total, sheet_df], ignore_index=True)
 
-            total_original = len(df_bruto)
+            total_bruto = len(df_total)
         except Exception as e:
-            self._notificar_discord("Falha na Telemetria", {"Erro": str(e)}, "erro")
+            self._notificar_discord("Falha de Conexão SSP", {"Erro": str(e)}, "erro")
             return
 
-        # 1. Limpeza de Dados Sujos
-        df_bruto['LATITUDE'] = pd.to_numeric(df_bruto['LATITUDE'], errors='coerce')
-        df_bruto['LONGITUDE'] = pd.to_numeric(df_bruto['LONGITUDE'], errors='coerce')
-        df_limpo = df_bruto[(df_bruto['LATITUDE'].notna()) & (df_bruto['LATITUDE'] != 0)].copy()
+      
+        df_total['LATITUDE'] = pd.to_numeric(df_total['LATITUDE'], errors='coerce')
+        df_total['LONGITUDE'] = pd.to_numeric(df_total['LONGITUDE'], errors='coerce')
+        df_clean = df_total[(df_total['LATITUDE'] != 0) & (df_total['LONGITUDE'] != 0)].dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
         
-        # 2. Categorizacao e Filtros de Mobilidade
-        df_limpo['CATEGORIA'] = df_limpo['NATUREZA_APURADA'].apply(self._categorizar_crime)
-        df_limpo['SUB_LIMPO'] = df_limpo['DESCR_SUBTIPOLOCAL'].apply(self._limpar_texto)
+        res = df_clean['NATUREZA_APURADA'].apply(self._categorizar_crime)
+        df_clean['CATEGORIA'] = [x[0] for x in res]
+        df_clean['PESO'] = [x[1] for x in res]
+        df_clean['SUB_LIMPO'] = df_clean['DESCR_SUBTIPOLOCAL'].apply(self._limpar_texto)
         
-        df_filtrado = df_limpo[
-            (df_limpo['CATEGORIA'].notna()) & 
-            (df_limpo['SUB_LIMPO'].isin(self.subtipos_alvo))
-        ].copy()
-
-        # Calculo de Eliminacao de Ruido 
-        eliminados = total_original - len(df_filtrado)
-        pct_limpeza = (eliminados / total_original * 100) if total_original > 0 else 0
+        df_filtrado = df_clean[(df_clean['CATEGORIA'].notna()) & (df_clean['SUB_LIMPO'].isin(self.subtipos_alvo))].copy()
+        limpeza_pct = ((total_bruto - len(df_filtrado)) / total_bruto * 100) if total_bruto > 0 else 0
 
         if not df_filtrado.empty:
-        
-            def classificar(row):
+         
+            def mapear_modais(row):
                 cat, sub = row['CATEGORIA'], row['SUB_LIMPO']
-                peso = self.pesos['FURTO'] if 'FURTO' in cat else self.pesos['ROUBO']
-                if 'LATROCINIO' in cat or 'EXTORSAO' in cat: peso = self.pesos['LATROCINIO']
-                perfil = 'pedestre' if any(x in sub for x in ['TRANSEUNTE', 'PRACA', 'CICLOFAIXA']) else 'motorista'
-                return pd.Series([perfil, peso])
+                
+          
+                if 'RUA' in cat or sub == 'TRANSEUNTE':
+                    return ['pedestre', 'onibus', 'bicicleta']
+                
+            
+                return ['carro', 'motociclista']
 
-            df_filtrado[['PERFIL', 'PESO_LEGAL']] = df_filtrado.apply(classificar, axis=1)
-            df_filtrado['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df_filtrado['LATITUDE'], df_filtrado['LONGITUDE'])]
+            df_filtrado['PERFIL_LIST'] = df_filtrado.apply(mapear_modais, axis=1)
+            df_final = df_filtrado.explode('PERFIL_LIST').rename(columns={'PERFIL_LIST': 'PERFIL'})
+            
+            df_final['GEOHASH'] = [gh.encode(la, lo, precision=6) for la, lo in zip(df_final['LATITUDE'], df_final['LONGITUDE'])]
 
-            grid = df_filtrado.groupby(['GEOHASH', 'PERFIL']).agg({'PESO_LEGAL': 'sum'}).reset_index()
-            grid['SCORE'] = (grid['PESO_LEGAL'] * 1.5 + 0.5).clip(0.5, 10.0).round(2)
+            grid = df_final.groupby(['GEOHASH', 'PERFIL']).agg({'PESO': 'sum'}).reset_index()
+            grid['SCORE'] = (grid['PESO'] * 1.5 + 0.5).clip(0.5, 10.0).round(2)
 
             if self.db:
                 batch = self.db.batch()
@@ -139,25 +139,20 @@ PIPELINE DE EXTRAÇÃO, LIMPEZA E PREVISÃO DE DADOS DA SSP
                     if (i + 1) % 400 == 0: batch.commit(); batch = self.db.batch()
                 batch.commit()
 
-            # Relatorio de Saude do Processo
-            resumo_counts = df_filtrado['CATEGORIA'].value_counts().head(3).to_dict()
-            resumo_str = "\n".join([f"🔹 {k}: {v}" for k, v in resumo_counts.items()])
+            df_final.to_csv("dados_publicos_safedriver.csv", index=False)
             
+            stats = df_final['PERFIL'].value_counts().to_dict()
             campos = {
-                "🛰️ Malha Analisada": f"{total_original} registros",
-                "🧹 Limpeza de Ruido": f"Eliminou {pct_limpeza:.1f}% de dados irrelevantes",
-                "📍 Zonas Detectadas": f"{len(grid)} quadrantes",
-                "🛡️ Score Medio": f"{grid['SCORE'].mean():.2f}",
-                "🚨 Principais Alertas": resumo_str,
-                "⏱️ Latencia": f"{(datetime.now() - inicio).seconds}s"
+                "🧹 Limpeza": f"Eliminou {limpeza_pct:.1f}% de dados irrelevantes",
+                "🚶 Pedestre/Ônibus/Bike": f"{stats.get('pedestre', 0)} alertas",
+                "🚗 Carro/Moto": f"{stats.get('carro', 0)} alertas",
+                "📍 Zonas Totais": f"{len(grid)} pontos",
+                "🚀 Status dos dados": "✅ Sincronizado",
+                "⏱️ Tempo": f"{(datetime.now() - inicio).seconds}s"
             }
-            self._notificar_discord("Dashboard de Inteligencia SafeDriver", campos, "sucesso")
-            
-            cols_pbi = ['NATUREZA_APURADA', 'NOME_MUNICIPIO', 'DATA_OCORRENCIA_BO', 'HORA_OCORRENCIA_BO', 'DESCR_TIPOLOCAL', 'DESCR_SUBTIPOLOCAL', 'LATITUDE', 'LONGITUDE', 'PERFIL', 'SCORE']
-            df_filtrado.rename(columns={'SCORE_RISCO': 'SCORE'}, errors='ignore')
-            df_filtrado.to_csv("dados_publicos_safedriver.csv", index=False)
+            self._notificar_discord("Dashboard Multi-Modal SafeDriver", campos, "sucesso")
         else:
-            self._notificar_discord("Alerta de Vacancia", {"Status": "Nenhum crime relevante nesta malha", "Limpeza": f"{pct_limpeza:.1f}%"}, "erro")
+            self._notificar_discord("Aviso", {"Status": "Sem incidentes na malha atual."}, "erro")
 
 if __name__ == "__main__":
     SafeDriverEngine().executar_pipeline()
