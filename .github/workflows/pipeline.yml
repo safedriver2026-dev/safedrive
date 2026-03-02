@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  processamento_de_dados:
-    name: Telemetria SafeDriver
+  telemetria_safedriver:
+    name: Inteligencia de Dados SSP-SP
     runs-on: ubuntu-latest
 
     steps:
@@ -19,12 +19,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar Bibliotecas de Inteligencia
+      - name: Instalar Dependencias
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy pygeohash openpyxl requests firebase-admin
 
-      - name: Executar Motor de Telemetria SafeDriver
+      - name: Executar Motor de Telemetria
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
@@ -32,7 +32,45 @@ jobs:
         run: |
           python motor_safedriver.py
 
-      - name: Salvar Dados Analiticos (Power BI)
+      - name: Disponibilizar Base para o Power BI
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-powerbi
+          path: dados_publicos_safedriver.csvname: Pipeline do Motor SafeDriver
+
+on:
+  schedule:
+    - cron: '0 0 1,15 * *'
+  workflow_dispatch:
+
+jobs:
+  telemetria_safedriver:
+    name: Inteligencia de Dados SSP-SP
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clonar Repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pygeohash openpyxl requests firebase-admin
+
+      - name: Executar Motor de Telemetria
+        env:
+          FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+        run: |
+          python motor_safedriver.py
+
+      - name: Disponibilizar Base para o Power BI
         uses: actions/upload-artifact@v4
         with:
           name: base-powerbi
