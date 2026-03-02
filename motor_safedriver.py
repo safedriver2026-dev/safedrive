@@ -9,8 +9,7 @@ import unicodedata
 
 class SafeDriverEngine:
     """
-    SafeDriver Core V3.0 - Multi-Modal Intelligence.
-    Padrao Google Maps: Pe, Bicicleta, Onibus, Moto e Carro.
+PIPILINE DADOS SSP - EXTRAÇÃO, LIMPEZA E PREVISÃO
     """
     def __init__(self):
         self.db = self._iniciar_persistencia()
