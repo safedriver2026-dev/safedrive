@@ -470,8 +470,9 @@ class SafeDriverEngine:
                 errors="coerce",
                 dayfirst=True,
             )
+    
             df["DIAS_DESDE_OCORRENCIA"] = (
-                referencia.normalize() - df["DATA_OCORRENCIA_BO"]
+                pd.Timestamp(referencia).normalize() - df["DATA_OCORRENCIA_BO"]
             ).dt.days
         else:
             df["DIAS_DESDE_OCORRENCIA"] = np.nan
@@ -581,7 +582,7 @@ class SafeDriverEngine:
             base[f"freq_{sufixo}"] = base[f"freq_{sufixo}"].fillna(0).astype(float)
             base[f"risco_{sufixo}"] = base[f"risco_{sufixo}"].fillna(0.0).astype(float)
 
-        # Score heurístico (0.5–10)
+        # Score (0.5–10)
         q95 = base["risco_total"].quantile(0.95)
         if pd.isna(q95) or q95 <= 0:
             q95 = 1.0
