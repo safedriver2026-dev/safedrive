@@ -1,38 +1,72 @@
-name: AutoBot SafeDriver
+name: Autobot SafeDriver
 
 on:
   schedule:
-    - cron: '0 0 1,15 * *'
-  workflow_dispatch:
+
+    - cron: "0 0 * * 1"
+  workflow_dispatch: {}
 
 jobs:
-  telemetria_automatica:
-    name: Execução Automática AutoBot
+  safedrive-weekly:
     runs-on: ubuntu-latest
+
+    env:
+      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+      DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+      FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
+      XGB_ALPHA: "0.6"
+      PROPHET_HORIZON_DIAS: "7"
+      PROPHET_TOP_GEOHASH: "20"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Instalar Dependências
+      - name: Install dependencies
         run: |
-          pip install pandas numpy pygeohash openpyxl requests firebase-admin
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
 
-      - name: Rodar AutoBot
-        env:
-          FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
-          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+      - name: Run tests (pytest)
+        id: tests
+        run: |
+          pytest -q
+
+      - name: Run SafeDriver weekly pipeline
+        id: pipeline
+        if: success()
         run: |
           python motor_safedriver.py
 
-      - name: Upload da Base (Power BI)
-        uses: actions/upload-artifact@v4
-        with:
-          name: base-autobot
-          path: dados_publicos_safedriver.csv
+      - name: Run Prophet forecasts for BI
+        id: prophet
+        if: success()
+        run: |
+          python forecast_prophet.py
+
+      - name: Notify Discord - tests failed
+        if: failure() && steps.tests.outcome == 'failure' && env.DISCORD_ERRO != ''
+        run: |
+          curl -X POST "$DISCORD_ERRO" \
+            -H "Content-Type: application/json" \
+            -d '{"content": "❌ SafeDrive semanal: testes falharam. Verifique o GitHub Actions."}'
+
+      - name: Notify Discord - pipeline failed
+        if: failure() && steps.tests.outcome == 'success' && steps.pipeline.outcome == 'failure' && env.DISCORD_ERRO != ''
+        run: |
+          curl -X POST "$DISCORD_ERRO" \
+            -H "Content-Type: application/json" \
+            -d '{"content": "❌ SafeDrive semanal: motor_safedriver.py falhou. Verifique os logs."}'
+
+      - name: Notify Discord - all good
+        if: success() && env.DISCORD_SUCESSO != ''
+        run: |
+          curl -X POST "$DISCORD_SUCESSO" \
+            -H "Content-Type: application/json" \
+            -d '{"content": "✅ SafeDrive: sync semanal executado com sucesso (testes + treino + malha + Prophet)."}'
