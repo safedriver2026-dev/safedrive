@@ -1,10 +1,26 @@
+# Pilha de dados 
 pandas
 numpy
+pyarrow
+
+# Geoespacial / grid
 pygeohash
+
+# Modelos preditivos
 xgboost
 scikit-learn
+
+# Datas / feriados
 holidays
+python-dateutil
+pytz
+
+# IO / HTTP / Excel
 requests
 openpyxl
+
+# Cloud
 firebase-admin
-pyarrow
+
+# BI / Forecast
+prophet
