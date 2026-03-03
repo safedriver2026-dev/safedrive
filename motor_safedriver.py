@@ -28,7 +28,7 @@ AnyStr = Union[str, bytes]
 @dataclass(frozen=True)
 class CrimeInfo:
     artigo: int
-    classe: str   # MEDIO, GRAVE, GRAVISSIMO
+    classe: str   
     peso: float
 
 
@@ -36,20 +36,29 @@ class SafeDriverEngine:
     """
     Motor de risco SafeDrive
 
-    - Lê histórico da SSP
-    - Usa NUM_BO para detectar se há BOs novos
-    - Se não houver BO novo, não recalcula malha nem treina modelo
+    Fluxo:
+    - Lê histórico da SSP (anos configuráveis)
+    - Usa NUM_BO para identificar BOs novos
+    - Se não houver BO novo:
+        - não recalcula malha, não treina modelo
+        - apenas envia log informativo
     - Se houver BO novo:
-        - recalcula malha com o histórico
-        - treina XGBoost com features temporais + calendário
-        - aplica modelo para score_final
+        - baixa + trata + aplica filtros
+        - calcula pesos / recência / feriados
+        - monta grid geohash + perfil + período
+        - treina XGBoost em cima do grid
+        - aplica score_final (blend modelo + heurística)
         - atualiza Firestore + CSV analítico
+        - registra BOs novos em bo_index
     """
 
     def __init__(self) -> None:
         self.db = self._iniciar_persistencia()
-        self.modelo_xgb = self._carregar_modelo_xgb()
 
+      
+        self.modelo_xgb: Optional[xgb.Booster] = None
+
+        # Mapa de crimes relevantes
         self.crime_map: Dict[str, CrimeInfo] = {
             "FURTO DE VEICULO": CrimeInfo(155, "MEDIO", 1.0),
             "FURTO DE CARGA": CrimeInfo(155, "MEDIO", 1.2),
@@ -59,11 +68,13 @@ class SafeDriverEngine:
             "EXTORSAO MEDIANTE A SEQUESTRO": CrimeInfo(159, "GRAVISSIMO", 5.0),
         }
 
+        # Locais macro
         self.tipos_local_validos = [
             self._limpar_texto("Via Pública"),
             self._limpar_texto("Rodovia/Estrada"),
         ]
 
+        # Subtipos de interesse
         self.subtipos_local_validos = [
             "VIA PUBLICA",
             "TRANSEUNTE",
@@ -85,6 +96,7 @@ class SafeDriverEngine:
             "VEICULO EM MOVIMENTO",
         ]
 
+        # Peso por período do dia
         self.peso_periodo = {
             "MADRUGADA": 1.3,
             "MANHA": 0.9,
@@ -93,16 +105,19 @@ class SafeDriverEngine:
             "INDEFINIDO": 1.0,
         }
 
-        # Feriados nacionais (pode trocar por holidays.Brazil(state="SP") se quiser)
+        # Feriados nacionais
         self.calendario_feriados = holidays.Brazil()
 
-  
+   
     def executar_pipeline(
         self,
         ano_inicio: int = 2022,
         ano_fim: Optional[int] = None,
     ) -> None:
-        referencia = datetime.now()
+        # Referência temporal para recência e logs
+        inicio_execucao = datetime.now()
+        referencia = inicio_execucao
+
         if ano_fim is None:
             ano_fim = referencia.year
 
@@ -112,7 +127,7 @@ class SafeDriverEngine:
             ano_fim,
         )
 
-        # Ingestão SSP 
+        # Ingestão histórica SSP
         try:
             df_hist = self._carregar_historico(ano_inicio, ano_fim)
         except Exception as e:
@@ -123,77 +138,86 @@ class SafeDriverEngine:
         total_brutos = len(df_hist)
         logging.info("Total de registros brutos na ingestão: %d", total_brutos)
 
-        # 2) Normalização de NUM_BO
+        # NUM_BO normalizado
         if "NUM_BO" not in df_hist.columns:
             logging.warning("Coluna NUM_BO não encontrada. Dedupe por BO não será aplicado.")
             df_hist["NUM_BO"] = None
         else:
             df_hist["NUM_BO"] = df_hist["NUM_BO"].astype(str).map(self._limpar_texto)
 
-        # Carrega índice de BO já processados
+        #  Carrega índice de BOs já processados
         index_bo = self._carregar_index_bo()
         logging.info("Índice BO carregado com %d boletins já conhecidos.", len(index_bo))
 
-        # Identifica BOs novos
+        # BOs novos
         df_hist["BO_CONHECIDO"] = df_hist["NUM_BO"].isin(index_bo)
         df_novos = df_hist[~df_hist["BO_CONHECIDO"]].copy()
         qtd_novos_bo = df_novos["NUM_BO"].nunique() if "NUM_BO" in df_novos.columns else 0
 
         logging.info("Boletins novos detectados nesta execução: %d", qtd_novos_bo)
 
+       
         if qtd_novos_bo == 0:
-            self._enviar_relatorio_consolidado(
-                {
-                    "Sincronização": "Sem novos boletins",
-                    "Total Registros Ingestão": f"{total_brutos:,}",
-                    "Boletins Novos": "0",
-                    "Observação": "Pipeline não recalculou a malha por ausência de novos NUM_BO.",
-                },
-                status="neutro",
-            )
+            logs = {
+                "Sincronização": "Sem novos boletins",
+                "Total Registros Ingestão": f"{total_brutos:,}",
+                "Boletins Novos": "0",
+                "Observação": "Pipeline não recalculou a malha por ausência de novos NUM_BO.",
+                "Tempo de Resposta": f"{(datetime.now() - inicio_execucao).seconds}s",
+                "Concluído em": referencia.strftime("%d/%m/%Y às %H:%M"),
+            }
+            self._enviar_relatorio_consolidado(logs, status="neutro")
             return
 
         logging.info("Novos BOs detectados. Recalculando malha e treinando XGBoost com todo o histórico.")
 
-        # Pipeline de risco com o histórico
+        # Pipeline de risco completo
+
+        #  Saneamento geo
         df_geo = self._sanear_geo(df_hist)
+
+        # Normalização texto
         df_norm = self._normalizar_campos_texto(df_geo)
+
+        # Filtros de conteúdo
         df_filtrado_conteudo = self._filtrar_conteudo(df_norm)
 
-        df_pesos, total_qualificados, aproveitamento = self._aplicar_pesos(
+        # Pesos 
+        df_pesos, total_qualificados, aproveitamento_final = self._aplicar_pesos(
             df_filtrado_conteudo,
             referencia,
             total_brutos,
         )
 
         if total_qualificados == 0:
-            self._enviar_relatorio_consolidado(
-                {
-                    "Sincronização": "Finalizada",
-                    "Observação": "Não foram detectados registros qualificados após os filtros.",
-                    "Data": referencia.strftime("%d/%m/%Y às %H:%M"),
-                },
-                "neutro",
-            )
+            logs = {
+                "Sincronização": "Finalizada",
+                "Observação": "Não foram detectados registros qualificados após os filtros.",
+                "Total Registros Ingestão": f"{total_brutos:,}",
+                "Boletins Novos": f"{qtd_novos_bo:,}",
+                "Tempo de Resposta": f"{(datetime.now() - inicio_execucao).seconds}s",
+                "Concluído em": referencia.strftime("%d/%m/%Y às %H:%M"),
+            }
+            self._enviar_relatorio_consolidado(logs, "neutro")
             return
 
         # Grid + features
         df_final, resumo_grid = self._preparar_grid(df_pesos)
 
-        # Treina XGBoost com o grid 
+        # Treino XGBoost com grid histórico
         self.modelo_xgb = self._treinar_xgb(resumo_grid)
 
-        # Aplica modelo
+        # Aplicação do modelo 
         resumo_grid = self._aplicar_modelo_xgb(resumo_grid)
 
-        # Observabilidade
+        # Observabilidade básica
         self._log_observabilidade(resumo_grid)
 
-        # Firestore + CSV
+       
         docs_higienizados = self._persistir_risco(resumo_grid)
         self._exportar_bi(df_final, referencia)
 
-        # Atualiza índice
+     
         novos_numeros_bo = (
             df_novos["NUM_BO"]
             .dropna()
@@ -204,20 +228,23 @@ class SafeDriverEngine:
         )
         self._atualizar_index_bo(novos_numeros_bo)
 
-        # Relatório
+        
         logs = self._gerar_logs(
             df_final,
             resumo_grid,
             total_brutos,
             total_qualificados,
-            aproveitamento,
+            aproveitamento_final,
             docs_higienizados,
-            referencia,
         )
+        logs["Boletins Novos"] = f"{qtd_novos_bo:,}"
+        logs["Tempo de Resposta"] = f"{(datetime.now() - inicio_execucao).seconds}s"
+        logs["Concluído em"] = referencia.strftime("%d/%m/%Y às %H:%M")
+
         self._enviar_relatorio_consolidado(logs, "sucesso")
         logging.info("Pipeline SafeDriver concluída com sucesso.")
 
-  
+    
     def _limpar_texto(self, texto: AnyStr) -> str:
         if not isinstance(texto, str):
             texto = str(texto)
@@ -237,31 +264,7 @@ class SafeDriverEngine:
         logging.info("Conexão com Firestore inicializada.")
         return firestore.client()
 
-    def _carregar_modelo_xgb(self):
-        caminho = os.environ.get(
-            "XGB_MODEL_PATH",
-            os.path.join("modelos", "modelo_safedriver_xgb.json"),
-        )
 
-        if not os.path.exists(caminho):
-            logging.info(
-                "Modelo XGBoost não encontrado em %s. Será treinado quando houver dados novos.",
-                caminho,
-            )
-            return None
-
-        try:
-            modelo = xgb.Booster()
-            modelo.load_model(caminho)
-            logging.info("Modelo XGBoost carregado de %s.", caminho)
-            return modelo
-        except Exception as e:
-            logging.warning(
-                "Falha ao carregar modelo XGBoost (%s). Será treinado do zero.", e
-            )
-            return None
-
-   
     def _carregar_index_bo(self) -> set[str]:
         if not self.db:
             return set()
@@ -361,7 +364,7 @@ class SafeDriverEngine:
         )
         return df_hist
 
-  
+   
     def _sanear_geo(self, df_raw: pd.DataFrame) -> pd.DataFrame:
         df = df_raw.copy()
         df["LATITUDE"] = pd.to_numeric(df["LATITUDE"], errors="coerce")
@@ -395,7 +398,7 @@ class SafeDriverEngine:
         logging.info("Filtros de conteúdo: %d registros após filtros.", len(df))
         return df
 
-    
+  
     def _definir_periodo(self, hora: AnyStr) -> str:
         try:
             h = int(str(hora).split(":")[0])
@@ -460,6 +463,7 @@ class SafeDriverEngine:
         else:
             aproveitamento_final = 0.0
 
+      
         if "DATA_OCORRENCIA_BO" in df.columns:
             df["DATA_OCORRENCIA_BO"] = pd.to_datetime(
                 df["DATA_OCORRENCIA_BO"],
@@ -472,6 +476,7 @@ class SafeDriverEngine:
         else:
             df["DIAS_DESDE_OCORRENCIA"] = np.nan
 
+     
         if "DATA_OCORRENCIA_BO" in df.columns:
             data_col = df["DATA_OCORRENCIA_BO"]
             data_date = data_col.dt.date
@@ -516,13 +521,14 @@ class SafeDriverEngine:
 
         return df, total_qualificados, aproveitamento_final
 
-  
+
     def _preparar_grid(
         self,
         df_com_pesos: pd.DataFrame,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         df = df_com_pesos.copy()
 
+        # Perfis por qualificação
         df["perfil"] = df["QUALIFICACAO"].apply(
             lambda x: ["Pedestre", "Ciclista", "Motorista"]
             if x == "ALERTA"
@@ -530,6 +536,7 @@ class SafeDriverEngine:
         )
         df_final = df.explode("perfil")
 
+        # Geohash
         df_final["geohash"] = [
             gh.encode(la, lo, precision=7)
             for la, lo in zip(df_final["LATITUDE"], df_final["LONGITUDE"])
@@ -537,6 +544,7 @@ class SafeDriverEngine:
 
         group_keys = ["geohash", "perfil", "PERIODO"]
 
+        # Agregado principal
         base = (
             df_final.groupby(group_keys)
             .agg(
@@ -551,6 +559,7 @@ class SafeDriverEngine:
             .reset_index()
         )
 
+        # Janelas temporais
         for limite, sufixo in [(30, "30"), (90, "90"), (365, "365")]:
             subset = df_final[df_final["DIAS_DESDE_OCORRENCIA"] <= limite]
             if subset.empty:
@@ -572,6 +581,7 @@ class SafeDriverEngine:
             base[f"freq_{sufixo}"] = base[f"freq_{sufixo}"].fillna(0).astype(float)
             base[f"risco_{sufixo}"] = base[f"risco_{sufixo}"].fillna(0.0).astype(float)
 
+        # Score heurístico (0.5–10)
         q95 = base["risco_total"].quantile(0.95)
         if pd.isna(q95) or q95 <= 0:
             q95 = 1.0
@@ -622,10 +632,11 @@ class SafeDriverEngine:
         X = df[feature_cols].astype(float)
         return X, feature_cols
 
- 
+   
     def _treinar_xgb(self, resumo_grid: pd.DataFrame) -> xgb.Booster:
         X, feature_cols = self._montar_features_xgb(resumo_grid)
 
+       
         q75 = resumo_grid["risco_total"].quantile(0.75)
         y = (resumo_grid["risco_total"] >= q75).astype(int)
 
@@ -654,6 +665,7 @@ class SafeDriverEngine:
             num_boost_round=150,
         )
 
+       
         caminho = os.environ.get(
             "XGB_MODEL_PATH",
             os.path.join("modelos", "modelo_safedriver_xgb.json"),
@@ -667,7 +679,7 @@ class SafeDriverEngine:
 
         return booster
 
-  
+   
     def _aplicar_modelo_xgb(self, resumo_grid: pd.DataFrame) -> pd.DataFrame:
         df = resumo_grid.copy()
 
@@ -700,7 +712,7 @@ class SafeDriverEngine:
         logging.info("Modelo XGBoost aplicado. alpha=%.2f", alpha)
         return df
 
-    
+
     def _log_observabilidade(self, resumo_grid: pd.DataFrame) -> None:
         if resumo_grid.empty:
             logging.warning(
@@ -835,7 +847,6 @@ class SafeDriverEngine:
         total_qualificados: int,
         aproveitamento_final: float,
         docs_higienizados: int,
-        referencia: datetime,
     ) -> Dict[str, str]:
         distribuicao = df_final["perfil"].value_counts(normalize=True) * 100
 
@@ -849,9 +860,7 @@ class SafeDriverEngine:
             "🧱 Células de Risco": f"{len(resumo_grid):,} geohashes",
             "🚀 Status Cloud": "Firestore & BI Atualizados"
             if self.db
-            else "Export local (CSV) concluída",
-            "⏱️ Tempo de Resposta": f"{(datetime.now() - referencia).seconds}s",
-            "📅 Concluído em": referencia.strftime("%d/%m/%Y às %H:%M"),
+            else "Exportação CSV concluída",
         }
         return logs
 
@@ -901,7 +910,7 @@ class SafeDriverEngine:
                     "color": cores.get(status, 0x3498DB),
                     "fields": fields,
                     "footer": {
-                        "text": " SafeDriver Autobot  • Monitoramento Inteligente"
+                        "text": "Autobot Infrastructure • Monitoramento Consolidado"
                     },
                 }
             ],
