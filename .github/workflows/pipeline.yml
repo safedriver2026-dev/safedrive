@@ -1,4 +1,4 @@
-name: 🤖 Autobot SafeDriver — Operação Semanal
+name: Autobot SafeDriver — Operação Semanal
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   autobot-safedriver:
-    name: 🤖 Autobot SafeDriver — Missão Semanal
+    name: Autobot SafeDriver — Missão Semanal
     runs-on: ubuntu-latest
 
     env:
