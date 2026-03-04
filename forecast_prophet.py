@@ -1,65 +1,65 @@
 import logging
 import os
 from datetime import timedelta
+from pathlib import Path
 
 import pandas as pd
 from prophet import Prophet
 import holidays
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+LAKE_DIR = Path(os.environ.get("LAKE_DIR", "data_lake"))
+REF_EVENTS_DIR = LAKE_DIR / "refined" / "events"
+FORECAST_DIR = LAKE_DIR / "refined" / "forecast"
+FORECAST_DIR.mkdir(parents=True, exist_ok=True)
+
+PARQUET_ENGINE = os.environ.get("PARQUET_ENGINE", "pyarrow")
+PARQUET_COMPRESSION = os.environ.get("PARQUET_COMPRESSION", "zstd")
+
+PROPHET_HORIZON_DIAS = int(os.environ.get("PROPHET_HORIZON_DIAS", "7"))
+PROPHET_TOP_GEOHASH = int(os.environ.get("PROPHET_TOP_GEOHASH", "20"))
 
 
-def carregar_base_analitica(path_csv: str) -> pd.DataFrame:
-    if not os.path.exists(path_csv):
-        logging.info(
-            "Base analítica %s não encontrada. Prophet não será executado.",
-            path_csv,
-        )
+def carregar_events_refined() -> pd.DataFrame:
+    if not REF_EVENTS_DIR.exists():
+        logging.info("Não encontrado Refined (%s).", REF_EVENTS_DIR)
         return pd.DataFrame()
 
-    df = pd.read_csv(path_csv, encoding="utf-8-sig")
-
-    if "DATA_OCORRENCIA_BO" not in df.columns:
-        logging.warning("Coluna DATA_OCORRENCIA_BO não encontrada no CSV.")
+    paths = list(REF_EVENTS_DIR.rglob("*.parquet"))
+    if not paths:
+        logging.info("Sem parquets em refined/events.")
         return pd.DataFrame()
 
-    if "geohash" not in df.columns:
-        logging.warning("Coluna geohash não encontrada no CSV.")
+    frames = []
+    for p in paths:
+        try:
+            frames.append(pd.read_parquet(p, columns=["DATA_OCORRENCIA_BO", "geohash"]))
+        except Exception:
+            continue
+
+    if not frames:
         return pd.DataFrame()
 
-    df["DATA_OCORRENCIA_BO"] = pd.to_datetime(
-        df["DATA_OCORRENCIA_BO"], errors="coerce"
-    )
-    df = df.dropna(subset=["DATA_OCORRENCIA_BO"])
-
-    if df.empty:
-        logging.info("Nenhum registro temporal válido na base analítica.")
-        return pd.DataFrame()
-
+    df = pd.concat(frames, ignore_index=True)
+    df["DATA_OCORRENCIA_BO"] = pd.to_datetime(df["DATA_OCORRENCIA_BO"], errors="coerce")
+    df = df.dropna(subset=["DATA_OCORRENCIA_BO", "geohash"])
     return df
 
 
-def gerar_previsoes_prophet(
-    df_final: pd.DataFrame,
-    horizonte_dias: int = 7,
-    top_k: int = 20,
-) -> pd.DataFrame:
-    df_ts = df_final.copy()
-    df_ts = df_ts.dropna(subset=["DATA_OCORRENCIA_BO"])
-    if df_ts.empty:
-        logging.info("Nenhum dado temporal válido para Prophet.")
+def gerar_previsoes_prophet(df: pd.DataFrame, horizonte_dias: int, top_k: int) -> pd.DataFrame:
+    if df.empty:
         return pd.DataFrame()
 
     series = (
-        df_ts.groupby(["DATA_OCORRENCIA_BO", "geohash"])
-        .size()
-        .reset_index(name="y")
+        df.assign(ds=df["DATA_OCORRENCIA_BO"].dt.floor("D"))
+          .groupby(["ds", "geohash"])
+          .size()
+          .reset_index(name="y")
     )
-    series = series.rename(columns={"DATA_OCORRENCIA_BO": "ds"})
+    if series.empty:
+        return pd.DataFrame()
 
     data_min = series["ds"].min().date()
     data_max = series["ds"].max().date() + timedelta(days=horizonte_dias)
@@ -76,24 +76,14 @@ def gerar_previsoes_prophet(
     soma_geo = soma_geo.sort_values("y", ascending=False).head(top_k)
 
     forecasts = []
-    logging.info(
-        "Gerando previsões Prophet para top %d geohashes (horizonte %d dias, com feriados).",
-        top_k,
-        horizonte_dias,
-    )
+    logging.info("Prophet: top_k=%d, horizonte=%d dias", top_k, horizonte_dias)
 
-    for _, row in soma_geo.iterrows():
-        geo = row["geohash"]
+    for geo in soma_geo["geohash"].tolist():
         df_geo = series[series["geohash"] == geo].copy()
-        if len(df_geo) < 10:
-            logging.info(
-                "Geohash %s com poucos pontos (%d). Pulando Prophet aqui.",
-                geo,
-                len(df_geo),
-            )
+        if len(df_geo) < 14:
             continue
 
-        modelo = Prophet(
+        model = Prophet(
             weekly_seasonality=True,
             yearly_seasonality=True,
             daily_seasonality=False,
@@ -101,53 +91,38 @@ def gerar_previsoes_prophet(
         )
 
         try:
-            modelo.fit(df_geo[["ds", "y"]])
-        except Exception as e:
-            logging.warning(
-                "Prophet falhou para geohash %s (%s). Pulando.", geo, e
-            )
+            model.fit(df_geo[["ds", "y"]])
+        except Exception:
             continue
 
-        futuro = modelo.make_future_dataframe(periods=horizonte_dias)
-        forecast = modelo.predict(futuro)
-        forecast["geohash"] = geo
+        futuro = model.make_future_dataframe(periods=horizonte_dias)
+        fc = model.predict(futuro)
 
-        forecasts.append(
-            forecast[["ds", "geohash", "yhat", "yhat_lower", "yhat_upper"]]
-        )
+        out = fc[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+        out["geohash"] = geo
+        forecasts.append(out)
 
     if not forecasts:
-        logging.info("Nenhuma previsão Prophet foi gerada (sem dados suficientes).")
         return pd.DataFrame()
 
-    df_forecast = pd.concat(forecasts, ignore_index=True)
-    return df_forecast
+    return pd.concat(forecasts, ignore_index=True)
 
 
 def main() -> None:
-    path_csv = "analise_consolidada_safedriver.csv"
-    df = carregar_base_analitica(path_csv)
-
+    df = carregar_events_refined()
     if df.empty:
-        logging.info("Base analítica indisponível ou vazia. Encerrando Prophet.")
+        logging.info("Sem base para Prophet. Encerrando.")
         return
 
-    horizonte = int(os.environ.get("PROPHET_HORIZON_DIAS", "7"))
-    top_k = int(os.environ.get("PROPHET_TOP_GEOHASH", "20"))
-
-    df_forecast = gerar_previsoes_prophet(
-        df,
-        horizonte_dias=horizonte,
-        top_k=top_k,
-    )
-
+    df_forecast = gerar_previsoes_prophet(df, PROPHET_HORIZON_DIAS, PROPHET_TOP_GEOHASH)
     if df_forecast.empty:
-        logging.info("Sem previsões geradas. Nada a exportar.")
+        logging.info("Sem previsões geradas.")
         return
 
-    saida = "forecast_prophet_safedriver.csv"
-    df_forecast.to_csv(saida, index=False, encoding="utf-8-sig")
-    logging.info("Exportação de previsões Prophet concluída (%s).", saida)
+    ts = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%S")
+    out_path = FORECAST_DIR / f"forecast-{ts}.parquet"
+    df_forecast.to_parquet(out_path, index=False, engine=PARQUET_ENGINE, compression=PARQUET_COMPRESSION)
+    logging.info("Forecast salvo: %s", out_path)
 
 
 if __name__ == "__main__":
