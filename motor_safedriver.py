@@ -29,7 +29,7 @@ LAKE_DIR = Path(os.environ.get("LAKE_DIR", "data_lake"))
 RAW_SSP_DIR = LAKE_DIR / "raw" / "ssp"
 REF_EVENTS_DIR = LAKE_DIR / "refined" / "events"
 REF_GRID_DIR = LAKE_DIR / "refined" / "grid"
-REF_FORECAST_DIR = LAKE_DIR / "refined" / "forecast" 
+REF_METRICS_DIR = LAKE_DIR / "refined" / "metrics"
 
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "modelos"))
 STATE_DIR = Path(os.environ.get("STATE_DIR", "state"))
@@ -37,12 +37,12 @@ STATE_DIR = Path(os.environ.get("STATE_DIR", "state"))
 RAW_SSP_DIR.mkdir(parents=True, exist_ok=True)
 REF_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 REF_GRID_DIR.mkdir(parents=True, exist_ok=True)
-REF_FORECAST_DIR.mkdir(parents=True, exist_ok=True)
+REF_METRICS_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 PARQUET_ENGINE = os.environ.get("PARQUET_ENGINE", "pyarrow")
-PARQUET_COMPRESSION = os.environ.get("PARQUET_COMPRESSION", "zstd") 
+PARQUET_COMPRESSION = os.environ.get("PARQUET_COMPRESSION", "zstd")  
 
 SSP_FORCE_REFRESH = os.environ.get("SSP_FORCE_REFRESH", "0").strip().lower() in ("1", "true", "yes", "y")
 GEOHASH_PRECISION_APP = int(os.environ.get("GEOHASH_PRECISION_APP", "7"))
@@ -68,6 +68,10 @@ SSP_STATE_PATH = STATE_DIR / "ssp_state.json"
 FIRESTORE_COLLECTION_RISK = os.environ.get("FIRESTORE_COLLECTION_RISK", "risk_cells_v2")
 
 
+DISCORD_SUCESSO = os.environ.get("DISCORD_SUCESSO", "")
+DISCORD_ERRO = os.environ.get("DISCORD_ERRO", "")
+
+
 COLS_SSP_MIN = [
     "NUM_BO",
     "DATA_OCORRENCIA_BO",
@@ -90,12 +94,22 @@ class CrimeInfo:
 
 class SafeDriverEngine:
     """
-Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
+    Autobot SafeDriver:
+    - Processar o mínimo necessário.
+    - Evitar download/parse quando SSP não atualizou.
+    - Treinar XGBoost só quando fizer sentido (threshold/cooldown).
+    - Entregar dados fáceis pro app (bounds/center e prefixos gh5/6/7).
+    - Registrar métricas executivas para governança e BI.
+
+    Contrato (testes):
+    - _carregar_historico, _sanear_geo, _normalizar_campos_texto, _filtrar_conteudo,
+      _aplicar_pesos, _preparar_grid, _montar_features_xgb, _treinar_xgb, _aplicar_modelo_xgb
     """
 
     def __init__(self) -> None:
         self.db = self._iniciar_persistencia()
         self.modelo_xgb: Optional[xgb.Booster] = None
+        self.exec_meta: Dict[str, Any] = {}
 
         self.crime_map: Dict[str, CrimeInfo] = {
             "FURTO DE VEICULO": CrimeInfo(155, "MEDIO", 1.0),
@@ -142,7 +156,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
 
         self.calendario_feriados = holidays.Brazil()
 
-  
+
     def executar_pipeline(self, ano_inicio: int = 2022, ano_fim: Optional[int] = None) -> None:
         inicio_execucao = datetime.now()
         referencia = inicio_execucao
@@ -151,76 +165,170 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
             ano_fim = referencia.year
         ano_atual = referencia.year
 
-        logging.info("SafeDriver: iniciando (%s–%s). Ano atual=%s", ano_inicio, ano_fim, ano_atual)
+        logging.info("Autobot SafeDriver: inicializando pipeline (%s–%s). Ano atual=%s", ano_inicio, ano_fim, ano_atual)
 
-   
-        df_hist = self._carregar_historico(ano_inicio, ano_fim)
-        total_brutos = len(df_hist)
-        logging.info("Ingestão SSP (raw parquet): %d registros.", total_brutos)
-
-    
-        if "NUM_BO" not in df_hist.columns:
-            df_hist["NUM_BO"] = None
-        df_hist["NUM_BO"] = df_hist["NUM_BO"].astype(str).map(self._limpar_texto)
-
-     
-        df_ano_atual = df_hist[df_hist["ANO_BASE"] == ano_atual].copy() if "ANO_BASE" in df_hist.columns else df_hist.copy()
-        index_bo = self._carregar_index_bo_refined(ano_atual)
-
-        df_ano_atual["BO_CONHECIDO"] = df_ano_atual["NUM_BO"].isin(index_bo)
-        df_novos = df_ano_atual[~df_ano_atual["BO_CONHECIDO"]].copy()
-        qtd_novos_bo = df_novos["NUM_BO"].dropna().nunique()
-
-        logging.info("BOs novos (ano atual %s): %d", ano_atual, qtd_novos_bo)
-        if qtd_novos_bo == 0:
-            logging.info("Sem BO novo. Encerrando (sem recalcular malha).")
-            return
-
-        # Processamento: saneamento + filtros + pesos
-        df_geo = self._sanear_geo(df_hist)
-        df_norm = self._normalizar_campos_texto(df_geo)
-        df_filtrado = self._filtrar_conteudo(df_norm)
-
-        df_pesos, total_qualificados, aproveitamento = self._aplicar_pesos(df_filtrado, referencia, total_brutos)
-        if total_qualificados == 0:
-            logging.info("Nenhum registro qualificado após filtros.")
-            return
-
-       
-        if TRAIN_WINDOW_MONTHS > 0:
-            cutoff = pd.Timestamp(referencia) - pd.DateOffset(months=TRAIN_WINDOW_MONTHS)
-            df_pesos = df_pesos[df_pesos["DATA_OCORRENCIA_BO"].notna() & (df_pesos["DATA_OCORRENCIA_BO"] >= cutoff)].copy()
-
-     
-        df_eventos, grid = self._preparar_grid(df_pesos)
-
-   
-        if self._deve_treinar(qtd_novos_bo, referencia):
-            self.modelo_xgb = self._treinar_xgb(grid)
-            self._salvar_estado_treino({"last_train_at": referencia.isoformat(), "last_novos_bo": qtd_novos_bo})
-        else:
-            self.modelo_xgb = self._carregar_modelo_xgb_se_existir()
-
-        grid = self._aplicar_modelo_xgb(grid)
+        try:
+           
+            df_hist = self._carregar_historico(ano_inicio, ano_fim)
+            total_brutos = len(df_hist)
+            logging.info("Autobot SafeDriver: ingestão concluída (RAW parquet). Registros=%d", total_brutos)
 
         
-        self._exportar_events_refined_parquet(df_eventos, referencia)
-        self._exportar_grid_refined_parquet(grid, referencia)
+            if "NUM_BO" not in df_hist.columns:
+                df_hist["NUM_BO"] = None
+            df_hist["NUM_BO"] = df_hist["NUM_BO"].astype(str).map(self._limpar_texto)
 
-      
-        self._persistir_grid_app_firestore(grid)
+        
+            df_ano_atual = df_hist[df_hist["ANO_BASE"] == ano_atual].copy() if "ANO_BASE" in df_hist.columns else df_hist.copy()
+            index_bo = self._carregar_index_bo_refined(ano_atual)
 
-        logging.info(
-            "Concluído: brutos=%d qualificados=%d (%.1f%%) grid=%d novos_bo=%d tempo=%ss",
-            total_brutos,
-            total_qualificados,
-            aproveitamento,
-            len(grid),
-            qtd_novos_bo,
-            (datetime.now() - inicio_execucao).seconds,
-        )
+            df_ano_atual["BO_CONHECIDO"] = df_ano_atual["NUM_BO"].isin(index_bo)
+            df_novos = df_ano_atual[~df_ano_atual["BO_CONHECIDO"]].copy()
+            qtd_novos_bo = int(df_novos["NUM_BO"].dropna().nunique())
 
+            logging.info("Autobot SafeDriver: BOs novos detectados (ano atual %s) = %d", ano_atual, qtd_novos_bo)
 
+            if qtd_novos_bo == 0:
+                # Resumo informativo
+                tempo_s = (datetime.now() - inicio_execucao).seconds
+                self.exec_meta.setdefault("xgb_status", "Não executado (sem BO novo)")
+                campos = self._gerar_resumo_executivo_motor(
+                    referencia=referencia,
+                    total_brutos=total_brutos,
+                    total_qualificados=0,
+                    aproveitamento=0.0,
+                    novos_bo=0,
+                    grid_size=0,
+                    events_parts_written=0,
+                    modalidades={},
+                    modalidades_periodo={},
+                    tempo_s=tempo_s,
+                )
+                self._enviar_resumo_discord_motor(campos, status="neutro")
+                self._exportar_metrics_execucao(
+                    referencia,
+                    total_brutos=total_brutos,
+                    total_qualificados=0,
+                    aproveitamento=0.0,
+                    qtd_novos_bo=0,
+                    grid_size=0,
+                    events_parts_written=0,
+                    tempo_s=tempo_s,
+                    modalidades={},
+                    modalidades_periodo={},
+                )
+                return
+
+            # Saneamento
+            df_geo = self._sanear_geo(df_hist)
+            df_norm = self._normalizar_campos_texto(df_geo)
+            df_filtrado = self._filtrar_conteudo(df_norm)
+
+            df_pesos, total_qualificados, aproveitamento = self._aplicar_pesos(df_filtrado, referencia, total_brutos)
+
+            if total_qualificados == 0:
+                tempo_s = (datetime.now() - inicio_execucao).seconds
+                campos = self._gerar_resumo_executivo_motor(
+                    referencia=referencia,
+                    total_brutos=total_brutos,
+                    total_qualificados=0,
+                    aproveitamento=aproveitamento,
+                    novos_bo=qtd_novos_bo,
+                    grid_size=0,
+                    events_parts_written=0,
+                    modalidades={},
+                    modalidades_periodo={},
+                    tempo_s=tempo_s,
+                )
+                self._enviar_resumo_discord_motor(campos, status="neutro")
+                self._exportar_metrics_execucao(
+                    referencia,
+                    total_brutos=total_brutos,
+                    total_qualificados=0,
+                    aproveitamento=aproveitamento,
+                    qtd_novos_bo=qtd_novos_bo,
+                    grid_size=0,
+                    events_parts_written=0,
+                    tempo_s=tempo_s,
+                    modalidades={},
+                    modalidades_periodo={},
+                )
+                return
+
+            # Janela de treino
+            if TRAIN_WINDOW_MONTHS > 0:
+                cutoff = pd.Timestamp(referencia) - pd.DateOffset(months=TRAIN_WINDOW_MONTHS)
+                df_pesos = df_pesos[df_pesos["DATA_OCORRENCIA_BO"].notna() & (df_pesos["DATA_OCORRENCIA_BO"] >= cutoff)].copy()
+
+            # Grid + eventos
+            df_eventos, grid = self._preparar_grid(df_pesos)
+
+            # Resumos por modalidade
+            modalidades = self._resumo_modalidades(df_eventos)
+            modalidades_periodo = self._resumo_modalidades_periodo(df_eventos)
+
+            # Treino controlado
+            if self._deve_treinar(qtd_novos_bo, referencia):
+                self.exec_meta["xgb_status"] = (
+                    f"Treino executado (hist + early stopping). "
+                    f"max_depth={XGB_MAX_DEPTH}, max_bin={XGB_MAX_BIN}, max_rows={XGB_MAX_ROWS}"
+                )
+                self.modelo_xgb = self._treinar_xgb(grid)
+                self._salvar_estado_treino({"last_train_at": referencia.isoformat(), "last_novos_bo": qtd_novos_bo})
+            else:
+                self.exec_meta["xgb_status"] = "Treino poupado (cooldown/threshold). Modelo carregado do cache."
+                self.modelo_xgb = self._carregar_modelo_xgb_se_existir()
+
+            grid = self._aplicar_modelo_xgb(grid)
+
+            # Salva refined Parquet
+            events_written = self._exportar_events_refined_parquet(df_eventos, referencia)
+            self._exportar_grid_refined_parquet(grid, referencia)
+
+            # Publica no Firestore 
+            self._persistir_grid_app_firestore(grid)
+
+            # Métricas e resumo executivo
+            tempo_s = (datetime.now() - inicio_execucao).seconds
+            self._exportar_metrics_execucao(
+                referencia,
+                total_brutos=total_brutos,
+                total_qualificados=total_qualificados,
+                aproveitamento=aproveitamento,
+                qtd_novos_bo=qtd_novos_bo,
+                grid_size=len(grid),
+                events_parts_written=events_written,
+                tempo_s=tempo_s,
+                modalidades=modalidades,
+                modalidades_periodo=modalidades_periodo,
+            )
+
+            campos = self._gerar_resumo_executivo_motor(
+                referencia=referencia,
+                total_brutos=total_brutos,
+                total_qualificados=total_qualificados,
+                aproveitamento=aproveitamento,
+                novos_bo=qtd_novos_bo,
+                grid_size=len(grid),
+                events_parts_written=events_written,
+                modalidades=modalidades,
+                modalidades_periodo=modalidades_periodo,
+                tempo_s=tempo_s,
+            )
+            self._enviar_resumo_discord_motor(campos, status="sucesso")
+
+        except Exception as e:
+            tempo_s = (datetime.now() - inicio_execucao).seconds
+            campos = {
+                "🤖 Autobot SafeDriver": "Falha detectada durante execução.",
+                "📌 Erro": f"{type(e).__name__}: {e}",
+                "⏱️ Tempo até falha": f"{tempo_s}s",
+                "🗓️ Timestamp": referencia.strftime("%d/%m/%Y %H:%M"),
+            }
+            self._enviar_resumo_discord_motor(campos, status="erro")
+            raise
+
+ 
     def _limpar_texto(self, texto: AnyStr) -> str:
         if not isinstance(texto, str):
             texto = str(texto)
@@ -230,15 +338,15 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
     def _iniciar_persistencia(self):
         secret_json = os.environ.get("FIREBASE_JSON")
         if not secret_json:
-            logging.info("FIREBASE_JSON não definido. Firestore desativado.")
+            logging.info("Autobot SafeDriver: FIREBASE_JSON ausente. Firestore desativado.")
             return None
         if not firebase_admin._apps:
             cred = credentials.Certificate(json.loads(secret_json))
             firebase_admin.initialize_app(cred)
-        logging.info("Firestore conectado.")
+        logging.info("Autobot SafeDriver: Firestore conectado.")
         return firestore.client()
 
-
+   
     def _load_json(self, path: Path) -> dict:
         if path.exists():
             try:
@@ -266,6 +374,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
     def _deve_treinar(self, novos_bo: int, referencia: datetime) -> bool:
         if not XGB_MODEL_PATH.exists():
             return True
+
         if novos_bo >= MIN_NOVOS_BO_TREINO:
             return True
 
@@ -287,10 +396,10 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         try:
             booster = xgb.Booster()
             booster.load_model(str(XGB_MODEL_PATH))
-            logging.info("Modelo XGB carregado (%s).", XGB_MODEL_PATH)
+            logging.info("Autobot SafeDriver: modelo XGB carregado (%s).", XGB_MODEL_PATH)
             return booster
         except Exception as e:
-            logging.warning("Falha ao carregar modelo XGB (%s).", e)
+            logging.warning("Autobot SafeDriver: falha ao carregar modelo XGB (%s).", e)
             return None
 
    
@@ -303,7 +412,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
     def _raw_parquet_path(self, ano: int) -> Path:
         return RAW_SSP_DIR / f"ano={ano}" / "ssp_raw.parquet"
 
-
+  
     def _parse_ssp_xlsx_to_df(self, xlsx_bytes: bytes, ano: int) -> pd.DataFrame:
         excel = pd.ExcelFile(io.BytesIO(xlsx_bytes))
         df_bruto = pd.DataFrame()
@@ -329,11 +438,6 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         return df_bruto
 
     def _carregar_dados_ssp(self, ano: int) -> pd.DataFrame:
-        """
-        CONTRATO mantido. Otimização:
-        - anos passados: usa RAW parquet
-        - ano atual: valida atualização (HEAD/ETag/Last-Modified + GET condicional + sha256)
-        """
         out_path = self._raw_parquet_path(ano)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -341,7 +445,8 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
 
        
         if ano != ano_atual and out_path.exists() and not SSP_FORCE_REFRESH:
-            logging.info("SSP %s: usando RAW parquet cache (ano passado).", ano)
+            self.exec_meta.setdefault("ssp_status", "SSP: histórico via cache Parquet (anos passados)")
+            logging.info("Autobot SafeDriver: SSP %s usando cache Parquet (ano passado).", ano)
             return pd.read_parquet(out_path)
 
         url = self._ssp_url(ano)
@@ -358,18 +463,18 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
                     content_len = h.headers.get("Content-Length")
 
                     if etag and meta.get("etag") and etag == meta["etag"]:
-                        logging.info("SSP %s: sem update (ETag igual).", ano)
+                        self.exec_meta["ssp_status"] = f"SSP {ano}: sem atualização (ETag)"
                         return pd.read_parquet(out_path)
                     if last_mod and meta.get("last_modified") and last_mod == meta["last_modified"]:
-                        logging.info("SSP %s: sem update (Last-Modified igual).", ano)
+                        self.exec_meta["ssp_status"] = f"SSP {ano}: sem atualização (Last-Modified)"
                         return pd.read_parquet(out_path)
                     if content_len and meta.get("content_length") and content_len == meta["content_length"]:
-                        logging.info("SSP %s: sem update provável (Content-Length igual).", ano)
+                        self.exec_meta["ssp_status"] = f"SSP {ano}: sem atualização provável (Content-Length)"
                         return pd.read_parquet(out_path)
             except Exception:
                 pass
 
-       
+        # GET condicional (melhor caso: 304)
         headers = {}
         if not SSP_FORCE_REFRESH:
             if meta.get("etag"):
@@ -377,23 +482,21 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
             if meta.get("last_modified"):
                 headers["If-Modified-Since"] = meta["last_modified"]
 
-        logging.info("SSP %s: consultando online (GET condicional).", ano)
+        logging.info("Autobot SafeDriver: SSP %s consultando online (GET condicional).", ano)
         resp = requests.get(url, timeout=120, headers=headers, allow_redirects=True)
 
         if resp.status_code == 304 and out_path.exists() and not SSP_FORCE_REFRESH:
-            logging.info("SSP %s: 304 Not Modified. Usando RAW parquet cache.", ano)
+            self.exec_meta["ssp_status"] = f"SSP {ano}: sem atualização (HTTP 304)"
             return pd.read_parquet(out_path)
 
         resp.raise_for_status()
         content = resp.content
         sha = hashlib.sha256(content).hexdigest()
 
-       
         if out_path.exists() and not SSP_FORCE_REFRESH and meta.get("sha256") == sha:
-            logging.info("SSP %s: conteúdo idêntico (sha256). Usando RAW parquet cache.", ano)
+            self.exec_meta["ssp_status"] = f"SSP {ano}: sem atualização (sha256)"
             return pd.read_parquet(out_path)
 
-        # salva parquet
         df = self._parse_ssp_xlsx_to_df(content, ano)
         df.to_parquet(out_path, index=False, engine=PARQUET_ENGINE, compression=PARQUET_COMPRESSION)
 
@@ -407,7 +510,8 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         }
         self._salvar_estado_ssp(state)
 
-        logging.info("SSP %s: atualizado (RAW parquet) linhas=%d", ano, len(df))
+        self.exec_meta["ssp_status"] = f"SSP {ano}: atualizado (download + Parquet)"
+        logging.info("Autobot SafeDriver: SSP %s atualizado. Linhas=%d", ano, len(df))
         return df
 
     def _carregar_historico(self, ano_inicio: int = 2022, ano_fim: Optional[int] = None) -> pd.DataFrame:
@@ -419,13 +523,13 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
             try:
                 dfs.append(self._carregar_dados_ssp(ano))
             except Exception as e:
-                logging.warning("Ano %s falhou (%s). Pulando.", ano, e)
+                logging.warning("Autobot SafeDriver: falha ao carregar ano %s (%s). Pulando.", ano, e)
 
         if not dfs:
-            raise RuntimeError("Nenhum ano carregado na ingestão.")
+            raise RuntimeError("Autobot SafeDriver: nenhum ano pôde ser carregado.")
         return pd.concat(dfs, ignore_index=True)
 
-  
+
     def _carregar_index_bo_refined(self, ano: int) -> set[str]:
         part_dir = REF_EVENTS_DIR / f"ano={ano}"
         if not part_dir.exists():
@@ -470,7 +574,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         df = df[df["DESCR_SUBTIPOLOCAL"].isin(self.subtipos_local_validos)]
         return df
 
- 
+
     def _definir_periodo(self, hora: AnyStr) -> str:
         try:
             h = int(str(hora).split(":")[0])
@@ -521,7 +625,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         df["QUALIFICACAO"] = df["NATUREZA_APURADA"].apply(self._classificar_qualificacao)
         df = df[df["QUALIFICACAO"].notna()].copy()
 
-        total_qualificados = len(df)
+        total_qualificados = int(len(df))
         aproveitamento_final = (total_qualificados / total_registros_brutos) * 100 if total_registros_brutos else 0.0
 
         df["DATA_OCORRENCIA_BO"] = pd.to_datetime(df.get("DATA_OCORRENCIA_BO"), errors="coerce", dayfirst=True)
@@ -538,29 +642,28 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         df["PESO_CRIME"] = df["NATUREZA_APURADA"].apply(self._peso_crime)
 
         hora_col = df.get("HORA_OCORRENCIA_BO")
-        if hora_col is not None:
-            df["PERIODO"] = hora_col.apply(self._definir_periodo)
-        else:
-            df["PERIODO"] = "INDEFINIDO"
-
+        df["PERIODO"] = hora_col.apply(self._definir_periodo) if hora_col is not None else "INDEFINIDO"
         df["PESO_PERIODO"] = df["PERIODO"].map(self.peso_periodo).fillna(1.0)
+
         df["PESO_LOCAL"] = df.apply(
             lambda r: self._peso_local(r.get("DESCR_TIPOLOCAL"), r.get("DESCR_SUBTIPOLOCAL")),
             axis=1,
         )
 
         df["PESO_RISCO"] = df["PESO_CRIME"] * df["PESO_RECENCIA"] * df["PESO_PERIODO"] * df["PESO_LOCAL"]
-        return df, total_qualificados, aproveitamento_final
+        return df, total_qualificados, float(aproveitamento_final)
 
-   
+
     def _preparar_grid(self, df_com_pesos: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         df = df_com_pesos.copy()
 
+        # Perfil (modalidade): ALERTA inclui Motorista
         df["perfil"] = df["QUALIFICACAO"].apply(
             lambda x: ["Pedestre", "Ciclista", "Motorista"] if x == "ALERTA" else ["Pedestre", "Ciclista"]
         )
         df_eventos = df.explode("perfil").copy()
 
+        # Geohash para o app
         df_eventos["geohash"] = [
             gh.encode(la, lo, precision=GEOHASH_PRECISION_APP)
             for la, lo in zip(df_eventos["LATITUDE"], df_eventos["LONGITUDE"])
@@ -613,6 +716,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         X = df[feature_cols].astype(np.float32)
         return X, feature_cols
 
+ 
     def _treinar_xgb(self, resumo_grid: pd.DataFrame) -> xgb.Booster:
         X, feature_cols = self._montar_features_xgb(resumo_grid)
 
@@ -673,7 +777,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
 
         XGB_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         booster.save_model(str(XGB_MODEL_PATH))
-        logging.info("XGB treinado: best_iter=%s, salvo=%s", booster.best_iteration, XGB_MODEL_PATH)
+        logging.info("Autobot SafeDriver: treino XGB concluído. best_iter=%s", booster.best_iteration)
         return booster
 
     def _aplicar_modelo_xgb(self, resumo_grid: pd.DataFrame) -> pd.DataFrame:
@@ -688,7 +792,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         try:
             proba = self.modelo_xgb.predict(dmat)
         except Exception as e:
-            logging.warning("Inferência XGB falhou (%s). Usando heurístico.", e)
+            logging.warning("Autobot SafeDriver: inferência XGB falhou (%s). Usando heurístico.", e)
             df["score_final"] = df["score"]
             return df
 
@@ -697,8 +801,8 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         df["score_final"] = (XGB_ALPHA * df["score_modelo"] + (1 - XGB_ALPHA) * df["score"]).round(2)
         return df
 
-   
-    def _exportar_events_refined_parquet(self, df_eventos: pd.DataFrame, referencia: datetime) -> None:
+
+    def _exportar_events_refined_parquet(self, df_eventos: pd.DataFrame, referencia: datetime) -> int:
         df = df_eventos.copy()
         df["TIMESTAMP_ATUALIZACAO"] = pd.Timestamp(referencia)
 
@@ -709,6 +813,7 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
 
         ts = referencia.strftime("%Y%m%dT%H%M%S")
 
+        written = 0
         part_keys = df[["ANO_PART", "MES_PART"]].drop_duplicates().values.tolist()
         for ano, mes in part_keys:
             out_dir = REF_EVENTS_DIR / f"ano={int(ano)}" / f"mes={int(mes):02d}"
@@ -719,7 +824,9 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
             df_part.drop(columns=["ANO_PART", "MES_PART"], inplace=True, errors="ignore")
 
             df_part.to_parquet(out_path, index=False, engine=PARQUET_ENGINE, compression=PARQUET_COMPRESSION)
-            logging.info("REF events salvo: %s (linhas=%d)", out_path, len(df_part))
+            written += 1
+
+        return written
 
     def _exportar_grid_refined_parquet(self, grid: pd.DataFrame, referencia: datetime) -> None:
         df = grid.copy()
@@ -727,7 +834,64 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
         ts = referencia.strftime("%Y%m%dT%H%M%S")
         out_path = REF_GRID_DIR / f"grid-{ts}.parquet"
         df.to_parquet(out_path, index=False, engine=PARQUET_ENGINE, compression=PARQUET_COMPRESSION)
-        logging.info("REF grid salvo: %s (linhas=%d)", out_path, len(df))
+
+
+    def _resumo_modalidades(self, df_eventos: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+        if df_eventos.empty or "perfil" not in df_eventos.columns:
+            return {}
+
+        total_linhas = int(len(df_eventos))
+        out: Dict[str, Dict[str, Any]] = {}
+
+        for perfil, dfp in df_eventos.groupby("perfil"):
+            linhas = int(len(dfp))
+            bos = int(dfp["NUM_BO"].nunique()) if "NUM_BO" in dfp.columns else 0
+            pct = (linhas / total_linhas * 100.0) if total_linhas else 0.0
+            out[str(perfil)] = {"linhas": linhas, "bos_unicos": bos, "pct": round(pct, 2)}
+
+        return out
+
+    def _resumo_modalidades_periodo(self, df_eventos: pd.DataFrame) -> Dict[str, int]:
+        if df_eventos.empty or "perfil" not in df_eventos.columns or "PERIODO" not in df_eventos.columns:
+            return {}
+        grp = df_eventos.groupby(["perfil", "PERIODO"]).size().reset_index(name="linhas")
+        out = {}
+        for _, r in grp.iterrows():
+            out[f"{r['perfil']}|{r['PERIODO']}"] = int(r["linhas"])
+        return out
+
+
+    def _exportar_metrics_execucao(
+        self,
+        referencia: datetime,
+        total_brutos: int,
+        total_qualificados: int,
+        aproveitamento: float,
+        qtd_novos_bo: int,
+        grid_size: int,
+        events_parts_written: int,
+        tempo_s: int,
+        modalidades: Dict[str, Dict[str, Any]],
+        modalidades_periodo: Dict[str, int],
+    ) -> None:
+        ts = referencia.strftime("%Y%m%dT%H%M%S")
+        out_path = REF_METRICS_DIR / f"metrics-{ts}.parquet"
+
+        rows = [{
+            "timestamp_execucao": pd.Timestamp(referencia),
+            "ssp_status": str(self.exec_meta.get("ssp_status", "")),
+            "xgb_status": str(self.exec_meta.get("xgb_status", "")),
+            "total_brutos": int(total_brutos),
+            "total_qualificados": int(total_qualificados),
+            "aproveitamento_pct": float(aproveitamento),
+            "novos_bo_ano_atual": int(qtd_novos_bo),
+            "grid_size": int(grid_size),
+            "events_parts_written": int(events_parts_written),
+            "tempo_s": int(tempo_s),
+            "modalidades_json": json.dumps(modalidades, ensure_ascii=False),
+            "modalidades_periodo_json": json.dumps(modalidades_periodo, ensure_ascii=False),
+        }]
+        pd.DataFrame(rows).to_parquet(out_path, index=False, engine=PARQUET_ENGINE, compression=PARQUET_COMPRESSION)
 
 
     def _geohash_bbox_center(self, geohash: str) -> Tuple[float, float, float, float, float, float]:
@@ -740,7 +904,6 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
 
     def _persistir_grid_app_firestore(self, grid: pd.DataFrame) -> None:
         if not self.db:
-            logging.info("Firestore desativado. Pulando persistência app.")
             return
 
         col = self.db.collection(FIRESTORE_COLLECTION_RISK)
@@ -748,20 +911,20 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
 
         batch = self.db.batch()
         for i, row in grid.iterrows():
-            geohash = str(row["geohash"])
+            geohash_v = str(row["geohash"])
             perfil = str(row["perfil"])
             periodo = str(row["PERIODO"])
 
-            doc_id = f"{geohash}|{perfil}|{periodo}"
+            doc_id = f"{geohash_v}|{perfil}|{periodo}"
             ref = col.document(doc_id)
 
-            min_lat, min_lon, max_lat, max_lon, c_lat, c_lon = self._geohash_bbox_center(geohash)
-            p5 = geohash[:5] if len(geohash) >= 5 else geohash
-            p6 = geohash[:6] if len(geohash) >= 6 else geohash
-            p7 = geohash[:7] if len(geohash) >= 7 else geohash
+            min_lat, min_lon, max_lat, max_lon, c_lat, c_lon = self._geohash_bbox_center(geohash_v)
+            p5 = geohash_v[:5] if len(geohash_v) >= 5 else geohash_v
+            p6 = geohash_v[:6] if len(geohash_v) >= 6 else geohash_v
+            p7 = geohash_v[:7] if len(geohash_v) >= 7 else geohash_v
 
             payload = {
-                "geohash": geohash,
+                "geohash": geohash_v,
                 "perfil": perfil,
                 "periodo": periodo,
                 "frequencia": int(row.get("frequencia", 0)),
@@ -781,13 +944,11 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
             }
 
             batch.set(ref, payload)
-
             if (i + 1) % 400 == 0:
                 batch.commit()
                 batch = self.db.batch()
 
         batch.commit()
-        logging.info("Firestore grid atualizado (%s): %d docs", FIRESTORE_COLLECTION_RISK, len(grid))
 
     def _limpar_colecao(self, collection_ref) -> None:
         docs = collection_ref.limit(500).stream()
@@ -801,6 +962,89 @@ Pipeline SafeDriver - ETL e geração de mapa de criminalidade urbana
                 break
             batch.commit()
             docs = collection_ref.limit(500).stream()
+
+
+    def _format_modalidades(self, modalidades: Dict[str, Dict[str, Any]]) -> str:
+        if not modalidades:
+            return "Sem dados suficientes para consolidar."
+        items = sorted(modalidades.items(), key=lambda kv: kv[1].get("linhas", 0), reverse=True)
+        linhas = []
+        for perfil, m in items:
+            linhas.append(f"• {perfil}: {m.get('linhas',0):,} linhas ({m.get('pct',0):.1f}%) | BOs únicos: {m.get('bos_unicos',0):,}")
+        return "\n".join(linhas)
+
+    def _format_modalidades_periodo_top(self, mod_periodo: Dict[str, int], top_n: int = 6) -> str:
+        if not mod_periodo:
+            return "Sem dados suficientes para consolidar."
+        items = sorted(mod_periodo.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+        return "\n".join([f"• {k}: {v:,}" for k, v in items])
+
+    def _gerar_resumo_executivo_motor(
+        self,
+        referencia: datetime,
+        total_brutos: int,
+        total_qualificados: int,
+        aproveitamento: float,
+        novos_bo: int,
+        grid_size: int,
+        events_parts_written: int,
+        modalidades: Dict[str, Dict[str, Any]],
+        modalidades_periodo: Dict[str, int],
+        tempo_s: int,
+    ) -> Dict[str, Any]:
+        return {
+            "🤖 Autobot SafeDriver": "Resumo Executivo — ETL & Previsões",
+            "📡 Fonte SSP (ano atual)": self.exec_meta.get("ssp_status", "Status SSP indisponível"),
+            "🆕 BOs novos (ano atual)": f"{novos_bo:,}",
+            "📦 Registros brutos": f"{total_brutos:,}",
+            "✅ Registros qualificados": f"{total_qualificados:,} ({aproveitamento:.1f}%)",
+            "🧩 Modalidades (perfil)": self._format_modalidades(modalidades),
+            "🕒 Modalidade x Período (Top)": self._format_modalidades_periodo_top(modalidades_periodo, top_n=6),
+            "🧠 Treino XGBoost": self.exec_meta.get("xgb_status", "Status XGB indisponível"),
+            "🧱 Células no grid": f"{grid_size:,}",
+            "📊 Refined Parquet (novos parts)": f"+{events_parts_written}",
+            "🗺️ Firestore": "Atualizado para o app" if self.db else "Desativado (sem credencial)",
+            "⏱️ Tempo total": f"{tempo_s}s",
+            "🗓️ Conclusão": referencia.strftime("%d/%m/%Y %H:%M"),
+        }
+
+    def _enviar_resumo_discord_motor(self, campos: Dict[str, Any], status: str = "sucesso") -> None:
+        if status == "erro":
+            webhook = DISCORD_ERRO or DISCORD_SUCESSO
+        elif status == "neutro":
+            webhook = DISCORD_SUCESSO or DISCORD_ERRO
+        else:
+            webhook = DISCORD_SUCESSO or DISCORD_ERRO
+
+        if not webhook:
+            return
+
+        cores = {"sucesso": 0x27AE60, "neutro": 0x3498DB, "erro": 0xE74C3C}
+        titulo = {
+            "sucesso": "🛡️ Autobot SafeDriver — ETL & Previsões | Execução concluída",
+            "neutro": "🛡️ Autobot SafeDriver — ETL & Previsões | Execução informativa",
+            "erro": "🛡️ Autobot SafeDriver — ETL & Previsões | Falha detectada",
+        }.get(status, "🛡️ Autobot SafeDriver — ETL & Previsões")
+
+        fields = []
+        for k, v in campos.items():
+            fields.append({"name": str(k), "value": str(v)[:1024], "inline": False})
+
+        payload = {
+            "username": "Autobot SafeDriver",
+            "avatar_url": "https://cdn-icons-png.flaticon.com/512/2082/2082805.png",
+            "embeds": [{
+                "title": titulo,
+                "color": cores.get(status, 0x3498DB),
+                "fields": fields,
+                "footer": {"text": "Autobot SafeDriver • Cache Parquet (raw/refined) • Firestore app grid"},
+            }]
+        }
+
+        try:
+            requests.post(webhook, json=payload, timeout=15)
+        except Exception as e:
+            logging.warning("Autobot SafeDriver: falha ao enviar resumo ao Discord (%s).", e)
 
 
 if __name__ == "__main__":
