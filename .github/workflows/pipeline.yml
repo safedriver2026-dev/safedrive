@@ -1,100 +1,148 @@
-name: Autobot SafeDriver
+name: 🤖 Autobot SafeDriver — Operação Semanal
 
 on:
   schedule:
+    # Toda segunda-feira às 00:00 (UTC)
     - cron: "0 0 * * 1"
   workflow_dispatch: {}
 
 jobs:
-  safedrive-weekly:
+  autobot-safedriver:
+    name: 🤖 Autobot SafeDriver — Missão Semanal
     runs-on: ubuntu-latest
 
     env:
+     
+      # CANAIS DO AUTOBOT (DISCORD)
+  
       DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
       DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+
+    
+      # IDENTIDADE / NÚCLEO CLOUD
+     
       FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
-
-      LAKE_DIR: "data_lake"
-      PARQUET_ENGINE: "pyarrow"
-      PARQUET_COMPRESSION: "zstd"
-      SSP_FORCE_REFRESH: "0"
-
-      GEOHASH_PRECISION_APP: "7"
       FIRESTORE_COLLECTION_RISK: "risk_cells_v2"
 
+     
+      # DATA LAKE (CACHE PARQUET)
+      
+      LAKE_DIR: "data_lake"
+      STATE_DIR: "state"
+      MODEL_DIR: "modelos"
+      PARQUET_ENGINE: "pyarrow"
+      PARQUET_COMPRESSION: "zstd"
+
+    
+      # SSP (ATUALIZAÇÃO INTELIGENTE)
+    
+      SSP_FORCE_REFRESH: "0"
+
+  
+      # MALHA DO APP
+    
+      GEOHASH_PRECISION_APP: "7"
+
+    
+      # XGBOOST (TREINO ECONÔMICO)
+     
       XGB_ALPHA: "0.6"
       MIN_NOVOS_BO_TREINO: "200"
       TREINO_COOLDOWN_H: "24"
       TRAIN_WINDOW_MONTHS: "24"
+
       XGB_MAX_ROWS: "50000"
       XGB_MAX_DEPTH: "4"
       XGB_MAX_BIN: "128"
       XGB_NUM_BOOST_ROUND: "1200"
       XGB_EARLY_STOP: "50"
 
+    
+      # PROPHET (HOTSPOTS)
+   
       PROPHET_HORIZON_DIAS: "7"
       PROPHET_TOP_GEOHASH: "20"
+      PROPHET_MIN_POINTS: "14"
 
     steps:
-      - name: Checkout
+      - name:  Autobot: Capturar repositório (Checkout)
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name:  Autobot: Preparar núcleo Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache lake + models + state
+      - name:  Autobot: Restaurar memória (cache do Data Lake, modelos e estado)
         uses: actions/cache@v4
         with:
           path: |
             data_lake
             modelos
             state
-          key: safedrive-${{ runner.os }}-${{ github.ref }}-${{ github.run_id }}
+          key: autobot-safedriver-${{ runner.os }}-${{ github.ref }}-${{ github.run_id }}
           restore-keys: |
-            safedrive-${{ runner.os }}-${{ github.ref }}-
-            safedrive-${{ runner.os }}-
+            autobot-safedriver-${{ runner.os }}-${{ github.ref }}-
+            autobot-safedriver-${{ runner.os }}-
 
-      - name: Install dependencies
+      - name:  Autobot: Instalar dependências do sistema (Prophet)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+          sudo apt-get clean
+
+      - name:  Autobot: Instalar dependências Python
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run tests (pytest)
-        id: tests
+      - name: Autobot: Verificação de integridade (pytest)
+        id: testes
         run: |
           pytest -q
 
-      - name: Run SafeDriver weekly pipeline
-        id: pipeline
+      - name: Autobot: Executar Motor SafeDriver (cache + malha + Firestore + métricas)
+        id: motor
         if: success()
         run: |
           python motor_safedriver.py
 
-      - name: Run Prophet forecasts for BI
+      - name: Autobot: Executar Núcleo Prophet (previsões + métricas)
         id: prophet
         if: success()
         run: |
           python forecast_prophet.py
 
-      - name: Notify Discord - tests failed
-        if: failure() && steps.tests.outcome == 'failure' && env.DISCORD_ERRO != ''
+    
+      # NOTIFICAÇÕES DE EMERGÊNCIA
+      
+      - name:  Autobot: Alerta — testes falharam
+        if: failure() && steps.testes.outcome == 'failure' && env.DISCORD_ERRO != ''
         run: |
           curl -X POST "$DISCORD_ERRO" \
             -H "Content-Type: application/json" \
-            -d '{"content": "❌ SafeDrive semanal: testes falharam. Verifique o GitHub Actions."}'
+            -d '{"content": "🚨🤖 Autobot SafeDriver: falha na verificação de integridade (pytest). Missão abortada. Consulte os logs do GitHub Actions."}'
 
-      - name: Notify Discord - pipeline failed
-        if: failure() && steps.tests.outcome == 'success' && steps.pipeline.outcome == 'failure' && env.DISCORD_ERRO != ''
+      - name:  Autobot: Alerta — motor falhou
+        if: failure() && steps.testes.outcome == 'success' && steps.motor.outcome == 'failure' && env.DISCORD_ERRO != ''
         run: |
           curl -X POST "$DISCORD_ERRO" \
             -H "Content-Type: application/json" \
-            -d '{"content": "❌ SafeDrive semanal: motor_safedriver.py falhou. Verifique os logs."}'
+            -d '{"content": "🚨🤖 Autobot SafeDriver: falha no motor (motor_safedriver.py). Missão interrompida. Consulte os logs do GitHub Actions."}'
 
-      - name: Notify Discord - all good
+      - name:  Autobot: Alerta — prophet falhou
+        if: failure() && steps.testes.outcome == 'success' && steps.motor.outcome == 'success' && steps.prophet.outcome == 'failure' && env.DISCORD_ERRO != ''
+        run: |
+          curl -X POST "$DISCORD_ERRO" \
+            -H "Content-Type: application/json" \
+            -d '{"content": "🚨🤖 Autobot SafeDriver: falha no núcleo Prophet (forecast_prophet.py). Motor concluiu, mas previsões não foram geradas. Consulte os logs do GitHub Actions."}'
+
+   
+      # CONFIRMAÇÃO FINAL
+   
+      - name:  Autobot: Missão concluída (confirmação final)
         if: success() && env.DISCORD_SUCESSO != ''
         run: |
           curl -X POST "$DISCORD_SUCESSO" \
             -H "Content-Type: application/json" \
-            -d '{"content": "✅ SafeDrive: sync semanal executado com sucesso (caches parquet + malha + Prophet)."}'
+            -d '{"content": "🟢🤖 Autobot SafeDriver: missão semanal concluída. Cache Parquet atualizado, malha publicada no Firestore e previsões Prophet (quando aplicável) exportadas. Relatórios executivos enviados pelo próprio Autobot."}'
