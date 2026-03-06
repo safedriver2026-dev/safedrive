@@ -1,4 +1,4 @@
-name: Execucao Semanal SafeDriver
+name: Integracao Continua SafeDriver
 
 on:
   schedule:
@@ -6,23 +6,29 @@ on:
   workflow_dispatch:
 
 jobs:
-  sincronizacao_dados:
+  sincronizacao:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - name: Clonar Repositorio
+        uses: actions/checkout@master
+
+      - name: Configurar Ambiente Python
+        uses: actions/setup-python@master
         with:
-          python-version: '3.10'
-      - name: Restauracao Cache Data Lake
-        uses: actions/cache@v3
+          python-version: '3.x'
+
+      - name: Restaurar Cache do Data Lake
+        uses: actions/cache@master
         with:
           path: datalake/
           key: cache-ssp-${{ hashFiles('datalake/metadata/*.json') }}
-      - name: Instalacao Pacotes
+
+      - name: Instalar Pacotes de Dependencia
         run: pip install -r requirements.txt
-      - name: Disparo do Motor Principal
+
+      - name: Executar Motor Preditivo
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        run: python autobot_engine.py
+        run: python autobot/autobot_engine.py
