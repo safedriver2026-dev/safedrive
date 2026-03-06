@@ -11,7 +11,7 @@ class MotorSafeDriver:
     """ Arquitetura principal para extração, saneamento e predição de risco viário. """
     
     def __init__(self):
-        # Definição do horizonte temporal e construção do Data Lake
+        # Estabelecimento do horizonte temporal e construção estrutural do Data Lake
         self.ano_vigente = datetime.now().year
         self.periodo_historico = range(2022, self.ano_vigente + 1)
         self.banco_nuvem = self._estabelecer_conexao_nuvem()
@@ -21,7 +21,7 @@ class MotorSafeDriver:
             os.makedirs(f'datalake/{pasta}', exist_ok=True)
 
     def _estabelecer_conexao_nuvem(self):
-        # Autenticação segura com a infraestrutura NoSQL
+        # Autenticação criptográfica com a infraestrutura NoSQL
         chave_secreta = os.environ.get('FIREBASE_JSON')
         if not chave_secreta or not firebase_admin._apps:
             credenciais = credentials.Certificate(json.loads(chave_secreta))
@@ -48,23 +48,32 @@ class MotorSafeDriver:
         requests.post(endereco_webhook, json=pacote_dados)
 
     def _higienizar_texto(self, texto_bruto):
-        # Normalização de caracteres para garantir integridade estrutural
+        # Normalização de caracteres para padronização analítica
         if pd.isna(texto_bruto) or not isinstance(texto_bruto, str): 
             return str(texto_bruto) if not pd.isna(texto_bruto) else ""
         texto_normalizado = unicodedata.normalize('NFKD', texto_bruto)
         return "".join([c for c in texto_normalizado if not unicodedata.combining(c)]).upper().strip()
 
     def _verificar_necessidade_download(self, endereco_arquivo, ano_referencia):
-        # Validação de metadados HTTP para prevenção de downloads redundantes
+        # Simulação de cabeçalho de navegador comercial para transpor barreiras anti-bot
+        cabecalho_navegador = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        }
         caminho_metadados = f"datalake/metadata/tamanho_{ano_referencia}.json"
+        
         try:
-            cabecalho = requests.head(endereco_arquivo, timeout=30)
-            tamanho_nuvem = int(cabecalho.headers.get('Content-Length', 0))
+            cabecalho_resposta = requests.head(endereco_arquivo, headers=cabecalho_navegador, timeout=30, allow_redirects=True)
+            tamanho_nuvem = int(cabecalho_resposta.headers.get('Content-Length', 0))
+            
             if os.path.exists(caminho_metadados):
                 with open(caminho_metadados, 'r') as arquivo_leitura:
-                    if json.load(arquivo_leitura).get('tamanho') == tamanho_nuvem: return False, tamanho_nuvem
+                    if json.load(arquivo_leitura).get('tamanho') == tamanho_nuvem: 
+                        return False, tamanho_nuvem
+                        
             return True, tamanho_nuvem
-        except: return True, 0
+        except: 
+            return True, 0
 
     def _processar_camadas_dados(self, dataframe_bruto, ano_referencia):
         # Garantia de contrato de colunas para evitar anomalias de schema
@@ -72,15 +81,15 @@ class MotorSafeDriver:
             if coluna not in dataframe_bruto.columns and coluna != 'ANO_BASE':
                 dataframe_bruto[coluna] = np.nan
 
-        # Tipagem estrutural para armazenamento colunar estável
+        # Tipagem estrutural primária
         dataframe_bruto['NUM_BO'] = dataframe_bruto['NUM_BO'].astype(str)
         dataframe_bruto['DATA_OCORRENCIA_BO'] = dataframe_bruto['DATA_OCORRENCIA_BO'].astype(str)
         dataframe_bruto['HORA_OCORRENCIA_BO'] = dataframe_bruto['HORA_OCORRENCIA_BO'].astype(str)
         dataframe_bruto['ANO_BASE'] = int(ano_referencia)
 
-        # Conversão numérica e tratamento rigoroso de coordenadas
-        dataframe_bruto['LATITUDE'] = pd.to_numeric(dataframe_bruto['LATITUDE'], errors="coerce")
-        dataframe_bruto['LONGITUDE'] = pd.to_numeric(dataframe_bruto['LONGITUDE'], errors="coerce")
+        # Conversão numérica lidando com o padrão brasileiro de separador decimal
+        dataframe_bruto['LATITUDE'] = pd.to_numeric(dataframe_bruto['LATITUDE'].astype(str).str.replace(',', '.'), errors="coerce")
+        dataframe_bruto['LONGITUDE'] = pd.to_numeric(dataframe_bruto['LONGITUDE'].astype(str).str.replace(',', '.'), errors="coerce")
 
         # Normalização textual restrita aos atributos categóricos
         for coluna in COLUNAS_TEXTO:
@@ -145,11 +154,47 @@ class MotorSafeDriver:
                 
                 realizar_download, tamanho_arquivo = self._verificar_necessidade_download(endereco_ssp, ano_alvo)
                 if realizar_download or not os.path.exists(caminho_raw):
-                    requisicao_dados = requests.get(endereco_ssp, timeout=120)
-                    tabela_temporaria = pd.read_excel(io.BytesIO(requisicao_dados.content), skiprows=1)
+                    
+                    # Máscara de conexão web para garantir a permissão de tráfego
+                    cabecalho_navegador = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    }
+                    requisicao_dados = requests.get(endereco_ssp, headers=cabecalho_navegador, timeout=120)
+                    
+                    if requisicao_dados.status_code != 200:
+                        raise ConnectionError(f"Safra {ano_alvo}: Servidor governamental recusou a conexão. Código: {requisicao_dados.status_code}")
+
+                    # Mapeamento dinâmico de cabeçalho para contornar instabilidades de formatação
+                    leitura_previa = pd.read_excel(io.BytesIO(requisicao_dados.content), nrows=50, header=None)
+                    linha_cabecalho = 0
+                    cabecalho_encontrado = False
+                    
+                    for indice, linha in leitura_previa.iterrows():
+                        linha_texto = [self._higienizar_texto(str(celula)) for celula in linha.values]
+                        if any(termo in linha_texto for termo in ['NUM_BO', 'LATITUDE', 'NATUREZA_APURADA', 'NUMERO_BO']):
+                            linha_cabecalho = indice
+                            cabecalho_encontrado = True
+                            break
+                            
+                    if not cabecalho_encontrado:
+                        raise ValueError(f"Safra {ano_alvo}: Estrutura de arquivo irreconhecível.")
+
+                    # Ingestão oficial baseada nas coordenadas identificadas
+                    tabela_temporaria = pd.read_excel(io.BytesIO(requisicao_dados.content), skiprows=linha_cabecalho)
                     tabela_temporaria.columns = [self._higienizar_texto(c) for c in tabela_temporaria.columns]
                     
-                    # Forçamento rigoroso de string para o Boletim de Ocorrência na extração imediata
+                    # Normalização de nomenclatura mediante dicionário de sinônimos
+                    mapeamento_correcao = {
+                        'NUMERO_BO': 'NUM_BO', 'N_BO': 'NUM_BO', 'BOLETIM': 'NUM_BO',
+                        'LAT': 'LATITUDE', 'LON': 'LONGITUDE',
+                        'DATA_FATO': 'DATA_OCORRENCIA_BO', 'HORA_FATO': 'HORA_OCORRENCIA_BO'
+                    }
+                    tabela_temporaria.rename(columns=mapeamento_correcao, inplace=True)
+                    
+                    if 'NUM_BO' not in tabela_temporaria.columns:
+                        colunas_lidas = ", ".join(tabela_temporaria.columns.tolist())
+                        raise KeyError(f"Safra {ano_alvo}: Ausência de chave primária. Colunas obtidas: {colunas_lidas}")
+                    
                     tabela_temporaria['NUM_BO'] = tabela_temporaria['NUM_BO'].astype(str)
                     tabela_temporaria.to_parquet(caminho_raw, index=False)
                     
@@ -161,10 +206,11 @@ class MotorSafeDriver:
 
                 self.metricas_auditoria['extraidos'] += len(tabela_temporaria)
                 
-                # Execução do funil de saneamento
+                # Progressão da malha de dados pelo funil de saneamento
                 tabela_refinada = self._processar_camadas_dados(tabela_temporaria, ano_alvo)
                 dataframe_mestre = pd.concat([dataframe_mestre, tabela_refinada])
 
+            # Encerramento precoce mediante conformidade absoluta da base local
             if not self.metricas_auditoria['novos_dados'] and os.path.exists("datalake/refined/malha_analitica.parquet"):
                 return
 
