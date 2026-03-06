@@ -9,7 +9,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from config import CATALOGO_CRIMES, TIPOS_LOCAL_PERMITIDOS, SUBTIPOS_LOCAL_PERMITIDOS, LIMITES_SP, ESQUEMA_TRUSTED, COLUNAS_REFINED, PALAVRAS_CHAVE_PERFIL
 
-# Bibliotecas de Inteligencia Artificial
+
 from prophet import Prophet
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
@@ -54,9 +54,12 @@ class MotorSafeDriver:
         endereco_webhook = os.environ.get('DISCORD_SUCESSO')
         if not endereco_webhook: return
         
+        status_extracao = "📥 Novos arquivos detectados e baixados da SSP." if self.auditoria['novos_dados'] else "♻️ Nenhum arquivo novo na SSP. Re-treinando IA e sincronizando malha."
+        
         pacote_dados = {
             "embeds": [{
                 "title": "Relatório Semanal Autobot SafeDriver",
+                "description": status_extracao,
                 "color": 3066993,
                 "fields": [
                     {"name": "🌊 Data Lake", "value": f"**RAW:** {self.auditoria['volume_raw']:,}\n**TRUSTED:** {self.auditoria['volume_trusted']:,}\n**REFINED:** {self.auditoria['volume_refined']:,}", "inline": False},
@@ -90,7 +93,7 @@ class MotorSafeDriver:
         except: return True, 0
 
     def _inferir_perfil_contextual(self, linha):
-        # Extrai perfis cruzando o contexto textual da camada Trusted
+        
         perfis_identificados = set()
         contexto_textual = f"{linha.get('NATUREZA_APURADA','')} {linha.get('DESCR_CONDUTA','')} {linha.get('DESCR_SUBTIPOLOCAL','')} {linha.get('RUBRICA','')}".upper()
 
@@ -98,7 +101,7 @@ class MotorSafeDriver:
             if any(palavra in contexto_textual for palavra in palavras):
                 perfis_identificados.add(perfil)
 
-        # Fallback heuristico para texto pobre
+        
         if not perfis_identificados:
             perfis_base = CATALOGO_CRIMES.get(linha.get('NATUREZA_APURADA'), {}).get('perfis', [])
             perfis_identificados.update(perfis_base)
@@ -139,14 +142,14 @@ class MotorSafeDriver:
             dataframe_trusted['DESCR_SUBTIPOLOCAL'].isin(SUBTIPOS_LOCAL_PERMITIDOS)
         )
         
-        # Refined recebe campos extras para inferencia
+       
         dataframe_refinado = dataframe_trusted[mascara_negocio][COLUNAS_REFINED].copy()
         self.auditoria['volume_refined'] += len(dataframe_refinado)
         
         return dataframe_trusted, dataframe_refinado
 
     def _treinar_ensemble_ia(self, dataframe_consolidado):
-        # Aplica NLP na camada Trusted para criar vetores de perfis
+       
         dataframe_consolidado['perfis_afetados'] = dataframe_consolidado.apply(self._inferir_perfil_contextual, axis=1)
         df_expandido = dataframe_consolidado.explode('perfis_afetados').dropna(subset=['perfis_afetados'])
         
@@ -159,14 +162,14 @@ class MotorSafeDriver:
             except: return 'Indefinido'
         df_expandido['turno_operacional'] = df_expandido['HORA_OCORRENCIA_BO'].apply(classificar_turno)
         
-        # Codifica variaveis categoricas
+  
         encoder_turno = LabelEncoder()
         encoder_perfil = LabelEncoder()
         df_expandido['turno_enc'] = encoder_turno.fit_transform(df_expandido['turno_operacional'])
         df_expandido['perfil_enc'] = encoder_perfil.fit_transform(df_expandido['perfis_afetados'])
         df_expandido['peso_estatistico'] = df_expandido['NATUREZA_APURADA'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
 
-        # Treina Prophet para prever tensao macro criminal
+     
         serie_temporal = df_expandido.groupby('DATA_OCORRENCIA_BO').size().reset_index()
         serie_temporal.columns = ['ds', 'y']
         
@@ -177,7 +180,7 @@ class MotorSafeDriver:
         df_expandido = df_expandido.merge(tendencia_prophet, left_on='DATA_OCORRENCIA_BO', right_on='ds', how='left')
         df_expandido['fator_prophet'] = df_expandido['yhat'].fillna(df_expandido['yhat'].mean())
 
-        # Treina XGBoost combinando espaco perfil e tendencia
+     
         df_treino = df_expandido.groupby(['codigo_geohash', 'LATITUDE', 'LONGITUDE', 'perfil_enc', 'turno_enc', 'fator_prophet']).agg({'peso_estatistico': 'sum'}).reset_index()
         
         X = df_treino[['LATITUDE', 'LONGITUDE', 'perfil_enc', 'turno_enc', 'fator_prophet']]
@@ -186,11 +189,11 @@ class MotorSafeDriver:
         modelo_xgb = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1)
         modelo_xgb.fit(X, y)
         
-        # Aplica inferencia e limita score final
+     
         df_treino['score_preditivo'] = modelo_xgb.predict(X)
         df_treino['score_preditivo'] = (df_treino['score_preditivo'] * 2.3).clip(0.5, 10.0).round(2)
         
-        # Restaura textos originais
+       
         df_treino['perfis_afetados'] = encoder_perfil.inverse_transform(df_treino['perfil_enc'])
         df_treino['turno_operacional'] = encoder_turno.inverse_transform(df_treino['turno_enc'])
         
@@ -202,7 +205,7 @@ class MotorSafeDriver:
         return df_treino[['codigo_geohash', 'perfis_afetados', 'turno_operacional', 'score_preditivo']], df_expandido
 
     def _sincronizacao_delta_firestore(self, malha_final):
-        # Recupera dados atuais para evitar escritas redundantes
+      
         colecao_risco = self.banco_nuvem.collection('niveis_risco')
         documentos_atuais = {doc.id: doc.to_dict().get('score') for doc in colecao_risco.stream()}
         
@@ -274,12 +277,10 @@ class MotorSafeDriver:
                 tabela_trusted.to_parquet(caminho_trusted, index=False)
                 dataframe_mestre_refinado = pd.concat([dataframe_mestre_refinado, tabela_refinada])
 
-            if not self.auditoria['novos_dados'] and os.path.exists("datalake/refined/malha_analitica.parquet"): return
-
-            # Treina ensemble de IA e recupera malha preditiva
+           
             malha_final, base_inteligencia = self._treinar_ensemble_ia(dataframe_mestre_refinado)
             
-            # Executa sincronizacao delta
+        
             if self.banco_nuvem:
                 self._sincronizacao_delta_firestore(malha_final)
 
