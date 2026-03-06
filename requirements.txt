@@ -6,3 +6,7 @@ openpyxl
 pyarrow
 firebase-admin
 python-dotenv
+urllib3
+xgboost
+prophet
+scikit-learn
