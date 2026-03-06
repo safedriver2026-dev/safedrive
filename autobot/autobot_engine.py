@@ -56,12 +56,12 @@ class MotorSafeDriver:
         
         pacote_dados = {
             "embeds": [{
-                "title": "🧠 Relatório de IA: MLOps e Sincronização Delta",
+                "title": "Relatório Semanal Autobot SafeDriver",
                 "color": 3066993,
                 "fields": [
-                    {"name": "🌊 Funil Medallion", "value": f"**RAW:** {self.auditoria['volume_raw']:,}\n**TRUSTED:** {self.auditoria['volume_trusted']:,}\n**REFINED:** {self.auditoria['volume_refined']:,}", "inline": False},
+                    {"name": "🌊 Data Lake", "value": f"**RAW:** {self.auditoria['volume_raw']:,}\n**TRUSTED:** {self.auditoria['volume_trusted']:,}\n**REFINED:** {self.auditoria['volume_refined']:,}", "inline": False},
                     {"name": "🎯 Qualificação Espacial", "value": f"Motoristas: {self.auditoria['malha_motorista']:,}\nMotos: {self.auditoria['malha_motociclista']:,}\nPedestres: {self.auditoria['malha_pedestre']:,}\nCiclistas: {self.auditoria['malha_ciclista']:,}", "inline": False},
-                    {"name": "☁️ Delta Sync (Firestore)", "value": f"Lotes avaliados: {self.auditoria['documentos_sincronizados']:,}\n**Novos/Alterados (Escritos): {self.auditoria['documentos_atualizados']:,}**", "inline": False}
+                    {"name": "☁️ Sincronização com Firestore", "value": f"Lotes avaliados: {self.auditoria['documentos_sincronizados']:,}\n**Novos/Alterados (Escritos): {self.auditoria['documentos_atualizados']:,}**", "inline": False}
                 ]
             }]
         }
@@ -70,7 +70,7 @@ class MotorSafeDriver:
     def _notificar_erro(self, diagnostico_falha):
         endereco_webhook = os.environ.get('DISCORD_ERRO')
         if not endereco_webhook: return
-        pacote_dados = {"embeds": [{"title": "⚠️ Interrupção Operacional MLOps", "color": 15158332, "fields": [{"name": "🛑 Diagnóstico", "value": diagnostico_falha, "inline": False}]}]}
+        pacote_dados = {"embeds": [{"title": "⚠️ Interrupção Operacional", "color": 15158332, "fields": [{"name": "🛑 Diagnóstico", "value": diagnostico_falha, "inline": False}]}]}
         requests.post(endereco_webhook, json=pacote_dados)
 
     def _higienizar_texto(self, texto_bruto):
