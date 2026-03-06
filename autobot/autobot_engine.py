@@ -5,28 +5,23 @@ import os, io, requests, json, unicodedata
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import CATALOGO_CRIMES, TIPOS_LOCAL_PERMITIDOS, SUBTIPOS_LOCAL_PERMITIDOS, LIMITES_SP, ESQUEMA_TRUSTED, COLUNAS_REFINED
 
 class MotorSafeDriver:
-    """ Infraestrutura de extração, paridade de schema e modelagem de risco. """
+    """ Infraestrutura de extração resiliente, paridade de schema e modelagem de risco. """
     
     def __init__(self):
-        # Parametrização temporal e alocação de armazenamento em múltiplas camadas
         self.ano_vigente = datetime.now().year
         self.periodo_historico = range(2022, self.ano_vigente + 1)
         self.banco_nuvem = self._estabelecer_conexao_nuvem()
+        self.sessao_web = self._criar_sessao_resiliente()
         
-        # Dicionário de auditoria expandido para refletir o Data Lake (Medallion)
         self.auditoria = {
-            "volume_raw": 0,
-            "volume_trusted": 0,
-            "volume_refined": 0,
-            "falhas_integridade": 0,
-            "malha_motorista": 0,
-            "malha_motociclista": 0,
-            "malha_pedestre": 0,
-            "malha_ciclista": 0,
-            "documentos_sincronizados": 0,
+            "volume_raw": 0, "volume_trusted": 0, "volume_refined": 0,
+            "falhas_integridade": 0, "malha_motorista": 0, "malha_motociclista": 0,
+            "malha_pedestre": 0, "malha_ciclista": 0, "documentos_sincronizados": 0,
             "novos_dados": False
         }
         
@@ -34,15 +29,39 @@ class MotorSafeDriver:
             os.makedirs(f'datalake/{pasta}', exist_ok=True)
 
     def _estabelecer_conexao_nuvem(self):
-        # Autenticação segura com infraestrutura NoSQL
         chave_secreta = os.environ.get('FIREBASE_JSON')
         if not chave_secreta or not firebase_admin._apps:
             credenciais = credentials.Certificate(json.loads(chave_secreta))
             firebase_admin.initialize_app(credenciais)
         return firestore.client()
 
+    def _criar_sessao_resiliente(self):
+        # Escudo de Auto-Cura de Rede: Sobrevive a cortes de conexão (Erro 104) e WAFs
+        sessao = requests.Session()
+        
+        # Tenta 5 vezes antes de desistir. Espera 2s, 4s, 8s, 16s entre falhas.
+        retentativas = Retry(
+            total=5,
+            backoff_factor=2,
+            status_forcelist=[403, 429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adaptador = HTTPAdapter(max_retries=retentativas)
+        sessao.mount("http://", adaptador)
+        sessao.mount("https://", adaptador)
+
+        # Disfarce hiper-realista para enganar o Firewall governamental
+        sessao.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        })
+        return sessao
+
     def _notificar_sucesso(self):
-        # Emissão de relatório analítico detalhando o funil do Data Lake e matriz de modais
         endereco_webhook = os.environ.get('DISCORD_SUCESSO')
         if not endereco_webhook: return
         
@@ -51,19 +70,17 @@ class MotorSafeDriver:
                 "title": "📊 Relatório Executivo: Data Lake, Qualidade e Sincronização",
                 "color": 3066993,
                 "fields": [
-                    {"name": "🌊 Saúde do Data Lake (Funil)", "value": f"**RAW (Bruto):** {self.auditoria['volume_raw']:,} registos\n**TRUSTED (Limpo):** {self.auditoria['volume_trusted']:,} registos\n**REFINED (Negócio):** {self.auditoria['volume_refined']:,} registos", "inline": False},
-                    {"name": "⚙️ Qualidade e Expurgo", "value": f"Anomalias e Coordenadas Inválidas Expurgadas: {self.auditoria['falhas_integridade']:,}", "inline": False},
+                    {"name": "🌊 Saúde do Data Lake (Funil)", "value": f"**RAW:** {self.auditoria['volume_raw']:,} registos\n**TRUSTED:** {self.auditoria['volume_trusted']:,} registos\n**REFINED:** {self.auditoria['volume_refined']:,} registos", "inline": False},
+                    {"name": "⚙️ Qualidade dos Dados", "value": f"Anomalias Espaciais Expurgadas: {self.auditoria['falhas_integridade']:,}", "inline": False},
                     {"name": "🚗 Risco Veicular", "value": f"Motoristas: {self.auditoria['malha_motorista']:,}\nMotociclistas: {self.auditoria['malha_motociclista']:,}", "inline": True},
                     {"name": "🚶 Risco Vulneráveis", "value": f"Pedestres: {self.auditoria['malha_pedestre']:,}\nCiclistas: {self.auditoria['malha_ciclista']:,}", "inline": True},
-                    {"name": "☁️ Sincronização Firestore", "value": f"{self.auditoria['documentos_sincronizados']:,} coleções espaciais sincronizadas com sucesso.", "inline": False}
-                ],
-                "footer": {"text": "Monitorização concluída. Data Lake e Nuvem operacionais."}
+                    {"name": "☁️ Sincronização Firestore", "value": f"{self.auditoria['documentos_sincronizados']:,} coleções espaciais sincronizadas.", "inline": False}
+                ]
             }]
         }
-        requests.post(endereco_webhook, json=pacote_dados)
+        self.sessao_web.post(endereco_webhook, json=pacote_dados)
 
     def _notificar_erro(self, diagnostico_falha):
-        # Bloqueio de operação por corrupção de malha ou erro de requisição
         endereco_webhook = os.environ.get('DISCORD_ERRO')
         if not endereco_webhook: return
         
@@ -73,26 +90,22 @@ class MotorSafeDriver:
                 "color": 15158332,
                 "fields": [
                     {"name": "🛑 Causa Primária", "value": diagnostico_falha, "inline": False},
-                    {"name": "☁️ Intervenção Automática", "value": "Sincronização com o Firestore paralisada para proteger o schema e a integridade da base de dados.", "inline": False}
+                    {"name": "☁️ Intervenção Automática", "value": "Sincronização com o Firestore paralisada para proteger o schema.", "inline": False}
                 ]
             }]
         }
-        requests.post(endereco_webhook, json=pacote_dados)
+        requests.post(endereco_webhook, json=pacote_dados) # Usa requests nativo para garantir envio se a sessão falhar
 
     def _higienizar_texto(self, texto_bruto):
-        # Expulsão de caracteres especiais e acentuação da matriz tabular
         if pd.isna(texto_bruto) or not isinstance(texto_bruto, str): 
             return str(texto_bruto) if not pd.isna(texto_bruto) else ""
         texto_normalizado = unicodedata.normalize('NFKD', texto_bruto)
         return "".join([c for c in texto_normalizado if not unicodedata.combining(c)]).upper().strip()
 
     def _verificar_necessidade_download(self, endereco_arquivo, ano_referencia):
-        # Leitura assíncrona de metadados para redução de consumo de banda
-        cabecalho_navegador = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         caminho_metadados = f"datalake/metadata/tamanho_{ano_referencia}.json"
-        
         try:
-            cabecalho_resposta = requests.head(endereco_arquivo, headers=cabecalho_navegador, timeout=30, allow_redirects=True)
+            cabecalho_resposta = self.sessao_web.head(endereco_arquivo, timeout=30, allow_redirects=True)
             tamanho_nuvem = int(cabecalho_resposta.headers.get('Content-Length', 0))
             if os.path.exists(caminho_metadados):
                 with open(caminho_metadados, 'r') as arquivo_leitura:
@@ -103,7 +116,6 @@ class MotorSafeDriver:
             return True, 0
 
     def _processar_camadas_dados(self, dataframe_bruto, ano_referencia):
-        # Injeção de paridade para colunas flutuantes da fonte governamental
         for coluna in ESQUEMA_TRUSTED.keys():
             if coluna not in dataframe_bruto.columns and coluna != 'ANO_BASE':
                 dataframe_bruto[coluna] = np.nan
@@ -111,7 +123,6 @@ class MotorSafeDriver:
         volume_inicial = len(dataframe_bruto)
         dataframe_bruto['ANO_BASE'] = str(ano_referencia)
         
-        # Tipagem dinâmica forçada e higienização em massa
         for coluna, tipo_dado in ESQUEMA_TRUSTED.items():
             if tipo_dado == 'string':
                 dataframe_bruto[coluna] = dataframe_bruto[coluna].apply(self._higienizar_texto)
@@ -122,7 +133,6 @@ class MotorSafeDriver:
             elif tipo_dado == 'int':
                 dataframe_bruto[coluna] = pd.to_numeric(dataframe_bruto[coluna], errors='coerce').fillna(0).astype(int)
 
-        # Restrição de perímetro espacial da camada limpa
         mascara_geografica = (
             dataframe_bruto['LATITUDE'].notna() & dataframe_bruto['LONGITUDE'].notna() &
             (dataframe_bruto['LATITUDE'] != 0) & (dataframe_bruto['LONGITUDE'] != 0) &
@@ -130,17 +140,12 @@ class MotorSafeDriver:
             dataframe_bruto['LONGITUDE'].between(LIMITES_SP['lon'][0], LIMITES_SP['lon'][1])
         )
         
-        # Camada TRUSTED: Todo o contexto de negócio padronizado
         dataframe_trusted = dataframe_bruto[mascara_geografica].copy()
-        
-        # Remoção de colunas nativas da SSP que não pertencem ao contrato Trusted
         dataframe_trusted = dataframe_trusted[list(ESQUEMA_TRUSTED.keys())]
         
-        # Auditoria do funil (O que foi expurgado entre RAW e TRUSTED)
         self.auditoria['falhas_integridade'] += (volume_inicial - len(dataframe_trusted))
         self.auditoria['volume_trusted'] += len(dataframe_trusted)
 
-        # Camada REFINED: Apenas os vetores estritos necessários para a predição viária
         if 'DESCR_TIPOLOCAL' not in dataframe_trusted.columns:
             dataframe_trusted['DESCR_TIPOLOCAL'] = 'VIA PUBLICA'
 
@@ -156,16 +161,13 @@ class MotorSafeDriver:
         return dataframe_trusted, dataframe_refinado
 
     def _calcular_predicao_risco(self, dataframe_consolidado):
-        # Explosão matricial para cobertura de múltiplos perfis por boletim
         dataframe_consolidado['perfis_afetados'] = dataframe_consolidado['NATUREZA_APURADA'].apply(
             lambda crime: CATALOGO_CRIMES.get(crime, {}).get('perfis', ['Indefinido'])
         )
         dataframe_expandido = dataframe_consolidado.explode('perfis_afetados').dropna(subset=['perfis_afetados'])
         
-        # Codificação de coordenadas flutuantes para quarteirões geohash
         dataframe_expandido['codigo_geohash'] = [gh.encode(lat, lon, precision=7) for lat, lon in zip(dataframe_expandido['LATITUDE'], dataframe_expandido['LONGITUDE'])]
         
-        # Identificação paramétrica de ciclos solares
         def classificar_turno(hora_texto):
             try:
                 hora_inteira = int(str(hora_texto).split(':')[0])
@@ -175,11 +177,9 @@ class MotorSafeDriver:
         dataframe_expandido['turno_operacional'] = dataframe_expandido['HORA_OCORRENCIA_BO'].apply(classificar_turno)
         dataframe_expandido['peso_estatistico'] = dataframe_expandido['NATUREZA_APURADA'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
         
-        # Cálculo colunar ponderado limitando o teto matemático a 10
         malha_risco = dataframe_expandido.groupby(['codigo_geohash', 'perfis_afetados', 'turno_operacional']).agg({'peso_estatistico': 'sum'}).reset_index()
         malha_risco['score_preditivo'] = (malha_risco['peso_estatistico'] * 2.3).clip(0.5, 10.0).round(2)
         
-        # Contabilização fragmentada de impacto nos modais
         self.auditoria['malha_motorista'] = len(malha_risco[malha_risco['perfis_afetados'] == 'Motorista'])
         self.auditoria['malha_motociclista'] = len(malha_risco[malha_risco['perfis_afetados'] == 'Motociclista'])
         self.auditoria['malha_pedestre'] = len(malha_risco[malha_risco['perfis_afetados'] == 'Pedestre'])
@@ -188,7 +188,6 @@ class MotorSafeDriver:
         return malha_risco, dataframe_expandido
 
     def executar_pipeline_completo(self):
-        # Regência do funil integral desde o download até a replicação Firebase
         dataframe_mestre_refinado = pd.DataFrame()
         
         try:
@@ -200,13 +199,12 @@ class MotorSafeDriver:
                 realizar_download, tamanho_arquivo = self._verificar_necessidade_download(endereco_ssp, ano_alvo)
                 
                 if realizar_download or not os.path.exists(caminho_raw):
-                    cabecalho_navegador = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                    requisicao_dados = requests.get(endereco_ssp, headers=cabecalho_navegador, timeout=120)
+                    # O download agora utiliza a sessão resiliente com auto-cura
+                    requisicao_dados = self.sessao_web.get(endereco_ssp, timeout=120)
                     
                     if requisicao_dados.status_code != 200:
-                        raise ConnectionError(f"Protocolo HTTP bloqueado. Resposta do servidor governamental: {requisicao_dados.status_code}.")
+                        raise ConnectionError(f"Resposta do servidor governamental: {requisicao_dados.status_code}.")
 
-                    # Varredura inteligente do início tabular
                     leitura_previa = pd.read_excel(io.BytesIO(requisicao_dados.content), nrows=50, header=None)
                     linha_cabecalho = 0
                     cabecalho_encontrado = False
@@ -219,9 +217,8 @@ class MotorSafeDriver:
                             break
                             
                     if not cabecalho_encontrado:
-                        raise ValueError("Ruído extremo na matriz. Cabeçalho governamental irreconhecível.")
+                        raise ValueError("Cabeçalho governamental irreconhecível.")
 
-                    # Blindagem da ingestão convertendo todos os bytes em cadeia string primitiva
                     tabela_temporaria = pd.read_excel(io.BytesIO(requisicao_dados.content), skiprows=linha_cabecalho, dtype=str)
                     tabela_temporaria.columns = [self._higienizar_texto(c) for c in tabela_temporaria.columns]
                     
@@ -233,7 +230,7 @@ class MotorSafeDriver:
                     tabela_temporaria.rename(columns=mapeamento_correcao, inplace=True)
                     
                     if 'NUM_BO' not in tabela_temporaria.columns:
-                        raise KeyError(f"Identificador primário ausente no escaneamento tabular do ficheiro do ano {ano_alvo}.")
+                        raise KeyError(f"Identificador primário ausente no ficheiro de {ano_alvo}.")
                     
                     tabela_temporaria.to_parquet(caminho_raw, index=False)
                     with open(f"datalake/metadata/tamanho_{ano_alvo}.json", 'w') as arquivo_escrita: 
@@ -243,25 +240,19 @@ class MotorSafeDriver:
                 else:
                     tabela_temporaria = pd.read_parquet(caminho_raw)
 
-                # Registo da volumetria inicial no Data Lake
                 self.auditoria['volume_raw'] += len(tabela_temporaria)
                 
-                # Execução da tipagem ampla gerando as partições Trusted (histórica) e Refined (preditiva)
                 tabela_trusted, tabela_refinada = self._processar_camadas_dados(tabela_temporaria, ano_alvo)
-                
-                # Materialização autônoma da camada Trusted
                 tabela_trusted.to_parquet(caminho_trusted, index=False)
                 
                 dataframe_mestre_refinado = pd.concat([dataframe_mestre_refinado, tabela_refinada])
 
-            # Aborto condicionado à ausência de vetores de alteração nas partições locais
             if not self.auditoria['novos_dados'] and os.path.exists("datalake/refined/malha_analitica.parquet"):
                 return
 
             malha_final, base_inteligencia = self._calcular_predicao_risco(dataframe_mestre_refinado)
             self.auditoria['documentos_sincronizados'] = len(malha_final)
 
-            # Transação paralela em blocos para a instância Firebase
             if self.banco_nuvem:
                 lote_nuvem = self.banco_nuvem.batch()
                 for indice, linha in malha_final.iterrows():
