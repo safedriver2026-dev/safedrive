@@ -2,12 +2,14 @@ name: Integracao Continua SafeDriver
 
 on:
   schedule:
-    - cron: '0 0 * * 1'
-  workflow_dispatch:
+    - cron: '0 0 * * 1' # Acionamento automatico semanal
+  workflow_dispatch: # Acionamento manual no painel
 
 jobs:
   sincronizacao:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Permissao obrigatoria para o robo salvar ficheiros no repositorio
     steps:
       - name: Clonar Repositorio
         uses: actions/checkout@master
@@ -32,3 +34,11 @@ jobs:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python autobot/autobot_engine.py
+
+      - name: Salvar Data Lake no Repositorio Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add datalake/
+          git commit -m "🤖 Atualizacao automatica do Data Lake" || echo "Nenhum dado novo para salvar"
+          git push
