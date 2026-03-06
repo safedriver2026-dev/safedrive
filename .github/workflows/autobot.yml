@@ -1,0 +1,28 @@
+name: Execucao Semanal SafeDriver
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+jobs:
+  sincronizacao_dados:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Restauracao Cache Data Lake
+        uses: actions/cache@v3
+        with:
+          path: datalake/
+          key: cache-ssp-${{ hashFiles('datalake/metadata/*.json') }}
+      - name: Instalacao Pacotes
+        run: pip install -r requirements.txt
+      - name: Disparo do Motor Principal
+        env:
+          FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+        run: python autobot_engine.py
