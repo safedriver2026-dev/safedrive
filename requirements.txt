@@ -1,0 +1,8 @@
+pandas
+numpy
+pygeohash
+requests
+openpyxl
+pyarrow
+firebase-admin
+python-dotenv
