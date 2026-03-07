@@ -13,7 +13,7 @@ jobs:
       - name: Instalacao de pacotes
         run: pip install pandas numpy xgboost prophet pyarrow fastparquet scikit-learn
       - name: Execucao do script
-        run: python valida_motores.py
+        run: python valida_tcc.py
       - name: Armazenar resultado
         uses: actions/upload-artifact@v4
         with:
