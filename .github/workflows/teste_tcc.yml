@@ -1,21 +1,22 @@
-name: Teste de Eficiência TCC
+name: Teste de Eficiencia
 
 on: [push, workflow_dispatch]
 
 jobs:
-  build:
+  benchmarking:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Python
+      - name: Bibliotecas Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          
-      - name: Instala dependencias
-        run: |
-          pip install pandas numpy xgboost prophet pyarrow fastparquet scikit-learn
-          
-      - name: Roda Teste de Eficiência
+      - name: Instalar Dependencias
+        run: pip install pandas numpy xgboost prophet pyarrow fastparquet scikit-learn
+      - name: Run Benchmarking
         run: python valida_tcc.py
+      - name: Download Relatorio
+        uses: actions/upload-artifact@v4
+        with:
+          name: Relatorio-Final-TCC
+          path: resultado_teste.txt
