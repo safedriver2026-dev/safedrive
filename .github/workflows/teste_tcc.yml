@@ -14,9 +14,9 @@ jobs:
       - name: Instalar Dependências
         run: pip install pandas numpy xgboost prophet pyarrow fastparquet scikit-learn
       - name: Rodar Teste de Stress
-        run: python valida_motores.py
+        run: python valida_tcc.py
       - name: Exportar Resultado para Download
         uses: actions/upload-artifact@v4
         with:
-          name: veredito-motores-2025
+          name: veredito-modelo-2025
           path: validacao_testes_2025.txt
