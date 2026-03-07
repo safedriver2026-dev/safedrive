@@ -1,4 +1,4 @@
-name: Teste de Eficiencia de Motores
+name: Teste de Eficiencia SafeDriver
 
 on: [push, workflow_dispatch]
 
@@ -6,16 +6,23 @@ jobs:
   validacao:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Instalacao de pacotes
-        run: pip install pandas numpy xgboost prophet pyarrow fastparquet scikit-learn
-      - name: Execucao do script
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas numpy xgboost prophet pyarrow fastparquet scikit-learn
+
+      - name: Execute Validacao
         run: python valida_tcc.py
-      - name: Armazenar resultado
+
+      - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
-          name: relatorio-performance
+          name: relatorio-final-2025
           path: validacao_motores_2025.txt
