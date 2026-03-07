@@ -1,22 +1,21 @@
-name: Pipeline de Teste de Eficiencia
+name: Teste de Eficiencia de Motores
 
 on: [push, workflow_dispatch]
 
 jobs:
-  validacao_tecnica:
+  validacao:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Instalar Dependências
+      - name: Instalacao de pacotes
         run: pip install pandas numpy xgboost prophet pyarrow fastparquet scikit-learn
-      - name: Rodar Teste de Stress
-        run: python valida_tcc.py
-      - name: Exportar Resultado para Download
+      - name: Execucao do script
+        run: python valida_motores.py
+      - name: Armazenar resultado
         uses: actions/upload-artifact@v4
         with:
-          name: veredito-modelo-2025
-          path: validacao_testes_2025.txt
+          name: relatorio-performance
+          path: validacao_motores_2025.txt
