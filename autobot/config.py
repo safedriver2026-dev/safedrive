@@ -1,4 +1,4 @@
-# Catalogo basico de fallback para taxonomia de crimes
+
 CATALOGO_CRIMES = {
     'FURTO DE VEICULO': {'perfis': ['Motorista', 'Motociclista'], 'peso': 1.0},
     'ROUBO DE VEICULO': {'perfis': ['Motorista', 'Motociclista'], 'peso': 2.5},
@@ -10,7 +10,7 @@ CATALOGO_CRIMES = {
     'FURTO DE CELULAR': {'perfis': ['Pedestre', 'Ciclista'], 'peso': 1.0}
 }
 
-# Dicionario de NLP para inferencia contextual na camada Trusted
+
 PALAVRAS_CHAVE_PERFIL = {
     'Ciclista': ['BICI', 'CICLO', 'BICICLETA', 'PEDALAR'],
     'Motociclista': ['MOTO', 'MOTOCICLETA', 'CAPACETE', 'MOTOBOY'],
@@ -43,7 +43,7 @@ ESQUEMA_TRUSTED = {
     'COD IBGE': 'string', 'ANO_BASE': 'int'
 }
 
-# A camada Refined agora herda campos descritivos para a IA minerar
+
 COLUNAS_REFINED = [
     'NUM_BO', 'DATA_OCORRENCIA_BO', 'HORA_OCORRENCIA_BO', 
     'LATITUDE', 'LONGITUDE', 'NATUREZA_APURADA', 
