@@ -21,7 +21,7 @@ from urllib3.util.retry import Retry
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import LabelEncoder
 
-from config import (
+from autobot.config import (
     CATALOGO_CRIMES, TIPOS_LOCAL_PERMITIDOS, SUBTIPOS_LOCAL_PERMITIDOS, LIMITES_SP,
     ESQUEMA_RAW_CANONICO, ESQUEMA_TRUSTED, COLUNAS_REFINED_EVENTOS,
     PALAVRAS_CHAVE_PERFIL, MAPA_SEMANTICO_COLUNAS
@@ -69,7 +69,7 @@ class MotorSafeDriver:
     def _notificar_sucesso(self):
         endereco_webhook = os.environ.get('DISCORD_SUCESSO')
         if not endereco_webhook: return
-        status_extracao = "Novos arquivos detectados e processados." if self.auditoria['novos_dados_baixados'] else "Processamento incremental MLOps concluído."
+        status_extracao = "Novos arquivos detectados e processados." if self.auditoria['novos_dados_baixados'] else "Processamento incremental MLOps concluido."
         pacote_dados = {
             "embeds": [{
                 "title": "Pipeline SafeDriver MLOps Executado",
@@ -87,7 +87,7 @@ class MotorSafeDriver:
     def _notificar_erro(self, diagnostico_falha):
         endereco_webhook = os.environ.get('DISCORD_ERRO')
         if not endereco_webhook: return
-        pacote_dados = {"embeds": [{"title": "Interrupção Operacional", "color": 15158332, "fields": [{"name": "Diagnóstico", "value": diagnostico_falha, "inline": False}]}]}
+        pacote_dados = {"embeds": [{"title": "Interrupcao Operacional", "color": 15158332, "fields": [{"name": "Diagnostico", "value": diagnostico_falha, "inline": False}]}]}
         requests.post(endereco_webhook, json=pacote_dados)
 
     def _higienizar_texto(self, texto):
@@ -191,7 +191,7 @@ class MotorSafeDriver:
         try:
             h = int(str(hora_str).split(':')[0])
             if 0 <= h < 6: return 'Madrugada'
-            if 6 <= h < 12: return 'Manhã'
+            if 6 <= h < 12: return 'Manha'
             if 12 <= h < 18: return 'Tarde'
             return 'Noite'
         except: return 'Noite'
@@ -325,21 +325,21 @@ class MotorSafeDriver:
         caminho_md = f"datalake/reports/runbook_{data_str}.md"
         
         conteudo = f"""# SafeDriver Data & AI Pipeline Runbook
-**Data da Execução:** {self.auditoria['timestamp']}
+**Data da Execucao:** {self.auditoria['timestamp']}
 
 ## 1. Integridade do Pipeline (Data Engineering)
 - **Registros Ingeridos (RAW):** {self.auditoria['volume_raw']:,}
 - **Registros Higienizados (TRUSTED):** {self.auditoria['volume_trusted']:,}
-- **Eventos Analíticos (REFINED):** {self.auditoria['volume_refined']:,}
+- **Eventos Analiticos (REFINED):** {self.auditoria['volume_refined']:,}
 - **Perda por Qualidade (Data Drops):** {self.auditoria['falhas_integridade']:,}
-- **Status da Fonte (SSP):** {'Novos dados consumidos' if self.auditoria['novos_dados_baixados'] else 'Nenhuma mutação detectada (Cache utilizado)'}
+- **Status da Fonte (SSP):** {'Novos dados consumidos' if self.auditoria['novos_dados_baixados'] else 'Nenhuma mutacao detectada (Cache utilizado)'}
 
 ## 2. Modelagem Preditiva (Foresight AI)
 - **MAE (Mean Absolute Error):** {self.auditoria['mae_modelo']}
 - **RMSE (Root Mean Squared Error):** {self.auditoria['rmse_modelo']}
-- **Janela de Contexto:** {self.janela_inicio.date()} até {self.data_execucao.date()}
+- **Janela de Contexto:** {self.janela_inicio.date()} ate {self.data_execucao.date()}
 
-## 3. Dispersão Geográfica do Risco (Output Size)
+## 3. Dispersao Geografica do Risco (Output Size)
 - **Motorista:** {self.auditoria['malha_motorista']:,} quadrantes ativados
 - **Motociclista:** {self.auditoria['malha_motociclista']:,} quadrantes ativados
 - **Ciclista:** {self.auditoria['malha_ciclista']:,} quadrantes ativados
@@ -347,7 +347,7 @@ class MotorSafeDriver:
 
 ## 4. Estado da Nuvem (Firebase Sync)
 - **Documentos Verificados:** {self.auditoria['documentos_sincronizados']:,}
-- **Mutações Escritas (Delta Update):** {self.auditoria['documentos_atualizados']:,}
+- **Mutacoes Escritas (Delta Update):** {self.auditoria['documentos_atualizados']:,}
 """
         with open(caminho_md, 'w', encoding='utf-8') as f:
             f.write(conteudo)
