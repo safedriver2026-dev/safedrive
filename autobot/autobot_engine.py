@@ -5,6 +5,7 @@ import math
 import hashlib
 import logging
 import unicodedata
+import warnings
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -23,6 +24,7 @@ from autobot.config import (
     ESQUEMA_TRUSTED, COLUNAS_REFINED_EVENTOS, PALAVRAS_CHAVE_PERFIL, MAPA_SEMANTICO_COLUNAS
 )
 
+warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 class MotorSafeDriver:
@@ -32,7 +34,7 @@ class MotorSafeDriver:
         self.periodo_historico = range(self.janela_inicio.year, self.data_execucao.year + 1)
         self.sessao = self._criar_sessao()
         self.db = self._conectar_firebase() if habilitar_firestore else None
-        self.auditoria = {"volume_raw": 0, "mae": 0.0, "rmse": 0.0, "sync": 0}
+        self.auditoria = {"volume_raw": 0, "mae": 0.0, "rmse": 0.0}
         for p in ['raw', 'trusted', 'refined', 'metadata', 'reports']: os.makedirs(f'datalake/{p}', exist_ok=True)
 
     def _conectar_firebase(self):
@@ -55,14 +57,16 @@ class MotorSafeDriver:
 
     def _ingerir_excel(self, content):
         excel = pd.ExcelFile(io.BytesIO(content))
-        abas_dados = [s for i, s in enumerate(excel.sheet_names) if i > 0]
         dfs = []
-        for aba in abas_dados:
+        for aba in excel.sheet_names:
+            if "CAMPOS" in aba.upper() or "METADADOS" in aba.upper(): continue
             df = excel.parse(aba, dtype=str)
             df.columns = [self._limpar_texto(c) for c in df.columns]
             for can, aliases in MAPA_SEMANTICO_COLUNAS.items():
                 match = [a for a in aliases if a in df.columns]
                 if match: df[can] = df[match[0]]
+            for col in ESQUEMA_RAW_CANONICO.keys():
+                if col not in df.columns: df[col] = np.nan
             dfs.append(df)
         return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
@@ -81,15 +85,17 @@ class MotorSafeDriver:
         mask = (df['DATA_OCORRENCIA_BO'].between(self.janela_inicio, self.data_execucao)) & \
                (df['LATITUDE'].between(LIMITES_SP['lat'][0], LIMITES_SP['lat'][1]))
         df_t = df[mask].copy()
+        if 'NATUREZA_APURADA' not in df_t.columns: return df_t, pd.DataFrame()
         df_r = df_t[df_t['NATUREZA_APURADA'].isin(CATALOGO_CRIMES.keys())][COLUNAS_REFINED_EVENTOS].copy()
         return df_t, df_r
 
     def _ml_features(self, df_r):
+        if df_r.empty: return pd.DataFrame(), None
         df = df_r.copy()
         df['perfis'] = df.apply(lambda x: [p for p, kws in PALAVRAS_CHAVE_PERFIL.items() if any(k in str(x).upper() for k in kws)] or ['Indefinido'], axis=1)
         df = df.explode('perfis')
         df['gh'] = [gh.encode(la, lo, precision=7) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
-        df['hr'] = df['HORA_OCORRENCIA_BO'].str[:2].replace('', '00').astype(int)
+        df['hr'] = df['HORA_OCORRENCIA_BO'].astype(str).str[:2].replace('', '00').astype(int)
         df['turno'] = df['hr'].apply(lambda h: 'Madrugada' if 0<=h<6 else 'Manha' if 6<=h<12 else 'Tarde' if 12<=h<18 else 'Noite')
         df['w'] = df['NATUREZA_APURADA'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
         pnl = df.groupby(['gh', 'perfis', 'turno', 'DATA_OCORRENCIA_BO'], as_index=False).agg(y=('w', 'sum'), la=('LATITUDE', 'mean'), lo=('LONGITUDE', 'mean'))
@@ -104,6 +110,7 @@ class MotorSafeDriver:
         return pnl, prj
 
     def _treinar_sync(self, pnl, prj):
+        if pnl.empty or prj is None: return
         pnl_v = pnl.dropna(subset=['target']).copy()
         le_p, le_t = LabelEncoder().fit(pnl['perfis']), LabelEncoder().fit(pnl['turno'])
         for d in [pnl_v, pnl]:
