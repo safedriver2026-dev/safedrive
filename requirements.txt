@@ -10,5 +10,6 @@ urllib3
 xgboost
 prophet
 scikit-learn
+pytest
 plotly
 nbformat
