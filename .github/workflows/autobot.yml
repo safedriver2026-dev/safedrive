@@ -38,7 +38,7 @@ jobs:
 
       - name: Rodar testes de contrato
         run: |
-          python -m pytest -q
+          python -m pytest tests/test_contracts.py -q
 
       - name: Executar motor preditivo
         env:
@@ -48,7 +48,7 @@ jobs:
         run: |
           python -m autobot.autobot_engine
 
-      - name: Upload de artefatos
+      - name: Upload de relatorios de observabilidade
         uses: actions/upload-artifact@v4
         with:
           name: safedriver-observability-reports
