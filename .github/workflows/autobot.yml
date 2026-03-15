@@ -30,14 +30,15 @@ jobs:
           restore-keys: |
             safedriver-storage-${{ runner.os }}-
 
-      - name: Instalar Dependências Sênior
+      - name: Instalar Dependências
         run: |
-          pip install pandas numpy pygeohash requests firebase-admin xgboost prophet scikit-learn openpyxl pyarrow
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Validar Pipeline (Testes Unitários)
+      - name: Testes Unitários
         run: python -m pytest tests/test_contracts.py -q
 
-      - name: Executar Motor Preditivo Definitivo
+      - name: Executar Motor Preditivo
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
