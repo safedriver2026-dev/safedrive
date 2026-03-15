@@ -24,12 +24,14 @@ def test_qualificacao_coordenadas_sujas():
         'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')]*4,
         'NATUREZA_APURADA': ['ROUBO DE VEICULO']*4,
         'HORA_OCORRENCIA_BO': ['12:00']*4,
-        'NUM_BO': ['1','2','3','4']
+        'NUM_BO': ['1','2','3','4'],
+        'DESCR_TIPOLOCAL': ['VIA PUBLICA']*4 # ADICIONADO PARA CUMPRIR O CONTRATO
     }
     df = pd.DataFrame(data)
     dt, dr = engine._qualificar_dados(df, 2026)
     assert len(dt) == 1
     assert dt['LATITUDE'].iloc[0] == -23.5
+    assert 'DESCR_TIPOLOCAL' in dr.columns
 
 def test_formatador_data_portugues():
     engine = MotorSafeDriver(habilitar_firestore=False)
