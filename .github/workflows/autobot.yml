@@ -30,15 +30,15 @@ jobs:
           restore-keys: |
             safedriver-storage-${{ runner.os }}-
 
-      - name: Instalar Dependências
+      - name: Instalar Dependências Sênior
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Testes Unitários
+      - name: Validar Pipeline (Testes Unitários)
         run: python -m pytest tests/test_contracts.py -q
 
-      - name: Executar Motor Preditivo
+      - name: Executar Motor Preditivo Definitivo
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
