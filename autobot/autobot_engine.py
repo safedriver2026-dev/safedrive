@@ -24,7 +24,6 @@ class MotorSafeDriver:
         self.db = self._conectar_firebase() if habilitar_firestore else None
         self.auditoria = {"modo": "INCREMENTAL", "volume_raw": 0, "dq_latlon": 0, "clusters_ativos": 0, "mae": 0.0}
         
-        # 12. ATUALIZAÇÃO INCREMENTAL / COLD START
         if not os.path.exists(self.lock_file):
             self.auditoria["modo"] = "FULL_RELOAD"
             if os.path.exists('datalake'): shutil.rmtree('datalake', ignore_errors=True)
@@ -64,7 +63,7 @@ class MotorSafeDriver:
                 {"name": "📊 DQ e Volume", "value": f"RAW: {self.auditoria['volume_raw']:,}\nLatLon Válida: {self.auditoria['dq_latlon']:.1f}%", "inline": True},
                 {"name": "🧠 Inteligência", "value": f"Clusters: {self.auditoria['clusters_ativos']}\nMAE: {self.auditoria['mae']}", "inline": True}
             ] if sucesso else [{"name": "Erro", "value": str(erro)}],
-            "footer": {"text": f"Duração: {(datetime.now() - self.ts_execucao).total_seconds():.1f}s • {self._formatar_data_pt(datetime.now())}"}
+            "footer": {"text": f"{self._formatar_data_pt(datetime.now())}"}
         }
         requests.post(webhook, json={"embeds": [embed]})
 
@@ -75,20 +74,18 @@ class MotorSafeDriver:
             if any(x in aba.upper() for x in ["CAMPOS", "METADADOS", "DICIONARIO"]): continue
             df = excel.parse(aba, dtype=str)
             df.columns = [self._normalizar_coluna(c) for c in df.columns]
-            
-            # FIX 2026: DEDUPLICAÇÃO POR FUSÃO (Resolve RUBRICA vs NATUREZA_APURADA)
             df = df.loc[:, ~df.columns.duplicated()].copy()
-            
-            for col in ESQUEMA_RAW_CANONICO.keys():
-                if col not in df.columns: df[col] = np.nan
             dfs.append(df)
         return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
     def _qualificar_dados(self, df_raw, ano):
         df = df_raw.copy()
-        df['ANO_BASE'] = int(ano)
         
-        # 14. DQ: Filtra '0' e '-' típicos de 2026
+        # BLINDAGEM SUPREMA: Garante que todas as colunas do contrato existam
+        for col in ESQUEMA_RAW_CANONICO.keys():
+            if col not in df.columns: df[col] = np.nan
+            
+        df['ANO_BASE'] = int(ano)
         valid_latlon = df['LATITUDE'].replace(['0', 0, '-', ' ', 'NULL'], np.nan).notna().sum()
         self.auditoria['dq_latlon'] = (valid_latlon / max(len(df), 1)) * 100
 
@@ -104,24 +101,23 @@ class MotorSafeDriver:
                
         df_t = df[mask].copy()
         df_r = df_t[df_t['NATUREZA_APURADA'].isin(CATALOGO_CRIMES.keys())].copy()
-        if not df_r.empty: df_r = df_r[COLUNAS_REFINED_EVENTOS].copy()
+        
+        if not df_r.empty: 
+            df_r = df_r[COLUNAS_REFINED_EVENTOS].copy()
+            
         return df_t, df_r
 
     def _gerar_inteligencia(self, df_r):
         if df_r.empty: return pd.DataFrame(), None
         df = df_r.copy()
-        
-        # 2. RECÊNCIA (Exponencial) e 3. FEATURES TEMPORAIS
         df['dias_desde_evento'] = (self.data_execucao - df['DATA_OCORRENCIA_BO']).dt.days
         df['peso_recencia'] = np.exp(-df['dias_desde_evento'] / 180)
         df['hora'] = df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(\d+)').fillna(0).astype(int)
         df['periodo_dia'] = df['hora'].apply(lambda h: 'Noite' if h>=18 or h<6 else 'Dia')
-        
         df['gh'] = [gh.encode(la, lo, precision=7) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
         df['peso_gravidade'] = df['NATUREZA_APURADA'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
         df['score_evento'] = df['peso_recencia'] * df['peso_gravidade']
         
-        # 8. CLUSTERS DBSCAN
         clustering = DBSCAN(eps=0.005, min_samples=10).fit(df[['LATITUDE', 'LONGITUDE']])
         df['cluster_id'] = clustering.labels_
         self.auditoria['clusters_ativos'] = len(set(clustering.labels_)) - 1
@@ -132,7 +128,6 @@ class MotorSafeDriver:
         pnl['vol_365d'] = pnl.groupby('gh')['vol_crimes'].transform('sum')
         pnl['target'] = pnl.groupby(['gh', 'periodo_dia'])['y'].transform(lambda x: x.shift(-7).rolling(7, min_periods=1).sum())
         
-        # 9. PROPHET
         macro = pnl.groupby('DATA_OCORRENCIA_BO')['vol_crimes'].sum().reset_index().rename(columns={'DATA_OCORRENCIA_BO': 'ds', 'vol_crimes': 'y'})
         if len(macro) >= 2:
             m_p = Prophet().fit(macro)
@@ -155,10 +150,9 @@ class MotorSafeDriver:
         grid['ft'] = prj.iloc[-1]['yhat'] / max(prj['yhat'].mean(), 1.0)
         grid['score_raw'] = np.clip(md.predict(grid[fs]), 0, None)
         
-        # 10. RISK SCORE (0-100) MASTIGADO PARA FLUTTER
         scaler = MinMaxScaler(feature_range=(0, 100))
-        grid['risk_score'] = scaler.fit_transform(grid[['score_raw']]).round(1)
-        grid['routing_penalty'] = (1.0 + (grid['risk_score'] / 50.0)).round(2)
+        grid['score'] = scaler.fit_transform(grid[['score_raw']]).round(1)
+        grid['penalty'] = (1.0 + (grid['score'] / 50.0)).round(2)
         
         if self.db:
             cl = self.db.collection('niveis_risco')
@@ -166,8 +160,8 @@ class MotorSafeDriver:
             for _, l in grid.iterrows():
                 did = f"{l['gh']}_{l['periodo_dia']}"
                 payload = {
-                    'score': float(l['risk_score']),
-                    'penalty': float(l['routing_penalty']),
+                    'score': float(l['score']),
+                    'penalty': float(l['penalty']),
                     'geohash': l['gh'],
                     'prefix': l['gh'][:4],
                     'periodo': l['periodo_dia'],
