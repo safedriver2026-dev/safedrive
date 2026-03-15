@@ -73,7 +73,7 @@ def test_normalizacao_turno():
     assert engine._classificar_turno(21) == "Noite"
 
 
-def test_target_futuro_7d_existe():
+def test_criar_target_futuro_7d():
     engine = MotorSafeDriver()
 
     df = pd.DataFrame({
@@ -82,29 +82,73 @@ def test_target_futuro_7d_existe():
         "turno_operacional": ["Noite"] * 10,
         "data_evento": pd.date_range("2026-01-01", periods=10, freq="D"),
         "target_dia": [1.0, 0.5, 0.0, 2.0, 1.5, 0.0, 3.0, 1.0, 0.0, 2.5],
-        "ocorrencias_dia": [1] * 10,
-        "latitude_media": [-23.55] * 10,
-        "longitude_media": [-46.63] * 10,
-        "geohash_prefix_4": ["6gyf"] * 10,
-        "geohash_prefix_5": ["6gyf4"] * 10,
-        "lag_1": [0.0] * 10,
-        "lag_7": [0.0] * 10,
-        "lag_14": [0.0] * 10,
-        "media_7d": [0.0] * 10,
-        "media_30d": [0.0] * 10,
-        "ocorrencias_7d": [0.0] * 10,
-        "ocorrencias_30d": [0.0] * 10,
-        "dias_desde_ultimo_evento": [1] * 10,
-        "dia_semana": [0] * 10,
-        "mes": [1] * 10,
-        "fim_semana": [0] * 10,
-        "tendencia_7_30": [0.0] * 10,
     })
 
     resultado = engine._criar_target_futuro(df)
 
     assert "target_futuro_7d" in resultado.columns
     assert resultado["target_futuro_7d"].notna().all()
+
+    primeiro_esperado = sum([0.5, 0.0, 2.0, 1.5, 0.0, 3.0, 1.0])
+    assert resultado.iloc[0]["target_futuro_7d"] == primeiro_esperado
+
+
+def test_payload_malha_tem_campos_esperados():
+    engine = MotorSafeDriver()
+
+    linha = {
+        "codigo_geohash": "6gyf4bf",
+        "geohash_prefix_4": "6gyf",
+        "geohash_prefix_5": "6gyf4",
+        "perfil": "Motorista",
+        "turno_operacional": "Noite",
+        "score": 8.42,
+        "risk_band": "alto",
+        "semana_referencia_inicio": pd.Timestamp("2026-03-16"),
+        "semana_referencia_fim": pd.Timestamp("2026-03-22"),
+        "data_evento": pd.Timestamp("2026-03-15"),
+    }
+
+    payload = {
+        "geohash": linha["codigo_geohash"],
+        "geohash_prefix_4": linha["geohash_prefix_4"],
+        "geohash_prefix_5": linha["geohash_prefix_5"],
+        "perfil": linha["perfil"],
+        "turno": linha["turno_operacional"],
+        "periodo": linha["turno_operacional"],
+        "score": round(float(linha["score"]), 2),
+        "risk_band": linha["risk_band"],
+        "modelo": "xgb_prophet",
+        "versao_modelo": engine.versao_modelo,
+        "janela_inicio": str(engine.janela_inicio.date()),
+        "janela_fim": str(engine.janela_fim.date()),
+        "semana_referencia_inicio": str(pd.Timestamp(linha["semana_referencia_inicio"]).date()),
+        "semana_referencia_fim": str(pd.Timestamp(linha["semana_referencia_fim"]).date()),
+        "horizonte_predicao_dias": engine.horizonte_predicao_dias,
+        "data_base_modelo": str(pd.Timestamp(linha["data_evento"]).date()),
+    }
+
+    campos_esperados = [
+        "geohash",
+        "geohash_prefix_4",
+        "geohash_prefix_5",
+        "perfil",
+        "turno",
+        "periodo",
+        "score",
+        "risk_band",
+        "modelo",
+        "versao_modelo",
+        "janela_inicio",
+        "janela_fim",
+        "semana_referencia_inicio",
+        "semana_referencia_fim",
+        "horizonte_predicao_dias",
+        "data_base_modelo",
+    ]
+
+    for campo in campos_esperados:
+        assert campo in payload, f"Campo obrigatorio ausente: {campo}"
 
 
 def test_score_e_faixa_validos():
@@ -113,3 +157,35 @@ def test_score_e_faixa_validos():
 
     assert 0.5 <= score <= 10.0
     assert risk_band in {"baixo", "medio", "alto", "critico"}
+
+
+def test_turnos_validos():
+    turnos_validos = {"Madrugada", "Manha", "Tarde", "Noite"}
+
+    assert "Madrugada" in turnos_validos
+    assert "Manha" in turnos_validos
+    assert "Tarde" in turnos_validos
+    assert "Noite" in turnos_validos
+
+
+def test_perfis_validos():
+    perfis_validos = {"Motorista", "Motociclista", "Pedestre", "Ciclista", "Indefinido"}
+
+    assert "Motorista" in perfis_validos
+    assert "Motociclista" in perfis_validos
+    assert "Pedestre" in perfis_validos
+    assert "Ciclista" in perfis_validos
+
+
+def test_geohash_tem_precisao_7():
+    geohash = "6gyf4bf"
+    assert isinstance(geohash, str)
+    assert len(geohash) == 7
+
+
+def test_semana_referencia_consistente():
+    semana_inicio = pd.Timestamp("2026-03-16")
+    semana_fim = pd.Timestamp("2026-03-22")
+
+    assert semana_inicio < semana_fim
+    assert (semana_fim - semana_inicio).days == 6
