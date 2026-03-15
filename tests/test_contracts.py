@@ -10,13 +10,13 @@ from autobot.autobot_engine import MotorSafeDriver
 
 
 def test_engine_instancia():
-    engine = MotorSafeDriver()
+    engine = MotorSafeDriver(habilitar_firestore=False)
     assert hasattr(engine, "executar_pipeline_completo")
     assert callable(engine.executar_pipeline_completo)
 
 
 def test_engine_tem_metodos_essenciais():
-    engine = MotorSafeDriver()
+    engine = MotorSafeDriver(habilitar_firestore=False)
 
     metodos_essenciais = [
         "_ler_ou_baixar_raw",
@@ -38,7 +38,7 @@ def test_engine_tem_metodos_essenciais():
 
 
 def test_classificacao_faixa_risco():
-    engine = MotorSafeDriver()
+    engine = MotorSafeDriver(habilitar_firestore=False)
 
     assert engine._classificar_faixa_risco(2.0) == "baixo"
     assert engine._classificar_faixa_risco(4.0) == "medio"
@@ -47,7 +47,7 @@ def test_classificacao_faixa_risco():
 
 
 def test_hash_registro_estavel():
-    engine = MotorSafeDriver()
+    engine = MotorSafeDriver(habilitar_firestore=False)
 
     payload = {
         "geohash": "6gyf4bf",
@@ -65,7 +65,7 @@ def test_hash_registro_estavel():
 
 
 def test_normalizacao_turno():
-    engine = MotorSafeDriver()
+    engine = MotorSafeDriver(habilitar_firestore=False)
 
     assert engine._classificar_turno(2) == "Madrugada"
     assert engine._classificar_turno(8) == "Manha"
@@ -74,7 +74,7 @@ def test_normalizacao_turno():
 
 
 def test_criar_target_futuro_7d():
-    engine = MotorSafeDriver()
+    engine = MotorSafeDriver(habilitar_firestore=False)
 
     df = pd.DataFrame({
         "codigo_geohash": ["6gyf4bf"] * 10,
@@ -94,7 +94,7 @@ def test_criar_target_futuro_7d():
 
 
 def test_payload_malha_tem_campos_esperados():
-    engine = MotorSafeDriver()
+    engine = MotorSafeDriver(habilitar_firestore=False)
 
     linha = {
         "codigo_geohash": "6gyf4bf",
