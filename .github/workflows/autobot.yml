@@ -10,35 +10,66 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
-      - name: Clonar Repositorio
-        uses: actions/checkout@master
-
-      - name: Configurar Ambiente Python
-        uses: actions/setup-python@master
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
         with:
-          python-version: '3.x'
+          fetch-depth: 0
 
-      - name: Restaurar Cache do Data Lake
-        uses: actions/cache@master
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Restaurar cache do Data Lake
+        uses: actions/cache@v4
         with:
           path: datalake/
-          key: cache-ssp-${{ hashFiles('datalake/metadata/*.json') }}
+          key: safedriver-datalake-${{ runner.os }}-${{ hashFiles('datalake/raw/*.parquet', 'datalake/metadata/*.json') }}
+          restore-keys: |
+            safedriver-datalake-${{ runner.os }}-
+            safedriver-datalake-
 
-      - name: Instalar Pacotes de Dependencia
-        run: pip install -r requirements.txt
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Executar Motor Preditivo de IA
+      - name: Rodar testes de contrato
+        run: |
+          pytest -q
+
+      - name: Executar motor preditivo
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        run: python autobot/autobot_engine.py
-
-      - name: Salvar Data Lake no Repositorio Git
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          python autobot/autobot_engine.py
+
+      - name: Upload de artefatos do ciclo
+        uses: actions/upload-artifact@v4
+        with:
+          name: safedriver-semanal
+          path: |
+            datalake/metadata/
+            datalake/refined/refined_eventos_total.parquet
+            datalake/refined/refined_modelagem.parquet
+            datalake/refined/malha_risco_atual.parquet
+            datalake/trusted/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Salvar Data Lake no repositorio Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add datalake/
-          git commit -m "🧠 Atualizacao automatica da IA no Data Lake" || echo "Nenhum dado novo para salvar"
-          git push
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteracao para commit"
+          else
+            git commit -m "Atualizacao automatica semanal do Data Lake SafeDriver"
+            git push
+          fi
