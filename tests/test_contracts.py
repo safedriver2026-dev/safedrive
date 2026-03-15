@@ -16,7 +16,7 @@ def test_engine_instancia():
 
 def test_metodos_obrigatorios():
     engine = MotorSafeDriver(habilitar_firestore=False)
-    metodos = ["_ingerir_fonte", "_qualificar_dados", "_ml_features", "_treinar_disseminar", "_notificar_discord", "_gerar_runbook"]
+    metodos = ["_ingerir_fonte", "_qualificar_dados", "_gerar_inteligencia", "_treinar_disseminar", "_notificar_discord", "_gerar_runbook"]
     for m in metodos:
         assert hasattr(engine, m)
 
@@ -43,13 +43,14 @@ def test_resiliencia_tipagem_e_limpeza():
 def test_normalizacao_turnos():
     engine = MotorSafeDriver(habilitar_firestore=False)
     df_teste = pd.DataFrame({
-        'LATITUDE': [-23.5], 'LONGITUDE': [-46.6], 
-        'HORA_OCORRENCIA_BO': ['08:15'], 'NATUREZA_APURADA': ['ROUBO DE VEICULO'],
-        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')]
+        'LATITUDE': [-23.5, -23.6], 'LONGITUDE': [-46.6, -46.7], 
+        'HORA_OCORRENCIA_BO': ['08:15', '22:30'], 'NATUREZA_APURADA': ['ROUBO DE VEICULO', 'FURTO DE VEICULO'],
+        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01'), pd.Timestamp('2026-01-02')]
     })
     pnl, prj = engine._gerar_inteligencia(df_teste)
     assert not pnl.empty
-    assert pnl['turno'].iloc[0] == 'Manha'
+    assert 'Manha' in pnl['turno'].values
+    assert 'Noite' in pnl['turno'].values
 
 def test_modo_checkpointing():
     if os.path.exists('datalake/metadata/baseline.lock'):
