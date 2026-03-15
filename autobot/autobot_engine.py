@@ -21,7 +21,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import LabelEncoder
 from urllib3.util.retry import Retry
 
-from config import (
+from autobot.config import (
     CATALOGO_CRIMES,
     TIPOS_LOCAL_PERMITIDOS,
     SUBTIPOS_LOCAL_PERMITIDOS,
@@ -685,6 +685,9 @@ class MotorSafeDriver:
         return treino, teste
 
     def _aplicar_encoders(self, treino, teste):
+        treino = treino.copy()
+        teste = teste.copy()
+
         encoder_turno = LabelEncoder()
         encoder_perfil = LabelEncoder()
 
