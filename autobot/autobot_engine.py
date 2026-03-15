@@ -38,7 +38,7 @@ logging.basicConfig(
 
 
 class MotorSafeDriver:
-    def __init__(self):
+    def __init__(self, habilitar_firestore=True):
         self.data_referencia = pd.Timestamp(datetime.now().date())
         self.janela_fim = self.data_referencia
         self.janela_inicio = self.janela_fim - pd.Timedelta(days=730)
@@ -47,10 +47,13 @@ class MotorSafeDriver:
         self.precisao_geohash = 7
         self.horizonte_predicao_dias = 7
         self.dias_holdout_teste = 60
-        self.versao_modelo = "safedriver_v3_2_0"
+        self.versao_modelo = "safedriver_v3_3_0"
 
-        self.banco_nuvem = self._estabelecer_conexao_nuvem()
         self.sessao_web = self._criar_sessao_resiliente()
+        self.banco_nuvem = None
+
+        if habilitar_firestore:
+            self.banco_nuvem = self._estabelecer_conexao_nuvem()
 
         self.auditoria = {
             "volume_raw": 0,
@@ -104,7 +107,7 @@ class MotorSafeDriver:
         adaptador = HTTPAdapter(max_retries=retentativas)
         sessao.mount("http://", adaptador)
         sessao.mount("https://", adaptador)
-        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/3.2"})
+        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/3.3"})
         return sessao
 
     def _notificar_sucesso(self):
@@ -373,6 +376,9 @@ class MotorSafeDriver:
             if coluna not in df.columns and coluna != "ANO_BASE":
                 df[coluna] = np.nan
 
+        if "DESCR_TIPOLOCAL" not in df.columns:
+            df["DESCR_TIPOLOCAL"] = np.nan
+
         df["ANO_BASE"] = ano_referencia
         volume_inicial = len(df)
 
@@ -397,9 +403,6 @@ class MotorSafeDriver:
 
         df = self._aplicar_janela_historica(df)
 
-        if "DESCR_TIPOLOCAL" not in df.columns:
-            df["DESCR_TIPOLOCAL"] = np.nan
-
         mascara_geografica = (
             df["LATITUDE"].notna()
             & df["LONGITUDE"].notna()
@@ -412,11 +415,9 @@ class MotorSafeDriver:
         trusted = df.loc[mascara_geografica].copy()
 
         colunas_trusted = list(ESQUEMA_TRUSTED.keys())
-        if "DESCR_TIPOLOCAL" not in colunas_trusted:
-            trusted["DESCR_TIPOLOCAL"] = trusted.get("DESCR_TIPOLOCAL", np.nan)
-            colunas_trusted = colunas_trusted + ["DESCR_TIPOLOCAL"]
-
         trusted = trusted[colunas_trusted].copy()
+
+        trusted["DESCR_TIPOLOCAL"] = df.loc[trusted.index, "DESCR_TIPOLOCAL"]
 
         self.auditoria["falhas_integridade"] += max(0, volume_inicial - len(trusted))
         self.auditoria["volume_trusted"] += len(trusted)
@@ -464,8 +465,7 @@ class MotorSafeDriver:
             & df["DESCR_SUBTIPOLOCAL"].isin(SUBTIPOS_LOCAL_PERMITIDOS)
         )
 
-        if "DESCR_TIPOLOCAL" in df.columns:
-            mascara_negocio = mascara_negocio & df["DESCR_TIPOLOCAL"].isin(TIPOS_LOCAL_PERMITIDOS)
+        mascara_negocio = mascara_negocio & df["DESCR_TIPOLOCAL"].isin(TIPOS_LOCAL_PERMITIDOS)
 
         refined = df.loc[mascara_negocio].copy()
 
@@ -507,7 +507,7 @@ class MotorSafeDriver:
         return refined
 
     # =========================================================
-    # REFINED MODELAGEM
+    # MODELAGEM
     # =========================================================
 
     def _criar_painel_diario(self, refined_eventos):
@@ -664,10 +664,6 @@ class MotorSafeDriver:
 
         painel = painel.dropna(subset=["target_futuro_7d"]).copy()
         return painel
-
-    # =========================================================
-    # MODELAGEM
-    # =========================================================
 
     def _split_temporal(self, base_modelagem):
         data_max = base_modelagem["data_evento"].max()
@@ -849,7 +845,7 @@ class MotorSafeDriver:
         documentos_atuais = {}
         for doc in colecao.stream():
             dados = doc.to_dict()
-            documentos_atuais[doc.id] = dados.get("hash_registro")
+            documentos_atuais[doc.id] = dados
 
         lote = self.banco_nuvem.batch()
         operacoes = 0
@@ -884,7 +880,22 @@ class MotorSafeDriver:
             payload["hash_registro"] = hash_registro
             payload["ultima_atualizacao"] = firestore.SERVER_TIMESTAMP
 
-            if documentos_atuais.get(doc_id) != hash_registro:
+            registro_atual = documentos_atuais.get(doc_id, {})
+            score_antigo = registro_atual.get("score")
+            hash_antigo = registro_atual.get("hash_registro")
+
+            deve_atualizar = (
+                hash_antigo != hash_registro
+                or score_antigo != payload["score"]
+                or "turno" not in registro_atual
+                or "risk_band" not in registro_atual
+                or "semana_referencia_inicio" not in registro_atual
+                or "semana_referencia_fim" not in registro_atual
+                or "geohash_prefix_4" not in registro_atual
+                or "geohash_prefix_5" not in registro_atual
+            )
+
+            if deve_atualizar:
                 ref = colecao.document(doc_id)
                 lote.set(ref, payload, merge=True)
                 operacoes += 1
