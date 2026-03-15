@@ -1,0 +1,19 @@
+{
+  "ano": 2026,
+  "linhas": 24,
+  "colunas_presentes": [
+    "NUM_BO",
+    "NUMERO DO BOLETIM DE OCORRENCIA"
+  ],
+  "colunas_criticas_presentes": {
+    "NATUREZA_APURADA": false,
+    "DESCR_TIPOLOCAL": false,
+    "DESCR_SUBTIPOLOCAL": false,
+    "LATITUDE": false,
+    "LONGITUDE": false,
+    "DATA_OCORRENCIA_BO": false
+  },
+  "top_natureza_apurada": {},
+  "top_descr_tipolocal": {},
+  "top_descr_subtipolocal": {}
+}

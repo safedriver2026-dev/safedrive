@@ -1,0 +1,41 @@
+{
+  "versao_modelo": "safedriver_v4_0_1",
+  "janela_inicio": "2024-03-15",
+  "janela_fim": "2026-03-15",
+  "horizonte_predicao_dias": 7,
+  "dias_holdout_teste": 60,
+  "mae_teste": 0.4921,
+  "rmse_teste": 0.9512,
+  "features": [
+    "latitude_media",
+    "longitude_media",
+    "perfil_enc",
+    "turno_enc",
+    "lag_1",
+    "lag_7",
+    "lag_14",
+    "media_7d",
+    "media_30d",
+    "ocorrencias_7d",
+    "ocorrencias_30d",
+    "dias_desde_ultimo_evento",
+    "dia_semana",
+    "mes",
+    "fim_semana",
+    "tendencia_7_30",
+    "fator_prophet"
+  ],
+  "classes_turno": [
+    "Madrugada",
+    "Manha",
+    "Noite",
+    "Tarde"
+  ],
+  "classes_perfil": [
+    "Ciclista",
+    "Motociclista",
+    "Motorista",
+    "Pedestre"
+  ],
+  "gerado_em": "2026-03-15T20:17:10.911022"
+}
