@@ -72,7 +72,7 @@ LIMITES_SP = {
     "lon": (-53.5, -44.0),
 }
 
-ESQUEMA_TRUSTED = {
+ESQUEMA_RAW_CANONICO = {
     "NOME_DEPARTAMENTO": "string",
     "NOME_SECCIONAL": "string",
     "NOME_DELEGACIA": "string",
@@ -106,7 +106,9 @@ ESQUEMA_TRUSTED = {
     "ANO_BASE": "int",
 }
 
-COLUNAS_REFINED = [
+ESQUEMA_TRUSTED = ESQUEMA_RAW_CANONICO.copy()
+
+COLUNAS_REFINED_EVENTOS = [
     "NUM_BO",
     "DATA_OCORRENCIA_BO",
     "HORA_OCORRENCIA_BO",
@@ -119,3 +121,129 @@ COLUNAS_REFINED = [
     "RUBRICA",
     "ANO_BASE",
 ]
+
+MAPA_SEMANTICO_COLUNAS = {
+    "NOME_DEPARTAMENTO": [
+        "NOME_DEPARTAMENTO",
+        "DEPARTAMENTO",
+    ],
+    "NOME_SECCIONAL": [
+        "NOME_SECCIONAL",
+        "SECCIONAL",
+    ],
+    "NOME_DELEGACIA": [
+        "NOME_DELEGACIA",
+        "DELEGACIA",
+    ],
+    "NOME_MUNICIPIO": [
+        "NOME_MUNICIPIO",
+        "CIDADE",
+        "MUNICIPIO",
+        "NOME_CIDADE",
+    ],
+    "NUM_BO": [
+        "NUM_BO",
+        "NUMERO_BO",
+        "N_BO",
+        "BO",
+    ],
+    "ANO_BO": [
+        "ANO_BO",
+    ],
+    "DATA_REGISTRO": [
+        "DATA_REGISTRO",
+        "DATA_COMUNICACAO_BO",
+        "DATA_COMUNICACAO",
+        "DATA_REGISTRO_BO",
+    ],
+    "DATA_OCORRENCIA_BO": [
+        "DATA_OCORRENCIA_BO",
+        "DATA_FATO",
+        "DATA_OCORRENCIA",
+    ],
+    "HORA_OCORRENCIA_BO": [
+        "HORA_OCORRENCIA_BO",
+        "HORA_FATO",
+        "HORA_OCORRENCIA",
+    ],
+    "DESC_PERIODO": [
+        "DESC_PERIODO",
+        "DESCR_PERIODO",
+        "PERIODO",
+    ],
+    "DESCR_TIPOLOCAL": [
+        "DESCR_TIPOLOCAL",
+        "TIPO_LOCAL",
+        "TIPOLOCAL",
+    ],
+    "DESCR_SUBTIPOLOCAL": [
+        "DESCR_SUBTIPOLOCAL",
+        "SUBTIPO_LOCAL",
+        "SUBTIPOLOCAL",
+    ],
+    "BAIRRO": [
+        "BAIRRO",
+    ],
+    "LOGRADOURO": [
+        "LOGRADOURO",
+        "ENDERECO",
+    ],
+    "NUMERO_LOGRADOURO": [
+        "NUMERO_LOGRADOURO",
+        "NUMERO",
+    ],
+    "LATITUDE": [
+        "LATITUDE",
+        "LAT",
+    ],
+    "LONGITUDE": [
+        "LONGITUDE",
+        "LON",
+        "LONG",
+    ],
+    "NOME_DELEGACIA_CIRCUNSCRICAO": [
+        "NOME_DELEGACIA_CIRCUNSCRICAO",
+    ],
+    "NOME_DEPARTAMENTO_CIRCUNSCRICAO": [
+        "NOME_DEPARTAMENTO_CIRCUNSCRICAO",
+    ],
+    "NOME_SECCIONAL_CIRCUNSCRICAO": [
+        "NOME_SECCIONAL_CIRCUNSCRICAO",
+    ],
+    "NOME_MUNICIPIO_CIRCUNSCRICAO": [
+        "NOME_MUNICIPIO_CIRCUNSCRICAO",
+    ],
+    "RUBRICA": [
+        "RUBRICA",
+        "RUBRICA_CRIME",
+    ],
+    "DESCR_CONDUTA": [
+        "DESCR_CONDUTA",
+        "CONDUTA",
+        "DESCRICAO_CONDUTA",
+    ],
+    "NATUREZA_APURADA": [
+        "NATUREZA_APURADA",
+        "NATUREZA",
+        "TIPO_CRIME",
+    ],
+    "MES_ESTATISTICA": [
+        "MES_ESTATISTICA",
+    ],
+    "ANO_ESTATISTICA": [
+        "ANO_ESTATISTICA",
+    ],
+    "CMD": [
+        "CMD",
+    ],
+    "BTL": [
+        "BTL",
+    ],
+    "CIA": [
+        "CIA",
+    ],
+    "COD IBGE": [
+        "COD IBGE",
+        "COD_IBGE",
+    ],
+}
