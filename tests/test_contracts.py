@@ -1,5 +1,6 @@
 import os
 import sys
+import numpy as np
 import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +23,7 @@ def test_engine_tem_metodos_essenciais():
         "_ler_ou_baixar_raw",
         "_processar_trusted",
         "_processar_refined_eventos",
+        "_gerar_geohash_seguro",
         "_criar_painel_diario",
         "_criar_target_futuro",
         "_criar_fator_prophet",
@@ -71,6 +73,32 @@ def test_normalizacao_turno():
     assert engine._classificar_turno(8) == "Manha"
     assert engine._classificar_turno(15) == "Tarde"
     assert engine._classificar_turno(21) == "Noite"
+
+
+def test_gerar_geohash_seguro_valido():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+
+    geohash = engine._gerar_geohash_seguro(-23.5505, -46.6333)
+
+    assert isinstance(geohash, str)
+    assert len(geohash) == 7
+
+
+def test_gerar_geohash_seguro_com_nan():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+
+    geohash_lat_nan = engine._gerar_geohash_seguro(np.nan, -46.6333)
+    geohash_lon_nan = engine._gerar_geohash_seguro(-23.5505, np.nan)
+
+    assert pd.isna(geohash_lat_nan)
+    assert pd.isna(geohash_lon_nan)
+
+
+def test_gerar_geohash_seguro_com_valor_invalido():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+
+    geohash = engine._gerar_geohash_seguro("abc", -46.6333)
+    assert pd.isna(geohash)
 
 
 def test_criar_target_futuro_7d():
@@ -226,3 +254,28 @@ def test_doc_id_formato_esperado():
 
     assert doc_id == "6gyf4bf_Motorista_Noite"
     assert doc_id.count("_") == 2
+
+
+def test_processar_refined_eventos_remove_geohash_invalido():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+
+    trusted = pd.DataFrame({
+        "NUM_BO": ["1", "2"],
+        "DATA_OCORRENCIA_BO": [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-02")],
+        "HORA_OCORRENCIA_BO": ["10:00", "20:00"],
+        "LATITUDE": [-23.5505, np.nan],
+        "LONGITUDE": [-46.6333, -46.6200],
+        "NATUREZA_APURADA": ["ROUBO DE VEICULO", "ROUBO DE VEICULO"],
+        "DESCR_TIPOLOCAL": ["VIA PUBLICA", "VIA PUBLICA"],
+        "DESCR_SUBTIPOLOCAL": ["VIA PUBLICA", "VIA PUBLICA"],
+        "DESCR_CONDUTA": ["VEICULO", "VEICULO"],
+        "RUBRICA": ["R1", "R2"],
+        "ANO_BASE": [2026, 2026],
+    })
+
+    resultado = engine._processar_refined_eventos(trusted)
+
+    assert "codigo_geohash" in resultado.columns
+    assert resultado["codigo_geohash"].notna().all()
+    assert resultado["codigo_geohash"].map(lambda x: isinstance(x, str)).all()
+    assert len(resultado) >= 1
