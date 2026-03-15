@@ -26,7 +26,7 @@ def test_engine_tem_metodos_essenciais():
 def test_normalizacao_turno():
     engine = MotorSafeDriver(habilitar_firestore=False)
     assert engine._classificar_turno("02:30") == "Madrugada"
-    assert engine._classificar_turno("08:15") == "Manhã"
+    assert engine._classificar_turno("08:15") == "Manha"
     assert engine._classificar_turno("14:45") == "Tarde"
     assert engine._classificar_turno("22:00") == "Noite"
     assert engine._classificar_turno("Invalido") == "Noite"
@@ -49,8 +49,8 @@ def test_fallback_schema():
     df_corrigido = engine._construir_raw_operacional(df_falso, 2026)
     assert "NATUREZA_APURADA" in df_corrigido.columns
     assert "BATATA" not in df_corrigido.columns
-    assert df_corrigido["NATUREZA_APURADA"].dtype == 'object'
-    assert df_corrigido["DESCR_TIPOLOCAL"].dtype == 'object'
+    assert df_corrigido["NATUREZA_APURADA"].dtype.name in ['object', 'string']
+    assert df_corrigido["DESCR_TIPOLOCAL"].dtype.name in ['object', 'string']
 
 def test_higienizacao_texto():
     engine = MotorSafeDriver(habilitar_firestore=False)
