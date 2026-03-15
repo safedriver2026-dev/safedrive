@@ -47,7 +47,7 @@ class MotorSafeDriver:
         self.precisao_geohash = 7
         self.horizonte_predicao_dias = 7
         self.dias_holdout_teste = 60
-        self.versao_modelo = "safedriver_v4_0_0"
+        self.versao_modelo = "safedriver_v4_0_1"
 
         self.sessao_web = self._criar_sessao_resiliente()
         self.banco_nuvem = None
@@ -107,7 +107,7 @@ class MotorSafeDriver:
         adaptador = HTTPAdapter(max_retries=retentativas)
         sessao.mount("http://", adaptador)
         sessao.mount("https://", adaptador)
-        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/4.0"})
+        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/4.0.1"})
         return sessao
 
     def _notificar_sucesso(self):
@@ -130,7 +130,7 @@ class MotorSafeDriver:
                     {
                         "name": "Janela de processamento",
                         "value": f"{self.janela_inicio.date()} ate {self.janela_fim.date()}",
-                        "inline": False
+                        "inline": False,
                     },
                     {
                         "name": "Camadas",
@@ -140,7 +140,7 @@ class MotorSafeDriver:
                             f"REFINED_EVENTOS: {self.auditoria['volume_refined_eventos']:,}\n"
                             f"REFINED_MODELAGEM: {self.auditoria['volume_refined_modelagem']:,}"
                         ),
-                        "inline": False
+                        "inline": False,
                     },
                     {
                         "name": "Validacao temporal",
@@ -150,7 +150,7 @@ class MotorSafeDriver:
                             f"MAE: {self.auditoria['mae_teste']}\n"
                             f"RMSE: {self.auditoria['rmse_teste']}"
                         ),
-                        "inline": False
+                        "inline": False,
                     },
                     {
                         "name": "Malha operacional",
@@ -160,7 +160,7 @@ class MotorSafeDriver:
                             f"Pedestre: {self.auditoria['malha_pedestre']:,}\n"
                             f"Ciclista: {self.auditoria['malha_ciclista']:,}"
                         ),
-                        "inline": False
+                        "inline": False,
                     },
                     {
                         "name": "Firestore",
@@ -169,9 +169,9 @@ class MotorSafeDriver:
                             f"Atualizados: {self.auditoria['documentos_atualizados']:,}\n"
                             f"Removidos: {self.auditoria['documentos_removidos']:,}"
                         ),
-                        "inline": False
-                    }
-                ]
+                        "inline": False,
+                    },
+                ],
             }]
         }
 
@@ -192,8 +192,8 @@ class MotorSafeDriver:
                 "fields": [{
                     "name": "Diagnostico",
                     "value": str(diagnostico_falha)[:1000],
-                    "inline": False
-                }]
+                    "inline": False,
+                }],
             }]
         }
 
@@ -310,7 +310,7 @@ class MotorSafeDriver:
                     for termo in ["NUM_BO", "LATITUDE", "NATUREZA_APURADA"]
                 )
             ),
-            None
+            None,
         )
 
         if linha_cabecalho is None:
@@ -364,8 +364,7 @@ class MotorSafeDriver:
         for coluna in ["NATUREZA_APURADA", "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"]:
             if coluna in df.columns:
                 serie = df[coluna].astype(str).map(self._higienizar_texto)
-                top = serie.value_counts(dropna=False).head(10).to_dict()
-                diagnostico[f"top_{coluna.lower()}"] = top
+                diagnostico[f"top_{coluna.lower()}"] = serie.value_counts(dropna=False).head(10).to_dict()
             else:
                 diagnostico[f"top_{coluna.lower()}"] = {}
 
@@ -373,12 +372,7 @@ class MotorSafeDriver:
         with open(caminho, "w", encoding="utf-8") as arquivo:
             json.dump(diagnostico, arquivo, ensure_ascii=False, indent=2)
 
-        logging.info(
-            "RAW %s | linhas=%s | colunas=%s",
-            ano_referencia,
-            len(df),
-            len(colunas),
-        )
+        logging.info("RAW %s | linhas=%s | colunas=%s", ano_referencia, len(df), len(colunas))
 
     # =========================================================
     # TRUSTED
@@ -403,7 +397,7 @@ class MotorSafeDriver:
             elif tipo_dado == "float":
                 df[coluna] = pd.to_numeric(
                     df[coluna].astype(str).str.replace(",", ".", regex=False),
-                    errors="coerce"
+                    errors="coerce",
                 )
             elif tipo_dado == "datetime":
                 df[coluna] = pd.to_datetime(df[coluna], errors="coerce")
@@ -426,12 +420,7 @@ class MotorSafeDriver:
         self.auditoria["falhas_integridade"] += max(0, volume_inicial - len(trusted))
         self.auditoria["volume_trusted"] += len(trusted)
 
-        logging.info(
-            "Trusted %s | entrada=%s | saida=%s",
-            ano_referencia,
-            volume_inicial,
-            len(trusted),
-        )
+        logging.info("Trusted %s | entrada=%s | saida=%s", ano_referencia, volume_inicial, len(trusted))
         return trusted
 
     # =========================================================
@@ -439,26 +428,33 @@ class MotorSafeDriver:
     # =========================================================
 
     def _imputar_turno(self, dataframe):
-        df = dataframe.copy()
+        df = dataframe.copy().reset_index(drop=True)
 
         moda_global = "Noite"
         moda_serie = df["turno_operacional"].dropna().mode()
         if not moda_serie.empty:
             moda_global = moda_serie.iloc[0]
 
+        base_moda = df.dropna(subset=["turno_operacional"]).copy()
+
+        if base_moda.empty:
+            df["turno_operacional"] = df["turno_operacional"].fillna(moda_global)
+            return df
+
         mapa_moda = (
-            df.dropna(subset=["turno_operacional"])
-            .groupby(["codigo_geohash", "perfil"])["turno_operacional"]
+            base_moda.groupby(["codigo_geohash", "perfil"])["turno_operacional"]
             .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else moda_global)
             .to_dict()
         )
 
+        df["chave_turno"] = list(zip(df["codigo_geohash"], df["perfil"]))
+
         mascara_nula = df["turno_operacional"].isna()
-        for idx in df[mascara_nula].index:
-            chave = (df.at[idx, "codigo_geohash"], df.at[idx, "perfil"])
-            df.at[idx, "turno_operacional"] = mapa_moda.get(chave, moda_global)
+        df.loc[mascara_nula, "turno_operacional"] = df.loc[mascara_nula, "chave_turno"].map(mapa_moda)
 
         df["turno_operacional"] = df["turno_operacional"].fillna(moda_global)
+        df = df.drop(columns=["chave_turno"])
+
         return df
 
     def _gerar_geohash_seguro(self, latitude, longitude):
@@ -486,11 +482,9 @@ class MotorSafeDriver:
 
         total_entrada = len(df)
 
-        # natureza é o filtro principal
         df = df[df["NATUREZA_APURADA"].isin(CATALOGO_CRIMES.keys())].copy()
         total_pos_natureza = len(df)
 
-        # fallback em tipo local
         df["DESCR_TIPOLOCAL"] = df["DESCR_TIPOLOCAL"].replace("", "VIA PUBLICA")
 
         mascara_tipo = df["DESCR_TIPOLOCAL"].isin(TIPOS_LOCAL_PERMITIDOS)
@@ -518,10 +512,12 @@ class MotorSafeDriver:
         refined["perfis_afetados"] = refined.apply(self._inferir_perfil_contextual, axis=1)
         refined = refined.explode("perfis_afetados").dropna(subset=["perfis_afetados"]).copy()
         refined.rename(columns={"perfis_afetados": "perfil"}, inplace=True)
+        refined["perfil"] = refined["perfil"].astype(str)
+        refined = refined.reset_index(drop=True)
 
         refined["codigo_geohash"] = refined.apply(
             lambda linha: self._gerar_geohash_seguro(linha["LATITUDE"], linha["LONGITUDE"]),
-            axis=1
+            axis=1,
         )
 
         refined = refined.dropna(subset=["codigo_geohash"]).copy()
@@ -552,6 +548,7 @@ class MotorSafeDriver:
             total_pos_natureza,
             len(refined),
         )
+
         return refined
 
     # =========================================================
@@ -561,15 +558,8 @@ class MotorSafeDriver:
     def _criar_painel_diario(self, refined_eventos):
         agrupado = (
             refined_eventos.groupby(
-                [
-                    "codigo_geohash",
-                    "geohash_prefix_4",
-                    "geohash_prefix_5",
-                    "perfil",
-                    "turno_operacional",
-                    "data_evento"
-                ],
-                as_index=False
+                ["codigo_geohash", "geohash_prefix_4", "geohash_prefix_5", "perfil", "turno_operacional", "data_evento"],
+                as_index=False,
             )
             .agg(
                 target_dia=("peso_evento", "sum"),
@@ -645,7 +635,7 @@ class MotorSafeDriver:
         if serie.empty or len(serie) < 14:
             return pd.DataFrame({
                 "data_evento": pd.to_datetime(datas_consulta).normalize(),
-                "fator_prophet": 1.0
+                "fator_prophet": 1.0,
             })
 
         calendario = pd.DataFrame({
@@ -659,7 +649,7 @@ class MotorSafeDriver:
                 yearly_seasonality=True,
                 weekly_seasonality=True,
                 daily_seasonality=False,
-                seasonality_mode="additive"
+                seasonality_mode="additive",
             )
             modelo.fit(serie)
 
@@ -677,7 +667,7 @@ class MotorSafeDriver:
             logging.warning("Falha no Prophet. Usando fator neutro. Motivo: %s", erro)
             return pd.DataFrame({
                 "data_evento": pd.to_datetime(datas_consulta).normalize(),
-                "fator_prophet": 1.0
+                "fator_prophet": 1.0,
             })
 
     def _montar_base_supervisionada(self, refined_eventos):
@@ -807,7 +797,7 @@ class MotorSafeDriver:
             base.sort_values("data_evento")
             .groupby(
                 ["codigo_geohash", "geohash_prefix_4", "geohash_prefix_5", "perfil", "turno_operacional"],
-                as_index=False
+                as_index=False,
             )
             .tail(1)
             .copy()
@@ -970,7 +960,7 @@ class MotorSafeDriver:
                 refined_eventos = self._processar_refined_eventos(trusted)
                 refined_eventos.to_parquet(
                     f"datalake/refined/ssp_refined_eventos_{ano_alvo}.parquet",
-                    index=False
+                    index=False,
                 )
 
                 logging.info("Refined eventos %s | linhas=%s", ano_alvo, len(refined_eventos))
@@ -999,7 +989,7 @@ class MotorSafeDriver:
             modelo_final, colunas_features, base_modelagem_final = self._treinar_modelo_final(
                 base_modelagem,
                 encoder_turno,
-                encoder_perfil
+                encoder_perfil,
             )
 
             self._salvar_metadata_modelo(modelo_final, colunas_features, encoder_turno, encoder_perfil)
