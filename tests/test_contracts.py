@@ -52,7 +52,6 @@ def test_normalizacao_turnos():
     assert pnl['turno'].iloc[0] == 'Manha'
 
 def test_modo_checkpointing():
-    # Testa se o lock_file determina o modo de execução
     if os.path.exists('datalake/metadata/baseline.lock'):
         os.remove('datalake/metadata/baseline.lock')
     e_full = MotorSafeDriver(habilitar_firestore=False)
