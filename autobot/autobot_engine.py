@@ -47,7 +47,7 @@ class MotorSafeDriver:
         self.precisao_geohash = 7
         self.horizonte_predicao_dias = 7
         self.dias_holdout_teste = 60
-        self.versao_modelo = "safedriver_v3_4_1"
+        self.versao_modelo = "safedriver_v4_0_0"
 
         self.sessao_web = self._criar_sessao_resiliente()
         self.banco_nuvem = None
@@ -107,7 +107,7 @@ class MotorSafeDriver:
         adaptador = HTTPAdapter(max_retries=retentativas)
         sessao.mount("http://", adaptador)
         sessao.mount("https://", adaptador)
-        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/3.4.1"})
+        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/4.0"})
         return sessao
 
     def _notificar_sucesso(self):
@@ -209,14 +209,11 @@ class MotorSafeDriver:
     def _higienizar_texto(self, texto_bruto):
         if pd.isna(texto_bruto):
             return ""
-
         if not isinstance(texto_bruto, str):
             texto_bruto = str(texto_bruto)
 
         texto_normalizado = unicodedata.normalize("NFKD", texto_bruto)
-        return "".join(
-            c for c in texto_normalizado if not unicodedata.combining(c)
-        ).upper().strip()
+        return "".join(c for c in texto_normalizado if not unicodedata.combining(c)).upper().strip()
 
     def _normalizar_hora(self, valor):
         if pd.isna(valor):
@@ -249,9 +246,7 @@ class MotorSafeDriver:
     def _classificar_turno(self, hora):
         if pd.isna(hora):
             return np.nan
-
         hora = int(hora)
-
         if 0 <= hora < 6:
             return "Madrugada"
         if 6 <= hora < 12:
@@ -275,28 +270,20 @@ class MotorSafeDriver:
                 perfis_identificados.add(perfil)
 
         if not perfis_identificados:
-            perfis_base = CATALOGO_CRIMES.get(
-                linha.get("NATUREZA_APURADA"),
-                {}
-            ).get("perfis", [])
+            perfis_base = CATALOGO_CRIMES.get(linha.get("NATUREZA_APURADA"), {}).get("perfis", [])
             perfis_identificados.update(perfis_base)
 
         return list(perfis_identificados) if perfis_identificados else ["Indefinido"]
 
     def _aplicar_janela_historica(self, dataframe):
         df = dataframe.copy()
-
-        df["DATA_OCORRENCIA_BO"] = pd.to_datetime(
-            df["DATA_OCORRENCIA_BO"],
-            errors="coerce"
-        ).dt.normalize()
+        df["DATA_OCORRENCIA_BO"] = pd.to_datetime(df["DATA_OCORRENCIA_BO"], errors="coerce").dt.normalize()
 
         mascara = (
             df["DATA_OCORRENCIA_BO"].notna()
             & (df["DATA_OCORRENCIA_BO"] >= self.janela_inicio)
             & (df["DATA_OCORRENCIA_BO"] <= self.janela_fim)
         )
-
         return df.loc[mascara].copy()
 
     # =========================================================
@@ -313,11 +300,7 @@ class MotorSafeDriver:
         resposta = self.sessao_web.get(endereco_arquivo, timeout=120)
         resposta.raise_for_status()
 
-        leitura_previa = pd.read_excel(
-            io.BytesIO(resposta.content),
-            nrows=50,
-            header=None
-        )
+        leitura_previa = pd.read_excel(io.BytesIO(resposta.content), nrows=50, header=None)
 
         linha_cabecalho = next(
             (
@@ -333,12 +316,7 @@ class MotorSafeDriver:
         if linha_cabecalho is None:
             raise ValueError(f"Cabecalho nao encontrado no arquivo SSP {ano_referencia}.")
 
-        tabela = pd.read_excel(
-            io.BytesIO(resposta.content),
-            skiprows=linha_cabecalho,
-            dtype=str
-        )
-
+        tabela = pd.read_excel(io.BytesIO(resposta.content), skiprows=linha_cabecalho, dtype=str)
         tabela.columns = [self._higienizar_texto(c) for c in tabela.columns]
 
         mapeamento = {
@@ -364,6 +342,43 @@ class MotorSafeDriver:
 
         logging.info("RAW local nao encontrado para %s. Baixando da SSP.", ano_referencia)
         return self._baixar_raw_ssp(ano_referencia)
+
+    def _analisar_raw(self, dataframe_raw, ano_referencia):
+        df = dataframe_raw.copy()
+        colunas = list(df.columns)
+
+        diagnostico = {
+            "ano": ano_referencia,
+            "linhas": int(len(df)),
+            "colunas_presentes": colunas,
+            "colunas_criticas_presentes": {
+                "NATUREZA_APURADA": "NATUREZA_APURADA" in colunas,
+                "DESCR_TIPOLOCAL": "DESCR_TIPOLOCAL" in colunas,
+                "DESCR_SUBTIPOLOCAL": "DESCR_SUBTIPOLOCAL" in colunas,
+                "LATITUDE": "LATITUDE" in colunas,
+                "LONGITUDE": "LONGITUDE" in colunas,
+                "DATA_OCORRENCIA_BO": "DATA_OCORRENCIA_BO" in colunas,
+            },
+        }
+
+        for coluna in ["NATUREZA_APURADA", "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"]:
+            if coluna in df.columns:
+                serie = df[coluna].astype(str).map(self._higienizar_texto)
+                top = serie.value_counts(dropna=False).head(10).to_dict()
+                diagnostico[f"top_{coluna.lower()}"] = top
+            else:
+                diagnostico[f"top_{coluna.lower()}"] = {}
+
+        caminho = f"datalake/metadata/raw_diagnostico_{ano_referencia}.json"
+        with open(caminho, "w", encoding="utf-8") as arquivo:
+            json.dump(diagnostico, arquivo, ensure_ascii=False, indent=2)
+
+        logging.info(
+            "RAW %s | linhas=%s | colunas=%s",
+            ano_referencia,
+            len(df),
+            len(colunas),
+        )
 
     # =========================================================
     # TRUSTED
@@ -393,10 +408,7 @@ class MotorSafeDriver:
             elif tipo_dado == "datetime":
                 df[coluna] = pd.to_datetime(df[coluna], errors="coerce")
             elif tipo_dado == "int":
-                df[coluna] = pd.to_numeric(
-                    df[coluna],
-                    errors="coerce"
-                ).fillna(0).astype(int)
+                df[coluna] = pd.to_numeric(df[coluna], errors="coerce").fillna(0).astype(int)
 
         df = self._aplicar_janela_historica(df)
 
@@ -414,6 +426,12 @@ class MotorSafeDriver:
         self.auditoria["falhas_integridade"] += max(0, volume_inicial - len(trusted))
         self.auditoria["volume_trusted"] += len(trusted)
 
+        logging.info(
+            "Trusted %s | entrada=%s | saida=%s",
+            ano_referencia,
+            volume_inicial,
+            len(trusted),
+        )
         return trusted
 
     # =========================================================
@@ -461,13 +479,37 @@ class MotorSafeDriver:
     def _processar_refined_eventos(self, trusted):
         df = trusted.copy()
 
-        mascara_negocio = (
-            df["NATUREZA_APURADA"].isin(CATALOGO_CRIMES.keys())
-            & df["DESCR_TIPOLOCAL"].isin(TIPOS_LOCAL_PERMITIDOS)
-            & df["DESCR_SUBTIPOLOCAL"].isin(SUBTIPOS_LOCAL_PERMITIDOS)
+        for coluna in ["NATUREZA_APURADA", "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL", "DESCR_CONDUTA", "RUBRICA"]:
+            if coluna not in df.columns:
+                df[coluna] = ""
+            df[coluna] = df[coluna].fillna("").astype(str).map(self._higienizar_texto)
+
+        total_entrada = len(df)
+
+        # natureza é o filtro principal
+        df = df[df["NATUREZA_APURADA"].isin(CATALOGO_CRIMES.keys())].copy()
+        total_pos_natureza = len(df)
+
+        # fallback em tipo local
+        df["DESCR_TIPOLOCAL"] = df["DESCR_TIPOLOCAL"].replace("", "VIA PUBLICA")
+
+        mascara_tipo = df["DESCR_TIPOLOCAL"].isin(TIPOS_LOCAL_PERMITIDOS)
+        mascara_subtipo = (
+            df["DESCR_SUBTIPOLOCAL"].isin(SUBTIPOS_LOCAL_PERMITIDOS)
+            | (df["DESCR_SUBTIPOLOCAL"] == "")
         )
 
-        refined = df.loc[mascara_negocio, COLUNAS_REFINED].copy()
+        df_filtrado = df[mascara_tipo & mascara_subtipo].copy()
+
+        if df_filtrado.empty:
+            logging.warning("Refined zerou com filtro tipo+subtipo. Aplicando fallback para natureza + tipo.")
+            df_filtrado = df[mascara_tipo].copy()
+
+        if df_filtrado.empty:
+            logging.warning("Refined zerou com filtro tipo local. Aplicando fallback para natureza apenas.")
+            df_filtrado = df.copy()
+
+        refined = df_filtrado[COLUNAS_REFINED].copy()
 
         refined = refined.dropna(
             subset=["LATITUDE", "LONGITUDE", "DATA_OCORRENCIA_BO", "NATUREZA_APURADA"]
@@ -484,7 +526,6 @@ class MotorSafeDriver:
 
         refined = refined.dropna(subset=["codigo_geohash"]).copy()
         refined["codigo_geohash"] = refined["codigo_geohash"].astype(str)
-
         refined = refined[refined["codigo_geohash"].str.len() == self.precisao_geohash].copy()
 
         refined["geohash_prefix_4"] = refined["codigo_geohash"].str[:4]
@@ -494,11 +535,7 @@ class MotorSafeDriver:
         refined["turno_operacional"] = refined["hora_normalizada"].apply(self._classificar_turno)
         refined = self._imputar_turno(refined)
 
-        refined["data_evento"] = pd.to_datetime(
-            refined["DATA_OCORRENCIA_BO"],
-            errors="coerce"
-        ).dt.normalize()
-
+        refined["data_evento"] = pd.to_datetime(refined["DATA_OCORRENCIA_BO"], errors="coerce").dt.normalize()
         refined["peso_evento"] = refined["NATUREZA_APURADA"].apply(
             lambda x: float(CATALOGO_CRIMES.get(x, {}).get("peso", 1.0))
         )
@@ -508,6 +545,13 @@ class MotorSafeDriver:
         ).copy()
 
         self.auditoria["volume_refined_eventos"] += len(refined)
+
+        logging.info(
+            "Refined eventos | entrada=%s | pos_natureza=%s | saida=%s",
+            total_entrada,
+            total_pos_natureza,
+            len(refined),
+        )
         return refined
 
     # =========================================================
@@ -533,9 +577,7 @@ class MotorSafeDriver:
                 latitude_media=("LATITUDE", "mean"),
                 longitude_media=("LONGITUDE", "mean"),
             )
-            .sort_values(
-                ["codigo_geohash", "perfil", "turno_operacional", "data_evento"]
-            )
+            .sort_values(["codigo_geohash", "perfil", "turno_operacional", "data_evento"])
         )
 
         chaves = ["codigo_geohash", "perfil", "turno_operacional"]
@@ -564,13 +606,8 @@ class MotorSafeDriver:
             .transform(lambda s: s.shift(1).rolling(30, min_periods=1).sum())
             .fillna(0.0)
         )
-
         agrupado["dias_desde_ultimo_evento"] = (
-            agrupado.groupby(chaves)["data_evento"]
-            .diff()
-            .dt.days
-            .fillna(999)
-            .clip(lower=0, upper=999)
+            agrupado.groupby(chaves)["data_evento"].diff().dt.days.fillna(999).clip(lower=0, upper=999)
         )
 
         agrupado["dia_semana"] = agrupado["data_evento"].dt.dayofweek
@@ -588,19 +625,13 @@ class MotorSafeDriver:
         def somar_janela_futura(serie):
             valores = serie.to_numpy(dtype=float)
             resultado = np.zeros(len(valores), dtype=float)
-
             for i in range(len(valores)):
                 inicio = i + 1
                 fim = i + 1 + self.horizonte_predicao_dias
                 resultado[i] = valores[inicio:fim].sum()
-
             return pd.Series(resultado, index=serie.index)
 
-        df["target_futuro_7d"] = (
-            df.groupby(chaves)["target_dia"]
-            .transform(somar_janela_futura)
-        )
-
+        df["target_futuro_7d"] = df.groupby(chaves)["target_dia"].transform(somar_janela_futura)
         return df
 
     def _criar_fator_prophet(self, base_treino, datas_consulta):
@@ -641,9 +672,7 @@ class MotorSafeDriver:
             else:
                 forecast["fator_prophet"] = (forecast["yhat"] / media_yhat).clip(0.25, 4.0)
 
-            return forecast.rename(columns={"ds": "data_evento"})[
-                ["data_evento", "fator_prophet"]
-            ]
+            return forecast.rename(columns={"ds": "data_evento"})[["data_evento", "fator_prophet"]]
         except Exception as erro:
             logging.warning("Falha no Prophet. Usando fator neutro. Motivo: %s", erro)
             return pd.DataFrame({
@@ -658,14 +687,10 @@ class MotorSafeDriver:
         cutoff = painel["data_evento"].max() - pd.Timedelta(days=self.dias_holdout_teste)
         treino_temporal = painel[painel["data_evento"] < cutoff].copy()
 
-        fator_prophet = self._criar_fator_prophet(
-            treino_temporal,
-            painel["data_evento"].unique()
-        )
+        fator_prophet = self._criar_fator_prophet(treino_temporal, painel["data_evento"].unique())
 
         painel = painel.merge(fator_prophet, on="data_evento", how="left")
         painel["fator_prophet"] = painel["fator_prophet"].fillna(1.0)
-
         painel = painel.dropna(subset=["target_futuro_7d"]).copy()
         return painel
 
@@ -681,7 +706,6 @@ class MotorSafeDriver:
 
         self.auditoria["linhas_treino"] = len(treino)
         self.auditoria["linhas_teste"] = len(teste)
-
         return treino, teste
 
     def _aplicar_encoders(self, treino, teste):
@@ -728,7 +752,7 @@ class MotorSafeDriver:
 
         modelo = xgb.XGBRegressor(
             objective="reg:squarederror",
-            n_estimators=350,
+            n_estimators=300,
             max_depth=6,
             learning_rate=0.05,
             subsample=0.9,
@@ -738,7 +762,6 @@ class MotorSafeDriver:
             random_state=42,
             n_jobs=4,
         )
-
         modelo.fit(X, y)
         return modelo, colunas_features
 
@@ -746,8 +769,7 @@ class MotorSafeDriver:
         X_teste = teste[colunas_features]
         y_teste = teste["target_futuro_7d"]
 
-        previsoes = modelo.predict(X_teste)
-        previsoes = np.clip(previsoes, 0.0, None)
+        previsoes = np.clip(modelo.predict(X_teste), 0.0, None)
 
         mae = mean_absolute_error(y_teste, previsoes)
         rmse = math.sqrt(mean_squared_error(y_teste, previsoes))
@@ -779,11 +801,7 @@ class MotorSafeDriver:
     def _gerar_malha_semanal(self, base_modelagem, modelo_final, colunas_features):
         base = base_modelagem.copy()
 
-        base["score_bruto"] = np.clip(
-            modelo_final.predict(base[colunas_features]),
-            0.0,
-            None
-        )
+        base["score_bruto"] = np.clip(modelo_final.predict(base[colunas_features]), 0.0, None)
 
         snapshot = (
             base.sort_values("data_evento")
@@ -940,13 +958,13 @@ class MotorSafeDriver:
                 raw = self._ler_ou_baixar_raw(ano_alvo)
                 self.auditoria["volume_raw"] += len(raw)
 
+                self._analisar_raw(raw, ano_alvo)
+
                 trusted = self._processar_trusted(raw, ano_alvo)
-                trusted.to_parquet(
-                    f"datalake/trusted/ssp_trusted_{ano_alvo}.parquet",
-                    index=False
-                )
+                trusted.to_parquet(f"datalake/trusted/ssp_trusted_{ano_alvo}.parquet", index=False)
 
                 if trusted.empty:
+                    logging.warning("Trusted %s ficou vazia.", ano_alvo)
                     continue
 
                 refined_eventos = self._processar_refined_eventos(trusted)
@@ -955,6 +973,8 @@ class MotorSafeDriver:
                     index=False
                 )
 
+                logging.info("Refined eventos %s | linhas=%s", ano_alvo, len(refined_eventos))
+
                 if not refined_eventos.empty:
                     bases_refined_eventos.append(refined_eventos)
 
@@ -962,16 +982,13 @@ class MotorSafeDriver:
                 raise ValueError("A camada refined_eventos ficou vazia apos o processamento.")
 
             refined_eventos_total = pd.concat(bases_refined_eventos, ignore_index=True)
-            refined_eventos_total.to_parquet(
-                "datalake/refined/refined_eventos_total.parquet",
-                index=False
-            )
+            refined_eventos_total.to_parquet("datalake/refined/refined_eventos_total.parquet", index=False)
 
             base_modelagem = self._montar_base_supervisionada(refined_eventos_total)
-            base_modelagem.to_parquet(
-                "datalake/refined/refined_modelagem.parquet",
-                index=False
-            )
+            if base_modelagem.empty:
+                raise ValueError("A base de modelagem ficou vazia apos a montagem supervisionada.")
+
+            base_modelagem.to_parquet("datalake/refined/refined_modelagem.parquet", index=False)
 
             treino, teste = self._split_temporal(base_modelagem)
             treino, teste, encoder_turno, encoder_perfil = self._aplicar_encoders(treino, teste)
@@ -985,23 +1002,10 @@ class MotorSafeDriver:
                 encoder_perfil
             )
 
-            self._salvar_metadata_modelo(
-                modelo_final,
-                colunas_features,
-                encoder_turno,
-                encoder_perfil
-            )
+            self._salvar_metadata_modelo(modelo_final, colunas_features, encoder_turno, encoder_perfil)
 
-            malha_final = self._gerar_malha_semanal(
-                base_modelagem_final,
-                modelo_final,
-                colunas_features
-            )
-
-            malha_final.to_parquet(
-                "datalake/refined/malha_risco_atual.parquet",
-                index=False
-            )
+            malha_final = self._gerar_malha_semanal(base_modelagem_final, modelo_final, colunas_features)
+            malha_final.to_parquet("datalake/refined/malha_risco_atual.parquet", index=False)
 
             if self.banco_nuvem:
                 self._sincronizacao_delta_firestore(malha_final)
