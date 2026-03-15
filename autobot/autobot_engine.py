@@ -47,7 +47,7 @@ class MotorSafeDriver:
         self.precisao_geohash = 7
         self.horizonte_predicao_dias = 7
         self.dias_holdout_teste = 60
-        self.versao_modelo = "safedriver_v3_4_0"
+        self.versao_modelo = "safedriver_v3_4_1"
 
         self.sessao_web = self._criar_sessao_resiliente()
         self.banco_nuvem = None
@@ -107,7 +107,7 @@ class MotorSafeDriver:
         adaptador = HTTPAdapter(max_retries=retentativas)
         sessao.mount("http://", adaptador)
         sessao.mount("https://", adaptador)
-        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/3.4"})
+        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/3.4.1"})
         return sessao
 
     def _notificar_sucesso(self):
@@ -443,6 +443,21 @@ class MotorSafeDriver:
         df["turno_operacional"] = df["turno_operacional"].fillna(moda_global)
         return df
 
+    def _gerar_geohash_seguro(self, latitude, longitude):
+        try:
+            if pd.isna(latitude) or pd.isna(longitude):
+                return np.nan
+
+            lat = float(latitude)
+            lon = float(longitude)
+
+            if not np.isfinite(lat) or not np.isfinite(lon):
+                return np.nan
+
+            return str(gh.encode(lat, lon, precision=self.precisao_geohash))
+        except Exception:
+            return np.nan
+
     def _processar_refined_eventos(self, trusted):
         df = trusted.copy()
 
@@ -454,14 +469,24 @@ class MotorSafeDriver:
 
         refined = df.loc[mascara_negocio, COLUNAS_REFINED].copy()
 
+        refined = refined.dropna(
+            subset=["LATITUDE", "LONGITUDE", "DATA_OCORRENCIA_BO", "NATUREZA_APURADA"]
+        ).copy()
+
         refined["perfis_afetados"] = refined.apply(self._inferir_perfil_contextual, axis=1)
         refined = refined.explode("perfis_afetados").dropna(subset=["perfis_afetados"]).copy()
         refined.rename(columns={"perfis_afetados": "perfil"}, inplace=True)
 
-        refined["codigo_geohash"] = [
-            gh.encode(lat, lon, precision=self.precisao_geohash)
-            for lat, lon in zip(refined["LATITUDE"], refined["LONGITUDE"])
-        ]
+        refined["codigo_geohash"] = refined.apply(
+            lambda linha: self._gerar_geohash_seguro(linha["LATITUDE"], linha["LONGITUDE"]),
+            axis=1
+        )
+
+        refined = refined.dropna(subset=["codigo_geohash"]).copy()
+        refined["codigo_geohash"] = refined["codigo_geohash"].astype(str)
+
+        refined = refined[refined["codigo_geohash"].str.len() == self.precisao_geohash].copy()
+
         refined["geohash_prefix_4"] = refined["codigo_geohash"].str[:4]
         refined["geohash_prefix_5"] = refined["codigo_geohash"].str[:5]
 
