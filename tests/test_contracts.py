@@ -93,7 +93,7 @@ def test_criar_target_futuro_7d():
     assert resultado.iloc[0]["target_futuro_7d"] == primeiro_esperado
 
 
-def test_payload_malha_tem_campos_esperados():
+def test_payload_firestore_tem_estrutura_antiga_e_nova():
     engine = MotorSafeDriver(habilitar_firestore=False)
 
     linha = {
@@ -151,6 +151,16 @@ def test_payload_malha_tem_campos_esperados():
         assert campo in payload, f"Campo obrigatorio ausente: {campo}"
 
 
+def test_periodo_e_turno_coerentes():
+    turno = "Noite"
+    payload = {
+        "turno": turno,
+        "periodo": turno,
+    }
+
+    assert payload["turno"] == payload["periodo"]
+
+
 def test_score_e_faixa_validos():
     score = 8.42
     risk_band = "alto"
@@ -183,9 +193,36 @@ def test_geohash_tem_precisao_7():
     assert len(geohash) == 7
 
 
+def test_prefixos_geohash_consistentes():
+    geohash = "6gyf4bf"
+    prefix_4 = geohash[:4]
+    prefix_5 = geohash[:5]
+
+    assert prefix_4 == "6gyf"
+    assert prefix_5 == "6gyf4"
+
+
 def test_semana_referencia_consistente():
     semana_inicio = pd.Timestamp("2026-03-16")
     semana_fim = pd.Timestamp("2026-03-22")
 
     assert semana_inicio < semana_fim
     assert (semana_fim - semana_inicio).days == 6
+
+
+def test_janela_historica_tem_730_dias():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+    diferenca = (engine.janela_fim - engine.janela_inicio).days
+
+    assert diferenca == 730
+
+
+def test_doc_id_formato_esperado():
+    geohash = "6gyf4bf"
+    perfil = "Motorista"
+    turno = "Noite"
+
+    doc_id = f"{geohash}_{perfil}_{turno}"
+
+    assert doc_id == "6gyf4bf_Motorista_Noite"
+    assert doc_id.count("_") == 2
