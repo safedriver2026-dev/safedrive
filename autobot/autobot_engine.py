@@ -47,7 +47,7 @@ class MotorSafeDriver:
         self.precisao_geohash = 7
         self.horizonte_predicao_dias = 7
         self.dias_holdout_teste = 60
-        self.versao_modelo = "safedriver_v3_3_0"
+        self.versao_modelo = "safedriver_v3_4_0"
 
         self.sessao_web = self._criar_sessao_resiliente()
         self.banco_nuvem = None
@@ -107,7 +107,7 @@ class MotorSafeDriver:
         adaptador = HTTPAdapter(max_retries=retentativas)
         sessao.mount("http://", adaptador)
         sessao.mount("https://", adaptador)
-        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/3.3"})
+        sessao.headers.update({"User-Agent": "Mozilla/5.0 SafeDriver/3.4"})
         return sessao
 
     def _notificar_sucesso(self):
@@ -376,9 +376,6 @@ class MotorSafeDriver:
             if coluna not in df.columns and coluna != "ANO_BASE":
                 df[coluna] = np.nan
 
-        if "DESCR_TIPOLOCAL" not in df.columns:
-            df["DESCR_TIPOLOCAL"] = np.nan
-
         df["ANO_BASE"] = ano_referencia
         volume_inicial = len(df)
 
@@ -412,12 +409,7 @@ class MotorSafeDriver:
             & df["LONGITUDE"].between(LIMITES_SP["lon"][0], LIMITES_SP["lon"][1])
         )
 
-        trusted = df.loc[mascara_geografica].copy()
-
-        colunas_trusted = list(ESQUEMA_TRUSTED.keys())
-        trusted = trusted[colunas_trusted].copy()
-
-        trusted["DESCR_TIPOLOCAL"] = df.loc[trusted.index, "DESCR_TIPOLOCAL"]
+        trusted = df.loc[mascara_geografica, list(ESQUEMA_TRUSTED.keys())].copy()
 
         self.auditoria["falhas_integridade"] += max(0, volume_inicial - len(trusted))
         self.auditoria["volume_trusted"] += len(trusted)
@@ -454,26 +446,13 @@ class MotorSafeDriver:
     def _processar_refined_eventos(self, trusted):
         df = trusted.copy()
 
-        if "DESCR_TIPOLOCAL" not in df.columns:
-            df["DESCR_TIPOLOCAL"] = "VIA PUBLICA"
-
-        if "DESCR_SUBTIPOLOCAL" not in df.columns:
-            df["DESCR_SUBTIPOLOCAL"] = ""
-
         mascara_negocio = (
             df["NATUREZA_APURADA"].isin(CATALOGO_CRIMES.keys())
+            & df["DESCR_TIPOLOCAL"].isin(TIPOS_LOCAL_PERMITIDOS)
             & df["DESCR_SUBTIPOLOCAL"].isin(SUBTIPOS_LOCAL_PERMITIDOS)
         )
 
-        mascara_negocio = mascara_negocio & df["DESCR_TIPOLOCAL"].isin(TIPOS_LOCAL_PERMITIDOS)
-
-        refined = df.loc[mascara_negocio].copy()
-
-        colunas_base = [c for c in COLUNAS_REFINED if c in refined.columns]
-        refined = refined[colunas_base].copy()
-
-        if "DESCR_TIPOLOCAL" not in refined.columns:
-            refined["DESCR_TIPOLOCAL"] = "VIA PUBLICA"
+        refined = df.loc[mascara_negocio, COLUNAS_REFINED].copy()
 
         refined["perfis_afetados"] = refined.apply(self._inferir_perfil_contextual, axis=1)
         refined = refined.explode("perfis_afetados").dropna(subset=["perfis_afetados"]).copy()
@@ -844,8 +823,7 @@ class MotorSafeDriver:
 
         documentos_atuais = {}
         for doc in colecao.stream():
-            dados = doc.to_dict()
-            documentos_atuais[doc.id] = dados
+            documentos_atuais[doc.id] = doc.to_dict()
 
         lote = self.banco_nuvem.batch()
         operacoes = 0
@@ -876,23 +854,21 @@ class MotorSafeDriver:
                 "data_base_modelo": str(pd.Timestamp(linha["data_evento"]).date()),
             }
 
-            hash_registro = self._hash_registro(payload)
-            payload["hash_registro"] = hash_registro
+            payload["hash_registro"] = self._hash_registro(payload)
             payload["ultima_atualizacao"] = firestore.SERVER_TIMESTAMP
 
             registro_atual = documentos_atuais.get(doc_id, {})
-            score_antigo = registro_atual.get("score")
-            hash_antigo = registro_atual.get("hash_registro")
-
             deve_atualizar = (
-                hash_antigo != hash_registro
-                or score_antigo != payload["score"]
+                registro_atual.get("hash_registro") != payload["hash_registro"]
+                or registro_atual.get("score") != payload["score"]
                 or "turno" not in registro_atual
+                or "periodo" not in registro_atual
                 or "risk_band" not in registro_atual
-                or "semana_referencia_inicio" not in registro_atual
-                or "semana_referencia_fim" not in registro_atual
                 or "geohash_prefix_4" not in registro_atual
                 or "geohash_prefix_5" not in registro_atual
+                or "semana_referencia_inicio" not in registro_atual
+                or "semana_referencia_fim" not in registro_atual
+                or "versao_modelo" not in registro_atual
             )
 
             if deve_atualizar:
