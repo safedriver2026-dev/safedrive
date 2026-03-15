@@ -25,6 +25,7 @@ def test_engine_tem_metodos_essenciais():
         "_processar_trusted",
         "_processar_refined_eventos",
         "_gerar_geohash_seguro",
+        "_imputar_turno",
         "_criar_painel_diario",
         "_criar_target_futuro",
         "_criar_fator_prophet",
@@ -42,7 +43,6 @@ def test_engine_tem_metodos_essenciais():
 
 def test_classificacao_faixa_risco():
     engine = MotorSafeDriver(habilitar_firestore=False)
-
     assert engine._classificar_faixa_risco(2.0) == "baixo"
     assert engine._classificar_faixa_risco(4.0) == "medio"
     assert engine._classificar_faixa_risco(7.0) == "alto"
@@ -69,7 +69,6 @@ def test_hash_registro_estavel():
 
 def test_normalizacao_turno():
     engine = MotorSafeDriver(habilitar_firestore=False)
-
     assert engine._classificar_turno(2) == "Madrugada"
     assert engine._classificar_turno(8) == "Manha"
     assert engine._classificar_turno(15) == "Tarde"
@@ -106,69 +105,12 @@ def test_criar_target_futuro_7d():
     })
 
     resultado = engine._criar_target_futuro(df)
+
     assert "target_futuro_7d" in resultado.columns
     assert resultado["target_futuro_7d"].notna().all()
 
     primeiro_esperado = sum([0.5, 0.0, 2.0, 1.5, 0.0, 3.0, 1.0])
     assert resultado.iloc[0]["target_futuro_7d"] == primeiro_esperado
-
-
-def test_payload_firestore_tem_estrutura_antiga_e_nova():
-    engine = MotorSafeDriver(habilitar_firestore=False)
-
-    linha = {
-        "codigo_geohash": "6gyf4bf",
-        "geohash_prefix_4": "6gyf",
-        "geohash_prefix_5": "6gyf4",
-        "perfil": "Motorista",
-        "turno_operacional": "Noite",
-        "score": 8.42,
-        "risk_band": "alto",
-        "semana_referencia_inicio": pd.Timestamp("2026-03-16"),
-        "semana_referencia_fim": pd.Timestamp("2026-03-22"),
-        "data_base_modelo": pd.Timestamp("2026-03-15"),
-    }
-
-    payload = {
-        "geohash": linha["codigo_geohash"],
-        "geohash_prefix_4": linha["geohash_prefix_4"],
-        "geohash_prefix_5": linha["geohash_prefix_5"],
-        "perfil": linha["perfil"],
-        "turno": linha["turno_operacional"],
-        "periodo": linha["turno_operacional"],
-        "score": round(float(linha["score"]), 2),
-        "risk_band": linha["risk_band"],
-        "modelo": "xgb_prophet",
-        "versao_modelo": engine.versao_modelo,
-        "janela_inicio": str(engine.janela_inicio.date()),
-        "janela_fim": str(engine.janela_fim.date()),
-        "semana_referencia_inicio": str(pd.Timestamp(linha["semana_referencia_inicio"]).date()),
-        "semana_referencia_fim": str(pd.Timestamp(linha["semana_referencia_fim"]).date()),
-        "horizonte_predicao_dias": engine.horizonte_predicao_dias,
-        "data_base_modelo": str(pd.Timestamp(linha["data_base_modelo"]).date()),
-    }
-
-    campos_esperados = [
-        "geohash",
-        "geohash_prefix_4",
-        "geohash_prefix_5",
-        "perfil",
-        "turno",
-        "periodo",
-        "score",
-        "risk_band",
-        "modelo",
-        "versao_modelo",
-        "janela_inicio",
-        "janela_fim",
-        "semana_referencia_inicio",
-        "semana_referencia_fim",
-        "horizonte_predicao_dias",
-        "data_base_modelo",
-    ]
-
-    for campo in campos_esperados:
-        assert campo in payload
 
 
 def test_periodo_e_turno_coerentes():
@@ -223,3 +165,100 @@ def test_doc_id_formato_esperado():
     doc_id = f"{'6gyf4bf'}_{'Motorista'}_{'Noite'}"
     assert doc_id == "6gyf4bf_Motorista_Noite"
     assert doc_id.count("_") == 2
+
+
+def test_payload_firestore_tem_estrutura_antiga_e_nova():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+
+    linha = {
+        "codigo_geohash": "6gyf4bf",
+        "geohash_prefix_4": "6gyf",
+        "geohash_prefix_5": "6gyf4",
+        "perfil": "Motorista",
+        "turno_operacional": "Noite",
+        "score": 8.42,
+        "risk_band": "alto",
+        "semana_referencia_inicio": pd.Timestamp("2026-03-16"),
+        "semana_referencia_fim": pd.Timestamp("2026-03-22"),
+        "data_evento": pd.Timestamp("2026-03-15"),
+    }
+
+    payload = {
+        "geohash": linha["codigo_geohash"],
+        "geohash_prefix_4": linha["geohash_prefix_4"],
+        "geohash_prefix_5": linha["geohash_prefix_5"],
+        "perfil": linha["perfil"],
+        "turno": linha["turno_operacional"],
+        "periodo": linha["turno_operacional"],
+        "score": round(float(linha["score"]), 2),
+        "risk_band": linha["risk_band"],
+        "modelo": "xgb_prophet",
+        "versao_modelo": engine.versao_modelo,
+        "janela_inicio": str(engine.janela_inicio.date()),
+        "janela_fim": str(engine.janela_fim.date()),
+        "semana_referencia_inicio": str(pd.Timestamp(linha["semana_referencia_inicio"]).date()),
+        "semana_referencia_fim": str(pd.Timestamp(linha["semana_referencia_fim"]).date()),
+        "horizonte_predicao_dias": engine.horizonte_predicao_dias,
+        "data_base_modelo": str(pd.Timestamp(linha["data_evento"]).date()),
+    }
+
+    campos_esperados = [
+        "geohash",
+        "geohash_prefix_4",
+        "geohash_prefix_5",
+        "perfil",
+        "turno",
+        "periodo",
+        "score",
+        "risk_band",
+        "modelo",
+        "versao_modelo",
+        "janela_inicio",
+        "janela_fim",
+        "semana_referencia_inicio",
+        "semana_referencia_fim",
+        "horizonte_predicao_dias",
+        "data_base_modelo",
+    ]
+
+    for campo in campos_esperados:
+        assert campo in payload
+
+
+def test_imputar_turno_funciona_com_indices_repetidos():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+
+    df = pd.DataFrame({
+        "codigo_geohash": ["6gyf4bf", "6gyf4bf", "6gyf4bf"],
+        "perfil": ["Motorista", "Motorista", "Motorista"],
+        "turno_operacional": ["Noite", np.nan, "Noite"],
+    })
+
+    resultado = engine._imputar_turno(df)
+    assert resultado["turno_operacional"].isna().sum() == 0
+    assert (resultado["turno_operacional"] == "Noite").all()
+
+
+def test_processar_refined_eventos_remove_geohash_invalido():
+    engine = MotorSafeDriver(habilitar_firestore=False)
+
+    trusted = pd.DataFrame({
+        "NUM_BO": ["1", "2"],
+        "DATA_OCORRENCIA_BO": [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-02")],
+        "HORA_OCORRENCIA_BO": ["10:00", "20:00"],
+        "LATITUDE": [-23.5505, np.nan],
+        "LONGITUDE": [-46.6333, -46.6200],
+        "NATUREZA_APURADA": ["ROUBO DE VEICULO", "ROUBO DE VEICULO"],
+        "DESCR_TIPOLOCAL": ["VIA PUBLICA", "VIA PUBLICA"],
+        "DESCR_SUBTIPOLOCAL": ["VIA PUBLICA", "VIA PUBLICA"],
+        "DESCR_CONDUTA": ["VEICULO", "VEICULO"],
+        "RUBRICA": ["R1", "R2"],
+        "ANO_BASE": [2026, 2026],
+    })
+
+    resultado = engine._processar_refined_eventos(trusted)
+
+    assert "codigo_geohash" in resultado.columns
+    assert resultado["codigo_geohash"].notna().all()
+    assert resultado["codigo_geohash"].map(lambda x: isinstance(x, str)).all()
+    assert len(resultado) >= 1
