@@ -46,6 +46,7 @@ class MotorSafeDriver:
             "dq_latlon": 0, "dq_hora": 0, "clusters_ativos": 0
         }
         
+        # LÓGICA DE COLD START: Se não houver lock, apaga tudo e reconstrói
         if not os.path.exists(self.lock_file):
             self.auditoria["modo"] = "FULL_RELOAD"
             if os.path.exists('datalake'): 
@@ -92,7 +93,7 @@ class MotorSafeDriver:
                 "title": f"🚀 SafeDriver City-Scale Engine: {self.auditoria['modo']} Concluído",
                 "color": 3066993,
                 "fields": [
-                    {"name": "📊 Qualidade de Dados (DQ)", "value": f"Registos Lidos: {self.auditoria['volume_raw']:,}\nCom Lat/Lon Válida: {self.auditoria['dq_latlon']:.1f}%\nCom Hora Válida: {self.auditoria['dq_hora']:.1f}%", "inline": False},
+                    {"name": "📊 Qualidade de Dados (DQ)", "value": f"Registros Lidos: {self.auditoria['volume_raw']:,}\nCom Lat/Lon Válida: {self.auditoria['dq_latlon']:.1f}%\nCom Hora Válida: {self.auditoria['dq_hora']:.1f}%", "inline": False},
                     {"name": "🧠 Performance e Clusters", "value": f"Hotspots Emergentes (DBSCAN): {self.auditoria['clusters_ativos']}\nErro MAE Espacial: {self.auditoria['mae']}", "inline": False},
                     {"name": "☁️ Sincronização Firebase", "value": f"Mutações: {self.auditoria['docs_atualizados']:,} | Removidos: {self.auditoria['docs_removidos']:,}", "inline": False}
                 ],
@@ -106,38 +107,25 @@ class MotorSafeDriver:
             }
         requests.post(webhook, json={"embeds": [embed]})
 
-    def _gerar_runbook(self):
-        ts = self.ts_execucao.strftime('%Y%m%d_%H%M%S')
-        conteudo = f"""# SafeDriver Engine MLOps Runbook
-**Timestamp:** {self._formatar_data_pt(self.ts_execucao)}
-**Modo de Execução:** {self.auditoria['modo']}
-
-## 1. Integridade de Dados (ETL)
-- **Registros Lidos da SSP (RAW):** {self.auditoria['volume_raw']:,}
-- **Registros Úteis com Coordenadas (TRUSTED):** {self.auditoria['volume_trusted']:,}
-- **Eventos Analíticos Filtrados (REFINED):** {self.auditoria['volume_refined']:,}
-
-## 2. Observabilidade de IA Preditiva
-- **MAE:** {self.auditoria['mae']}
-- **RMSE:** {self.auditoria['rmse']}
-
-## 3. Topologia da Nuvem (Delta Sync)
-- **Documentos Atualizados/Criados:** {self.auditoria['docs_atualizados']:,}
-- **Documentos Expirados/Removidos:** {self.auditoria['docs_removidos']:,}
-"""
-        with open(f"datalake/reports/runbook_{ts}.md", 'w', encoding='utf-8') as f:
-            f.write(conteudo)
-
     def _ingerir_fonte(self, content):
         excel = pd.ExcelFile(io.BytesIO(content))
         dfs = []
         for aba in excel.sheet_names:
             if any(x in aba.upper() for x in ["CAMPOS", "METADADOS", "DICIONARIO", "LEGENDA"]): continue
             df = excel.parse(aba, dtype=str)
+            
+            # NORMALIZAÇÃO SEMÂNTICA
             df.columns = [self._normalizar_coluna(c) for c in df.columns]
+            
+            # SOLUÇÃO PARA DUPLICADOS: Agrupar colunas com mesmo nome e fundir os dados
+            # Se houver duas colunas 'NUM_BO', pegamos a informação da primeira que não for nula
+            df = df.groupby(level=0, axis=1).first()
+            
+            # Garantir colunas mínimas
             for col in ESQUEMA_RAW_CANONICO.keys():
                 if col not in df.columns: df[col] = np.nan
             dfs.append(df)
+            
         return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
     def _qualificar_dados(self, df_raw, ano):
@@ -179,13 +167,10 @@ class MotorSafeDriver:
         if df_r.empty: return pd.DataFrame(), None
         df = df_r.copy()
         
+        # PESO POR RECÊNCIA E FEATURES TEMPORAIS
         df['dias_desde_evento'] = (self.data_execucao - df['DATA_OCORRENCIA_BO']).dt.days
         df['peso_recencia'] = np.exp(-df['dias_desde_evento'] / 180)
-        
         df['hora'] = df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(\d+)').fillna(0).astype(int)
-        df['dia_semana'] = df['DATA_OCORRENCIA_BO'].dt.dayofweek
-        df['mes'] = df['DATA_OCORRENCIA_BO'].dt.month
-        df['fim_semana'] = (df['dia_semana'] >= 5).astype(int)
         df['periodo_dia'] = df['hora'].apply(lambda h: 'Madrugada' if 0<=h<6 else 'Manha' if 6<=h<12 else 'Tarde' if 12<=h<18 else 'Noite')
         
         df['perfis'] = df.apply(lambda x: [p for p, kws in PALAVRAS_CHAVE_PERFIL.items() if any(k in str(x).upper() for k in kws)] or ['Indefinido'], axis=1)
@@ -195,6 +180,7 @@ class MotorSafeDriver:
         df['peso_gravidade'] = df['NATUREZA_APURADA'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
         df['score_evento'] = df['peso_recencia'] * df['peso_gravidade']
         
+        # CLUSTERS DBSCAN
         coords = df[['LATITUDE', 'LONGITUDE']].values
         clustering = DBSCAN(eps=0.005, min_samples=15).fit(coords)
         df['cluster_id'] = clustering.labels_
@@ -206,9 +192,9 @@ class MotorSafeDriver:
         )
         pnl = pnl.sort_values(['gh', 'perfis', 'periodo_dia', 'DATA_OCORRENCIA_BO'])
         
+        # DENSIDADES
         pnl['is_30d'] = ((self.data_execucao - pnl['DATA_OCORRENCIA_BO']).dt.days <= 30).astype(int) * pnl['vol_crimes']
         pnl['is_90d'] = ((self.data_execucao - pnl['DATA_OCORRENCIA_BO']).dt.days <= 90).astype(int) * pnl['vol_crimes']
-        
         pnl['densidade_30d'] = pnl.groupby(['gh'])['is_30d'].transform('sum')
         pnl['densidade_90d'] = pnl.groupby(['gh'])['is_90d'].transform('sum')
         pnl['vol_historico_365d'] = pnl.groupby(['gh'])['vol_crimes'].transform('sum')
@@ -241,12 +227,12 @@ class MotorSafeDriver:
         
         previsoes = np.clip(md.predict(pnl_v[fs]), 0, None)
         self.auditoria['mae'] = round(float(mean_absolute_error(pnl_v['target'], previsoes)), 3)
-        self.auditoria['rmse'] = round(float(math.sqrt(mean_squared_error(pnl_v['target'], previsoes))), 3)
 
         grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'perfis', 'periodo_dia']).tail(1).copy()
         grid['ft'] = prj.iloc[-1]['yhat'] / max(prj['yhat'].mean(), 1.0)
         grid['xgb_raw'] = np.clip(md.predict(grid[fs]), 0, None)
         
+        # SUAVIZAÇÃO ESPACIAL
         gh_scores = grid.groupby('gh')['xgb_raw'].mean().to_dict()
         def get_neighbor_score(g):
             neighbors = gh.neighbors(g)
@@ -256,18 +242,9 @@ class MotorSafeDriver:
         grid['suavizacao'] = grid['gh'].apply(get_neighbor_score)
         grid['score_final'] = (grid['xgb_raw'] * 0.7) + (grid['suavizacao'] * 0.3)
         
+        # RISK SCORE 0-100 PARA FLUTTER
         scaler = MinMaxScaler(feature_range=(0, 100))
         grid['risk_score'] = scaler.fit_transform(grid[['score_final']]).round(1)
-        
-        def classificar_risco(s):
-            if s <= 20: return "Seguro"
-            elif s <= 40: return "Atenção"
-            elif s <= 60: return "Moderado"
-            elif s <= 80: return "Perigoso"
-            else: return "Crítico"
-            
-        grid['categoria'] = grid['risk_score'].apply(classificar_risco)
-        grid['confidence_score'] = np.clip((grid['vol_historico_365d'] / 30) * 100, 0, 100).round(1)
         grid['routing_penalty'] = (1.0 + (grid['risk_score'] / 50.0)).round(2)
         
         if self.db:
@@ -281,8 +258,6 @@ class MotorSafeDriver:
                 
                 payload = {
                     'risk_score': float(l['risk_score']),
-                    'risk_category': l['categoria'],
-                    'confidence_score': float(l['confidence_score']),
                     'routing_penalty': float(l['routing_penalty']),
                     'geohash': l['gh'],
                     'geohash_prefix_4': l['gh'][:4],
@@ -319,7 +294,10 @@ class MotorSafeDriver:
                 if res.status_code == 200:
                     df_r = self._ingerir_fonte(res.content)
                     self.auditoria['volume_raw'] += len(df_r)
+                    
+                    # SALVAR RAW SEM DUPLICADOS
                     df_r.to_parquet(f'datalake/raw/ssp_{a}.parquet', index=False)
+                    
                     dt, dr = self._qualificar_dados(df_r, a)
                     if not dr.empty: df_master = pd.concat([df_master, dr])
             
@@ -328,7 +306,6 @@ class MotorSafeDriver:
                 self._treinar_disseminar(pnl, prj)
                 
             with open(self.lock_file, 'w') as f: f.write(str(datetime.now()))
-            
             self._gerar_runbook()
             self._notificar_discord(sucesso=True)
             
