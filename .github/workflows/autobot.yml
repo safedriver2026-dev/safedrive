@@ -39,7 +39,7 @@ jobs:
 
       - name: Rodar testes de contrato
         run: |
-          pytest -q
+          python -m pytest -q
 
       - name: Executar motor preditivo
         env:
@@ -49,20 +49,18 @@ jobs:
         run: |
           python autobot/autobot_engine.py
 
-      - name: Upload de artefatos do ciclo
+      - name: Upload de artefatos
         uses: actions/upload-artifact@v4
         with:
           name: safedriver-semanal
           path: |
             datalake/metadata/
-            datalake/refined/refined_eventos_total.parquet
-            datalake/refined/refined_modelagem.parquet
-            datalake/refined/malha_risco_atual.parquet
+            datalake/refined/
             datalake/trusted/
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Salvar Data Lake no repositorio Git
+      - name: Salvar Data Lake no repositorio
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
