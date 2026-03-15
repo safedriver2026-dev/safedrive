@@ -6,43 +6,48 @@ on:
   workflow_dispatch:
 
 jobs:
-  processamento:
-    name: Execução do Motor de Inteligência
+  producao:
+    name: Ciclo de Inteligência Geoespacial
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Baixar código do repositório
+      - name: Sincronizar Repositório
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Configurar ambiente Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Instalar bibliotecas necessárias
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Recuperar Cache do Data Lake
+        uses: actions/cache@v4
+        with:
+          path: datalake/
+          key: safedriver-storage-${{ runner.os }}-${{ hashFiles('datalake/metadata/baseline.lock') }}
+          restore-keys: |
+            safedriver-storage-${{ runner.os }}-
 
-      - name: Validar integridade do motor (Testes)
+      - name: Instalar Dependências Sênior
+        run: |
+          pip install pandas numpy pygeohash requests firebase-admin xgboost prophet scikit-learn openpyxl pyarrow
+
+      - name: Validar Pipeline (Testes Unitários)
         run: python -m pytest tests/test_contracts.py -q
 
-      - name: Rodar Motor Preditivo SafeDriver
+      - name: Executar Motor Preditivo Definitivo
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -m autobot.autobot_engine
 
-      - name: Sincronizar Base de Dados e Runbooks
+      - name: Persistir Relatórios, Runbooks e Baseline
         run: |
-          git config --global user.name "SafeDriver Bot"
-          git config --global user.email "bot@safedriver.com"
+          git config --global user.name "SafeDriver Core"
+          git config --global user.email "core@safedriver.ia"
           git add datalake/
-          git commit -m "MLOps: Atualização de Dados e Relatórios [Automático]" || echo "Sem mudanças"
+          git commit -m "Sistema: Ciclo Preditivo Concluído [Automático]" || echo "Sem deltas estruturais"
           git push
