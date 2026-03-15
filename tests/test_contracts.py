@@ -10,9 +10,16 @@ def test_engine_init():
 
 def test_coordinate_cleaning():
     e = MotorSafeDriver(habilitar_firestore=False)
-    df = pd.DataFrame({'LATITUDE': ['-23.5', '0', '-'], 'LONGITUDE': ['-46.6', '0', '-'], 'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')]*3})
+    # Adicionada a coluna NATUREZA_APURADA para evitar o KeyError no teste
+    df = pd.DataFrame({
+        'LATITUDE': ['-23.5', '0', '-'], 
+        'LONGITUDE': ['-46.6', '0', '-'], 
+        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')]*3,
+        'NATUREZA_APURADA': ['ROUBO DE VEICULO', 'N/A', 'N/A']
+    })
     df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
     dt, dr = e._etrar_trusted(df, 2026)
+    # A limpeza deve manter apenas a linha com coordenadas válidas
     assert len(dt) == 1
     assert dt['LATITUDE'].iloc[0] == -23.5
 
