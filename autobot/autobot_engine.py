@@ -165,7 +165,7 @@ class MotorSafeDriver:
         df['perfis'] = df.apply(lambda x: [p for p, kws in PALAVRAS_CHAVE_PERFIL.items() if any(k in str(x).upper() for k in kws)] or ['Indefinido'], axis=1)
         df = df.explode('perfis')
         df['gh'] = [gh.encode(la, lo, precision=7) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
-        df['hr'] = df['HORA_OCORRENCIA_BO'].astype(str).str.extract('(\d+)').fillna(0).astype(int)
+        df['hr'] = df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(\d+)').fillna(0).astype(int)
         df['turno'] = df['hr'].apply(lambda h: 'Madrugada' if 0<=h<6 else 'Manha' if 6<=h<12 else 'Tarde' if 12<=h<18 else 'Noite')
         df['w'] = df['NATUREZA_APURADA'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
         
@@ -175,16 +175,23 @@ class MotorSafeDriver:
         pnl['target'] = pnl.groupby(['gh', 'perfis', 'turno'])['y'].transform(lambda x: x.shift(-7).rolling(7, min_periods=1).sum())
         
         macro = pnl.groupby('DATA_OCORRENCIA_BO')['y'].sum().reset_index().rename(columns={'DATA_OCORRENCIA_BO': 'ds', 'y': 'y'})
-        m_p = Prophet(yearly_seasonality=True, weekly_seasonality=True).fit(macro)
-        prj = m_p.predict(m_p.make_future_dataframe(periods=14))[['ds', 'yhat']]
-        
-        pnl = pnl.merge(prj, left_on='DATA_OCORRENCIA_BO', right_on='ds', how='left')
-        pnl['ft'] = pnl['yhat'] / max(pnl['yhat'].mean(), 1.0)
+        if len(macro) >= 2:
+            m_p = Prophet(yearly_seasonality=True, weekly_seasonality=True).fit(macro)
+            prj = m_p.predict(m_p.make_future_dataframe(periods=14))[['ds', 'yhat']]
+            pnl = pnl.merge(prj, left_on='DATA_OCORRENCIA_BO', right_on='ds', how='left')
+            pnl['ft'] = pnl['yhat'] / max(pnl['yhat'].mean(), 1.0)
+        else:
+            pnl['ft'] = 1.0
+            prj = pd.DataFrame({'ds': [self.data_execucao], 'yhat': [1.0]})
+            
         return pnl, prj
 
     def _treinar_disseminar(self, pnl, prj):
         if pnl.empty: return
         pnl_v = pnl.dropna(subset=['target']).copy()
+        
+        if pnl_v.empty: return
+        
         le_p, le_t = LabelEncoder().fit(pnl['perfis']), LabelEncoder().fit(pnl['turno'])
         for d in [pnl_v, pnl]:
             d['pe'], d['te'] = le_p.transform(d['perfis']), le_t.transform(d['turno'])
