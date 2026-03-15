@@ -1,27 +1,63 @@
 name: Fluxo Semanal SafeDriver
+
 on:
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
+
 jobs:
-  run:
+  processamento:
+    name: Execução do Motor de Inteligência
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar ambiente Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      - run: pip install -r requirements.txt
-      - run: python -m pytest tests/test_contracts.py
-      - env:
+
+      - name: Gerenciar Cache do Data Lake
+        uses: actions/cache@v4
+        with:
+          path: datalake/
+          key: safedriver-dl-${{ runner.os }}-${{ hashFiles('datalake/metadata/*.json') }}
+          restore-keys: |
+            safedriver-dl-${{ runner.os }}-
+
+      - name: Instalar bibliotecas necessárias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validar integridade do motor (Testes)
+        run: python -m pytest tests/test_contracts.py -q
+
+      - name: Rodar Motor Preditivo SafeDriver
+        env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -m autobot.autobot_engine
-      - run: |
-          git config --global user.name "bot"
-          git config --global user.email "bot@bot.com"
+
+      - name: Arquivar Relatórios de Observabilidade
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorios-safedriver
+          path: datalake/reports/
+          retention-days: 90
+
+      - name: Sincronizar Base de Dados e Runbooks
+        run: |
+          git config --global user.name "SafeDriver Bot"
+          git config --global user.email "bot@safedriver.com"
           git add datalake/
-          git commit -m "Update Datasets" || echo "No changes"
+          git commit -m "MLOps: Atualização de Dados e Relatórios [Automático]" || echo "Sem mudanças para salvar"
           git push
