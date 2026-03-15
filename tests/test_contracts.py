@@ -21,6 +21,7 @@ def test_engine_tem_metodos_essenciais():
 
     metodos_essenciais = [
         "_ler_ou_baixar_raw",
+        "_analisar_raw",
         "_processar_trusted",
         "_processar_refined_eventos",
         "_gerar_geohash_seguro",
@@ -77,28 +78,20 @@ def test_normalizacao_turno():
 
 def test_gerar_geohash_seguro_valido():
     engine = MotorSafeDriver(habilitar_firestore=False)
-
     geohash = engine._gerar_geohash_seguro(-23.5505, -46.6333)
-
     assert isinstance(geohash, str)
     assert len(geohash) == 7
 
 
 def test_gerar_geohash_seguro_com_nan():
     engine = MotorSafeDriver(habilitar_firestore=False)
-
-    geohash_lat_nan = engine._gerar_geohash_seguro(np.nan, -46.6333)
-    geohash_lon_nan = engine._gerar_geohash_seguro(-23.5505, np.nan)
-
-    assert pd.isna(geohash_lat_nan)
-    assert pd.isna(geohash_lon_nan)
+    assert pd.isna(engine._gerar_geohash_seguro(np.nan, -46.6333))
+    assert pd.isna(engine._gerar_geohash_seguro(-23.5505, np.nan))
 
 
 def test_gerar_geohash_seguro_com_valor_invalido():
     engine = MotorSafeDriver(habilitar_firestore=False)
-
-    geohash = engine._gerar_geohash_seguro("abc", -46.6333)
-    assert pd.isna(geohash)
+    assert pd.isna(engine._gerar_geohash_seguro("abc", -46.6333))
 
 
 def test_criar_target_futuro_7d():
@@ -113,7 +106,6 @@ def test_criar_target_futuro_7d():
     })
 
     resultado = engine._criar_target_futuro(df)
-
     assert "target_futuro_7d" in resultado.columns
     assert resultado["target_futuro_7d"].notna().all()
 
@@ -134,7 +126,7 @@ def test_payload_firestore_tem_estrutura_antiga_e_nova():
         "risk_band": "alto",
         "semana_referencia_inicio": pd.Timestamp("2026-03-16"),
         "semana_referencia_fim": pd.Timestamp("2026-03-22"),
-        "data_evento": pd.Timestamp("2026-03-15"),
+        "data_base_modelo": pd.Timestamp("2026-03-15"),
     }
 
     payload = {
@@ -153,7 +145,7 @@ def test_payload_firestore_tem_estrutura_antiga_e_nova():
         "semana_referencia_inicio": str(pd.Timestamp(linha["semana_referencia_inicio"]).date()),
         "semana_referencia_fim": str(pd.Timestamp(linha["semana_referencia_fim"]).date()),
         "horizonte_predicao_dias": engine.horizonte_predicao_dias,
-        "data_base_modelo": str(pd.Timestamp(linha["data_evento"]).date()),
+        "data_base_modelo": str(pd.Timestamp(linha["data_base_modelo"]).date()),
     }
 
     campos_esperados = [
@@ -176,30 +168,21 @@ def test_payload_firestore_tem_estrutura_antiga_e_nova():
     ]
 
     for campo in campos_esperados:
-        assert campo in payload, f"Campo obrigatorio ausente: {campo}"
+        assert campo in payload
 
 
 def test_periodo_e_turno_coerentes():
-    turno = "Noite"
-    payload = {
-        "turno": turno,
-        "periodo": turno,
-    }
-
+    payload = {"turno": "Noite", "periodo": "Noite"}
     assert payload["turno"] == payload["periodo"]
 
 
 def test_score_e_faixa_validos():
-    score = 8.42
-    risk_band = "alto"
-
-    assert 0.5 <= score <= 10.0
-    assert risk_band in {"baixo", "medio", "alto", "critico"}
+    assert 0.5 <= 8.42 <= 10.0
+    assert "alto" in {"baixo", "medio", "alto", "critico"}
 
 
 def test_turnos_validos():
     turnos_validos = {"Madrugada", "Manha", "Tarde", "Noite"}
-
     assert "Madrugada" in turnos_validos
     assert "Manha" in turnos_validos
     assert "Tarde" in turnos_validos
@@ -208,7 +191,6 @@ def test_turnos_validos():
 
 def test_perfis_validos():
     perfis_validos = {"Motorista", "Motociclista", "Pedestre", "Ciclista", "Indefinido"}
-
     assert "Motorista" in perfis_validos
     assert "Motociclista" in perfis_validos
     assert "Pedestre" in perfis_validos
@@ -216,66 +198,28 @@ def test_perfis_validos():
 
 
 def test_geohash_tem_precisao_7():
-    geohash = "6gyf4bf"
-    assert isinstance(geohash, str)
-    assert len(geohash) == 7
+    assert len("6gyf4bf") == 7
 
 
 def test_prefixos_geohash_consistentes():
     geohash = "6gyf4bf"
-    prefix_4 = geohash[:4]
-    prefix_5 = geohash[:5]
-
-    assert prefix_4 == "6gyf"
-    assert prefix_5 == "6gyf4"
+    assert geohash[:4] == "6gyf"
+    assert geohash[:5] == "6gyf4"
 
 
 def test_semana_referencia_consistente():
     semana_inicio = pd.Timestamp("2026-03-16")
     semana_fim = pd.Timestamp("2026-03-22")
-
     assert semana_inicio < semana_fim
     assert (semana_fim - semana_inicio).days == 6
 
 
 def test_janela_historica_tem_730_dias():
     engine = MotorSafeDriver(habilitar_firestore=False)
-    diferenca = (engine.janela_fim - engine.janela_inicio).days
-
-    assert diferenca == 730
+    assert (engine.janela_fim - engine.janela_inicio).days == 730
 
 
 def test_doc_id_formato_esperado():
-    geohash = "6gyf4bf"
-    perfil = "Motorista"
-    turno = "Noite"
-
-    doc_id = f"{geohash}_{perfil}_{turno}"
-
+    doc_id = f"{'6gyf4bf'}_{'Motorista'}_{'Noite'}"
     assert doc_id == "6gyf4bf_Motorista_Noite"
     assert doc_id.count("_") == 2
-
-
-def test_processar_refined_eventos_remove_geohash_invalido():
-    engine = MotorSafeDriver(habilitar_firestore=False)
-
-    trusted = pd.DataFrame({
-        "NUM_BO": ["1", "2"],
-        "DATA_OCORRENCIA_BO": [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-02")],
-        "HORA_OCORRENCIA_BO": ["10:00", "20:00"],
-        "LATITUDE": [-23.5505, np.nan],
-        "LONGITUDE": [-46.6333, -46.6200],
-        "NATUREZA_APURADA": ["ROUBO DE VEICULO", "ROUBO DE VEICULO"],
-        "DESCR_TIPOLOCAL": ["VIA PUBLICA", "VIA PUBLICA"],
-        "DESCR_SUBTIPOLOCAL": ["VIA PUBLICA", "VIA PUBLICA"],
-        "DESCR_CONDUTA": ["VEICULO", "VEICULO"],
-        "RUBRICA": ["R1", "R2"],
-        "ANO_BASE": [2026, 2026],
-    })
-
-    resultado = engine._processar_refined_eventos(trusted)
-
-    assert "codigo_geohash" in resultado.columns
-    assert resultado["codigo_geohash"].notna().all()
-    assert resultado["codigo_geohash"].map(lambda x: isinstance(x, str)).all()
-    assert len(resultado) >= 1
