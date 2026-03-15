@@ -1,4 +1,3 @@
-# 5. CLASSIFICAÇÃO POR GRAVIDADE (Base Código Penal)
 CATALOGO_CRIMES = {
     "LATROCINIO": {"perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"], "peso": 5.0},
     "EXTORSAO MEDIANTE SEQUESTRO": {"perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"], "peso": 5.0},
@@ -32,7 +31,7 @@ COLUNAS_REFINED_EVENTOS = [
     "NATUREZA_APURADA", "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL", "ANO_BASE"
 ]
 
-# 1. NORMALIZAÇÃO SEMÂNTICA (Dicionário de Equivalência)
+
 MAPA_SEMANTICO_COLUNAS = {
     "NUM_BO": ["NUM_BO", "NUMERO_BO", "BO_NUMERO", "N_BO", "BO"],
     "DATA_OCORRENCIA_BO": ["DATA_OCORRENCIA_BO", "DATA_FATO", "DATAOCORRENCIA", "DATA"],
