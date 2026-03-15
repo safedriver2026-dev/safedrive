@@ -47,7 +47,7 @@ jobs:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: |
-          python autobot/autobot_engine.py
+          python -m autobot.autobot_engine
 
       - name: Upload de artefatos
         uses: actions/upload-artifact@v4
