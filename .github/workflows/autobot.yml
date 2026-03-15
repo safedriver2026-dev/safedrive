@@ -25,17 +25,17 @@ jobs:
       - name: Instalar Dependências
         run: pip install -r requirements.txt
 
-      - name: Validar Contratos (Pytest)
+      - name: Validar Contratos
         run: python -m pytest tests/test_contracts.py -v
 
-      - name: Executar Motor Supremo
+      - name: Executar Motor Autônomo
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -m autobot.autobot_engine
 
-      - name: Salvar Baseline
+      - name: Persistir Baseline
         run: |
           git config --global user.name "SafeDriver Core"
           git config --global user.email "core@safedriver.ia"
