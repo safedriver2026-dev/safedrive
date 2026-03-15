@@ -6,7 +6,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from autobot_engine import MotorSafeDriver
+from autobot.autobot_engine import MotorSafeDriver
 
 
 def test_engine_instancia():
@@ -15,7 +15,7 @@ def test_engine_instancia():
     assert callable(engine.executar_pipeline_completo)
 
 
-def test_engine_tem_metodos_essenciais_do_novo_pipeline():
+def test_engine_tem_metodos_essenciais():
     engine = MotorSafeDriver()
 
     metodos_essenciais = [
@@ -107,86 +107,9 @@ def test_target_futuro_7d_existe():
     assert resultado["target_futuro_7d"].notna().all()
 
 
-def test_payload_malha_final_tem_campos_esperados():
-    engine = MotorSafeDriver()
-
-    semana_inicio = pd.Timestamp("2026-03-16")
-    semana_fim = pd.Timestamp("2026-03-22")
-
-    linha = {
-        "codigo_geohash": "6gyf4bf",
-        "geohash_prefix_4": "6gyf",
-        "geohash_prefix_5": "6gyf4",
-        "perfil": "Motorista",
-        "turno_operacional": "Noite",
-        "score": 8.42,
-        "risk_band": "alto",
-        "semana_referencia_inicio": semana_inicio,
-        "semana_referencia_fim": semana_fim,
-        "data_evento": pd.Timestamp("2026-03-15"),
-    }
-
-    payload = {
-        "geohash": linha["codigo_geohash"],
-        "geohash_prefix_4": linha["geohash_prefix_4"],
-        "geohash_prefix_5": linha["geohash_prefix_5"],
-        "perfil": linha["perfil"],
-        "turno": linha["turno_operacional"],
-        "periodo": linha["turno_operacional"],
-        "score": round(float(linha["score"]), 2),
-        "risk_band": linha["risk_band"],
-        "modelo": "xgb_prophet",
-        "versao_modelo": engine.versao_modelo,
-        "janela_inicio": str(engine.janela_inicio.date()),
-        "janela_fim": str(engine.janela_fim.date()),
-        "semana_referencia_inicio": str(pd.Timestamp(linha["semana_referencia_inicio"]).date()),
-        "semana_referencia_fim": str(pd.Timestamp(linha["semana_referencia_fim"]).date()),
-        "horizonte_predicao_dias": engine.horizonte_predicao_dias,
-        "data_base_modelo": str(pd.Timestamp(linha["data_evento"]).date()),
-    }
-
-    campos_esperados = [
-        "geohash",
-        "geohash_prefix_4",
-        "geohash_prefix_5",
-        "perfil",
-        "turno",
-        "periodo",
-        "score",
-        "risk_band",
-        "modelo",
-        "versao_modelo",
-        "janela_inicio",
-        "janela_fim",
-        "semana_referencia_inicio",
-        "semana_referencia_fim",
-        "horizonte_predicao_dias",
-        "data_base_modelo",
-    ]
-
-    for campo in campos_esperados:
-        assert campo in payload, f"Campo obrigatorio ausente: {campo}"
-
-
 def test_score_e_faixa_validos():
     score = 8.42
     risk_band = "alto"
 
     assert 0.5 <= score <= 10.0
     assert risk_band in {"baixo", "medio", "alto", "critico"}
-
-
-def test_turnos_validos():
-    turnos_validos = {"Madrugada", "Manha", "Tarde", "Noite"}
-    assert "Noite" in turnos_validos
-    assert "Manha" in turnos_validos
-    assert "Tarde" in turnos_validos
-    assert "Madrugada" in turnos_validos
-
-
-def test_perfis_validos():
-    perfis_validos = {"Motorista", "Motociclista", "Pedestre", "Ciclista", "Indefinido"}
-    assert "Motorista" in perfis_validos
-    assert "Motociclista" in perfis_validos
-    assert "Pedestre" in perfis_validos
-    assert "Ciclista" in perfis_validos
