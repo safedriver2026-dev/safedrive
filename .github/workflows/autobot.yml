@@ -1,69 +1,44 @@
 name: Fluxo Semanal SafeDriver
-
 on:
   schedule:
     - cron: '0 3 * * 1'
   workflow_dispatch:
-
 jobs:
   sincronizacao:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - name: Clonar repositorio
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
-      - name: Restaurar cache do Data Lake
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: datalake/
-          key: safedriver-datalake-${{ runner.os }}-${{ hashFiles('datalake/metadata/*.json') }}
+          key: safedriver-dl-${{ runner.os }}-${{ hashFiles('datalake/metadata/*.json') }}
           restore-keys: |
-            safedriver-datalake-${{ runner.os }}-
-
-      - name: Instalar dependencias
-        run: |
+            safedriver-dl-${{ runner.os }}-
+      - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Rodar testes de contrato
-        run: |
-          python -m pytest tests/test_contracts.py -q
-
-      - name: Executar motor preditivo
-        env:
+      - run: python -m pytest tests/test_contracts.py -q
+      - env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        run: |
-          python -m autobot.autobot_engine
-
-      - name: Upload de relatorios de observabilidade
-        uses: actions/upload-artifact@v4
+        run: python -m autobot.autobot_engine
+      - uses: actions/upload-artifact@v4
         with:
-          name: safedriver-observability-reports
+          name: reports
           path: datalake/reports/
-          if-no-files-found: warn
           retention-days: 90
-
-      - name: Salvar Data Lake no repositorio
-        run: |
+      - run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add datalake/
-          if git diff --cached --quiet; then
-            echo "Sem alteracoes."
-          else
-            git commit -m "MLOps: Runbook e Datasets Atualizados"
-            git push
-          fi
+          git commit -m "MLOps: Datasets e Runbooks" || echo "Sem mudancas"
+          git push
