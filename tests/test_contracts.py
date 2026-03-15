@@ -14,38 +14,27 @@ def test_engine_instancia():
 
 def test_engine_tem_metodos_essenciais():
     engine = MotorSafeDriver(habilitar_firestore=False)
-    metodos = ["_ler_ou_baixar_raw", "_processar_trusted", "_sincronizacao_delta_firestore"]
+    metodos = ["_verificar_atualizacao", "_construir_raw_operacional", "_construir_features_preditivas", "_treinar_modelo", "_gerar_documentacao_runbook"]
     for nome in metodos: assert hasattr(engine, nome)
-
-def test_classificacao_faixa_risco():
-    engine = MotorSafeDriver(habilitar_firestore=False)
-    assert engine._classificar_faixa_risco(2.0) == "baixo"
-    assert engine._classificar_faixa_risco(9.0) == "critico"
 
 def test_normalizacao_turno():
     engine = MotorSafeDriver(habilitar_firestore=False)
-    assert engine._classificar_turno(2) == "Madrugada"
-    assert engine._classificar_turno(21) == "Noite"
-
-def test_gerar_geohash_seguro():
-    engine = MotorSafeDriver(habilitar_firestore=False)
-    assert len(engine._gerar_geohash_seguro(-23.5505, -46.6333)) == 7
-    assert pd.isna(engine._gerar_geohash_seguro(np.nan, -46.6333))
+    assert engine._classificar_turno("02:30") == "Madrugada"
+    assert engine._classificar_turno("22:00") == "Noite"
 
 def test_janela_historica_tem_730_dias():
     engine = MotorSafeDriver(habilitar_firestore=False)
-    assert (engine.janela_fim - engine.janela_inicio).days == 730
+    assert (engine.data_execucao - engine.janela_inicio).days == 730
 
-def test_routing_penalty_in_payload():
+def test_criacao_diretorios():
+    MotorSafeDriver(habilitar_firestore=False)
+    assert os.path.exists("datalake/reports")
+    assert os.path.exists("datalake/metadata")
+
+def test_fallback_schema():
     engine = MotorSafeDriver(habilitar_firestore=False)
-    linha = {
-        "codigo_geohash": "6gyf4bf", "geohash_prefix_4": "6gyf", "geohash_prefix_5": "6gyf4",
-        "perfil": "Motorista", "turno_operacional": "Noite", "score": 8.42, 
-        "risk_band": "alto", "routing_penalty": 2.26
-    }
-    payload = {
-        "geohash": linha["codigo_geohash"], "score": linha["score"],
-        "routing_penalty": linha["routing_penalty"]
-    }
-    assert "routing_penalty" in payload
-    assert payload["routing_penalty"] > 1.0
+    df_falso = pd.DataFrame({"LATITUDE": ["-23.5"], "LONGITUDE": ["-46.6"], "BATATA": ["1"]})
+    df_corrigido = engine._construir_raw_operacional(df_falso, 2026)
+    assert "NATUREZA_APURADA" in df_corrigido.columns
+    assert "BATATA" not in df_corrigido.columns
+    assert df_corrigido["NATUREZA_APURADA"].dtype == 'object'
