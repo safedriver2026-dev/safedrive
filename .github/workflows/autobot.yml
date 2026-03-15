@@ -27,7 +27,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: datalake/
-          key: safedriver-datalake-${{ runner.os }}-${{ hashFiles('datalake/raw/*.parquet', 'datalake/metadata/*.json') }}
+          key: safedriver-datalake-${{ runner.os }}-${{ hashFiles('datalake/metadata/*.json') }}
           restore-keys: |
             safedriver-datalake-${{ runner.os }}-
             safedriver-datalake-
@@ -48,17 +48,6 @@ jobs:
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: |
           python -m autobot.autobot_engine
-
-      - name: Upload de artefatos
-        uses: actions/upload-artifact@v4
-        with:
-          name: safedriver-semanal
-          path: |
-            datalake/metadata/
-            datalake/refined/
-            datalake/trusted/
-          if-no-files-found: warn
-          retention-days: 30
 
       - name: Salvar Data Lake no repositorio
         run: |
