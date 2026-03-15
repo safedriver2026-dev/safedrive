@@ -24,14 +24,6 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Gerenciar Cache do Data Lake
-        uses: actions/cache@v4
-        with:
-          path: datalake/
-          key: safedriver-dl-${{ runner.os }}-${{ hashFiles('datalake/metadata/*.json') }}
-          restore-keys: |
-            safedriver-dl-${{ runner.os }}-
-
       - name: Instalar bibliotecas necessárias
         run: |
           python -m pip install --upgrade pip
@@ -47,17 +39,10 @@ jobs:
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -m autobot.autobot_engine
 
-      - name: Arquivar Relatórios de Observabilidade
-        uses: actions/upload-artifact@v4
-        with:
-          name: relatorios-safedriver
-          path: datalake/reports/
-          retention-days: 90
-
       - name: Sincronizar Base de Dados e Runbooks
         run: |
           git config --global user.name "SafeDriver Bot"
           git config --global user.email "bot@safedriver.com"
           git add datalake/
-          git commit -m "MLOps: Atualização de Dados e Relatórios [Automático]" || echo "Sem mudanças para salvar"
+          git commit -m "MLOps: Atualização de Dados e Relatórios [Automático]" || echo "Sem mudanças"
           git push
