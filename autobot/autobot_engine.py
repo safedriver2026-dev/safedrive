@@ -1,4 +1,4 @@
-import io, os, json, math, shutil, logging, unicodedata, warnings
+import io, os, json, math, shutil, hashlib, logging, unicodedata, warnings, difflib
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -8,7 +8,7 @@ import xgboost as xgb
 from firebase_admin import credentials, firestore
 from prophet import Prophet
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.cluster import DBSCAN
 from sklearn.model_selection import train_test_split
 from requests.adapters import HTTPAdapter
@@ -33,14 +33,11 @@ class MotorSafeDriver:
             "malha": {"Motorista": 0, "Motociclista": 0, "Pedestre": 0, "Ciclista": 0},
             "sincronizacao": {"avaliados": 0, "atualizados": 0, "removidos": 0}
         }
-
+        
         if not os.path.exists(self.lock):
             self.auditoria["modo"] = "HARD_RESET"
-            for s in ['raw', 'trusted', 'refined']:
-                p = f'datalake/{s}'
-                if os.path.exists(p):
-                    shutil.rmtree(p, ignore_errors=True)
-
+            if os.path.exists('datalake'): shutil.rmtree('datalake', ignore_errors=True)
+        
         for d in ['raw', 'trusted', 'refined', 'metadata']:
             os.makedirs(f'datalake/{d}', exist_ok=True)
 
@@ -58,71 +55,31 @@ class MotorSafeDriver:
         return firestore.client()
 
     def _limpar(self, t):
-        if pd.isna(t):
-            return ""
+        if pd.isna(t): return ""
         n = unicodedata.normalize('NFKD', str(t))
         return "".join([c for c in n if not unicodedata.combining(c)]).upper().strip()
 
     def _normalizar(self, n):
         l = self._limpar(n).replace(" ", "_")
         for k, v in DICIONARIO_SEMANTICO.items():
-            if l in v:
-                return k
+            if l in v: return k
         return l
 
-    def _normalizar_coord(self, valor, tipo):
-        if pd.isna(valor):
-            return np.nan
-        s = str(valor).strip()
-        if s == "":
-            return np.nan
-        s = s.replace("−", "-").replace("–", "-").replace("—", "-")
-        s = s.replace(" ", "")
-        if "," in s and "." in s:
-            if s.rfind(",") > s.rfind("."):
-                s = s.replace(".", "").replace(",", ".")
-            else:
-                s = s.replace(",", "")
-        elif "," in s:
-            s = s.replace(",", ".")
+    def _corrigir_ponto_decimal(self, v, is_lat=True):
         try:
-            v = float(s)
+            val = float(str(v).replace(',', '.'))
+            limit = 90 if is_lat else 180
+            if abs(val) > limit:
+                val /= 1_000_000
+            if abs(val) > limit:
+                return np.nan
+            return val
         except:
             return np.nan
 
-        lim = 90.0 if tipo == "lat" else 180.0
-
-        if -lim <= v <= lim:
-            return v
-
-        av = abs(v)
-        while av > lim and av >= 100:
-            v = v / 10.0
-            av = abs(v)
-
-        if -lim <= v <= lim:
-            return v
-
-        if tipo == "lat" and 1000000 <= abs(float(s.replace(".", "").replace("-", ""))) <= 999999999:
-            txt = s.replace(".", "").replace("-", "")
-            for casas in range(4, 9):
-                vv = float(txt) / (10 ** casas)
-                if -90 <= vv <= 90:
-                    return -abs(vv) if str(valor).strip().startswith("-") else vv
-
-        if tipo == "lon" and 1000000 <= abs(float(s.replace(".", "").replace("-", ""))) <= 999999999:
-            txt = s.replace(".", "").replace("-", "")
-            for casas in range(4, 9):
-                vv = float(txt) / (10 ** casas)
-                if -180 <= vv <= 180:
-                    return -abs(vv) if str(valor).strip().startswith("-") else vv
-
-        return np.nan
-
     def _notificar(self, s=True, e=None):
         u = os.environ.get('DISCORD_SUCESSO') if s else os.environ.get('DISCORD_ERRO')
-        if not u:
-            return
+        if not u: return
         pipeline_desc = "Relatorio Semanal SafeDriver\nPipeline executado com sucesso."
         m = {
             "embeds": [{
@@ -139,16 +96,14 @@ class MotorSafeDriver:
                 "footer": {"text": f"Duração: {(datetime.now() - self.inicio).total_seconds():.1f}s"}
             }]
         }
-        if not s:
-            m["embeds"][0]["fields"].append({"name": "Erro", "value": f"```{str(e)}```"})
+        if not s: m["embeds"][0]["fields"].append({"name": "Erro", "value": f"```{str(e)}```"})
         self.session.post(u, json=m)
 
     def _extrair(self, b):
         xl = pd.ExcelFile(io.BytesIO(b))
         ds = []
         for s in xl.sheet_names:
-            if any(x in s.upper() for x in ["CAMPOS", "METADADOS"]):
-                continue
+            if any(x in s.upper() for x in ["CAMPOS", "METADADOS"]): continue
             am = xl.parse(s, nrows=50, header=None)
             lh = 0
             for i, r in am.iterrows():
@@ -165,179 +120,98 @@ class MotorSafeDriver:
     def _qualificar(self, raw, a):
         df = raw.copy()
         for c in ESQUEMA_CANONICO.keys():
-            if c not in df.columns:
-                df[c] = np.nan
-
-        df['LATITUDE'] = df['LATITUDE'].apply(lambda x: self._normalizar_coord(x, 'lat'))
-        df['LONGITUDE'] = df['LONGITUDE'].apply(lambda x: self._normalizar_coord(x, 'lon'))
+            if c not in df.columns: df[c] = np.nan
+        
+        df['LATITUDE'] = df['LATITUDE'].apply(lambda x: self._corrigir_ponto_decimal(x, True))
+        df['LONGITUDE'] = df['LONGITUDE'].apply(lambda x: self._corrigir_ponto_decimal(x, False))
+        
         df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
-
         df = df.dropna(subset=['LATITUDE', 'LONGITUDE', 'DATA_OCORRENCIA_BO']).copy()
         df['DATA_OCORRENCIA_BO'] = df['DATA_OCORRENCIA_BO'].dt.normalize()
-
-        m_espacial = (
-            df['DATA_OCORRENCIA_BO'].between(self.janela, self.ref) &
-            df['LATITUDE'].between(LIMITES_GEOGRAFICOS['lat'][0], LIMITES_GEOGRAFICOS['lat'][1]) &
-            df['LONGITUDE'].between(LIMITES_GEOGRAFICOS['lon'][0], LIMITES_GEOGRAFICOS['lon'][1])
-        )
-
+        m_espacial = (df['DATA_OCORRENCIA_BO'].between(self.janela, self.ref)) & \
+                     (df['LATITUDE'].between(LIMITES_GEOGRAFICOS['lat'][0], LIMITES_GEOGRAFICOS['lat'][1])) & \
+                     (df['LONGITUDE'].between(LIMITES_GEOGRAFICOS['lon'][0], LIMITES_GEOGRAFICOS['lon'][1]))
         df_t = df[m_espacial].copy()
         self.auditoria["volumes"]["trusted"] += len(df_t)
-
         df_t['CRIME_DETECTADO'] = df_t['NATUREZA_APURADA'].apply(
             lambda x: next((k for k in CATALOGO_CRIMES.keys() if k in self._limpar(x)), None)
         )
-
         df_r = df_t.dropna(subset=['CRIME_DETECTADO']).copy()
         self.auditoria["volumes"]["refined_e"] = len(df_r)
         return df_t, df_r
 
     def _modelar(self, df_eventos):
-        if df_eventos.empty:
-            return pd.DataFrame(), pd.DataFrame()
-
+        if df_eventos.empty: return pd.DataFrame(), pd.DataFrame()
         df = df_eventos.copy()
-
-        df = df[
-            df['LATITUDE'].notna() &
-            df['LONGITUDE'].notna() &
-            df['LATITUDE'].between(-90, 90) &
-            df['LONGITUDE'].between(-180, 180)
-        ].copy()
-
-        if df.empty:
-            return pd.DataFrame(), pd.DataFrame()
-
-        df['pf'] = df.apply(
-            lambda x: [p for p, k in PALAVRAS_CHAVE_PERFIL.items() if any(z in str(x).upper() for z in k)] or ['Motorista'],
-            axis=1
-        )
+        df['pf'] = df.apply(lambda x: [p for p, k in PALAVRAS_CHAVE_PERFIL.items() if any(z in str(x).upper() for z in k)] or ['Motorista'], axis=1)
         df = df.explode('pf')
-
-        df['gh'] = [gh.encode(float(la), float(lo), precision=7) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
-        df['hr'] = pd.to_numeric(df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(\d{1,2})')[0], errors='coerce').fillna(0).astype(int)
+        df['gh'] = [gh.encode(la, lo, precision=7) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
+        df['hr'] = df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(\d+)').fillna(0).astype(int)
         df['pd'] = df['hr'].apply(lambda h: 'Noite' if h >= 18 or h < 6 else 'Dia')
         df['rc'] = (self.ref - df['DATA_OCORRENCIA_BO']).dt.days
         df['yw'] = np.exp(-df['rc'] / 180) * df['CRIME_DETECTADO'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
-
-        if len(df) >= 10:
-            cl = DBSCAN(eps=0.005, min_samples=10).fit(df[['LATITUDE', 'LONGITUDE']])
-            df['cl'] = cl.labels_
-        else:
-            df['cl'] = -1
-
-        pnl = df.groupby(['gh', 'pf', 'pd', 'DATA_OCORRENCIA_BO'], as_index=False).agg(
-            y=('yw', 'sum'),
-            v=('NUM_BO', 'count'),
-            la=('LATITUDE', 'mean'),
-            lo=('LONGITUDE', 'mean'),
-            c=('cl', 'max')
-        )
-
+        cl = DBSCAN(eps=0.005, min_samples=10).fit(df[['LATITUDE', 'LONGITUDE']])
+        df['cl'] = cl.labels_
+        pnl = df.groupby(['gh', 'pf', 'pd', 'DATA_OCORRENCIA_BO'], as_index=False).agg(y=('yw', 'sum'), v=('NUM_BO', 'count'), la=('LATITUDE', 'mean'), lo=('LONGITUDE', 'mean'), c=('cl', 'max'))
         self.auditoria["volumes"]["refined_m"] = len(pnl)
-
-        pnl = pnl.sort_values(['gh', 'pf', 'pd', 'DATA_OCORRENCIA_BO']).copy()
         pnl['target'] = pnl.groupby(['gh', 'pf', 'pd'])['y'].transform(lambda x: x.shift(-7).rolling(7, min_periods=1).sum())
-
         st = pnl.groupby('DATA_OCORRENCIA_BO')['v'].sum().reset_index().rename(columns={'DATA_OCORRENCIA_BO': 'ds', 'v': 'y'})
-
         if len(st) >= 2:
-            pp = Prophet()
-            pp.fit(st)
+            pp = Prophet().fit(st)
             pre = pp.predict(pp.make_future_dataframe(periods=14))[['ds', 'yhat']]
             pnl = pnl.merge(pre, left_on='DATA_OCORRENCIA_BO', right_on='ds', how='left')
             pnl['ft'] = pnl['yhat'] / max(pnl['yhat'].mean(), 1.0)
-        else:
-            pnl['ft'] = 1.0
-
-        pnl['ft'] = pnl['ft'].replace([np.inf, -np.inf], 1.0).fillna(1.0)
-
+        else: pnl['ft'] = 1.0
         return pnl, df
 
     def _finalizar(self, pnl, df_base):
-        if df_base.empty or pnl.empty:
-            return
-
+        if df_base.empty or pnl.empty: return
         val = pnl.dropna(subset=['target']).copy()
-
         if len(val) >= 2:
             tr, te = train_test_split(val, test_size=0.2, shuffle=False)
             self.auditoria["validacao"]["treino"], self.auditoria["validacao"]["teste"] = len(tr), len(te)
             fs = ['la', 'lo', 'c', 'ft']
-            md = xgb.XGBRegressor(n_estimators=100)
-            md.fit(tr[fs], tr['target'])
-            pred = md.predict(te[fs])
-            self.auditoria['validacao']['mae'] = mean_absolute_error(te['target'], pred)
-            self.auditoria['validacao']['rmse'] = math.sqrt(mean_squared_error(te['target'], pred))
+            md = xgb.XGBRegressor(n_estimators=100).fit(tr[fs], tr['target'])
+            self.auditoria['validacao']['mae'] = mean_absolute_error(te['target'], md.predict(te[fs]))
+            self.auditoria['validacao']['rmse'] = math.sqrt(mean_squared_error(te['target'], md.predict(te[fs])))
             grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'pf', 'pd']).tail(1).copy()
             grid['rs'] = np.clip(md.predict(grid[fs]), 0, None)
         else:
-            grid = pnl.copy()
+            grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'pf', 'pd']).tail(1).copy()
             grid['rs'] = grid['y']
-
+            
         scaler = MinMaxScaler(feature_range=(0, 100))
         grid['score'] = scaler.fit_transform(grid[['rs']]).round(1)
         grid['penalty'] = (1.0 + (grid['score'] / 50.0)).round(2)
-
+        
         counts = grid['pf'].value_counts().to_dict()
-        for p in self.auditoria["malha"]:
-            self.auditoria["malha"][p] = counts.get(p, 0)
-
+        for p in self.auditoria["malha"]: self.auditoria["malha"][p] = counts.get(p, 0)
+        
         bi_path = 'datalake/refined/power_bi_visualizacao.csv'
-        df_base.merge(grid[['gh', 'pf', 'pd', 'score', 'penalty']], on=['gh', 'pf', 'pd'], how='left').to_csv(
-            bi_path, index=False, sep=';', encoding='utf-8-sig'
-        )
-
+        df_base.merge(grid[['gh', 'pf', 'pd', 'score', 'penalty']], on=['gh', 'pf', 'pd'], how='left').to_csv(bi_path, index=False, sep=';', encoding='utf-8-sig')
+        
         if self.db:
             col = self.db.collection('niveis_risco')
             vs, l, o = set(), self.db.batch(), 0
             ats = {d.id: d.to_dict().get('score') for d in col.stream()}
-
             for _, r in grid.iterrows():
                 did = f"{r['gh']}_{r['pf']}_{r['pd']}"
-                vs.add(did)
-                sc = float(r['score'])
-
+                vs.add(did); sc = float(r['score'])
                 if did not in ats or ats[did] != sc:
-                    l.set(
-                        col.document(did),
-                        {
-                            'score': sc,
-                            'penalty': float(r['penalty']),
-                            'geohash': r['gh'],
-                            'prefix': r['gh'][:4],
-                            'perfil': r['pf'],
-                            'periodo': r['pd'],
-                            'ts': firestore.SERVER_TIMESTAMP
-                        },
-                        merge=True
-                    )
-                    o += 1
-                    self.auditoria["sincronizacao"]["atualizados"] += 1
-
+                    l.set(col.document(did), {'score': sc, 'penalty': float(r['penalty']), 'geohash': r['gh'], 'prefix': r['gh'][:4], 'perfil': r['pf'], 'periodo': r['pd'], 'ts': firestore.SERVER_TIMESTAMP}, merge=True)
+                    o += 1; self.auditoria["sincronizacao"]["atualizados"] += 1
                 self.auditoria["sincronizacao"]["avaliados"] += 1
-
-                if o >= 450:
-                    l.commit()
-                    l, o = self.db.batch(), 0
-
+                if o >= 450: l.commit(); l, o = self.db.batch(), 0
             for rid in ats.keys():
                 if rid not in vs:
-                    l.delete(col.document(rid))
-                    o += 1
-                    self.auditoria["sincronizacao"]["removidos"] += 1
-                    if o >= 450:
-                        l.commit()
-                        l, o = self.db.batch(), 0
-
-            if o > 0:
-                l.commit()
+                    l.delete(col.document(rid)); o += 1; self.auditoria["sincronizacao"]["removidos"] += 1
+                    if o >= 450: l.commit(); l, o = self.db.batch(), 0
+            if o > 0: l.commit()
 
     def rodar(self):
         try:
             m = pd.DataFrame()
             anos = range(2022, self.inicio.year + 1) if self.auditoria["modo"] == "HARD_RESET" else [self.inicio.year]
-
             for a in anos:
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{a}.xlsx"
                 r = self.session.get(url, timeout=600)
@@ -346,21 +220,13 @@ class MotorSafeDriver:
                     self.auditoria["volumes"]["raw"] += len(df)
                     df.to_parquet(f'datalake/raw/ssp_{a}.parquet', index=False)
                     t, d = self._qualificar(df, a)
-                    if not d.empty:
-                        m = pd.concat([m, d], ignore_index=True)
-
+                    if not d.empty: m = pd.concat([m, d], ignore_index=True)
             if not m.empty:
                 p, b = self._modelar(m)
                 self._finalizar(p, b)
-
-            with open(self.lock, 'w') as f:
-                f.write(str(datetime.now()))
-
+            with open(self.lock, 'w') as f: f.write(str(datetime.now()))
             self._notificar(True)
-
-        except Exception as e:
-            self._notificar(False, e)
-            raise
+        except Exception as e: self._notificar(False, e); raise
 
 if __name__ == "__main__":
     MotorSafeDriver().rodar()
