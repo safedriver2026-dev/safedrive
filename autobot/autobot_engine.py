@@ -33,7 +33,7 @@ class MotorSafeDriver:
         
         if not os.path.exists(self.lock):
             self.auditoria["modo"] = "HARD_RESET"
-            for s in ['raw', 'trusted']:
+            for s in ['raw', 'trusted', 'refined']:
                 p = f'datalake/{s}'
                 if os.path.exists(p): shutil.rmtree(p, ignore_errors=True)
         
@@ -62,11 +62,11 @@ class MotorSafeDriver:
         u = os.environ.get('DISCORD_SUCESSO') if s else os.environ.get('DISCORD_ERRO')
         if not u: return
         
-        pipeline_desc = "Pipeline executado com HARD_RESET." if self.auditoria["modo"] == "HARD_RESET" else "Pipeline executado reutilizando o RAW local."
+        pipeline_desc = "Relatorio Semanal SafeDriver\nPipeline executado com HARD_RESET." if self.auditoria["modo"] == "HARD_RESET" else "Relatorio Semanal SafeDriver\nPipeline executado reutilizando o RAW local."
         
         m = {
             "embeds": [{
-                "title": "Relatorio Semanal SafeDriver",
+                "title": "SafeDriver Supreme Engine Status",
                 "description": pipeline_desc,
                 "color": 3066993 if s else 15158332,
                 "fields": [
@@ -76,7 +76,7 @@ class MotorSafeDriver:
                     {"name": "Malha operacional", "value": f"Motorista: {self.auditoria['malha']['Motorista']:,}\nMotociclista: {self.auditoria['malha']['Motociclista']:,}\nPedestre: {self.auditoria['malha']['Pedestre']:,}\nCiclista: {self.auditoria['malha']['Ciclista']:,}", "inline": True},
                     {"name": "Firestore", "value": f"Avaliados: {self.auditoria['sincronizacao']['avaliados']:,}\nAtualizados: {self.auditoria['sincronizacao']['atualizados']:,}\nRemovidos: {self.auditoria['sincronizacao']['removidos']:,}", "inline": True}
                 ],
-                "footer": {"text": f"Execução concluída em {(datetime.now() - self.inicio).total_seconds():.1f}s"}
+                "footer": {"text": f"Duração: {(datetime.now() - self.inicio).total_seconds():.1f}s"}
             }]
         }
         if not s: m["embeds"][0]["fields"].append({"name": "Erro", "value": f"```{str(e)}```"})
@@ -145,31 +145,33 @@ class MotorSafeDriver:
         return pnl, df
 
     def _finalizar(self, pnl, df_base):
+        if df_base.empty: return
         val = pnl.dropna(subset=['target']).copy()
-        if val.empty: return
-        tr, te = train_test_split(val, test_size=0.2, shuffle=False)
-        self.auditoria["validacao"]["treino"] = len(tr)
-        self.auditoria["validacao"]["teste"] = len(te)
-        fs = ['la', 'lo', 'c', 'ft']
-        md = xgb.XGBRegressor(n_estimators=100).fit(tr[fs], tr['target'])
-        self.auditoria['validacao']['mae'] = mean_absolute_error(te['target'], md.predict(te[fs]))
-        self.auditoria['validacao']['rmse'] = math.sqrt(mean_squared_error(te['target'], md.predict(te[fs])))
         
-        grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'pf', 'pd']).tail(1).copy()
-        grid['rs'] = np.clip(md.predict(grid[fs]), 0, None)
+        if len(val) >= 2:
+            tr, te = train_test_split(val, test_size=0.2, shuffle=False)
+            self.auditoria["validacao"]["treino"], self.auditoria["validacao"]["teste"] = len(tr), len(te)
+            fs = ['la', 'lo', 'c', 'ft']
+            md = xgb.XGBRegressor(n_estimators=100).fit(tr[fs], tr['target'])
+            self.auditoria['validacao']['mae'] = mean_absolute_error(te['target'], md.predict(te[fs]))
+            self.auditoria['validacao']['rmse'] = math.sqrt(mean_squared_error(te['target'], md.predict(te[fs])))
+            grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'pf', 'pd']).tail(1).copy()
+            grid['rs'] = np.clip(md.predict(grid[fs]), 0, None)
+        else:
+            grid = pnl.copy()
+            grid['rs'] = grid['y']
+            
         scaler = MinMaxScaler(feature_range=(0, 100))
         grid['score'] = scaler.fit_transform(grid[['rs']]).round(1)
         grid['penalty'] = (1.0 + (grid['score'] / 50.0)).round(2)
         
-        counts = grid['pf'].value_counts().to_dict()
-        for p in self.auditoria["malha"]: self.auditoria["malha"][p] = counts.get(p, 0)
-
+        for p in self.auditoria["malha"]: self.auditoria["malha"][p] = grid[grid['pf']==p].shape[0]
+        
         df_base.merge(grid[['gh', 'pf', 'pd', 'score', 'penalty']], on=['gh', 'pf', 'pd'], how='left').to_csv('datalake/refined/power_bi_visualizacao.csv', index=False, sep=';', encoding='utf-8-sig')
-
+        
         if self.db:
             col = self.db.collection('niveis_risco')
-            vs = set()
-            l, o = self.db.batch(), 0
+            vs, l, o = set(), self.db.batch(), 0
             ats = {d.id: d.to_dict().get('score') for d in col.stream()}
             for _, r in grid.iterrows():
                 did = f"{r['gh']}_{r['pf']}_{r['pd']}"
