@@ -1,16 +1,20 @@
 CATALOGO_CRIMES = {
-    "LATROCINIO": {"peso": 5.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
-    "EXTORSAO": {"peso": 5.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
-    "ROUBO": {"peso": 4.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
-    "FURTO": {"peso": 3.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
-    "DANO": {"peso": 2.0, "perfis": ["Motorista", "Motociclista"]},
-    "HOMICIDIO": {"peso": 5.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]}
+    "LATROCINIO": {"peso": 5.0},
+    "EXTORSAO MEDIANTE SEQUESTRO": {"peso": 5.0},
+    "ROUBO DE VEICULO": {"peso": 4.0},
+    "ROUBO DE CARGA": {"peso": 4.0},
+    "ROUBO A TRANSEUNTE": {"peso": 4.0},
+    "FURTO DE VEICULO": {"peso": 3.0},
+    "FURTO DE CARGA": {"peso": 3.0},
+    "FURTO DE CELULAR": {"peso": 3.0},
+    "DANO": {"peso": 2.0},
+    "OUTROS": {"peso": 1.0}
 }
 
 PALAVRAS_CHAVE_PERFIL = {
     "Ciclista": ["BICI", "CICLO", "BICICLETA", "PEDALAR"],
     "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY"],
-    "Motorista": ["VEICULO", "CARGA", "CARRO", "CAMINHAO", "AUTOMOVEL", "ESTACIONAMENTO"],
+    "Motorista": ["VEICULO", "CARGA", "CARRO", "CAMINHAO", "AUTOMOVEL"],
     "Pedestre": ["TRANSEUNTE", "CELULAR", "PEDESTRE", "CALCADA", "PONTO DE ONIBUS"],
 }
 
