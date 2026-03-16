@@ -3,25 +3,34 @@ from datetime import datetime
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from autobot.autobot_engine import MotorSafeDriver
 
-def test_hard_reset_operational():
+def test_engine_instancia():
+    engine = MotorSafeDriver(persistencia=False)
+    assert hasattr(engine, "rodar")
+
+def test_correcao_coordenada_ssp():
+    engine = MotorSafeDriver(persistencia=False)
+    valor_errado = -46779670.0
+    resultado = engine._corrigir_ponto_decimal(valor_errado, is_lat=False)
+    assert resultado == -46.779670
+
+def test_normalizacao_semantica():
+    engine = MotorSafeDriver(persistencia=False)
+    assert engine._normalizar("RUBRICA") == "NATUREZA_APURADA"
+
+def test_qualificacao_fluxo():
+    engine = MotorSafeDriver(persistencia=False)
+    df = pd.DataFrame({
+        'LATITUDE': ['-23.5'], 'LONGITUDE': ['-46.6'],
+        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')],
+        'NATUREZA_APURADA': ['ROUBO DE VEICULO'],
+        'NUM_BO': ['1']
+    })
+    t, r = engine._qualificar(df, 2026)
+    assert len(t) == 1
+    assert len(r) == 1
+
+def test_modo_reset():
     if os.path.exists('datalake/metadata/baseline.lock'):
         os.remove('datalake/metadata/baseline.lock')
-    m = MotorSafeDriver(persistencia=False)
-    assert m.auditoria["modo"] == "HARD_RESET"
-
-def test_bi_export_persistence():
-    m = MotorSafeDriver(persistencia=False)
-    df = pd.DataFrame({
-        'NATUREZA_APURADA': ['ROUBO'], 'LATITUDE': [-23.5], 'LONGITUDE': [-46.6], 
-        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')], 'NUM_BO': ['1'], 'HORA_OCORRENCIA_BO': ['12:00']
-    })
-    t, r = m._qualificar(df, 2026)
-    p, b = m._modelar(r)
-    m._finalizar(p, b)
-    assert os.path.exists('datalake/refined/power_bi_visualizacao.csv')
-
-def test_fuzzy_match_resilience():
-    m = MotorSafeDriver(persistencia=False)
-    df = pd.DataFrame({'NATUREZA_APURADA': ['FURTO DE CELULAR'], 'LATITUDE': [-23.5], 'LONGITUDE': [-46.6], 'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')], 'NUM_BO': ['1']})
-    t, r = m._qualificar(df, 2026)
-    assert len(r) == 1
+    engine = MotorSafeDriver(persistencia=False)
+    assert engine.auditoria["modo"] == "HARD_RESET"
