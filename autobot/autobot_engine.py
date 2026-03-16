@@ -114,17 +114,15 @@ class MotorSafeDriver:
             df = xl.parse(s, skiprows=lh, dtype=str)
             df.columns = [self._normalizar(c) for c in df.columns]
             df = df.loc[:, ~df.columns.duplicated()].copy()
-            dfs.append(df)
-        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+            ds.append(df)
+        return pd.concat(ds, ignore_index=True) if ds else pd.DataFrame()
 
     def _qualificar(self, raw, a):
         df = raw.copy()
         for c in ESQUEMA_CANONICO.keys():
             if c not in df.columns: df[c] = np.nan
-        
         df['LATITUDE'] = df['LATITUDE'].apply(lambda x: self._corrigir_ponto_decimal(x, True))
         df['LONGITUDE'] = df['LONGITUDE'].apply(lambda x: self._corrigir_ponto_decimal(x, False))
-        
         df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
         df = df.dropna(subset=['LATITUDE', 'LONGITUDE', 'DATA_OCORRENCIA_BO']).copy()
         df['DATA_OCORRENCIA_BO'] = df['DATA_OCORRENCIA_BO'].dt.normalize()
@@ -186,9 +184,6 @@ class MotorSafeDriver:
         
         counts = grid['pf'].value_counts().to_dict()
         for p in self.auditoria["malha"]: self.auditoria["malha"][p] = counts.get(p, 0)
-        
-        bi_path = 'datalake/refined/power_bi_visualizacao.csv'
-        df_base.merge(grid[['gh', 'pf', 'pd', 'score', 'penalty']], on=['gh', 'pf', 'pd'], how='left').to_csv(bi_path, index=False, sep=';', encoding='utf-8-sig')
         
         if self.db:
             col = self.db.collection('niveis_risco')
