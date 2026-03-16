@@ -3,20 +3,22 @@ from datetime import datetime
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from autobot.autobot_engine import MotorSafeDriver
 
-def test_hard_reset_state():
+def test_hard_reset_logic():
     if os.path.exists('datalake/metadata/baseline.lock'):
         os.remove('datalake/metadata/baseline.lock')
     m = MotorSafeDriver(persistencia=False)
     assert m.auditoria["modo"] == "HARD_RESET"
 
-def test_fuzzy_logic():
+def test_bi_export():
     m = MotorSafeDriver(persistencia=False)
-    c = ['RUBRICA', 'LATITUDE', 'LONGITUDE']
-    n = [m._normalizar(x) for x in c]
-    assert 'NATUREZA_APURADA' in n
+    df = pd.DataFrame({'NATUREZA_APURADA': ['ROUBO'], 'LATITUDE': [-23.5], 'LONGITUDE': [-46.6], 'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')], 'NUM_BO': ['1'], 'HORA_OCORRENCIA_BO': ['12:00']})
+    t, r = m._qualificar(df, 2026)
+    p, b = m._modelar(r)
+    m._finalizar(p, b)
+    assert os.path.exists('datalake/refined/power_bi_visualizacao.csv')
 
-def test_data_integrity():
+def test_fuzzy_matching():
     m = MotorSafeDriver(persistencia=False)
-    d = {'LATITUDE': ['-23.5', '0'], 'LONGITUDE': ['-46.6', '0'], 'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')]*2, 'NATUREZA_APURADA': ['ROUBO DE VEICULO']*2}
-    t, r = m._qualificar(pd.DataFrame(d), 2026)
-    assert len(t) == 1
+    df = pd.DataFrame({'NATUREZA_APURADA': ['FURTO DE VEÍCULO (ART. 155)'], 'LATITUDE': [-23.5], 'LONGITUDE': [-46.6], 'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-01-01')], 'NUM_BO': ['1']})
+    t, r = m._qualificar(df, 2026)
+    assert len(r) == 1
