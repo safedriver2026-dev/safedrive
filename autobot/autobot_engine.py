@@ -25,10 +25,10 @@ class MotorSafeDriver:
         self.db = self._conectar() if persistencia else None
         self.auditoria = {
             "modo": "INCREMENTAL",
-            "vols": {"raw": 0, "trusted": 0, "refined_e": 0, "refined_m": 0},
-            "valid": {"mae": 0.0, "rmse": 0.0},
-            "mesh": {"Motorista": 0, "Motociclista": 0, "Pedestre": 0, "Ciclista": 0},
-            "sync": {"avaliados": 0, "atualizados": 0, "removidos": 0}
+            "volumes": {"raw": 0, "trusted": 0, "refined_e": 0, "refined_m": 0},
+            "validacao": {"treino": 0, "teste": 0, "mae": 0.0, "rmse": 0.0},
+            "malha": {"Motorista": 0, "Motociclista": 0, "Pedestre": 0, "Ciclista": 0},
+            "sincronizacao": {"avaliados": 0, "atualizados": 0, "removidos": 0}
         }
         
         if not os.path.exists(self.lock):
@@ -61,17 +61,22 @@ class MotorSafeDriver:
     def _notificar(self, s=True, e=None):
         u = os.environ.get('DISCORD_SUCESSO') if s else os.environ.get('DISCORD_ERRO')
         if not u: return
+        
+        pipeline_desc = "Pipeline executado com HARD_RESET." if self.auditoria["modo"] == "HARD_RESET" else "Pipeline executado reutilizando o RAW local."
+        
         m = {
             "embeds": [{
-                "title": "🤖 SafeDriver Supreme Engine",
-                "description": f"Modo: {self.auditoria['modo']}",
+                "title": "Relatorio Semanal SafeDriver",
+                "description": pipeline_desc,
                 "color": 3066993 if s else 15158332,
                 "fields": [
-                    {"name": "Camadas", "value": f"RAW: {self.auditoria['vols']['raw']}\nTRUSTED: {self.auditoria['vols']['trusted']}\nREFINED: {self.auditoria['vols']['refined_m']}", "inline": True},
-                    {"name": "Performance", "value": f"MAE: {self.auditoria['valid']['mae']:.4f}\nRMSE: {self.auditoria['valid']['rmse']:.4f}", "inline": True},
-                    {"name": "Delta Sync", "value": f"Alt: {self.auditoria['sync']['atualizados']}\nRem: {self.auditoria['sync']['removidos']}", "inline": True}
+                    {"name": "Janela de processamento", "value": f"{self.janela.strftime('%Y-%m-%d')} ate {self.ref.strftime('%Y-%m-%d')}", "inline": False},
+                    {"name": "Camadas", "value": f"RAW: {self.auditoria['volumes']['raw']:,}\nTRUSTED: {self.auditoria['volumes']['trusted']:,}\nREFINED_EVENTOS: {self.auditoria['volumes']['refined_e']:,}\nREFINED_MODELAGEM: {self.auditoria['volumes']['refined_m']:,}", "inline": True},
+                    {"name": "Validacao temporal", "value": f"Treino: {self.auditoria['validacao']['treino']:,}\nTeste: {self.auditoria['validacao']['teste']:,}\nMAE: {self.auditoria['validacao']['mae']:.4f}\nRMSE: {self.auditoria['validacao']['rmse']:.4f}", "inline": True},
+                    {"name": "Malha operacional", "value": f"Motorista: {self.auditoria['malha']['Motorista']:,}\nMotociclista: {self.auditoria['malha']['Motociclista']:,}\nPedestre: {self.auditoria['malha']['Pedestre']:,}\nCiclista: {self.auditoria['malha']['Ciclista']:,}", "inline": True},
+                    {"name": "Firestore", "value": f"Avaliados: {self.auditoria['sincronizacao']['avaliados']:,}\nAtualizados: {self.auditoria['sincronizacao']['atualizados']:,}\nRemovidos: {self.auditoria['sincronizacao']['removidos']:,}", "inline": True}
                 ],
-                "footer": {"text": f"Duração: {(datetime.now() - self.inicio).total_seconds():.1f}s"}
+                "footer": {"text": f"Execução concluída em {(datetime.now() - self.inicio).total_seconds():.1f}s"}
             }]
         }
         if not s: m["embeds"][0]["fields"].append({"name": "Erro", "value": f"```{str(e)}```"})
@@ -86,7 +91,7 @@ class MotorSafeDriver:
             lh = 0
             for i, r in am.iterrows():
                 ts = [self._limpar(str(v)) for v in r.values]
-                if any(k in ts for k in ['NUM_BO', 'NATUREZA_APURADA', 'LATITUDE']):
+                if any(k in ts for k in ['NUM_BO', 'NATUREZA_APURADA', 'LATITUDE', 'RUBRICA']):
                     lh = i
                     break
             df = xl.parse(s, skiprows=lh, dtype=str)
@@ -104,52 +109,63 @@ class MotorSafeDriver:
         df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
         df = df.dropna(subset=['LATITUDE', 'LONGITUDE', 'DATA_OCORRENCIA_BO']).copy()
         df['DATA_OCORRENCIA_BO'] = df['DATA_OCORRENCIA_BO'].dt.normalize()
-        m = (df['DATA_OCORRENCIA_BO'].between(self.janela, self.ref)) & \
-            (df['LATITUDE'].between(LIMITES_GEOGRAFICOS['lat'][0], LIMITES_GEOGRAFICOS['lat'][1]))
-        df_t = df[m].copy()
-        self.auditoria["vols"]["trusted"] += len(df_t)
-        df_r = df_t[df_t['NATUREZA_APURADA'].isin(CATALOGO_CRIMES.keys())].copy()
+        m_espacial = (df['DATA_OCORRENCIA_BO'].between(self.janela, self.ref)) & \
+                     (df['LATITUDE'].between(LIMITES_GEOGRAFICOS['lat'][0], LIMITES_GEOGRAFICOS['lat'][1]))
+        df_t = df[m_espacial].copy()
+        self.auditoria["volumes"]["trusted"] += len(df_t)
+        df_t['CRIME_DETECTADO'] = df_t['NATUREZA_APURADA'].apply(
+            lambda x: next((k for k in CATALOGO_CRIMES.keys() if k in self._limpar(x)), None)
+        )
+        df_r = df_t.dropna(subset=['CRIME_DETECTADO']).copy()
+        self.auditoria["volumes"]["refined_e"] = len(df_r)
         return df_t, df_r
 
-    def _prever(self, evs):
-        df = evs.copy()
+    def _modelar(self, df_eventos):
+        if df_eventos.empty: return pd.DataFrame(), pd.DataFrame()
+        df = df_eventos.copy()
         df['pf'] = df.apply(lambda x: [p for p, k in PALAVRAS_CHAVE_PERFIL.items() if any(z in str(x).upper() for z in k)] or ['Motorista'], axis=1)
         df = df.explode('pf')
         df['gh'] = [gh.encode(la, lo, precision=7) for la, lo in zip(df['LATITUDE'], df['LONGITUDE'])]
         df['hr'] = df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(\d+)').fillna(0).astype(int)
         df['pd'] = df['hr'].apply(lambda h: 'Noite' if h >= 18 or h < 6 else 'Dia')
         df['rc'] = (self.ref - df['DATA_OCORRENCIA_BO']).dt.days
-        df['yw'] = np.exp(-df['rc'] / 180) * df['NATUREZA_APURADA'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
+        df['yw'] = np.exp(-df['rc'] / 180) * df['CRIME_DETECTADO'].apply(lambda x: CATALOGO_CRIMES.get(x, {}).get('peso', 1.0))
         cl = DBSCAN(eps=0.005, min_samples=10).fit(df[['LATITUDE', 'LONGITUDE']])
         df['cl'] = cl.labels_
         pnl = df.groupby(['gh', 'pf', 'pd', 'DATA_OCORRENCIA_BO'], as_index=False).agg(y=('yw', 'sum'), v=('NUM_BO', 'count'), la=('LATITUDE', 'mean'), lo=('LONGITUDE', 'mean'), c=('cl', 'max'))
-        self.auditoria["vols"]["refined_m"] = len(pnl)
+        self.auditoria["volumes"]["refined_m"] = len(pnl)
         pnl['target'] = pnl.groupby(['gh', 'pf', 'pd'])['y'].transform(lambda x: x.shift(-7).rolling(7, min_periods=1).sum())
         st = pnl.groupby('DATA_OCORRENCIA_BO')['v'].sum().reset_index().rename(columns={'DATA_OCORRENCIA_BO': 'ds', 'v': 'y'})
         if len(st) >= 2:
-            pp = Prophet(yearly_seasonality=True).fit(st)
+            pp = Prophet().fit(st)
             pre = pp.predict(pp.make_future_dataframe(periods=14))[['ds', 'yhat']]
             pnl = pnl.merge(pre, left_on='DATA_OCORRENCIA_BO', right_on='ds', how='left')
             pnl['ft'] = pnl['yhat'] / max(pnl['yhat'].mean(), 1.0)
         else: pnl['ft'] = 1.0
-        return pnl
+        return pnl, df
 
-    def _sync(self, pnl):
+    def _finalizar(self, pnl, df_base):
         val = pnl.dropna(subset=['target']).copy()
         if val.empty: return
         tr, te = train_test_split(val, test_size=0.2, shuffle=False)
+        self.auditoria["validacao"]["treino"] = len(tr)
+        self.auditoria["validacao"]["teste"] = len(te)
         fs = ['la', 'lo', 'c', 'ft']
         md = xgb.XGBRegressor(n_estimators=100).fit(tr[fs], tr['target'])
-        self.auditoria['valid']['mae'] = mean_absolute_error(te['target'], md.predict(te[fs]))
-        self.auditoria['valid']['rmse'] = math.sqrt(mean_squared_error(te['target'], md.predict(te[fs])))
+        self.auditoria['validacao']['mae'] = mean_absolute_error(te['target'], md.predict(te[fs]))
+        self.auditoria['validacao']['rmse'] = math.sqrt(mean_squared_error(te['target'], md.predict(te[fs])))
+        
         grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'pf', 'pd']).tail(1).copy()
         grid['rs'] = np.clip(md.predict(grid[fs]), 0, None)
         scaler = MinMaxScaler(feature_range=(0, 100))
-        grid['sc'] = scaler.fit_transform(grid[['rs']]).round(1)
-        grid['pt'] = (1.0 + (grid['sc'] / 50.0)).round(2)
-        counts = grid['pf'].value_counts().to_dict()
-        for k in self.auditoria["mesh"]: self.auditoria["mesh"][k] = counts.get(k, 0)
+        grid['score'] = scaler.fit_transform(grid[['rs']]).round(1)
+        grid['penalty'] = (1.0 + (grid['score'] / 50.0)).round(2)
         
+        counts = grid['pf'].value_counts().to_dict()
+        for p in self.auditoria["malha"]: self.auditoria["malha"][p] = counts.get(p, 0)
+
+        df_base.merge(grid[['gh', 'pf', 'pd', 'score', 'penalty']], on=['gh', 'pf', 'pd'], how='left').to_csv('datalake/refined/power_bi_visualizacao.csv', index=False, sep=';', encoding='utf-8-sig')
+
         if self.db:
             col = self.db.collection('niveis_risco')
             vs = set()
@@ -158,18 +174,14 @@ class MotorSafeDriver:
             for _, r in grid.iterrows():
                 did = f"{r['gh']}_{r['pf']}_{r['pd']}"
                 vs.add(did)
-                sc = float(r['sc'])
-                if did not in ats or ats[did] != sc:
-                    l.set(col.document(did), {'score': sc, 'penalty': float(r['pt']), 'geohash': r['gh'], 'prefix': r['gh'][:4], 'perfil': r['pf'], 'periodo': r['pd'], 'ts': firestore.SERVER_TIMESTAMP}, merge=True)
-                    o += 1
-                    self.auditoria["sync"]["atualizados"] += 1
-                self.auditoria["sync"]["avaliados"] += 1
+                if did not in atuais or atuais[did] != float(r['score']):
+                    l.set(col.document(did), {'score': float(r['score']), 'penalty': float(r['penalty']), 'geohash': r['gh'], 'prefix': r['gh'][:4], 'perfil': r['pf'], 'periodo': r['pd'], 'ts': firestore.SERVER_TIMESTAMP}, merge=True)
+                    o += 1; self.auditoria["sincronizacao"]["atualizados"] += 1
+                self.auditoria["sincronizacao"]["avaliados"] += 1
                 if o >= 450: l.commit(); l, o = self.db.batch(), 0
             for rid in ats.keys():
                 if rid not in vs:
-                    l.delete(col.document(rid))
-                    o += 1
-                    self.auditoria["sync"]["removidos"] += 1
+                    l.delete(col.document(rid)); o += 1; self.auditoria["sincronizacao"]["removidos"] += 1
                     if o >= 450: l.commit(); l, o = self.db.batch(), 0
             if o > 0: l.commit()
 
@@ -181,13 +193,13 @@ class MotorSafeDriver:
                 r = requests.get(f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{a}.xlsx", timeout=180)
                 if r.status_code == 200:
                     df = self._extrair(r.content)
-                    self.auditoria["vols"]["raw"] += len(df)
+                    self.auditoria["volumes"]["raw"] += len(df)
                     df.to_parquet(f'datalake/raw/ssp_{a}.parquet', index=False)
                     t, d = self._qualificar(df, a)
                     if not d.empty: m = pd.concat([m, d], ignore_index=True)
             if not m.empty:
-                p = self._prever(m)
-                self._sync(p)
+                p, b = self._modelar(m)
+                self._finalizar(p, b)
             with open(self.lock, 'w') as f: f.write(str(datetime.now()))
             self._notificar(True)
         except Exception as e: self._notificar(False, e); raise
