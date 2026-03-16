@@ -11,6 +11,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.cluster import DBSCAN
 from sklearn.model_selection import train_test_split
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from autobot.config import *
 
 warnings.filterwarnings("ignore")
@@ -23,6 +25,7 @@ class MotorSafeDriver:
         self.janela = self.ref - pd.Timedelta(days=730)
         self.lock = 'datalake/metadata/baseline.lock'
         self.db = self._conectar() if persistencia else None
+        self.session = self._criar_sessao_resiliente()
         self.auditoria = {
             "modo": "INCREMENTAL",
             "volumes": {"raw": 0, "trusted": 0, "refined_e": 0, "refined_m": 0},
@@ -39,6 +42,12 @@ class MotorSafeDriver:
         
         for d in ['raw', 'trusted', 'refined', 'metadata']:
             os.makedirs(f'datalake/{d}', exist_ok=True)
+
+    def _criar_sessao_resiliente(self):
+        s = requests.Session()
+        retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        s.mount('https://', HTTPAdapter(max_retries=retries))
+        return s
 
     def _conectar(self):
         c = os.environ.get('FIREBASE_JSON')
@@ -61,33 +70,31 @@ class MotorSafeDriver:
     def _notificar(self, s=True, e=None):
         u = os.environ.get('DISCORD_SUCESSO') if s else os.environ.get('DISCORD_ERRO')
         if not u: return
-        
-        pipeline_desc = "Relatorio Semanal SafeDriver\nPipeline executado com HARD_RESET." if self.auditoria["modo"] == "HARD_RESET" else "Relatorio Semanal SafeDriver\nPipeline executado reutilizando o RAW local."
-        
+        pipeline_desc = "Relatorio Semanal SafeDriver\nPipeline executado com sucesso."
         m = {
             "embeds": [{
-                "title": "SafeDriver Supreme Engine Status",
+                "title": f"🛡️ SafeDriver Engine: {self.auditoria['modo']}",
                 "description": pipeline_desc,
                 "color": 3066993 if s else 15158332,
                 "fields": [
-                    {"name": "Janela de processamento", "value": f"{self.janela.strftime('%Y-%m-%d')} ate {self.ref.strftime('%Y-%m-%d')}", "inline": False},
-                    {"name": "Camadas", "value": f"RAW: {self.auditoria['volumes']['raw']:,}\nTRUSTED: {self.auditoria['volumes']['trusted']:,}\nREFINED_EVENTOS: {self.auditoria['volumes']['refined_e']:,}\nREFINED_MODELAGEM: {self.auditoria['volumes']['refined_m']:,}", "inline": True},
-                    {"name": "Validacao temporal", "value": f"Treino: {self.auditoria['validacao']['treino']:,}\nTeste: {self.auditoria['validacao']['teste']:,}\nMAE: {self.auditoria['validacao']['mae']:.4f}\nRMSE: {self.auditoria['validacao']['rmse']:.4f}", "inline": True},
-                    {"name": "Malha operacional", "value": f"Motorista: {self.auditoria['malha']['Motorista']:,}\nMotociclista: {self.auditoria['malha']['Motociclista']:,}\nPedestre: {self.auditoria['malha']['Pedestre']:,}\nCiclista: {self.auditoria['malha']['Ciclista']:,}", "inline": True},
-                    {"name": "Firestore", "value": f"Avaliados: {self.auditoria['sincronizacao']['avaliados']:,}\nAtualizados: {self.auditoria['sincronizacao']['atualizados']:,}\nRemovidos: {self.auditoria['sincronizacao']['removidos']:,}", "inline": True}
+                    {"name": "Janela", "value": f"{self.janela.strftime('%Y-%m-%d')} a {self.ref.strftime('%Y-%m-%d')}", "inline": False},
+                    {"name": "Camadas", "value": f"RAW: {self.auditoria['volumes']['raw']:,}\nTRUSTED: {self.auditoria['volumes']['trusted']:,}\nREFINED: {self.auditoria['volumes']['refined_e']:,}", "inline": True},
+                    {"name": "Performance", "value": f"MAE: {self.auditoria['validacao']['mae']:.4f}\nRMSE: {self.auditoria['validacao']['rmse']:.4f}", "inline": True},
+                    {"name": "Malha", "value": "\n".join([f"{k}: {v:,}" for k, v in self.auditoria['malha'].items()]), "inline": True},
+                    {"name": "Cloud", "value": f"Atualizados: {self.auditoria['sincronizacao']['atualizados']:,}", "inline": True}
                 ],
                 "footer": {"text": f"Duração: {(datetime.now() - self.inicio).total_seconds():.1f}s"}
             }]
         }
         if not s: m["embeds"][0]["fields"].append({"name": "Erro", "value": f"```{str(e)}```"})
-        requests.post(u, json=m)
+        self.session.post(u, json=m)
 
     def _extrair(self, b):
         xl = pd.ExcelFile(io.BytesIO(b))
         ds = []
         for s in xl.sheet_names:
             if any(x in s.upper() for x in ["CAMPOS", "METADADOS"]): continue
-            am = xl.parse(s, nrows=40, header=None)
+            am = xl.parse(s, nrows=50, header=None)
             lh = 0
             for i, r in am.iterrows():
                 ts = [self._limpar(str(v)) for v in r.values]
@@ -145,9 +152,8 @@ class MotorSafeDriver:
         return pnl, df
 
     def _finalizar(self, pnl, df_base):
-        if df_base.empty: return
+        if df_base.empty or pnl.empty: return
         val = pnl.dropna(subset=['target']).copy()
-        
         if len(val) >= 2:
             tr, te = train_test_split(val, test_size=0.2, shuffle=False)
             self.auditoria["validacao"]["treino"], self.auditoria["validacao"]["teste"] = len(tr), len(te)
@@ -158,16 +164,17 @@ class MotorSafeDriver:
             grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'pf', 'pd']).tail(1).copy()
             grid['rs'] = np.clip(md.predict(grid[fs]), 0, None)
         else:
-            grid = pnl.copy()
-            grid['rs'] = grid['y']
+            grid = pnl.copy(); grid['rs'] = grid['y']
             
         scaler = MinMaxScaler(feature_range=(0, 100))
         grid['score'] = scaler.fit_transform(grid[['rs']]).round(1)
         grid['penalty'] = (1.0 + (grid['score'] / 50.0)).round(2)
         
-        for p in self.auditoria["malha"]: self.auditoria["malha"][p] = grid[grid['pf']==p].shape[0]
+        counts = grid['pf'].value_counts().to_dict()
+        for p in self.auditoria["malha"]: self.auditoria["malha"][p] = counts.get(p, 0)
         
-        df_base.merge(grid[['gh', 'pf', 'pd', 'score', 'penalty']], on=['gh', 'pf', 'pd'], how='left').to_csv('datalake/refined/power_bi_visualizacao.csv', index=False, sep=';', encoding='utf-8-sig')
+        bi_path = 'datalake/refined/power_bi_visualizacao.csv'
+        df_base.merge(grid[['gh', 'pf', 'pd', 'score', 'penalty']], on=['gh', 'pf', 'pd'], how='left').to_csv(bi_path, index=False, sep=';', encoding='utf-8-sig')
         
         if self.db:
             col = self.db.collection('niveis_risco')
@@ -175,9 +182,9 @@ class MotorSafeDriver:
             ats = {d.id: d.to_dict().get('score') for d in col.stream()}
             for _, r in grid.iterrows():
                 did = f"{r['gh']}_{r['pf']}_{r['pd']}"
-                vs.add(did)
-                if did not in atuais or atuais[did] != float(r['score']):
-                    l.set(col.document(did), {'score': float(r['score']), 'penalty': float(r['penalty']), 'geohash': r['gh'], 'prefix': r['gh'][:4], 'perfil': r['pf'], 'periodo': r['pd'], 'ts': firestore.SERVER_TIMESTAMP}, merge=True)
+                vs.add(did); sc = float(r['score'])
+                if did not in ats or ats[did] != sc:
+                    l.set(col.document(did), {'score': sc, 'penalty': float(r['penalty']), 'geohash': r['gh'], 'prefix': r['gh'][:4], 'perfil': r['pf'], 'periodo': r['pd'], 'ts': firestore.SERVER_TIMESTAMP}, merge=True)
                     o += 1; self.auditoria["sincronizacao"]["atualizados"] += 1
                 self.auditoria["sincronizacao"]["avaliados"] += 1
                 if o >= 450: l.commit(); l, o = self.db.batch(), 0
@@ -192,7 +199,8 @@ class MotorSafeDriver:
             m = pd.DataFrame()
             anos = range(2022, self.inicio.year + 1) if self.auditoria["modo"] == "HARD_RESET" else [self.inicio.year]
             for a in anos:
-                r = requests.get(f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{a}.xlsx", timeout=180)
+                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{a}.xlsx"
+                r = self.session.get(url, timeout=600) # Timeout estendido para 10 minutos
                 if r.status_code == 200:
                     df = self._extrair(r.content)
                     self.auditoria["volumes"]["raw"] += len(df)
