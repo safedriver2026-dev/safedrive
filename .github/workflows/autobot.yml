@@ -28,17 +28,17 @@ jobs:
       - name: Validar Contratos
         run: python -m pytest tests/test_contracts.py -v
 
-      - name: Executar Motor Autônomo
+      - name: Executar Motor Supremo
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -m autobot.autobot_engine
 
-      - name: Persistir Baseline e BI
+      - name: Salvar Baseline
         run: |
           git config --global user.name "SafeDriver Core"
           git config --global user.email "core@safedriver.ia"
-          git add datalake/metadata/baseline.lock datalake/refined/power_bi_visualizacao.csv
-          git commit -m "Sistema: Atualização de Telemetria e BI [Automático]" || echo "Sem deltas"
+          git add datalake/metadata/baseline.lock
+          git commit -m "Sistema: Atualização de Baseline [Automático]" || echo "Sem deltas"
           git push
