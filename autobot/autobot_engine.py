@@ -114,8 +114,8 @@ class MotorSafeDriver:
             df = xl.parse(s, skiprows=lh, dtype=str)
             df.columns = [self._normalizar(c) for c in df.columns]
             df = df.loc[:, ~df.columns.duplicated()].copy()
-            ds.append(df)
-        return pd.concat(ds, ignore_index=True) if ds else pd.DataFrame()
+            dfs.append(df)
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
     def _qualificar(self, raw, a):
         df = raw.copy()
