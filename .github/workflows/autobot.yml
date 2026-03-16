@@ -35,10 +35,10 @@ jobs:
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -m autobot.autobot_engine
 
-      - name: Persistir Baseline
+      - name: Persistir Artefatos
         run: |
           git config --global user.name "SafeDriver Core"
           git config --global user.email "core@safedriver.ia"
-          git add datalake/metadata/baseline.lock
-          git commit -m "Sistema: Atualização de Baseline [Automático]" || echo "Sem deltas"
+          git add datalake/metadata/baseline.lock datalake/refined/power_bi_visualizacao.csv
+          git commit -m "Sistema: Ciclo concluído e artefatos gerados [Automático]" || echo "Sem deltas"
           git push
