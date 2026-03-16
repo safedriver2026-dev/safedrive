@@ -1,14 +1,10 @@
 CATALOGO_CRIMES = {
     "LATROCINIO": {"peso": 5.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
-    "EXTORSAO MEDIANTE SEQUESTRO": {"peso": 5.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
-    "ROUBO DE VEICULO": {"peso": 4.0, "perfis": ["Motorista", "Motociclista"]},
-    "ROUBO DE CARGA": {"peso": 4.0, "perfis": ["Motorista"]},
-    "ROUBO A TRANSEUNTE": {"peso": 4.0, "perfis": ["Pedestre", "Ciclista"]},
-    "FURTO DE VEICULO": {"peso": 3.0, "perfis": ["Motorista", "Motociclista"]},
-    "FURTO DE CARGA": {"peso": 3.0, "perfis": ["Motorista"]},
-    "FURTO DE CELULAR": {"peso": 3.0, "perfis": ["Pedestre", "Ciclista"]},
+    "EXTORSAO": {"peso": 5.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
+    "ROUBO": {"peso": 4.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
+    "FURTO": {"peso": 3.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]},
     "DANO": {"peso": 2.0, "perfis": ["Motorista", "Motociclista"]},
-    "OUTROS": {"peso": 1.0, "perfis": ["Pedestre"]}
+    "HOMICIDIO": {"peso": 5.0, "perfis": ["Motorista", "Motociclista", "Pedestre", "Ciclista"]}
 }
 
 PALAVRAS_CHAVE_PERFIL = {
@@ -35,3 +31,4 @@ DICIONARIO_SEMANTICO = {
     "NATUREZA_APURADA": ["NATUREZA_APURADA", "NATUREZA", "TIPO_CRIME", "RUBRICA"],
     "DESCR_TIPOLOCAL": ["DESCR_TIPOLOCAL", "TIPOLOCAL", "LOCAL", "TIPO_LOCAL"]
 }
+COLUNAS_REFINED = list(ESQUEMA_CANONICO.keys())
