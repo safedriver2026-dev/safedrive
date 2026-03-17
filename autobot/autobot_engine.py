@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import os, io, requests, json, unicodedata, gc
+import os, io, requests, json, unicodedata, gc, re
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -35,10 +35,10 @@ class AutobotSafeDriver:
         }
         
         self.mapa_palavras_perfil = {
-            "Pedestre": ["PEDESTRE", "TRANSEUNTE", "CELULAR", "CALCADA", "PONTO DE ONIBUS"],
-            "Motorista": ["VEICULO", "CARRO", "CAMINHAO", "AUTOMOVEL", "CARGA"],
-            "Ciclista": ["BICI", "CICLO", "BICICLETA", "PEDALAR"],
-            "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY"]
+            "Pedestre": ["PEDESTRE", "TRANSEUNTE", "CELULAR", "CALCADA", "ONIBUS"],
+            "Motorista": ["VEICULO", "CARRO", "CAMINHAO", "AUTOMOVEL", "CARGA", "MOTORISTA"],
+            "Ciclista": ["BICICLETA", "CICLISTA", "PEDALAR"],
+            "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY", "MOTOCICLISTA"]
         }
         
         self.limites_sp = {"lat": (-24.5, -23.0), "lon": (-47.0, -45.5)}
@@ -90,7 +90,10 @@ class AutobotSafeDriver:
         natureza = str(linha.get('NATUREZA_APURADA', ''))
         local = str(linha.get('LOCAL', ''))
         texto = f"{natureza} {local}".upper()
-        encontrados = [p for p, palavras in self.mapa_palavras_perfil.items() if any(w in texto for w in palavras)]
+        encontrados = []
+        for p, palavras in self.mapa_palavras_perfil.items():
+            if any(re.search(rf'\b{w}\b', texto) for w in palavras):
+                encontrados.append(p)
         return encontrados if encontrados else ["Geral"]
 
     def _processar_ia(self, df):
@@ -166,30 +169,58 @@ class AutobotSafeDriver:
 
     def executar(self):
         mestre = pd.DataFrame()
+        metadata_path = 'datalake/bruto/metadata.json'
+        metadata = {}
+        
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+            except: pass
+
         for ano in self.periodo_historico:
             caminho_bruto = f'datalake/bruto/ssp_{ano}.parquet'
+            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             df_ano = pd.DataFrame()
             
-            if os.path.exists(caminho_bruto):
-                df_ano = pd.read_parquet(caminho_bruto)
-            else:
+            tamanho_remoto = None
+            try:
+                head_req = self.sessao_rede.head(url, timeout=30)
+                if head_req.status_code == 200 and 'Content-Length' in head_req.headers:
+                    tamanho_remoto = int(head_req.headers['Content-Length'])
+            except: pass
+
+            precisa_baixar = False
+            if not os.path.exists(caminho_bruto):
+                precisa_baixar = True
+            elif tamanho_remoto and metadata.get(str(ano)) != tamanho_remoto:
+                precisa_baixar = True
+
+            if precisa_baixar:
                 try:
-                    url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                     r = self.sessao_rede.get(url, timeout=300)
-                    df_ano = pd.read_excel(io.BytesIO(r.content), dtype=str)
-                    df_ano.columns = [self._normalizar_coluna(c) for c in df_ano.columns]
-                    df_ano = df_ano.loc[:, ~df_ano.columns.duplicated()].copy()
-                    
-                    colunas_essenciais = ['LATITUDE', 'LONGITUDE', 'NATUREZA_APURADA', 'LOCAL', 'HORA_OCORRENCIA_BO', 'DATA_OCORRENCIA_BO']
-                    for col in colunas_essenciais:
-                        if col not in df_ano.columns: df_ano[col] = ""
-                            
-                    df_ano['LATITUDE'] = df_ano['LATITUDE'].apply(lambda x: self._corrigir_gps(x, True))
-                    df_ano['LONGITUDE'] = df_ano['LONGITUDE'].apply(lambda x: self._corrigir_gps(x, False))
-                    df_ano.to_parquet(caminho_bruto, index=False)
-                except Exception as e:
-                    print(f"Ignorando o ano {ano}: {e}")
-                    continue
+                    if r.status_code == 200:
+                        df_ano = pd.read_excel(io.BytesIO(r.content), dtype=str)
+                        df_ano.columns = [self._normalizar_coluna(c) for c in df_ano.columns]
+                        df_ano = df_ano.loc[:, ~df_ano.columns.duplicated()].copy()
+                        
+                        colunas_essenciais = ['LATITUDE', 'LONGITUDE', 'NATUREZA_APURADA', 'LOCAL', 'HORA_OCORRENCIA_BO', 'DATA_OCORRENCIA_BO']
+                        for col in colunas_essenciais:
+                            if col not in df_ano.columns: df_ano[col] = ""
+                                
+                        df_ano['LATITUDE'] = df_ano['LATITUDE'].apply(lambda x: self._corrigir_gps(x, True))
+                        df_ano['LONGITUDE'] = df_ano['LONGITUDE'].apply(lambda x: self._corrigir_gps(x, False))
+                        df_ano.to_parquet(caminho_bruto, index=False)
+                        
+                        if tamanho_remoto:
+                            metadata[str(ano)] = tamanho_remoto
+                            with open(metadata_path, 'w') as f:
+                                json.dump(metadata, f)
+                except Exception:
+                    if os.path.exists(caminho_bruto):
+                        df_ano = pd.read_parquet(caminho_bruto)
+            else:
+                df_ano = pd.read_parquet(caminho_bruto)
             
             if not df_ano.empty:
                 self.auditoria['camadas']['bruta'] += len(df_ano)
@@ -213,16 +244,16 @@ class AutobotSafeDriver:
     def _notificar(self):
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
-        perf_str = "\n".join([f"**{k}:** {v} ocorrências de risco" for k, v in self.auditoria['perfis'].items()])
+        perf_str = "\n".join([f"**{k}:** {v} registros" for k, v in self.auditoria['perfis'].items()])
         payload = {
             "embeds": [{
                 "title": f"🚀 {self.identidade} - Relatório de Missão",
                 "color": 3066993,
                 "fields": [
-                    {"name": "🌊 Camadas do Lakehouse", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
+                    {"name": "🌊 Lakehouse", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
                     {"name": "📉 IA (MAE/RMSE)", "value": f"{self.auditoria['metricas']['mae']} / {self.auditoria['metricas']['rmse']}", "inline": True},
-                    {"name": "👥 Volumetria por Perfil", "value": perf_str, "inline": False},
-                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['nuvem']['documentos']} Documentos Atômicos", "inline": True}
+                    {"name": "👥 Perfis", "value": perf_str, "inline": False},
+                    {"name": "☁️ Nuvem", "value": f"{self.auditoria['nuvem']['documentos']} Docs", "inline": True}
                 ]
             }]
         }
