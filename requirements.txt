@@ -1,8 +1,8 @@
 pandas>=2.0.0
 numpy
-pygeohash
 requests
 firebase-admin
+h3
 xgboost
 prophet
 scikit-learn
