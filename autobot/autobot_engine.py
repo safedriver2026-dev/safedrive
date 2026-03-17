@@ -81,17 +81,14 @@ class AutobotSafeDriver:
     def _processar_ia(self, df):
         if len(df) < 20: return pd.DataFrame()
         
-        # Identificação de Hotspots
         df['hotspot'] = DBSCAN(eps=0.001, min_samples=5).fit_predict(df[['LATITUDE', 'LONGITUDE']])
         df = df[df['hotspot'] != -1].copy()
         
-        # Engenharia de Turnos
         def h_int(x):
             try: return int(str(x).split(':')[0].strip())
             except: return 0
         df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=h_int(x)<6 else 'Manha' if 6<=h_int(x)<12 else 'Tarde' if 12<=h_int(x)<18 else 'Noite')
         
-        # Sazonalidade (Prophet)
         df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
         hist = df.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
         f_saz = 1.0
@@ -100,7 +97,6 @@ class AutobotSafeDriver:
             prev = m_p.predict(pd.DataFrame({'ds': [datetime.now() + timedelta(days=1)]}))
             f_saz = max(0.5, prev['yhat'].values[0] / hist['y'].mean())
 
-        # Treinamento Preditivo (XGBoost)
         enc_t = LabelEncoder()
         df['t_cod'] = enc_t.fit_transform(df['turno'])
         df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.pesos_crimes.get(x, 1.0))
@@ -109,17 +105,14 @@ class AutobotSafeDriver:
         y = df['peso']
         modelo = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05).fit(X, y)
         
-        # Métricas de Performance
         preds = modelo.predict(X)
         self.auditoria['metricas']['mae'] = round(float(mean_absolute_error(y, preds)), 4)
         self.auditoria['metricas']['rmse'] = round(float(np.sqrt(mean_squared_error(y, preds))), 4)
         
-        # Agregação H3 com Variância
         df['h3'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
         res = df.groupby(['h3', 'turno']).agg({'peso': ['mean', 'count']}).reset_index()
         res.columns = ['h3', 'turno', 'peso_medio', 'freq']
         
-        # Cálculo de Risco Dinâmico
         res['pt_bruta'] = res['peso_medio'] * np.log2(res['freq'] + 1) * f_saz
         scaler = MinMaxScaler(feature_range=(0.5, 10.0))
         res['pt'] = scaler.fit_transform(res[['pt_bruta']]).round(1)
@@ -170,11 +163,9 @@ class AutobotSafeDriver:
             mestre = pd.concat([mestre, validados])
 
         if not mestre.empty:
-            # Relatório por Categoria
             contagem = mestre['NATUREZA_APURADA'].value_counts().to_dict()
             self.auditoria['categorias'] = {k: int(v) for k, v in contagem.items() if k in self.pesos_crimes}
             
-            # IA e Sincronismo
             previsoes = self._processar_ia(mestre)
             self.auditoria['camadas']['refinada'] = len(previsoes)
             previsoes.to_parquet('datalake/refinado/malha_final.parquet', index=False)
@@ -184,19 +175,17 @@ class AutobotSafeDriver:
     def _notificar(self):
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
-        
         cat_str = "\n".join([f"**{k}:** {v}" for k, v in self.auditoria['categorias'].items()])
         payload = {
             "embeds": [{
-                "title": f"🚀 {self.identidade} - Relatório Operacional",
+                "title": f"🚀 {self.identidade} - Relatório de Missão",
                 "color": 3066993,
                 "fields": [
-                    {"name": "🌊 Camadas do Data Lake", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
-                    {"name": "📉 Performance IA", "value": f"MAE: {self.auditoria['metricas']['mae']}\nRMSE: {self.auditoria['metricas']['rmse']}", "inline": True},
-                    {"name": "🗂️ Crimes por Categoria", "value": cat_str or "Nenhum detectado", "inline": False},
-                    {"name": "☁️ Cloud", "value": f"H3 Atualizados: {self.auditoria['nuvem']['hexagonos']}", "inline": True}
-                ],
-                "footer": {"text": "Processamento autônomo concluído."}
+                    {"name": "🌊 Fluxo do Data Lake", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
+                    {"name": "📉 Treinamento (MAE/RMSE)", "value": f"{self.auditoria['metricas']['mae']} / {self.auditoria['metricas']['rmse']}", "inline": True},
+                    {"name": "🗂️ Crimes Processados", "value": cat_str or "Vazio", "inline": False},
+                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['nuvem']['hexagonos']} Hexágonos", "inline": True}
+                ]
             }]
         }
         requests.post(webhook, json=payload)
