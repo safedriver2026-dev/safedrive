@@ -18,7 +18,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 class MotorSafeDriver:
     def __init__(self, persistencia=True):
-        self.identidade = "Autobot SafeDriver Engine v3.3"
+        self.identidade = "Autobot SafeDriver Engine v3.4"
         self.ano_vigente = datetime.now().year
         self.periodo_historico = range(2022, self.ano_vigente + 1)
         self.persistencia_ativa = persistencia
@@ -99,10 +99,10 @@ class MotorSafeDriver:
                     "color": 3066993,
                     "fields": [
                         {"name": "🌊 Camadas Data Lake", "value": f"**RAW:** {self.auditoria['volume_raw']:,}\n**TRUSTED:** {self.auditoria['volume_trusted']:,}\n**REFINED:** {self.auditoria['volume_refined']:,}", "inline": False},
-                        {"name": "🎯 Qualificação H3 por Perfil", "value": distribuicao_perfis or "Nenhum dado", "inline": True},
+                        {"name": "🎯 Qualificação H3 por Perfil", "value": distribuicao_perfis or "Aguardando processamento", "inline": True},
                         {"name": "☁️ Sincronização Firestore", "value": f"**H3 Avaliados:** {self.auditoria['h3_avaliados']:,}\n**H3 Mutados:** {self.auditoria['h3_mutados']:,}", "inline": True},
                         {"name": "📈 Precisão Preditiva (IA)", "value": f"**MAE:** {self.auditoria['mae']}\n**RMSE:** {self.auditoria['rmse']}", "inline": False},
-                        {"name": "🧪 Validação de Contratos", "value": "✅ Protocolos PyTest aprovados.", "inline": False}
+                        {"name": "🧪 Validação", "value": "✅ Protocolos PyTest aprovados.", "inline": False}
                     ],
                     "footer": {"text": self.identidade}
                 }]
@@ -192,15 +192,11 @@ class MotorSafeDriver:
         df_t = df_hotspots.groupby(['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc', 'DATA_OCORRENCIA_BO']).agg({'gravidade': 'sum'}).reset_index()
         df_t = df_t.merge(baseline, on=['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc'])
         df_t['sazonalidade'] = prophet.predict(df_t[['DATA_OCORRENCIA_BO']].rename(columns={'DATA_OCORRENCIA_BO': 'ds'}))['yhat'].values
-        
         X = df_t[['perfil_enc', 'vetor_comportamental', 'turno_enc', 'risco_base', 'sazonalidade']]
         y = df_t['gravidade']
         model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100).fit(X, y)
-        
-        pred_treino = model.predict(X)
-        self.auditoria['mae'] = round(mean_absolute_error(y, pred_treino), 4)
-        self.auditoria['rmse'] = round(np.sqrt(mean_squared_error(y, pred_treino)), 4)
-        
+        self.auditoria['mae'] = round(mean_absolute_error(y, model.predict(X)), 3)
+        self.auditoria['rmse'] = round(np.sqrt(mean_squared_error(y, model.predict(X))), 3)
         amanha = datetime.now() + timedelta(days=1)
         df_f = baseline.copy()
         df_f['sazonalidade'] = prophet.predict(pd.DataFrame({'ds': [amanha]}))['yhat'].values[0]
@@ -210,7 +206,6 @@ class MotorSafeDriver:
         df_f['codigo_h3'] = df_f.apply(lambda r: h3.latlng_to_cell(r['lat'], r['lon'], 10), axis=1)
         df_f['turno_desc'] = enc_t.inverse_transform(df_f['turno_enc'])
         df_f['perfil_desc'] = enc_p.inverse_transform(df_f['perfil_enc'])
-        
         self.auditoria['perfis_h3'] = df_f.groupby('perfil_desc')['codigo_h3'].nunique().to_dict()
         self.auditoria['manchas_identificadas'] = len(df_f['id_hotspot'].unique())
         return df_f.groupby(['codigo_h3', 'turno_desc']).agg({'score': 'max', 'penalidade': 'max', 'vetor_comportamental': 'first'}).reset_index()
@@ -219,23 +214,23 @@ class MotorSafeDriver:
         if not self.banco_dados or not self.persistencia_ativa: return
         colecao = self.banco_dados.collection('malha_preditiva_diaria')
         if self.auditoria["modo"] == "HARD_RESET":
-            for doc in colecao.stream(): colecao.document(doc.id).delete()
-        for turno in df_h3['turno_desc'].unique():
-            df_turno = df_h3[df_h3['turno_desc'] == turno]
-            ref_doc = colecao.document(f"turno_{turno}")
-            snap = ref_doc.get()
-            dados_nuvem = snap.to_dict().get("h3_dados", {}) if snap.exists else {}
-            payload_delta = {}
+            for d in colecao.stream(): d.reference.delete()
+        for t in df_h3['turno_desc'].unique():
+            df_turno = df_h3[df_h3['turno_desc'] == t]
+            ref = colecao.document(f"turno_{t}")
+            snap = ref.get()
+            dn = snap.to_dict().get("h3_dados", {}) if snap.exists else {}
+            pd = {}
             for _, r in df_turno.iterrows():
-                h3_id, s, p, c = r['codigo_h3'], round(float(r['score']), 1), round(float(r['penalidade']), 1), int(r['vetor_comportamental'])
-                novo = {"score": s, "penalidade": p, "cluster": c}
-                if h3_id not in dados_nuvem or dados_nuvem[h3_id] != novo:
-                    payload_delta[f"h3_dados.{h3_id}"] = novo
+                h, s, p, c = r['codigo_h3'], round(float(r['score']), 1), round(float(r['penalidade']), 1), int(r['vetor_comportamental'])
+                nv = {"score": s, "penalidade": p, "cluster": c}
+                if h not in dn or dn[h] != nv:
+                    pd[f"h3_dados.{h}"] = nv
                     self.auditoria['h3_mutados'] += 1
-            if payload_delta:
-                payload_delta["ultima_atualizacao"] = firestore.SERVER_TIMESTAMP
-                if snap.exists: ref_doc.update(payload_delta)
-                else: ref_doc.set({"h3_dados": {k.split('.')[1]: v for k, v in payload_delta.items() if k != "ultima_atualizacao"}, "ultima_atualizacao": firestore.SERVER_TIMESTAMP})
+            if pd:
+                pd["ultima_atualizacao"] = firestore.SERVER_TIMESTAMP
+                if snap.exists: ref.update(pd)
+                else: ref.set({"h3_dados": {k.split('.')[1]: v for k, v in pd.items() if k != "ultima_atualizacao"}, "ultima_atualizacao": firestore.SERVER_TIMESTAMP})
         if self.auditoria["modo"] == "HARD_RESET":
             with open('datalake/metadata/baseline.lock', 'w') as f: f.write(str(datetime.now()))
             self.auditoria["modo"] = "OPERACIONAL"
@@ -255,6 +250,8 @@ class MotorSafeDriver:
                     if header is None: continue
                     df_temp = pd.read_excel(io.BytesIO(res.content), skiprows=header, dtype=str)
                     df_temp.columns = [self._normalizar(c) for c in df_temp.columns]
+                    # FIX: Remove colunas duplicadas geradas pela normalização semântica
+                    df_temp = df_temp.loc[:, ~df_temp.columns.duplicated()].copy()
                     df_temp.to_parquet(f'datalake/raw/ssp_{ano}.parquet', index=False)
                     with open(f"datalake/metadata/fonte_{ano}.json", 'w') as f: json.dump({'tamanho': tamanho}, f)
                     self.auditoria['dados_origem_atualizados'] = True
@@ -273,4 +270,5 @@ class MotorSafeDriver:
             self._comunicar_status("FALHA", str(e)); raise
 
 if __name__ == "__main__":
-    MotorSafeDriver().rodar()
+    motor = MotorSafeDriver()
+    motor.rodar()
