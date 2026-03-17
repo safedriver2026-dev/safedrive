@@ -16,14 +16,15 @@ def test_normalizacao_colunas():
 def test_higienizacao_dados_sujos():
     bot = AutobotSafeDriver(persistencia=False)
     df = pd.DataFrame({
-        'LATITUDE': [-23.5, -23.5], 'LONGITUDE': [-46.6, -46.6],
-        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-03-01'), pd.Timestamp('2026-03-02')],
-        'HORA_OCORRENCIA_BO': ['', ' '], 
-        'NATUREZA_APURADA': ['ROUBO DE VEICULO', 'FURTO DE CELULAR'],
-        'LOCAL': ['VIA PUBLICA', 'CALCADA']
+        'LATITUDE': [-23.5, -23.51, -23.52], 
+        'LONGITUDE': [-46.6, -46.61, -46.62],
+        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-03-01'), pd.Timestamp('2026-03-02'), pd.Timestamp('2026-03-03')],
+        'HORA_OCORRENCIA_BO': ['', ' ', '14:00'], 
+        'NATUREZA_APURADA': ['ROUBO DE VEICULO', 'FURTO DE CELULAR', 'LATROCINIO'],
+        'LOCAL': ['VIA PUBLICA', 'CALCADA', 'VEICULO']
     })
     res = bot._processar_ia(df)
-    assert len(res) >= 0
+    assert not res.empty
 
 def test_fallback_colunas_ausentes():
     bot = AutobotSafeDriver(persistencia=False)
