@@ -88,14 +88,15 @@ class AutobotSafeDriver:
         except: return np.nan
 
     def _atribuir_perfis(self, linha):
-        texto = f"{linha['NATUREZA_APURADA']} {linha['LOCAL']}".upper()
+        natureza = str(linha.get('NATUREZA_APURADA', ''))
+        local = str(linha.get('LOCAL', ''))
+        texto = f"{natureza} {local}".upper()
         encontrados = [p for p, palavras in self.mapa_palavras_perfil.items() if any(w in texto for w in palavras)]
         return encontrados if encontrados else ["Geral"]
 
     def _processar_ia(self, df):
         if len(df) < 20: return pd.DataFrame()
         
-        # Expansão por Perfis e Limpeza Espacial
         df['perfis'] = df.apply(self._atribuir_perfis, axis=1)
         df = df.explode('perfis')
         df['hotspot'] = DBSCAN(eps=0.001, min_samples=5).fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
@@ -106,7 +107,14 @@ class AutobotSafeDriver:
             except: return 0
         df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=h_int(x)<6 else 'Manha' if 6<=h_int(x)<12 else 'Tarde' if 12<=h_int(x)<18 else 'Noite')
         
-        # IA Preditiva (XGBoost)
+        df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
+        hist = df.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
+        f_saz = 1.0
+        if len(hist) >= 2:
+            m_p = Prophet(yearly_seasonality=True, daily_seasonality=False).fit(hist)
+            prev = m_p.predict(pd.DataFrame({'ds': [datetime.now() + timedelta(days=1)]}))
+            f_saz = max(0.5, prev['yhat'].values[0] / hist['y'].mean())
+
         enc_t, enc_p = LabelEncoder(), LabelEncoder()
         df['t_cod'] = enc_t.fit_transform(df['turno'])
         df['p_cod'] = enc_p.fit_transform(df['perfis'])
@@ -119,13 +127,11 @@ class AutobotSafeDriver:
         self.auditoria['metricas']['mae'] = round(float(mean_absolute_error(y, modelo.predict(X))), 4)
         self.auditoria['metricas']['rmse'] = round(float(np.sqrt(mean_squared_error(y, modelo.predict(X)))), 4)
         
-        # Agregação H3 Nível 10
         df['h3'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
         res = df.groupby(['h3', 'perfis', 'turno']).agg({'peso': ['mean', 'count']}).reset_index()
         res.columns = ['h3', 'perfil', 'turno', 'peso_medio', 'freq']
         
-        # Score com Variância (Frequência Logarítmica)
-        res['pt_bruta'] = res['peso_medio'] * np.log2(res['freq'] + 1)
+        res['pt_bruta'] = res['peso_medio'] * np.log2(res['freq'] + 1) * f_saz
         scaler = MinMaxScaler(feature_range=(0.5, 10.0))
         res['pt'] = scaler.fit_transform(res[['pt_bruta']]).round(1)
         res['pn'] = (1 + (res['pt'] * 0.15)).round(2)
@@ -139,7 +145,6 @@ class AutobotSafeDriver:
         count = 0
 
         for _, r in malha.iterrows():
-            # Documentos Atômicos: perfil_hexagono
             doc_id = f"{r['perfil'].lower()}_{r['h3']}"
             batch.set(col.document(doc_id), {
                 "id_h3": r['h3'],
@@ -169,10 +174,19 @@ class AutobotSafeDriver:
                     df = pd.read_excel(io.BytesIO(r.content), dtype=str)
                     df.columns = [self._normalizar_coluna(c) for c in df.columns]
                     df = df.loc[:, ~df.columns.duplicated()].copy()
+                    
+                    # Garantia Estrutural: Cria colunas vazias se a fonte falhar em enviá-las
+                    colunas_essenciais = ['LATITUDE', 'LONGITUDE', 'NATUREZA_APURADA', 'LOCAL', 'HORA_OCORRENCIA_BO', 'DATA_OCORRENCIA_BO']
+                    for col in colunas_essenciais:
+                        if col not in df.columns:
+                            df[col] = ""
+                            
                     df['LATITUDE'] = df['LATITUDE'].apply(lambda x: self._corrigir_gps(x, True))
                     df['LONGITUDE'] = df['LONGITUDE'].apply(lambda x: self._corrigir_gps(x, False))
                     df.to_parquet(caminho_bruto, index=False)
-                except: continue
+                except Exception as e:
+                    print(f"Ignorando o ano {ano} devido a erro de download: {e}")
+                    continue
             
             self.auditoria['camadas']['bruta'] += len(df)
             val = df[df['LATITUDE'].notna()].copy()
@@ -183,7 +197,6 @@ class AutobotSafeDriver:
             prev = self._processar_ia(mestre)
             self.auditoria['camadas']['refinada'] = len(prev)
             
-            # Contagem detalhada por perfil para o relatório
             for p in self.auditoria['perfis'].keys():
                 self.auditoria['perfis'][p] = int(len(prev[prev['perfil'] == p]))
                 
@@ -203,7 +216,7 @@ class AutobotSafeDriver:
                     {"name": "🌊 Camadas do Lakehouse", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
                     {"name": "📉 IA (MAE/RMSE)", "value": f"{self.auditoria['metricas']['mae']} / {self.auditoria['metricas']['rmse']}", "inline": True},
                     {"name": "👥 Volumetria por Perfil", "value": perf_str, "inline": False},
-                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['camadas']['refinada']} Documentos", "inline": True}
+                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['camadas']['refinada']} Documentos Atômicos", "inline": True}
                 ]
             }]
         }
