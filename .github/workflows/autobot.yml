@@ -1,45 +1,32 @@
 name: Fluxo Semanal SafeDriver
-
 on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
   schedule:
-    - cron: '0 3 * * 1'
-  workflow_dispatch:
+    - cron: '0 3 * * *'
 
 jobs:
-  producao:
-    name: Ciclo de Inteligencia Geoespacial
+  diagnostico_sistemas:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
+    
     steps:
-      - name: Sincronizar Repositorio
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Instalar Dependencias
-        run: pip install -r requirements.txt
-
-      - name: Validar Contratos
-        run: python -m pytest tests/test_contracts.py -v
-
-      - name: Executar Motor Supremo
-        env:
-          FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
-          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        run: python -m autobot.autobot_engine
-
-      - name: Salvar Baseline
-        run: |
-          git config --global user.name "SafeDriver Core"
-          git config --global user.email "core@safedriver.ia"
-          git add datalake/metadata/
-          git add datalake/raw/
-          git commit -m "Sistema: Atualizacao de Baseline" || echo "Sem deltas"
-          git push
+    - uses: actions/checkout@v3
+    
+    - name: Inicializar Ambiente Py
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Carregar Matriz de Dependencias
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pandas numpy requests firebase-admin h3 prophet xgboost scikit-learn fastparquet openpyxl
+        
+    - name: Executar Protocolos de Teste
+      env:
+        FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
+        DISCORD_AUDITORIA: ${{ secrets.DISCORD_AUDITORIA }}
+      run: |
+        pytest tests/test_contracts.py -v
