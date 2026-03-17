@@ -1,4 +1,5 @@
-name: Fluxo Semanal SafeDriver
+name: Fluxo Diario SafeDriver
+
 on:
   push:
     branches: [ "main", "master" ]
