@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import os, io, requests, json, unicodedata, sys
+import os, io, requests, json, unicodedata, gc
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -10,7 +10,6 @@ import h3
 from prophet import Prophet
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
-from sklearn.cluster import DBSCAN
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 class AutobotSafeDriver:
@@ -97,10 +96,15 @@ class AutobotSafeDriver:
     def _processar_ia(self, df):
         if len(df) < 20: return pd.DataFrame()
         
+        df['h3'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
+        h3_counts = df['h3'].value_counts()
+        hotspots_validos = h3_counts[h3_counts >= 5].index
+        df = df[df['h3'].isin(hotspots_validos)].copy()
+        
+        del h3_counts; gc.collect()
+        
         df['perfis'] = df.apply(self._atribuir_perfis, axis=1)
         df = df.explode('perfis')
-        df['hotspot'] = DBSCAN(eps=0.001, min_samples=5).fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
-        df = df[df['hotspot'] != -1].copy()
         
         def h_int(x):
             try: return int(str(x).split(':')[0].strip())
@@ -120,14 +124,13 @@ class AutobotSafeDriver:
         df['p_cod'] = enc_p.fit_transform(df['perfis'])
         df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.pesos_crimes.get(x, 1.0))
         
-        X = df[['LATITUDE', 'LONGITUDE', 't_cod', 'p_cod', 'hotspot']]
+        X = df[['LATITUDE', 'LONGITUDE', 't_cod', 'p_cod']]
         y = df['peso']
-        modelo = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05).fit(X, y)
+        modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6).fit(X, y)
         
         self.auditoria['metricas']['mae'] = round(float(mean_absolute_error(y, modelo.predict(X))), 4)
         self.auditoria['metricas']['rmse'] = round(float(np.sqrt(mean_squared_error(y, modelo.predict(X)))), 4)
         
-        df['h3'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
         res = df.groupby(['h3', 'perfis', 'turno']).agg({'peso': ['mean', 'count']}).reset_index()
         res.columns = ['h3', 'perfil', 'turno', 'peso_medio', 'freq']
         
@@ -165,33 +168,36 @@ class AutobotSafeDriver:
         mestre = pd.DataFrame()
         for ano in self.periodo_historico:
             caminho_bruto = f'datalake/bruto/ssp_{ano}.parquet'
+            df_ano = pd.DataFrame()
+            
             if os.path.exists(caminho_bruto):
-                df = pd.read_parquet(caminho_bruto)
+                df_ano = pd.read_parquet(caminho_bruto)
             else:
                 try:
                     url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                     r = self.sessao_rede.get(url, timeout=300)
-                    df = pd.read_excel(io.BytesIO(r.content), dtype=str)
-                    df.columns = [self._normalizar_coluna(c) for c in df.columns]
-                    df = df.loc[:, ~df.columns.duplicated()].copy()
+                    df_ano = pd.read_excel(io.BytesIO(r.content), dtype=str)
+                    df_ano.columns = [self._normalizar_coluna(c) for c in df_ano.columns]
+                    df_ano = df_ano.loc[:, ~df_ano.columns.duplicated()].copy()
                     
-                    # Garantia Estrutural: Cria colunas vazias se a fonte falhar em enviá-las
                     colunas_essenciais = ['LATITUDE', 'LONGITUDE', 'NATUREZA_APURADA', 'LOCAL', 'HORA_OCORRENCIA_BO', 'DATA_OCORRENCIA_BO']
                     for col in colunas_essenciais:
-                        if col not in df.columns:
-                            df[col] = ""
+                        if col not in df_ano.columns: df_ano[col] = ""
                             
-                    df['LATITUDE'] = df['LATITUDE'].apply(lambda x: self._corrigir_gps(x, True))
-                    df['LONGITUDE'] = df['LONGITUDE'].apply(lambda x: self._corrigir_gps(x, False))
-                    df.to_parquet(caminho_bruto, index=False)
+                    df_ano['LATITUDE'] = df_ano['LATITUDE'].apply(lambda x: self._corrigir_gps(x, True))
+                    df_ano['LONGITUDE'] = df_ano['LONGITUDE'].apply(lambda x: self._corrigir_gps(x, False))
+                    df_ano.to_parquet(caminho_bruto, index=False)
                 except Exception as e:
-                    print(f"Ignorando o ano {ano} devido a erro de download: {e}")
+                    print(f"Ignorando o ano {ano}: {e}")
                     continue
             
-            self.auditoria['camadas']['bruta'] += len(df)
-            val = df[df['LATITUDE'].notna()].copy()
-            self.auditoria['camadas']['confiavel'] += len(val)
-            mestre = pd.concat([mestre, val])
+            if not df_ano.empty:
+                self.auditoria['camadas']['bruta'] += len(df_ano)
+                val = df_ano[df_ano['LATITUDE'].notna()].copy()
+                self.auditoria['camadas']['confiavel'] += len(val)
+                mestre = pd.concat([mestre, val])
+                
+            del df_ano; gc.collect()
 
         if not mestre.empty:
             prev = self._processar_ia(mestre)
@@ -207,7 +213,7 @@ class AutobotSafeDriver:
     def _notificar(self):
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
-        perf_str = "\n".join([f"**{k}:** {v} hexágonos de risco" for k, v in self.auditoria['perfis'].items()])
+        perf_str = "\n".join([f"**{k}:** {v} ocorrências de risco" for k, v in self.auditoria['perfis'].items()])
         payload = {
             "embeds": [{
                 "title": f"🚀 {self.identidade} - Relatório de Missão",
@@ -216,7 +222,7 @@ class AutobotSafeDriver:
                     {"name": "🌊 Camadas do Lakehouse", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
                     {"name": "📉 IA (MAE/RMSE)", "value": f"{self.auditoria['metricas']['mae']} / {self.auditoria['metricas']['rmse']}", "inline": True},
                     {"name": "👥 Volumetria por Perfil", "value": perf_str, "inline": False},
-                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['camadas']['refinada']} Documentos Atômicos", "inline": True}
+                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['nuvem']['documentos']} Documentos Atômicos", "inline": True}
                 ]
             }]
         }
