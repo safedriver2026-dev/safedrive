@@ -6,19 +6,17 @@ on:
   schedule:
     - cron: '0 3 * * *'
 
+permissions:
+  contents: write
+
 jobs:
   missao:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Cache Data Lake
-      uses: actions/cache@v4
+    - name: Checkout do Código
+      uses: actions/checkout@v4
       with:
-        path: datalake
-        key: ${{ runner.os }}-datalake-${{ hashFiles('datalake/bruto/*.parquet') }}
-        restore-keys: |
-          ${{ runner.os }}-datalake-
+        fetch-depth: 0
 
     - name: Setup Python
       uses: actions/setup-python@v5
@@ -31,7 +29,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Validar Contratos
+    - name: Restaurar Data Lake Histórico (GitOps)
+      run: |
+        git config --global user.name "Autobot SafeDriver"
+        git config --global user.email "bot@safedriver.local"
+        git fetch origin data-api || echo "Branch data-api ainda não existe."
+        git checkout origin/data-api -- datalake/ || echo "Nenhum dado anterior encontrado."
+
+    - name: Executar Testes de Contrato
       run: pytest tests/test_contracts.py -v
 
     - name: Acionar Autobot
@@ -40,3 +45,10 @@ jobs:
         DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
         FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       run: python autobot/autobot_engine.py
+
+    - name: Salvar Data Lake Completo no GitHub
+      run: |
+        git checkout -B data-api
+        git add datalake/ -f
+        git commit -m "🤖 Persistência do Data Lake (Camadas Bruta e Refinada)" || echo "Sem mudanças para comitar"
+        git push origin data-api --force
