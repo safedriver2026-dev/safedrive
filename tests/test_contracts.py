@@ -28,7 +28,5 @@ def test_higienizacao_dados_sujos():
 def test_fallback_colunas_ausentes():
     bot = AutobotSafeDriver(persistencia=False)
     df = pd.DataFrame({'LATITUDE': [-23.5], 'LONGITUDE': [-46.6]})
-    # Simulando um dataframe que veio sem a coluna LOCAL ou NATUREZA
     res = bot._processar_ia(df)
-    # A IA vai dropar por não ter dados suficientes (< 20 linhas neste mock), mas não vai dar KeyError
     assert res.empty
