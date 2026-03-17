@@ -1,4 +1,4 @@
-import io, os, json, math, shutil, hashlib, unicodedata, warnings
+import io, os, json, math, shutil, unicodedata, warnings
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -20,6 +20,7 @@ warnings.filterwarnings("ignore")
 class MotorSafeDriver:
     def __init__(self, persistencia=True):
         self.inicio = datetime.now()
+        self.ano_vigente = self.inicio.year
         self.ref = pd.Timestamp(self.inicio.date())
         self.janela = self.ref - pd.Timedelta(days=730)
         self.lock = 'datalake/metadata/baseline.lock'
@@ -30,7 +31,8 @@ class MotorSafeDriver:
             "volumes": {"raw": 0, "trusted": 0, "refined_e": 0, "refined_m": 0},
             "validacao": {"treino": 0, "teste": 0, "mae": 0.0, "rmse": 0.0},
             "malha": {"Motorista": 0, "Motociclista": 0, "Pedestre": 0, "Ciclista": 0},
-            "sincronizacao": {"avaliados": 0, "atualizados": 0, "removidos": 0}
+            "sincronizacao": {"avaliados": 0, "atualizados": 0, "removidos": 0},
+            "novos_dados": False
         }
         
         if not os.path.exists(self.lock):
@@ -42,8 +44,12 @@ class MotorSafeDriver:
 
     def _criar_sessao_resiliente(self):
         s = requests.Session()
-        retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        retries = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504], allowed_methods=["HEAD", "GET", "OPTIONS"])
+        s.mount('http://', HTTPAdapter(max_retries=retries))
         s.mount('https://', HTTPAdapter(max_retries=retries))
+        s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
         return s
 
     def _conectar(self):
@@ -84,46 +90,52 @@ class MotorSafeDriver:
             if k != "OUTROS" and k in limpo: return k
         return "OUTROS"
 
+    def _verificar_necessidade_download(self, url, ano):
+        path = f"datalake/metadata/tamanho_{ano}.json"
+        try:
+            head = self.session.head(url, timeout=30, allow_redirects=True)
+            tamanho = int(head.headers.get('Content-Length', 0))
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    if json.load(f).get('tamanho') == tamanho: return False, tamanho
+            return True, tamanho
+        except: return True, 0
+
     def _notificar(self, s=True, e=None):
         u = os.environ.get('DISCORD_SUCESSO') if s else os.environ.get('DISCORD_ERRO')
         if not u: return
+        desc = "Novos arquivos detectados." if self.auditoria['novos_dados'] else "Re-treinando IA com cache."
         m = {
             "embeds": [{
                 "title": f"SafeDriver Engine: {self.auditoria['modo']}",
+                "description": desc if s else "Falha Critica",
                 "color": 3066993 if s else 15158332,
                 "fields": [
-                    {"name": "Janela", "value": f"{self.janela.strftime('%Y-%m-%d')} a {self.ref.strftime('%Y-%m-%d')}", "inline": False},
                     {"name": "Camadas", "value": f"RAW: {self.auditoria['volumes']['raw']:,}\nTRUSTED: {self.auditoria['volumes']['trusted']:,}\nREFINED: {self.auditoria['volumes']['refined_e']:,}", "inline": True},
                     {"name": "Performance", "value": f"MAE: {self.auditoria['validacao']['mae']:.4f}\nRMSE: {self.auditoria['validacao']['rmse']:.4f}", "inline": True},
                     {"name": "Cloud Sync", "value": f"Atualizados: {self.auditoria['sincronizacao']['atualizados']:,}", "inline": True}
                 ],
-                "footer": {"text": f"Duração: {(datetime.now() - self.inicio).total_seconds():.1f}s"}
+                "footer": {"text": f"Duracao: {(datetime.now() - self.inicio).total_seconds():.1f}s"}
             }]
         }
-        if not s:
-            erro_msg = str(e)[:1000]
-            m["embeds"][0]["fields"].append({"name": "Erro", "value": erro_msg})
+        if not s: m["embeds"][0]["fields"].append({"name": "Erro", "value": f"{str(e)[:1000]}"})
         self.session.post(u, json=m)
 
-    def _extrair(self, b):
-        xl = pd.ExcelFile(io.BytesIO(b))
-        ds = []
-        for s in xl.sheet_names:
-            if any(x in s.upper() for x in ["CAMPOS", "METADADOS"]): continue
-            am = xl.parse(s, nrows=50, header=None)
-            lh = 0
-            for i, r in am.iterrows():
-                ts = [self._limpar(str(v)) for v in r.values]
-                if any(k in ts for k in ['NUM_BO', 'NATUREZA_APURADA', 'LATITUDE', 'RUBRICA']):
-                    lh = i
-                    break
-            df = xl.parse(s, skiprows=lh, dtype=str)
-            df.columns = [self._normalizar(c) for c in df.columns]
-            df = df.loc[:, ~df.columns.duplicated()].copy()
-            ds.append(df)
-        return pd.concat(ds, ignore_index=True) if ds else pd.DataFrame()
+    def _extrair_arquivo(self, url, ano, caminho_raw, tamanho):
+        r = self.session.get(url, timeout=120)
+        if r.status_code != 200: raise ConnectionError(f"Erro HTTP {r.status_code}")
+        pre = pd.read_excel(io.BytesIO(r.content), nrows=50, header=None)
+        lh = next((i for i, row in pre.iterrows() if any(t in [self._limpar(str(c)) for c in row.values] for t in ['NUM_BO', 'LATITUDE', 'NATUREZA_APURADA'])), None)
+        if lh is None: lh = 0
+        df = pd.read_excel(io.BytesIO(r.content), skiprows=lh, dtype=str)
+        df.columns = [self._normalizar(c) for c in df.columns]
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        df.to_parquet(caminho_raw, index=False)
+        with open(f"datalake/metadata/tamanho_{ano}.json", 'w') as f: json.dump({'tamanho': tamanho}, f)
+        self.auditoria['novos_dados'] = True
+        return df
 
-    def _qualificar(self, raw, a):
+    def _qualificar(self, raw):
         df = raw.copy()
         for c in ESQUEMA_CANONICO.keys():
             if c not in df.columns: df[c] = np.nan
@@ -163,8 +175,8 @@ class MotorSafeDriver:
         else: pnl['ft'] = 1.0
         return pnl, df
 
-    def _finalizar(self, pnl, df_base):
-        if df_base.empty or pnl.empty: return
+    def _finalizar(self, pnl):
+        if pnl.empty: return pd.DataFrame()
         val = pnl.dropna(subset=['target']).copy()
         if len(val) >= 10:
             tr, te = train_test_split(val, test_size=0.2, shuffle=False)
@@ -180,8 +192,11 @@ class MotorSafeDriver:
             grid = pnl.sort_values('DATA_OCORRENCIA_BO').groupby(['gh', 'pf', 'pd']).tail(1).copy()
             grid['rs'] = grid['y']
             
-        scaler = MinMaxScaler(feature_range=(1.0, 5.0))
-        grid['penalty'] = scaler.fit_transform(grid[['rs']]).round(2)
+        scaler_penalty = MinMaxScaler(feature_range=(1.0, 5.0))
+        grid['penalty'] = scaler_penalty.fit_transform(grid[['rs']]).round(2)
+        
+        scaler_score = MinMaxScaler(feature_range=(0, 100))
+        grid['score'] = scaler_score.fit_transform(grid[['rs']]).round(1)
         
         counts = grid['pf'].value_counts().to_dict()
         for p in self.auditoria["malha"]: self.auditoria["malha"][p] = counts.get(p, 0)
@@ -194,7 +209,7 @@ class MotorSafeDriver:
                 did = f"{r['gh']}_{r['pf']}_{r['pd']}"
                 vs.add(did); pnlty = float(r['penalty'])
                 if did not in ats or ats[did] != pnlty or self.auditoria["modo"] == "HARD_RESET":
-                    l.set(col.document(did), {'penalty': pnlty, 'geohash': r['gh'], 'prefix': r['gh'][:4], 'perfil': r['pf'], 'periodo': r['pd'], 'ts': firestore.SERVER_TIMESTAMP}, merge=True)
+                    l.set(col.document(did), {'penalty': pnlty, 'score': float(r['score']), 'geohash': r['gh'], 'prefix': r['gh'][:4], 'perfil': r['pf'], 'periodo': r['pd'], 'ts': firestore.SERVER_TIMESTAMP}, merge=True)
                     o += 1; self.auditoria["sincronizacao"]["atualizados"] += 1
                 if o >= 450: l.commit(); l, o = self.db.batch(), 0
             for rid in ats.keys():
@@ -203,23 +218,29 @@ class MotorSafeDriver:
                     o += 1
                     if o >= 450: l.commit(); l, o = self.db.batch(), 0
             if o > 0: l.commit()
+        return grid
 
     def rodar(self):
         try:
             m = pd.DataFrame()
-            anos = range(2022, self.inicio.year + 1) if self.auditoria["modo"] == "HARD_RESET" else [self.inicio.year]
+            anos = range(2022, self.ano_vigente + 1) if self.auditoria["modo"] == "HARD_RESET" else [self.ano_vigente]
             for a in anos:
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{a}.xlsx"
-                r = self.session.get(url, timeout=600)
-                if r.status_code == 200:
-                    df = self._extrair(r.content)
-                    self.auditoria["volumes"]["raw"] += len(df)
-                    df.to_parquet(f'datalake/raw/ssp_{a}.parquet', index=False)
-                    t, d = self._qualificar(df, a)
-                    if not d.empty: m = pd.concat([m, d], ignore_index=True)
+                caminho_raw = f'datalake/raw/ssp_{a}.parquet'
+                baixar, tamanho = self._verificar_necessidade_download(url, a)
+                if baixar or not os.path.exists(caminho_raw):
+                    df = self._extrair_arquivo(url, a, caminho_raw, tamanho)
+                else:
+                    df = pd.read_parquet(caminho_raw)
+                
+                self.auditoria["volumes"]["raw"] += len(df)
+                t, d = self._qualificar(df)
+                if not d.empty: m = pd.concat([m, d], ignore_index=True)
+                
             if not m.empty:
                 p, b = self._modelar(m)
-                self._finalizar(p, b)
+                self._finalizar(p)
+                
             with open(self.lock, 'w') as f: f.write(str(datetime.now()))
             self._notificar(True)
         except Exception as e: self._notificar(False, e); raise
