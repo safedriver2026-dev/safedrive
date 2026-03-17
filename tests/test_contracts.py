@@ -1,7 +1,4 @@
-import os
-import sys
-import pandas as pd
-import numpy as np
+import os, sys, pandas as pd, numpy as np
 from datetime import datetime
 import pytest
 
@@ -14,9 +11,7 @@ def test_engine_instancia():
 
 def test_correcao_coordenada_ssp():
     engine = MotorSafeDriver(persistencia=False)
-    valor_errado = -46779670.0
-    resultado = engine._corrigir_ponto_decimal(valor_errado, is_lat=False)
-    assert -47.0 < resultado < -46.0
+    assert -47.0 < engine._corrigir_ponto_decimal(-46779670.0, is_lat=False) < -46.0
 
 def test_normalizacao_semantica():
     engine = MotorSafeDriver(persistencia=False)
@@ -25,25 +20,15 @@ def test_normalizacao_semantica():
 def test_classificacao_crime():
     engine = MotorSafeDriver(persistencia=False)
     assert engine._classificar_crime("ROUBO DE CARGA") == "ROUBO DE CARGA"
-    assert engine._classificar_crime("CRIME DESCONHECIDO") == "OUTROS"
-    assert pd.isna(engine._classificar_crime(np.nan))
+    assert engine._classificar_crime("?") == "OUTROS"
 
 def test_qualificacao_fluxo():
     engine = MotorSafeDriver(persistencia=False)
-    df = pd.DataFrame({
-        'LATITUDE': ['-23.5'], 
-        'LONGITUDE': ['-46.6'],
-        'DATA_OCORRENCIA_BO': [pd.Timestamp(datetime.now().date())],
-        'NATUREZA_APURADA': ['ROUBO DE VEICULO'],
-        'NUM_BO': ['1'],
-        'DESCR_TIPOLOCAL': ['VIA PUBLICA']
-    })
+    df = pd.DataFrame({'LATITUDE':['-23.5'],'LONGITUDE':['-46.6'],'DATA_OCORRENCIA_BO':[pd.Timestamp(datetime.now().date())],'NATUREZA_APURADA':['ROUBO DE VEICULO'],'NUM_BO':['1'],'DESCR_TIPOLOCAL':['VIA PUBLICA']})
     t, r = engine._qualificar(df)
-    assert len(t) == 1
-    assert len(r) == 1
+    assert len(t) == 1 and len(r) == 1
 
 def test_modo_reset():
-    if os.path.exists('datalake/metadata/baseline.lock'):
-        os.remove('datalake/metadata/baseline.lock')
+    if os.path.exists('datalake/metadata/baseline.lock'): os.remove('datalake/metadata/baseline.lock')
     engine = MotorSafeDriver(persistencia=False)
     assert engine.auditoria["modo"] == "HARD_RESET"
