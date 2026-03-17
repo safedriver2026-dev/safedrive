@@ -24,7 +24,7 @@ class AutobotSafeDriver:
         self.auditoria = {
             "camadas": {"bruta": 0, "confiavel": 0, "refinada": 0},
             "perfis": {"Pedestre": 0, "Motorista": 0, "Ciclista": 0, "Motociclista": 0, "Geral": 0},
-            "metricas": {"mae": 0.0, "rmse": 0.0},
+            "metricas": {"mae": 0.0, "rmse": 0.0, "acerto": 0.0},
             "nuvem": {"documentos": 0}
         }
         
@@ -97,14 +97,19 @@ class AutobotSafeDriver:
         return encontrados if encontrados else ["Geral"]
 
     def _processar_ia(self, df):
-        if len(df) < 20: return pd.DataFrame()
+        min_linhas = 20 if self.persistencia_ativa else 2
+        min_densidade = 5 if self.persistencia_ativa else 1
+        
+        if len(df) < min_linhas: return pd.DataFrame()
         
         df['h3'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
         h3_counts = df['h3'].value_counts()
-        hotspots_validos = h3_counts[h3_counts >= 5].index
+        hotspots_validos = h3_counts[h3_counts >= min_densidade].index
         df = df[df['h3'].isin(hotspots_validos)].copy()
         
         del h3_counts; gc.collect()
+        
+        if len(df) < min_linhas: return pd.DataFrame()
         
         df['perfis'] = df.apply(self._atribuir_perfis, axis=1)
         df = df.explode('perfis')
@@ -131,15 +136,25 @@ class AutobotSafeDriver:
         y = df['peso']
         modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6).fit(X, y)
         
-        self.auditoria['metricas']['mae'] = round(float(mean_absolute_error(y, modelo.predict(X))), 4)
-        self.auditoria['metricas']['rmse'] = round(float(np.sqrt(mean_squared_error(y, modelo.predict(X)))), 4)
+        mae = float(mean_absolute_error(y, modelo.predict(X)))
+        rmse = float(np.sqrt(mean_squared_error(y, modelo.predict(X))))
+        taxa_acerto = max(0.0, 100.0 - ((mae / 10.0) * 100.0))
+        
+        self.auditoria['metricas']['mae'] = round(mae, 4)
+        self.auditoria['metricas']['rmse'] = round(rmse, 4)
+        self.auditoria['metricas']['acerto'] = round(taxa_acerto, 2)
         
         res = df.groupby(['h3', 'perfis', 'turno']).agg({'peso': ['mean', 'count']}).reset_index()
         res.columns = ['h3', 'perfil', 'turno', 'peso_medio', 'freq']
         
         res['pt_bruta'] = res['peso_medio'] * np.log2(res['freq'] + 1) * f_saz
         scaler = MinMaxScaler(feature_range=(0.5, 10.0))
-        res['pt'] = scaler.fit_transform(res[['pt_bruta']]).round(1)
+        
+        if len(res) > 1:
+            res['pt'] = scaler.fit_transform(res[['pt_bruta']]).round(1)
+        else:
+            res['pt'] = 5.0
+            
         res['pn'] = (1 + (res['pt'] * 0.15)).round(2)
         
         return res
@@ -182,8 +197,8 @@ class AutobotSafeDriver:
             caminho_bruto = f'datalake/bruto/ssp_{ano}.parquet'
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             df_ano = pd.DataFrame()
-            
             tamanho_remoto = None
+            
             try:
                 head_req = self.sessao_rede.head(url, timeout=30)
                 if head_req.status_code == 200 and 'Content-Length' in head_req.headers:
@@ -242,6 +257,12 @@ class AutobotSafeDriver:
             self._notificar()
 
     def _notificar(self):
+        print(f"\n--- RESULTADO DO TREINAMENTO IA ---")
+        print(f"Taxa de Acerto do Modelo: {self.auditoria['metricas']['acerto']}%")
+        print(f"MAE: {self.auditoria['metricas']['mae']}")
+        print(f"RMSE: {self.auditoria['metricas']['rmse']}")
+        print(f"-----------------------------------\n")
+
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
         perf_str = "\n".join([f"**{k}:** {v} registros" for k, v in self.auditoria['perfis'].items()])
@@ -250,10 +271,11 @@ class AutobotSafeDriver:
                 "title": f"🚀 {self.identidade} - Relatório de Missão",
                 "color": 3066993,
                 "fields": [
+                    {"name": "🎯 Taxa de Acerto IA", "value": f"**{self.auditoria['metricas']['acerto']}%**", "inline": False},
                     {"name": "🌊 Lakehouse", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
-                    {"name": "📉 IA (MAE/RMSE)", "value": f"{self.auditoria['metricas']['mae']} / {self.auditoria['metricas']['rmse']}", "inline": True},
+                    {"name": "📉 Margem Erro", "value": f"MAE: {self.auditoria['metricas']['mae']}\nRMSE: {self.auditoria['metricas']['rmse']}", "inline": True},
                     {"name": "👥 Perfis", "value": perf_str, "inline": False},
-                    {"name": "☁️ Nuvem", "value": f"{self.auditoria['nuvem']['documentos']} Docs", "inline": True}
+                    {"name": "☁️ Nuvem", "value": f"{self.auditoria['nuvem']['documentos']} Docs Atualizados", "inline": True}
                 ]
             }]
         }
