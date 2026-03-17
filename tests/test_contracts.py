@@ -1,5 +1,10 @@
-import os, sys, pandas as pd, numpy as np
+import os
+import sys
+import pandas as pd
+import numpy as np
 from datetime import datetime
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from autobot.autobot_engine import MotorSafeDriver
 
@@ -30,7 +35,8 @@ def test_qualificacao_fluxo():
         'LONGITUDE': ['-46.6'],
         'DATA_OCORRENCIA_BO': [pd.Timestamp(datetime.now().date())],
         'NATUREZA_APURADA': ['ROUBO DE VEICULO'],
-        'NUM_BO': ['1']
+        'NUM_BO': ['1'],
+        'DESCR_TIPOLOCAL': ['VIA PUBLICA']
     })
     t, r = engine._qualificar(df)
     assert len(t) == 1
