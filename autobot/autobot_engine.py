@@ -9,7 +9,7 @@ from urllib3.util.retry import Retry
 import h3
 from prophet import Prophet
 import xgboost as xgb
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.cluster import DBSCAN
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -21,20 +21,21 @@ class AutobotSafeDriver:
         self.persistencia_ativa = persistencia
         self.banco_nuvem = self._conectar_nuvem() if persistencia else None
         self.sessao_rede = self._gerar_sessao_resiliente()
-        self.auditoria = {
-            "volume_bruto": 0, "volume_refinado": 0,
-            "hexagonos_processados": 0, "mae": 0.0, "rmse": 0.0
-        }
-        self.biblioteca_crimes = {
-            "LATROCINIO": 5.0, "EXTORSAO MEDIANTE SEQUESTRO": 5.0,
-            "ROUBO DE VEICULO": 4.5, "ROUBO DE CARGA": 4.0,
-            "ROUBO A TRANSEUNTE": 3.5, "FURTO DE VEICULO": 3.0, "OUTROS": 1.0
-        }
-        self.limites_sp = {"lat": (-25.5, -19.5), "lon": (-53.5, -44.0)}
         
-        # Estrutura de pastas para o Data Lake
-        for pasta in ['bruto', 'confiavel', 'refinado']: 
-            os.makedirs(f'datalake/{pasta}', exist_ok=True)
+        self.auditoria = {
+            "camadas": {"bruta": 0, "confiavel": 0, "refinada": 0},
+            "categorias": {},
+            "metricas": {"mae": 0.0, "rmse": 0.0},
+            "nuvem": {"hexagonos": 0}
+        }
+        
+        self.pesos_crimes = {
+            "LATROCINIO": 10.0, "ROUBO DE VEICULO": 8.5, "ROUBO DE CARGA": 8.0,
+            "ROUBO A TRANSEUNTE": 7.0, "FURTO DE VEICULO": 4.0, "OUTROS": 1.0
+        }
+        
+        self.limites_sp = {"lat": (-24.5, -23.0), "lon": (-47.0, -45.5)}
+        for p in ['bruto', 'confiavel', 'refinado']: os.makedirs(f'datalake/{p}', exist_ok=True)
 
     def _conectar_nuvem(self):
         config = os.environ.get('FIREBASE_JSON')
@@ -51,18 +52,18 @@ class AutobotSafeDriver:
         s.headers.update({'User-Agent': 'Mozilla/5.0'})
         return s
 
-    def _higienizar(self, texto):
-        if pd.isna(texto) or not isinstance(texto, str): return str(texto) if not pd.isna(texto) else ""
-        return "".join([c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c)]).upper().strip()
+    def _higienizar(self, t):
+        if pd.isna(t) or not isinstance(t, str): return str(t) if not pd.isna(t) else ""
+        return "".join([c for c in unicodedata.normalize('NFKD', t) if not unicodedata.combining(c)]).upper().strip()
 
-    def _normalizar(self, coluna):
-        limpo = self._higienizar(coluna)
+    def _normalizar_coluna(self, c):
+        limpo = self._higienizar(c)
         mapa = {
-            "NUM_BO": ["NUM_BO", "NUMERO_BO", "N_BO"],
-            "DATA_OCORRENCIA_BO": ["DATA_OCORRENCIA_BO", "DATA_FATO", "DATAOCORRENCIA"],
+            "NUM_BO": ["NUM_BO", "NUMERO_BO"],
+            "DATA_OCORRENCIA_BO": ["DATA_OCORRENCIA_BO", "DATA_FATO", "DATA"],
             "HORA_OCORRENCIA_BO": ["HORA_OCORRENCIA_BO", "HORA_FATO"],
-            "LATITUDE": ["LATITUDE", "LAT", "LATITUDEDECIMAL"],
-            "LONGITUDE": ["LONGITUDE", "LON", "LONGITUDEDECIMAL"],
+            "LATITUDE": ["LATITUDE", "LAT"],
+            "LONGITUDE": ["LONGITUDE", "LON"],
             "NATUREZA_APURADA": ["NATUREZA_APURADA", "NATUREZA", "RUBRICA"]
         }
         for k, v in mapa.items():
@@ -80,18 +81,18 @@ class AutobotSafeDriver:
     def _processar_ia(self, df):
         if len(df) < 20: return pd.DataFrame()
         
-        # Identificação de manchas de crime (Hotspots)
-        df['hotspot'] = DBSCAN(eps=0.001, min_samples=3).fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
+        # Identificação de Hotspots
+        df['hotspot'] = DBSCAN(eps=0.001, min_samples=5).fit_predict(df[['LATITUDE', 'LONGITUDE']])
         df = df[df['hotspot'] != -1].copy()
         
-        def extrair_hora(celula):
-            try: return int(str(celula).split(':')[0].strip())
+        # Engenharia de Turnos
+        def h_int(x):
+            try: return int(str(x).split(':')[0].strip())
             except: return 0
-            
-        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=extrair_hora(x)<6 else 'Manha' if 6<=extrair_hora(x)<12 else 'Tarde' if 12<=extrair_hora(x)<18 else 'Noite')
-        df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
+        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=h_int(x)<6 else 'Manha' if 6<=h_int(x)<12 else 'Tarde' if 12<=h_int(x)<18 else 'Noite')
         
-        # Sazonalidade Temporal (Prophet)
+        # Sazonalidade (Prophet)
+        df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
         hist = df.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
         f_saz = 1.0
         if len(hist) >= 2:
@@ -99,91 +100,103 @@ class AutobotSafeDriver:
             prev = m_p.predict(pd.DataFrame({'ds': [datetime.now() + timedelta(days=1)]}))
             f_saz = max(0.5, prev['yhat'].values[0] / hist['y'].mean())
 
-        # Motor de Inferência (XGBoost)
+        # Treinamento Preditivo (XGBoost)
         enc_t = LabelEncoder()
         df['t_cod'] = enc_t.fit_transform(df['turno'])
-        df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.biblioteca_crimes.get(x, 1.0))
+        df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.pesos_crimes.get(x, 1.0))
         
         X = df[['LATITUDE', 'LONGITUDE', 't_cod', 'hotspot']]
         y = df['peso']
-        m_x = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05).fit(X, y)
+        modelo = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05).fit(X, y)
         
-        # Métricas de Validação
-        preds = m_x.predict(X)
-        self.auditoria['mae'] = round(float(mean_absolute_error(y, preds)), 4)
-        self.auditoria['rmse'] = round(float(np.sqrt(mean_squared_error(y, preds))), 4)
+        # Métricas de Performance
+        preds = modelo.predict(X)
+        self.auditoria['metricas']['mae'] = round(float(mean_absolute_error(y, preds)), 4)
+        self.auditoria['metricas']['rmse'] = round(float(np.sqrt(mean_squared_error(y, preds))), 4)
         
-        # Geração da Malha H3 Nível 10
+        # Agregação H3 com Variância
         df['h3'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
         res = df.groupby(['h3', 'turno']).agg({'peso': ['mean', 'count']}).reset_index()
-        res.columns = ['h3', 'turno', 'peso_medio', 'frequencia']
+        res.columns = ['h3', 'turno', 'peso_medio', 'freq']
         
-        # Pontuação Dinâmica (Logarítmica para evitar notas iguais)
-        res['pt'] = (res['peso_medio'] * np.log1p(res['frequencia']) * f_saz * 2).clip(0.5, 10.0).round(1)
-        res['pn'] = (1 + (res['pt'] * 0.2)).round(1)
+        # Cálculo de Risco Dinâmico
+        res['pt_bruta'] = res['peso_medio'] * np.log2(res['freq'] + 1) * f_saz
+        scaler = MinMaxScaler(feature_range=(0.5, 10.0))
+        res['pt'] = scaler.fit_transform(res[['pt_bruta']]).round(1)
+        res['pn'] = (1 + (res['pt'] * 0.15)).round(2)
         
         return res
 
     def _sincronizar(self, malha):
         if not self.banco_nuvem or malha.empty: return
-        colecao = self.banco_nuvem.collection('malha_seguranca')
+        col = self.banco_nuvem.collection('malha_seguranca')
         agrupado = malha.groupby('h3')
         batch = self.banco_nuvem.batch()
-        contador = 0
+        count = 0
 
         for h3_id, dados in agrupado:
-            doc_ref = colecao.document(h3_id)
+            doc_ref = col.document(h3_id)
             scores = {row['turno']: {"pt": row['pt'], "pn": row['pn']} for _, row in dados.iterrows()}
-            batch.set(doc_ref, {"id_h3": h3_id, "scores": scores, "ultima_atualizacao": firestore.SERVER_TIMESTAMP}, merge=True)
-            contador += 1
-            if contador >= 400:
+            batch.set(doc_ref, {"id_h3": h3_id, "scores": scores, "data": firestore.SERVER_TIMESTAMP}, merge=True)
+            count += 1
+            if count >= 400:
                 batch.commit()
                 batch = self.banco_nuvem.batch()
-                contador = 0
+                count = 0
         batch.commit()
-        self.auditoria['hexagonos_processados'] = len(agrupado)
+        self.auditoria['nuvem']['hexagonos'] = len(agrupado)
 
     def executar(self):
         mestre = pd.DataFrame()
         for ano in self.periodo_historico:
-            caminho_bruto = f'datalake/bruto/ssp_{ano}.parquet'
-            
-            if os.path.exists(caminho_bruto):
-                df = pd.read_parquet(caminho_bruto)
+            caminho = f'datalake/bruto/ssp_{ano}.parquet'
+            if os.path.exists(caminho):
+                df = pd.read_parquet(caminho)
             else:
                 try:
                     url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                     r = self.sessao_rede.get(url, timeout=300)
                     df = pd.read_excel(io.BytesIO(r.content), dtype=str)
-                    df.columns = [self._normalizar(c) for c in df.columns]
+                    df.columns = [self._normalizar_coluna(c) for c in df.columns]
                     df = df.loc[:, ~df.columns.duplicated()].copy()
                     df['LATITUDE'] = df['LATITUDE'].apply(lambda x: self._corrigir_gps(x, True))
                     df['LONGITUDE'] = df['LONGITUDE'].apply(lambda x: self._corrigir_gps(x, False))
-                    df.to_parquet(caminho_bruto, index=False)
+                    df.to_parquet(caminho, index=False)
                 except: continue
             
-            mestre = pd.concat([mestre, df[df['LATITUDE'].notna()]])
-            self.auditoria['volume_bruto'] += len(df)
-            
+            self.auditoria['camadas']['bruta'] += len(df)
+            validados = df[df['LATITUDE'].notna()].copy()
+            self.auditoria['camadas']['confiavel'] += len(validados)
+            mestre = pd.concat([mestre, validados])
+
         if not mestre.empty:
-            self.auditoria['volume_refinado'] = len(mestre)
+            # Relatório por Categoria
+            contagem = mestre['NATUREZA_APURADA'].value_counts().to_dict()
+            self.auditoria['categorias'] = {k: int(v) for k, v in contagem.items() if k in self.pesos_crimes}
+            
+            # IA e Sincronismo
             previsoes = self._processar_ia(mestre)
+            self.auditoria['camadas']['refinada'] = len(previsoes)
             previsoes.to_parquet('datalake/refinado/malha_final.parquet', index=False)
             self._sincronizar(previsoes)
-            self._notificar_discord()
+            self._notificar()
 
-    def _notificar_discord(self):
+    def _notificar(self):
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
+        
+        cat_str = "\n".join([f"**{k}:** {v}" for k, v in self.auditoria['categorias'].items()])
         payload = {
             "embeds": [{
-                "title": f"🚀 {self.identidade}",
+                "title": f"🚀 {self.identidade} - Relatório Operacional",
                 "color": 3066993,
                 "fields": [
-                    {"name": "📉 Métricas IA", "value": f"**MAE:** {self.auditoria['mae']}\n**RMSE:** {self.auditoria['rmse']}", "inline": False},
-                    {"name": "🌊 Camada Bruta", "value": f"Registros: {self.auditoria['volume_bruto']}", "inline": True},
-                    {"name": "☁️ Firestore", "value": f"Hexágonos H3: {self.auditoria['hexagonos_processados']}", "inline": True}
-                ]
+                    {"name": "🌊 Camadas do Data Lake", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
+                    {"name": "📉 Performance IA", "value": f"MAE: {self.auditoria['metricas']['mae']}\nRMSE: {self.auditoria['metricas']['rmse']}", "inline": True},
+                    {"name": "🗂️ Crimes por Categoria", "value": cat_str or "Nenhum detectado", "inline": False},
+                    {"name": "☁️ Cloud", "value": f"H3 Atualizados: {self.auditoria['nuvem']['hexagonos']}", "inline": True}
+                ],
+                "footer": {"text": "Processamento autônomo concluído."}
             }]
         }
         requests.post(webhook, json=payload)
