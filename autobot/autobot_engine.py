@@ -24,14 +24,22 @@ class AutobotSafeDriver:
         
         self.auditoria = {
             "camadas": {"bruta": 0, "confiavel": 0, "refinada": 0},
-            "categorias": {},
+            "perfis": {"Pedestre": 0, "Motorista": 0, "Ciclista": 0, "Motociclista": 0, "Geral": 0},
             "metricas": {"mae": 0.0, "rmse": 0.0},
-            "nuvem": {"hexagonos": 0}
+            "nuvem": {"documentos": 0}
         }
         
         self.pesos_crimes = {
-            "LATROCINIO": 10.0, "ROUBO DE VEICULO": 8.5, "ROUBO DE CARGA": 8.0,
-            "ROUBO A TRANSEUNTE": 7.0, "FURTO DE VEICULO": 4.0, "OUTROS": 1.0
+            "LATROCINIO": 10.0, "EXTORSAO MEDIANTE SEQUESTRO": 10.0,
+            "ROUBO DE VEICULO": 8.5, "ROUBO DE CARGA": 8.0,
+            "ROUBO A TRANSEUNTE": 7.5, "FURTO DE VEICULO": 4.0, "OUTROS": 1.0
+        }
+        
+        self.mapa_palavras_perfil = {
+            "Pedestre": ["PEDESTRE", "TRANSEUNTE", "CELULAR", "CALCADA", "PONTO DE ONIBUS"],
+            "Motorista": ["VEICULO", "CARRO", "CAMINHAO", "AUTOMOVEL", "CARGA"],
+            "Ciclista": ["BICI", "CICLO", "BICICLETA", "PEDALAR"],
+            "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY"]
         }
         
         self.limites_sp = {"lat": (-24.5, -23.0), "lon": (-47.0, -45.5)}
@@ -59,12 +67,13 @@ class AutobotSafeDriver:
     def _normalizar_coluna(self, c):
         limpo = self._higienizar(c)
         mapa = {
-            "NUM_BO": ["NUM_BO", "NUMERO_BO"],
-            "DATA_OCORRENCIA_BO": ["DATA_OCORRENCIA_BO", "DATA_FATO", "DATA"],
+            "NUM_BO": ["NUM_BO", "NUMERO_BO", "N_BO"],
+            "DATA_OCORRENCIA_BO": ["DATA_OCORRENCIA_BO", "DATA_FATO", "DATAOCORRENCIA"],
             "HORA_OCORRENCIA_BO": ["HORA_OCORRENCIA_BO", "HORA_FATO"],
-            "LATITUDE": ["LATITUDE", "LAT"],
-            "LONGITUDE": ["LONGITUDE", "LON"],
-            "NATUREZA_APURADA": ["NATUREZA_APURADA", "NATUREZA", "RUBRICA"]
+            "LATITUDE": ["LATITUDE", "LAT", "LATITUDEDECIMAL"],
+            "LONGITUDE": ["LONGITUDE", "LON", "LONGITUDEDECIMAL"],
+            "NATUREZA_APURADA": ["NATUREZA_APURADA", "NATUREZA", "RUBRICA"],
+            "LOCAL": ["DESCR_TIPOLOCAL", "TIPOLOCAL", "LOCAL"]
         }
         for k, v in mapa.items():
             if limpo in v: return k
@@ -78,10 +87,18 @@ class AutobotSafeDriver:
             return val
         except: return np.nan
 
+    def _atribuir_perfis(self, linha):
+        texto = f"{linha['NATUREZA_APURADA']} {linha['LOCAL']}".upper()
+        encontrados = [p for p, palavras in self.mapa_palavras_perfil.items() if any(w in texto for w in palavras)]
+        return encontrados if encontrados else ["Geral"]
+
     def _processar_ia(self, df):
         if len(df) < 20: return pd.DataFrame()
         
-        df['hotspot'] = DBSCAN(eps=0.001, min_samples=5).fit_predict(df[['LATITUDE', 'LONGITUDE']])
+        # Expansão por Perfis e Limpeza Espacial
+        df['perfis'] = df.apply(self._atribuir_perfis, axis=1)
+        df = df.explode('perfis')
+        df['hotspot'] = DBSCAN(eps=0.001, min_samples=5).fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
         df = df[df['hotspot'] != -1].copy()
         
         def h_int(x):
@@ -89,31 +106,26 @@ class AutobotSafeDriver:
             except: return 0
         df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=h_int(x)<6 else 'Manha' if 6<=h_int(x)<12 else 'Tarde' if 12<=h_int(x)<18 else 'Noite')
         
-        df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
-        hist = df.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
-        f_saz = 1.0
-        if len(hist) >= 2:
-            m_p = Prophet(yearly_seasonality=True, daily_seasonality=False).fit(hist)
-            prev = m_p.predict(pd.DataFrame({'ds': [datetime.now() + timedelta(days=1)]}))
-            f_saz = max(0.5, prev['yhat'].values[0] / hist['y'].mean())
-
-        enc_t = LabelEncoder()
+        # IA Preditiva (XGBoost)
+        enc_t, enc_p = LabelEncoder(), LabelEncoder()
         df['t_cod'] = enc_t.fit_transform(df['turno'])
+        df['p_cod'] = enc_p.fit_transform(df['perfis'])
         df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.pesos_crimes.get(x, 1.0))
         
-        X = df[['LATITUDE', 'LONGITUDE', 't_cod', 'hotspot']]
+        X = df[['LATITUDE', 'LONGITUDE', 't_cod', 'p_cod', 'hotspot']]
         y = df['peso']
         modelo = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05).fit(X, y)
         
-        preds = modelo.predict(X)
-        self.auditoria['metricas']['mae'] = round(float(mean_absolute_error(y, preds)), 4)
-        self.auditoria['metricas']['rmse'] = round(float(np.sqrt(mean_squared_error(y, preds))), 4)
+        self.auditoria['metricas']['mae'] = round(float(mean_absolute_error(y, modelo.predict(X))), 4)
+        self.auditoria['metricas']['rmse'] = round(float(np.sqrt(mean_squared_error(y, modelo.predict(X)))), 4)
         
+        # Agregação H3 Nível 10
         df['h3'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
-        res = df.groupby(['h3', 'turno']).agg({'peso': ['mean', 'count']}).reset_index()
-        res.columns = ['h3', 'turno', 'peso_medio', 'freq']
+        res = df.groupby(['h3', 'perfis', 'turno']).agg({'peso': ['mean', 'count']}).reset_index()
+        res.columns = ['h3', 'perfil', 'turno', 'peso_medio', 'freq']
         
-        res['pt_bruta'] = res['peso_medio'] * np.log2(res['freq'] + 1) * f_saz
+        # Score com Variância (Frequência Logarítmica)
+        res['pt_bruta'] = res['peso_medio'] * np.log2(res['freq'] + 1)
         scaler = MinMaxScaler(feature_range=(0.5, 10.0))
         res['pt'] = scaler.fit_transform(res[['pt_bruta']]).round(1)
         res['pn'] = (1 + (res['pt'] * 0.15)).round(2)
@@ -123,28 +135,33 @@ class AutobotSafeDriver:
     def _sincronizar(self, malha):
         if not self.banco_nuvem or malha.empty: return
         col = self.banco_nuvem.collection('malha_seguranca')
-        agrupado = malha.groupby('h3')
         batch = self.banco_nuvem.batch()
         count = 0
 
-        for h3_id, dados in agrupado:
-            doc_ref = col.document(h3_id)
-            scores = {row['turno']: {"pt": row['pt'], "pn": row['pn']} for _, row in dados.iterrows()}
-            batch.set(doc_ref, {"id_h3": h3_id, "scores": scores, "data": firestore.SERVER_TIMESTAMP}, merge=True)
+        for _, r in malha.iterrows():
+            # Documentos Atômicos: perfil_hexagono
+            doc_id = f"{r['perfil'].lower()}_{r['h3']}"
+            batch.set(col.document(doc_id), {
+                "id_h3": r['h3'],
+                "perfil": r['perfil'],
+                "scores": {r['turno']: {"pt": r['pt'], "pn": r['pn']}},
+                "data": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+            
             count += 1
             if count >= 400:
                 batch.commit()
                 batch = self.banco_nuvem.batch()
                 count = 0
         batch.commit()
-        self.auditoria['nuvem']['hexagonos'] = len(agrupado)
+        self.auditoria['nuvem']['documentos'] = count + (self.auditoria['nuvem']['documentos'])
 
     def executar(self):
         mestre = pd.DataFrame()
         for ano in self.periodo_historico:
-            caminho = f'datalake/bruto/ssp_{ano}.parquet'
-            if os.path.exists(caminho):
-                df = pd.read_parquet(caminho)
+            caminho_bruto = f'datalake/bruto/ssp_{ano}.parquet'
+            if os.path.exists(caminho_bruto):
+                df = pd.read_parquet(caminho_bruto)
             else:
                 try:
                     url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
@@ -154,37 +171,39 @@ class AutobotSafeDriver:
                     df = df.loc[:, ~df.columns.duplicated()].copy()
                     df['LATITUDE'] = df['LATITUDE'].apply(lambda x: self._corrigir_gps(x, True))
                     df['LONGITUDE'] = df['LONGITUDE'].apply(lambda x: self._corrigir_gps(x, False))
-                    df.to_parquet(caminho, index=False)
+                    df.to_parquet(caminho_bruto, index=False)
                 except: continue
             
             self.auditoria['camadas']['bruta'] += len(df)
-            validados = df[df['LATITUDE'].notna()].copy()
-            self.auditoria['camadas']['confiavel'] += len(validados)
-            mestre = pd.concat([mestre, validados])
+            val = df[df['LATITUDE'].notna()].copy()
+            self.auditoria['camadas']['confiavel'] += len(val)
+            mestre = pd.concat([mestre, val])
 
         if not mestre.empty:
-            contagem = mestre['NATUREZA_APURADA'].value_counts().to_dict()
-            self.auditoria['categorias'] = {k: int(v) for k, v in contagem.items() if k in self.pesos_crimes}
+            prev = self._processar_ia(mestre)
+            self.auditoria['camadas']['refinada'] = len(prev)
             
-            previsoes = self._processar_ia(mestre)
-            self.auditoria['camadas']['refinada'] = len(previsoes)
-            previsoes.to_parquet('datalake/refinado/malha_final.parquet', index=False)
-            self._sincronizar(previsoes)
+            # Contagem detalhada por perfil para o relatório
+            for p in self.auditoria['perfis'].keys():
+                self.auditoria['perfis'][p] = int(len(prev[prev['perfil'] == p]))
+                
+            prev.to_parquet('datalake/refinado/malha_final.parquet', index=False)
+            self._sincronizar(prev)
             self._notificar()
 
     def _notificar(self):
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
-        cat_str = "\n".join([f"**{k}:** {v}" for k, v in self.auditoria['categorias'].items()])
+        perf_str = "\n".join([f"**{k}:** {v} hexágonos de risco" for k, v in self.auditoria['perfis'].items()])
         payload = {
             "embeds": [{
                 "title": f"🚀 {self.identidade} - Relatório de Missão",
                 "color": 3066993,
                 "fields": [
-                    {"name": "🌊 Fluxo do Data Lake", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
-                    {"name": "📉 Treinamento (MAE/RMSE)", "value": f"{self.auditoria['metricas']['mae']} / {self.auditoria['metricas']['rmse']}", "inline": True},
-                    {"name": "🗂️ Crimes Processados", "value": cat_str or "Vazio", "inline": False},
-                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['nuvem']['hexagonos']} Hexágonos", "inline": True}
+                    {"name": "🌊 Camadas do Lakehouse", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
+                    {"name": "📉 IA (MAE/RMSE)", "value": f"{self.auditoria['metricas']['mae']} / {self.auditoria['metricas']['rmse']}", "inline": True},
+                    {"name": "👥 Volumetria por Perfil", "value": perf_str, "inline": False},
+                    {"name": "☁️ Sincronização", "value": f"{self.auditoria['camadas']['refinada']} Documentos", "inline": True}
                 ]
             }]
         }
