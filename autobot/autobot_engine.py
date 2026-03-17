@@ -15,10 +15,9 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans, DBSCAN
 
-
 class MotorSafeDriver:
     def __init__(self, persistencia=True):
-        self.identidade = "Autobot SafeDriver Engine v2.1"
+        self.identidade = "Autobot SafeDriver Engine v3.0"
         self.ano_vigente = datetime.now().year
         self.periodo_historico = range(2022, self.ano_vigente + 1)
         self.persistencia_ativa = persistencia
@@ -27,7 +26,7 @@ class MotorSafeDriver:
         self.auditoria = {
             "volume_raw": 0, "volume_trusted": 0, "volume_refined": 0,
             "registros_inconsistentes": 0, "manchas_identificadas": 0,
-            "h3_avaliados": 0, "dados_origem_atualizados": False,
+            "h3_avaliados": 0, "h3_mutados": 0, "dados_origem_atualizados": False,
             "modo": "OPERACIONAL"
         }
         
@@ -65,7 +64,6 @@ class MotorSafeDriver:
     def _iniciar_sistemas_internos(self):
         for pasta in ['raw', 'trusted', 'refined', 'metadata']:
             os.makedirs(f'datalake/{pasta}', exist_ok=True)
-            
         if not os.path.exists('datalake/metadata/baseline.lock'):
             self.auditoria["modo"] = "HARD_RESET"
 
@@ -80,252 +78,169 @@ class MotorSafeDriver:
 
     def _configurar_sessao_resiliente(self):
         sessao = requests.Session()
-        politica_retentativa = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
-        adaptador = HTTPAdapter(max_retries=politica_retentativa)
-        sessao.mount("http://", adaptador)
-        sessao.mount("https://", adaptador)
+        politica = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
+        sessao.mount("http://", HTTPAdapter(max_retries=politica))
+        sessao.mount("https://", HTTPAdapter(max_retries=politica))
         sessao.headers.update({'User-Agent': self.identidade})
         return sessao
 
     def _comunicar_status(self, nivel, mensagem=None):
-        endereco_webhook = os.environ.get('DISCORD_AUDITORIA')
-        if not endereco_webhook or not self.persistencia_ativa: return
-
+        webhook = os.environ.get('DISCORD_AUDITORIA')
+        if not webhook or not self.persistencia_ativa: return
+        
+        status = "Novos dados processados." if self.auditoria['dados_origem_atualizados'] else "Predicao de D+1 finalizada via Delta Sync."
         if nivel == "OPERACIONAL":
-            status = "Novos dados detectados na grade." if self.auditoria['dados_origem_atualizados'] else "Matriz preditiva retreinada sem alterações na fonte."
-            if self.auditoria["modo"] == "HARD_RESET": status = "Sincronização primária e expurgo de dados concluídos (HARD_RESET)."
-            
             payload = {
                 "embeds": [{
-                    "title": f"Terminal de Status: {self.identidade}",
+                    "title": f"Terminal Autobot: {self.identidade}",
                     "description": status,
                     "color": 3066993,
                     "fields": [
-                        {"name": "Processamento de Dados", "value": f"Ingeridos: {self.auditoria['volume_raw']:,}\nRefinados: {self.auditoria['volume_refined']:,}", "inline": False},
-                        {"name": "Inteligência Espacial", "value": f"Hotspots (DBSCAN): {self.auditoria['manchas_identificadas']:,}\nMalha H3 Atualizada: {self.auditoria['h3_avaliados']:,}", "inline": False}
+                        {"name": "Ingestao", "value": f"Raw: {self.auditoria['volume_raw']}\nRefined: {self.auditoria['volume_refined']}", "inline": False},
+                        {"name": "Sync Nuvem", "value": f"H3 Avaliados: {self.auditoria['h3_avaliados']}\nH3 Mutados (Delta): {self.auditoria['h3_mutados']}", "inline": False}
                     ]
                 }]
             }
         else:
-            payload = {
-                "embeds": [{
-                    "title": "Aviso de Falha no Subsistema",
-                    "color": 15158332,
-                    "fields": [{"name": "Log de Erro", "value": str(mensagem), "inline": False}]
-                }]
-            }
-        requests.post(endereco_webhook, json=payload)
+            payload = {"embeds": [{"title": "Falha Critica", "description": str(mensagem), "color": 15158332}]}
+        requests.post(webhook, json=payload)
 
     def _higienizar_string(self, texto):
         if pd.isna(texto) or not isinstance(texto, str): return str(texto) if not pd.isna(texto) else ""
-        texto_limpo = unicodedata.normalize('NFKD', texto)
-        return "".join([c for c in texto_limpo if not unicodedata.combining(c)]).upper().strip()
+        return "".join([c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c)]).upper().strip()
 
-    def _normalizar(self, nome_coluna):
-        nome_limpo = self._higienizar_string(nome_coluna)
-        for chave_canonica, sinonimos in self.dicionario_semantico.items():
-            if nome_limpo in sinonimos:
-                return chave_canonica
-        return nome_limpo
+    def _normalizar(self, coluna):
+        limpa = self._higienizar_string(coluna)
+        for k, v in self.dicionario_semantico.items():
+            if limpa in v: return k
+        return limpa
 
     def _classificar_crime(self, natureza):
         if pd.isna(natureza): return np.nan
-        natureza_limpa = self._higienizar_string(natureza)
-        if natureza_limpa in self.catalogo_conhecimento:
-            return natureza_limpa
-        return "OUTROS"
+        limpa = self._higienizar_string(natureza)
+        return limpa if limpa in self.catalogo_conhecimento else "OUTROS"
 
     def _corrigir_ponto_decimal(self, valor, is_lat=True):
         try:
             v = float(str(valor).replace(',', '.'))
-            if is_lat and (v < self.limites_territoriais['lat'][0] or v > self.limites_territoriais['lat'][1]):
-                v = v / (10 ** (len(str(int(abs(v)))) - 2))
-            elif not is_lat and (v < self.limites_territoriais['lon'][0] or v > self.limites_territoriais['lon'][1]):
+            limites = self.limites_territoriais['lat'] if is_lat else self.limites_territoriais['lon']
+            if v < limites[0] or v > limites[1]:
                 v = v / (10 ** (len(str(int(abs(v)))) - 2))
             return v
         except: return np.nan
 
     def _verificar_fonte(self, url, ano):
         if self.auditoria["modo"] == "HARD_RESET": return True, 0
-        caminho_metadados = f"datalake/metadata/fonte_{ano}.json"
+        metadados = f"datalake/metadata/fonte_{ano}.json"
         try:
             cabecalho = self.sessao_http.head(url, timeout=30, allow_redirects=True)
             tamanho = int(cabecalho.headers.get('Content-Length', 0))
-            if os.path.exists(caminho_metadados):
-                with open(caminho_metadados, 'r') as arquivo:
-                    if json.load(arquivo).get('tamanho') == tamanho: return False, tamanho
+            if os.path.exists(metadados):
+                with open(metadados, 'r') as f:
+                    if json.load(f).get('tamanho') == tamanho: return False, tamanho
             return True, tamanho
         except: return True, 0
 
-    def _classificar_comportamento(self, linha):
-        perfis = set()
-        contexto = f"{linha.get('NATUREZA_APURADA','')} {linha.get('DESCR_TIPOLOCAL','')} ".upper()
-        for perfil, palavras in self.matriz_comportamental.items():
-            if any(palavra in contexto for palavra in palavras):
-                perfis.add(perfil)
-        return list(perfis) if perfis else ['Geral']
-
-    def _qualificar(self, df_bruto):
+    def _qualificar(self, df):
+        df_bruto = df.copy()
         for col in self.esquema_canonico.keys():
-            if col not in df_bruto.columns and col != 'ANO_BASE': df_bruto[col] = np.nan
+            if col not in df_bruto.columns:
+                if col == 'ANO_BASE': df_bruto[col] = self.ano_vigente
+                elif col == 'HORA_OCORRENCIA_BO': df_bruto[col] = "00:00:00"
+                else: df_bruto[col] = np.nan
 
-        volume_entrada = len(df_bruto)
-        
         for col, tipo in self.esquema_canonico.items():
-            if col not in df_bruto.columns: continue
             if tipo == 'string': df_bruto[col] = df_bruto[col].apply(self._higienizar_string)
-            elif tipo == 'float': 
-                eh_lat = (col == 'LATITUDE')
-                df_bruto[col] = df_bruto[col].apply(lambda x: self._corrigir_ponto_decimal(x, eh_lat))
+            elif tipo == 'float': df_bruto[col] = df_bruto[col].apply(lambda x: self._corrigir_ponto_decimal(x, col == 'LATITUDE'))
             elif tipo == 'datetime': df_bruto[col] = pd.to_datetime(df_bruto[col], errors='coerce')
             elif tipo == 'int': df_bruto[col] = pd.to_numeric(df_bruto[col], errors='coerce').fillna(0).astype(int)
 
         df_bruto['NATUREZA_APURADA'] = df_bruto['NATUREZA_APURADA'].apply(self._classificar_crime)
-
-        mascara_limites = (
-            df_bruto['LATITUDE'].notna() & df_bruto['LONGITUDE'].notna() &
-            (df_bruto['LATITUDE'] != 0) & (df_bruto['LONGITUDE'] != 0) &
-            df_bruto['LATITUDE'].between(self.limites_territoriais['lat'][0], self.limites_territoriais['lat'][1]) &
-            df_bruto['LONGITUDE'].between(self.limites_territoriais['lon'][0], self.limites_territoriais['lon'][1])
-        )
-        df_trusted = df_bruto[mascara_limites].copy()[list(self.esquema_canonico.keys())]
-        self.auditoria['registros_inconsistentes'] += (volume_entrada - len(df_trusted))
+        mascara = (df_bruto['LATITUDE'].notna() & df_bruto['LONGITUDE'].notna() &
+                   df_bruto['LATITUDE'].between(self.limites_territoriais['lat'][0], self.limites_territoriais['lat'][1]) &
+                   df_bruto['LONGITUDE'].between(self.limites_territoriais['lon'][0], self.limites_territoriais['lon'][1]))
         
-        mascara_regras = df_trusted['NATUREZA_APURADA'].notna()
-        df_refined = df_trusted[mascara_regras].copy()
-        
+        df_trusted = df_bruto[mascara].copy()[list(self.esquema_canonico.keys())]
+        df_refined = df_trusted[df_trusted['NATUREZA_APURADA'].notna()].copy()
         return df_trusted, df_refined
 
-    def _mapear_territorio(self, df_eventos):
-        df_eventos['perfil_alvo'] = df_eventos.apply(self._classificar_comportamento, axis=1)
-        df_eventos = df_eventos.explode('perfil_alvo').dropna(subset=['perfil_alvo'])
+    def _mapear_territorio(self, df):
+        df['perfil_alvo'] = df.apply(lambda r: [p for p, words in self.matriz_comportamental.items() if any(w in f"{r['NATUREZA_APURADA']} {r['DESCR_TIPOLOCAL']}".upper() for w in words)] or ['Geral'], axis=1)
+        df = df.explode('perfil_alvo')
+        vetor = TfidfVectorizer(max_features=50).fit_transform(df['NATUREZA_APURADA'].fillna('') + " " + df['DESCR_TIPOLOCAL'].fillna(''))
+        df['vetor_comportamental'] = KMeans(n_clusters=4, random_state=42, n_init="auto").fit_predict(vetor)
+        df['gravidade'] = df['NATUREZA_APURADA'].apply(lambda x: self.catalogo_conhecimento.get(x, {}).get('peso', 1.0))
+        df['id_hotspot'] = DBSCAN(eps=0.001, min_samples=3, metric='euclidean').fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
+        return df[df['id_hotspot'] != -1].copy()
 
-        textos = df_eventos['NATUREZA_APURADA'].fillna('') + " " + df_eventos['DESCR_TIPOLOCAL'].fillna('')
-        vetorizador = TfidfVectorizer(max_features=50)
-        matriz_tfidf = vetorizador.fit_transform(textos)
-        
-        kmeans = KMeans(n_clusters=4, random_state=42, n_init="auto")
-        df_eventos['vetor_comportamental'] = kmeans.fit_predict(matriz_tfidf)
-        df_eventos['gravidade'] = df_eventos['NATUREZA_APURADA'].apply(lambda x: self.catalogo_conhecimento.get(x, {}).get('peso', 1.0))
-
-        coordenadas = df_eventos[['LATITUDE', 'LONGITUDE']].values
-        dbscan = DBSCAN(eps=0.001, min_samples=3, metric='euclidean', n_jobs=-1)
-        df_eventos['id_hotspot'] = dbscan.fit_predict(coordenadas)
-        
-        return df_eventos[df_eventos['id_hotspot'] != -1].copy()
-
-    def _processar_redes_neurais(self, df_hotspots):
-        def classificar_iluminacao(hora):
-            try:
-                h = int(str(hora).split(':')[0])
-                return 'Madrugada' if 0<=h<6 else 'Manhã' if 6<=h<12 else 'Tarde' if 12<=h<18 else 'Noite'
-            except: return 'Indefinido'
-            
-        df_hotspots['turno'] = df_hotspots['HORA_OCORRENCIA_BO'].apply(classificar_iluminacao)
-        
-        enc_turno = LabelEncoder()
-        enc_perfil = LabelEncoder()
-        df_hotspots['turno_enc'] = enc_turno.fit_transform(df_hotspots['turno'])
-        df_hotspots['perfil_enc'] = enc_perfil.fit_transform(df_hotspots['perfil_alvo'])
-
+    def _processar_predicao_diaria(self, df_hotspots):
+        df_hotspots['turno'] = df_hotspots['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=int(str(x).split(':')[0])<6 else 'Manha' if 6<=int(str(x).split(':')[0])<12 else 'Tarde' if 12<=int(str(x).split(':')[0])<18 else 'Noite')
+        enc_t, enc_p = LabelEncoder(), LabelEncoder()
+        df_hotspots['turno_enc'], df_hotspots['perfil_enc'] = enc_t.fit_transform(df_hotspots['turno']), enc_p.fit_transform(df_hotspots['perfil_alvo'])
         df_hotspots['DATA_OCORRENCIA_BO'] = pd.to_datetime(df_hotspots['DATA_OCORRENCIA_BO'])
-        df_hotspots['dia_semana'] = df_hotspots['DATA_OCORRENCIA_BO'].dt.dayofweek
-        df_hotspots['mes'] = df_hotspots['DATA_OCORRENCIA_BO'].dt.month
-
+        
         serie = df_hotspots.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
-        prophet = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
-        prophet.fit(serie)
-
-        baseline = df_hotspots.groupby(['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc']).agg(
-            lat=('LATITUDE', 'mean'),
-            lon=('LONGITUDE', 'mean'),
-            risco_base=('gravidade', 'mean'),
-            volume=('gravidade', 'count')
-        ).reset_index()
-
-        df_treino = df_hotspots.groupby(['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc', 'DATA_OCORRENCIA_BO', 'dia_semana', 'mes']).agg({'gravidade': 'sum'}).reset_index()
-        df_treino = df_treino.merge(baseline[['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc', 'risco_base']], on=['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc'], how='left')
+        prophet = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False).fit(serie)
         
-        fator_sazonal = prophet.predict(df_treino[['DATA_OCORRENCIA_BO']].rename(columns={'DATA_OCORRENCIA_BO': 'ds'}))
-        df_treino['sazonalidade'] = fator_sazonal['yhat'].values
-
-        X = df_treino[['perfil_enc', 'vetor_comportamental', 'turno_enc', 'dia_semana', 'mes', 'risco_base', 'sazonalidade']]
-        y = df_treino['gravidade']
+        baseline = df_hotspots.groupby(['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc']).agg({'LATITUDE': 'mean', 'LONGITUDE': 'mean', 'gravidade': ['mean', 'count']}).reset_index()
+        baseline.columns = ['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc', 'lat', 'lon', 'risco_base', 'volume']
         
-        xgboost = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, max_depth=5)
-        xgboost.fit(X, y)
-
-        projecoes = []
-        for dia in range(1, 8):
-            data = datetime.now() + timedelta(days=dia)
-            df_dia = baseline.copy()
-            df_dia['dia_semana'] = data.weekday()
-            df_dia['mes'] = data.month
-            df_dia['sazonalidade'] = prophet.predict(pd.DataFrame({'ds': [data]}))['yhat'].values[0]
-            
-            X_futuro = df_dia[['perfil_enc', 'vetor_comportamental', 'turno_enc', 'dia_semana', 'mes', 'risco_base', 'sazonalidade']]
-            df_dia['intensidade'] = xgboost.predict(X_futuro)
-            projecoes.append(df_dia)
-            
-        df_semana = pd.concat(projecoes)
+        df_t = df_hotspots.groupby(['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc', 'DATA_OCORRENCIA_BO']).agg({'gravidade': 'sum'}).reset_index()
+        df_t = df_t.merge(baseline, on=['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc'])
+        df_t['sazonalidade'] = prophet.predict(df_t[['DATA_OCORRENCIA_BO']].rename(columns={'DATA_OCORRENCIA_BO': 'ds'}))['yhat'].values
         
-        df_resultado = df_semana.groupby(['id_hotspot', 'lat', 'lon', 'turno_enc', 'vetor_comportamental']).agg(
-            risco_medio=('intensidade', 'mean'),
-            volume_historico=('volume', 'first')
-        ).reset_index()
-
-        df_resultado['energia'] = df_resultado['risco_medio'] * df_resultado['volume_historico']
-        limite = df_resultado['energia'].quantile(0.95)
+        X = df_t[['perfil_enc', 'vetor_comportamental', 'turno_enc', 'risco_base', 'sazonalidade']]
+        model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100).fit(X, df_t['gravidade'])
         
-        df_resultado['score'] = (df_resultado['energia'] / limite) * 10
-        df_resultado['score'] = df_resultado['score'].clip(0.5, 10.0).round(2)
-        df_resultado['penalidade'] = (1 + (df_resultado['score'] * 0.2)).round(2)
-        df_resultado['turno_desc'] = enc_turno.inverse_transform(df_resultado['turno_enc'])
+        amanha = datetime.now() + timedelta(days=1)
+        df_f = baseline.copy()
+        df_f['sazonalidade'] = prophet.predict(pd.DataFrame({'ds': [amanha]}))['yhat'].values[0]
+        df_f['pred'] = model.predict(df_f[['perfil_enc', 'vetor_comportamental', 'turno_enc', 'risco_base', 'sazonalidade']])
         
-        df_resultado['codigo_h3'] = df_resultado.apply(lambda row: h3.latlng_to_cell(row['lat'], row['lon'], 10), axis=1)
-
-        self.auditoria['manchas_identificadas'] = len(df_resultado['id_hotspot'].unique())
+        df_f['score'] = ((df_f['pred'] * df_f['volume']) / (df_f['pred'] * df_f['volume']).max() * 10).clip(0.5, 10.0).round(1)
+        df_f['penalidade'] = (1 + (df_f['score'] * 0.2)).round(1)
+        df_f['codigo_h3'] = df_f.apply(lambda r: h3.latlng_to_cell(r['lat'], r['lon'], 10), axis=1)
+        df_f['turno_desc'] = enc_t.inverse_transform(df_f['turno_enc'])
         
-        return df_resultado.groupby(['codigo_h3', 'turno_desc']).agg(
-            score=('score', 'max'),
-            penalidade=('penalidade', 'max'),
-            cluster=('vetor_comportamental', 'first')
-        ).reset_index()
+        self.auditoria['manchas_identificadas'] = len(df_f['id_hotspot'].unique())
+        return df_f.groupby(['codigo_h3', 'turno_desc']).agg({'score': 'max', 'penalidade': 'max', 'vetor_comportamental': 'first'}).reset_index()
 
-    def _executar_expurgo_firestore(self):
-        if not self.banco_dados or not self.persistencia_ativa: return
-        colecao = self.banco_dados.collection('malha_preditiva_semanal')
-        lote = self.banco_dados.batch()
-        for doc in colecao.stream():
-            lote.delete(doc.reference)
-        lote.commit()
-
-    def _exportar_dados_terminais(self, df_malha_h3):
+    def _sincronizar_delta(self, df_h3):
         if not self.banco_dados or not self.persistencia_ativa: return
         
+        colecao = self.banco_dados.collection('malha_preditiva_diaria')
+        turnos = df_h3['turno_desc'].unique()
+        self.auditoria['h3_avaliados'] = len(df_h3)
+
         if self.auditoria["modo"] == "HARD_RESET":
-            self._executar_expurgo_firestore()
-        
-        colecao = self.banco_dados.collection('malha_preditiva_semanal')
-        turnos = df_malha_h3['turno_desc'].unique()
-        self.auditoria['h3_avaliados'] = len(df_malha_h3)
+            for doc in colecao.stream(): colecao.document(doc.id).delete()
 
         for turno in turnos:
-            df_turno = df_malha_h3[df_malha_h3['turno_desc'] == turno]
+            df_turno = df_h3[df_h3['turno_desc'] == turno]
+            ref_doc = colecao.document(f"turno_{turno}")
+            doc_snap = ref_doc.get()
+            dados_nuvem = doc_snap.to_dict().get("h3_dados", {}) if doc_snap.exists else {}
             
-            payload = {}
+            payload_delta = {}
             for _, linha in df_turno.iterrows():
-                payload[linha['codigo_h3']] = {
-                    "score": float(linha['score']),
-                    "penalidade": float(linha['penalidade']),
-                    "cluster": int(linha['cluster'])
-                }
-            
-            colecao.document(f"turno_{turno}").set({
-                "ultima_atualizacao": firestore.SERVER_TIMESTAMP,
-                "h3_dados": payload
-            })
-            
+                h3_id = linha['codigo_h3']
+                s = round(float(linha['score']), 1)
+                p = round(float(linha['penalidade']), 1)
+                c = int(linha['vetor_comportamental'])
+                
+                novo_dado = {"score": s, "penalidade": p, "cluster": c}
+                if h3_id not in dados_nuvem or dados_nuvem[h3_id] != novo_dado:
+                    payload_delta[f"h3_dados.{h3_id}"] = novo_dado
+                    self.auditoria['h3_mutados'] += 1
+
+            if payload_delta:
+                payload_delta["ultima_atualizacao"] = firestore.SERVER_TIMESTAMP
+                if doc_snap.exists:
+                    ref_doc.update(payload_delta)
+                else:
+                    estrutura_inicial = {"h3_dados": {k.split('.')[1]: v for k, v in payload_delta.items() if k != "ultima_atualizacao"}, "ultima_atualizacao": firestore.SERVER_TIMESTAMP}
+                    ref_doc.set(estrutura_inicial)
+                    
         if self.auditoria["modo"] == "HARD_RESET":
             with open('datalake/metadata/baseline.lock', 'w') as f: f.write(str(datetime.now()))
             self.auditoria["modo"] = "OPERACIONAL"
@@ -335,33 +250,28 @@ class MotorSafeDriver:
         try:
             for ano in self.periodo_historico:
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                caminho_raw = f'datalake/raw/ssp_{ano}.parquet'
-                caminho_trusted = f'datalake/trusted/ssp_trusted_{ano}.parquet'
+                caminho = f'datalake/raw/ssp_{ano}.parquet'
                 
                 baixar, tamanho = self._verificar_fonte(url, ano)
-                
-                if baixar or not os.path.exists(caminho_raw):
+                if baixar or not os.path.exists(caminho):
                     res = self.sessao_http.get(url, timeout=120)
                     if res.status_code != 200: continue
-
                     amostra = pd.read_excel(io.BytesIO(res.content), nrows=50, header=None)
-                    linha_header = next((i for i, l in amostra.iterrows() if any(t in [self._higienizar_string(str(c)) for c in l.values] for t in ['NUM_BO', 'LATITUDE', 'NATUREZA_APURADA'])), None)
-                    if linha_header is None: continue
-
-                    df_temp = pd.read_excel(io.BytesIO(res.content), skiprows=linha_header, dtype=str)
+                    header = next((i for i, l in amostra.iterrows() if any(t in [self._higienizar_string(str(c)) for c in l.values] for t in ['NUM_BO', 'LATITUDE', 'NATUREZA_APURADA'])), None)
+                    if header is None: continue
+                    df_temp = pd.read_excel(io.BytesIO(res.content), skiprows=header, dtype=str)
                     df_temp.columns = [self._normalizar(c) for c in df_temp.columns]
-                    
-                    df_temp.to_parquet(caminho_raw, index=False)
+                    df_temp.to_parquet(caminho, index=False)
                     with open(f"datalake/metadata/fonte_{ano}.json", 'w') as f: json.dump({'tamanho': tamanho}, f)
                     self.auditoria['dados_origem_atualizados'] = True
                 else:
-                    df_temp = pd.read_parquet(caminho_raw)
+                    df_temp = pd.read_parquet(caminho)
 
                 df_temp['ANO_BASE'] = ano
                 self.auditoria['volume_raw'] += len(df_temp)
                 df_trusted, df_refined = self._qualificar(df_temp)
                 
-                if self.persistencia_ativa: df_trusted.to_parquet(caminho_trusted, index=False)
+                if self.persistencia_ativa: df_trusted.to_parquet(f'datalake/trusted/ssp_trusted_{ano}.parquet', index=False)
                 df_master = pd.concat([df_master, df_refined])
                 self.auditoria['volume_trusted'] += len(df_trusted)
                 self.auditoria['volume_refined'] += len(df_refined)
@@ -369,16 +279,16 @@ class MotorSafeDriver:
             if df_master.empty: return
 
             df_manchas = self._mapear_territorio(df_master)
-            malha_h3 = self._processar_redes_neurais(df_manchas)
+            malha_h3 = self._processar_predicao_diaria(df_manchas)
             
             if self.persistencia_ativa:
-                malha_h3.to_parquet("datalake/refined/malha_h3_semanal.parquet", index=False)
+                malha_h3.to_parquet("datalake/refined/malha_h3_diaria.parquet", index=False)
             
-            self._exportar_dados_terminais(malha_h3)
-            self._comunicar_status(nivel="OPERACIONAL")
+            self._sincronizar_delta(malha_h3)
+            self._comunicar_status("OPERACIONAL")
 
         except Exception as e:
-            self._comunicar_status(nivel="FALHA", mensagem=str(e))
+            self._comunicar_status("FALHA", str(e))
             raise
 
 if __name__ == "__main__":
