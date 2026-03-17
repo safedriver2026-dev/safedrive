@@ -7,13 +7,13 @@ on:
     - cron: '0 3 * * *'
 
 jobs:
-  execucao:
+  missao:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-
+    - uses: actions/checkout@v4
+    
     - name: Cache Data Lake
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: datalake
         key: ${{ runner.os }}-datalake-${{ hashFiles('datalake/bruto/*.parquet') }}
@@ -21,20 +21,21 @@ jobs:
           ${{ runner.os }}-datalake-
 
     - name: Setup Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    - name: Install Dependencies
+    - name: Dependencias
       run: |
         python -m pip install --upgrade pip
         pip install pytest pandas numpy requests firebase-admin h3 prophet xgboost scikit-learn fastparquet openpyxl
 
-    - name: Run Tests
+    - name: Validar Contratos
       run: pytest tests/test_contracts.py -v
 
-    - name: Run Autobot
+    - name: Acionar Autobot
       env:
         FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
         DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       run: python autobot/autobot_engine.py
