@@ -15,7 +15,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 class AutobotSafeDriver:
     def __init__(self, persistencia=True):
-        self.identidade = "Autobot SafeDriver v4.2"
+        self.identidade = "Autobot SafeDriver v4.4"
         self.ano_atual = datetime.now().year
         self.periodo_historico = range(2022, self.ano_atual + 1)
         self.persistencia_ativa = persistencia
@@ -83,20 +83,19 @@ class AutobotSafeDriver:
             resumo_perfis = "\n".join([f"**{perfil}:** {qtd}" for perfil, qtd in self.auditoria['perfis_mapeados'].items()])
             mensagem = {
                 "embeds": [{
-                    "title": f"🚀 {self.identidade} - Processamento Concluído",
-                    "description": f"**Modo:** {self.auditoria['estado_operacional']}\n**Previsão:** Amanhã (D+1)",
+                    "title": f"🚀 {self.identidade} - Missão Finalizada",
+                    "description": f"**Estado:** {self.auditoria['estado_operacional']}",
                     "color": 3066993,
                     "fields": [
-                        {"name": "🌊 Fluxo de Dados", "value": f"Bruto: {self.auditoria['volume_bruto']}\nRefinado: {self.auditoria['volume_refinado']}", "inline": True},
-                        {"name": "☁️ Sincronização", "value": f"H3 Analisados: {self.auditoria['h3_analisados']}\nAlterações: {self.auditoria['h3_alterados']}", "inline": True},
-                        {"name": "📉 Precisão (MAE/RMSE)", "value": f"{self.auditoria['erro_medio_absoluto']} / {self.auditoria['raiz_erro_quadratico']}", "inline": False},
-                        {"name": "🎯 Densidade por Perfil", "value": resumo_perfis or "Calculando...", "inline": False}
+                        {"name": "🌊 Fluxo (Bruto -> Confiavel)", "value": f"Bruto: {self.auditoria['volume_bruto']}\nConfiavel: {self.auditoria['volume_confiavel']}", "inline": True},
+                        {"name": "☁️ Sincronização H3", "value": f"Lidos: {self.auditoria['h3_analisados']}\nMutações: {self.auditoria['h3_alterados']}", "inline": True},
+                        {"name": "📉 Validação IA", "value": f"MAE: {self.auditoria['erro_medio_absoluto']}\nRMSE: {self.auditoria['raiz_erro_quadratico']}", "inline": False}
                     ]
                 }]
             }
             requests.post(canal_sucesso, json=mensagem)
         elif tipo == "ERRO" and canal_erro:
-            requests.post(canal_erro, json={"content": f"⚠️ **FALHA NO AUTOBOT:** {aviso}"})
+            requests.post(canal_erro, json={"content": f"⚠️ **ALERTA CRITICO:** {aviso}"})
 
     def _higienizar_texto(self, original):
         if pd.isna(original) or not isinstance(original, str): return str(original) if not pd.isna(original) else ""
@@ -124,7 +123,7 @@ class AutobotSafeDriver:
         except: return np.nan
 
     def _baixar_dados(self, link):
-        resposta = self.sessao_rede.get(link, timeout=120)
+        resposta = self.sessao_rede.get(link, timeout=180)
         resposta.raise_for_status()
         return io.BytesIO(resposta.content)
 
@@ -149,37 +148,38 @@ class AutobotSafeDriver:
         return df_confiavel, df_refinado
 
     def _processar_ia(self, df):
+        if len(df) < 10: return pd.DataFrame()
         df['perfil_alvo'] = df.apply(lambda r: [p for p, palavras in self.mapa_comportamental.items() if any(pal in f"{r['NATUREZA_APURADA']} {r['DESCR_TIPOLOCAL']}".upper() for pal in palavras)] or ['Geral'], axis=1)
         df = df.explode('perfil_alvo')
         df['hotspot'] = DBSCAN(eps=0.001, min_samples=3).fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
         df = df[df['hotspot'] != -1].copy()
-        
-        def obter_hora(x):
+        if df.empty: return pd.DataFrame()
+        def extrair_hora(cel):
             try:
-                parte = str(x).split(':')[0].strip()
-                return int(parte) if parte else 0
+                p = str(cel).split(':')[0].strip()
+                return int(p) if p else 0
             except: return 0
-            
-        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=obter_hora(x)<6 else 'Manha' if 6<=obter_hora(x)<12 else 'Tarde' if 12<=obter_hora(x)<18 else 'Noite')
+        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=extrair_hora(x)<6 else 'Manha' if 6<=extrair_hora(x)<12 else 'Tarde' if 12<=extrair_hora(x)<18 else 'Noite')
         df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
         historico = df.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
-        ia_temporal = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False).fit(historico)
+        fator_sazonal = 1.0
+        if len(historico) >= 2:
+            ia_temp = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False).fit(historico)
+            prev = ia_temp.predict(pd.DataFrame({'ds': [datetime.now() + timedelta(days=1)]}))
+            fator_sazonal = max(0.1, prev['yhat'].values[0] / historico['y'].mean())
         enc_t, enc_p = LabelEncoder(), LabelEncoder()
         df['turno_cod'], df['perfil_cod'] = enc_t.fit_transform(df['turno']), enc_p.fit_transform(df['perfil_alvo'])
         df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.biblioteca_crimes.get(x, {}).get('peso', 1.0))
         base = df.groupby(['hotspot', 'perfil_cod', 'turno_cod']).agg({'LATITUDE': 'mean', 'LONGITUDE': 'mean', 'peso': ['mean', 'count']}).reset_index()
         base.columns = ['hotspot', 'perfil_cod', 'turno_cod', 'lat', 'lon', 'risco_base', 'volume']
-        df_treino = df.groupby(['hotspot', 'perfil_cod', 'turno_cod', 'DATA_OCORRENCIA_BO']).agg({'peso': 'sum'}).reset_index()
-        df_treino = df_treino.merge(base, on=['hotspot', 'perfil_cod', 'turno_cod'])
-        df_treino['sazonalidade'] = ia_temporal.predict(df_treino[['DATA_OCORRENCIA_BO']].rename(columns={'DATA_OCORRENCIA_BO': 'ds'}))['yhat'].values
-        X, y = df_treino[['perfil_cod', 'turno_cod', 'risco_base', 'sazonalidade']], df_treino['peso']
-        ia_preditiva = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100).fit(X, y)
-        self.auditoria['erro_medio_absoluto'] = round(mean_absolute_error(y, ia_preditiva.predict(X)), 3)
-        self.auditoria['raiz_erro_quadratico'] = round(np.sqrt(mean_squared_error(y, ia_preditiva.predict(X))), 3)
-        amanha = datetime.now() + timedelta(days=1)
+        ia_pred = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=50)
+        X, y = df[['LATITUDE', 'LONGITUDE', 'turno_cod', 'perfil_cod']], df['peso']
+        ia_pred.fit(X, y)
+        self.auditoria['erro_medio_absoluto'] = round(mean_absolute_error(y, ia_pred.predict(X)), 3)
+        self.auditoria['raiz_erro_quadratico'] = round(np.sqrt(mean_squared_error(y, ia_pred.predict(X))), 3)
         futuro = base.copy()
-        futuro['sazonalidade'] = ia_temporal.predict(pd.DataFrame({'ds': [amanha]}))['yhat'].values[0]
-        futuro['predicao'] = ia_preditiva.predict(futuro[['perfil_cod', 'turno_cod', 'risco_base', 'sazonalidade']])
+        X_fut = futuro[['lat', 'lon', 'turno_cod', 'perfil_cod']].rename(columns={'lat':'LATITUDE', 'lon':'LONGITUDE'})
+        futuro['predicao'] = ia_pred.predict(X_fut) * fator_sazonal
         futuro['pontuacao'] = ((futuro['predicao'] * futuro['volume']) / (futuro['predicao'] * futuro['volume']).max() * 10).clip(0.5, 10.0).round(1)
         futuro['penalidade'] = (1 + (futuro['pontuacao'] * 0.2)).round(1)
         futuro['h3_index'] = futuro.apply(lambda r: h3.latlng_to_cell(r['lat'], r['lon'], 10), axis=1)
@@ -189,26 +189,26 @@ class AutobotSafeDriver:
         return futuro.groupby(['h3_index', 'turno_nome']).agg({'pontuacao': 'max', 'penalidade': 'max'}).reset_index()
 
     def _sincronizar(self, malha):
-        if not self.banco_nuvem: return
-        colecao = self.banco_nuvem.collection('malha_autobot_preditiva')
+        if not self.banco_nuvem or malha.empty: return
+        col = self.banco_nuvem.collection('malha_autobot_preditiva')
         if self.auditoria["estado_operacional"] == "REINICIALIZACAO_TOTAL":
-            for doc in colecao.stream(): doc.reference.delete()
-        for turno in malha['turno_nome'].unique():
-            df_turno = malha[malha['turno_nome'] == turno]
-            referencia = colecao.document(f"turno_{turno}")
-            snapshot = referencia.get()
-            dados_nuvem = snapshot.to_dict().get("dados_h3", {}) if snapshot.exists else {}
-            pacote_atualizacao = {}
-            for _, r in df_turno.iterrows():
-                id_h3, pt, pn = r['h3_index'], round(float(r['pontuacao']), 1), round(float(r['penalidade']), 1)
-                novo = {"pontuacao": pt, "penalidade": pn}
-                if id_h3 not in dados_nuvem or dados_nuvem[id_h3] != novo:
-                    pacote_atualizacao[f"dados_h3.{id_h3}"] = novo
+            for d in col.stream(): d.reference.delete()
+        for t in malha['turno_nome'].unique():
+            df_t = malha[malha['turno_nome'] == t]
+            ref = col.document(f"turno_{t}")
+            snap = ref.get()
+            dn = snap.to_dict().get("dados_h3", {}) if snap.exists else {}
+            pac = {}
+            for _, r in df_t.iterrows():
+                h, pt, pn = r['h3_index'], round(float(r['pontuacao']), 1), round(float(r['penalidade']), 1)
+                nv = {"pontuacao": pt, "penalidade": pn}
+                if h not in dn or dn[h] != nv:
+                    pac[f"dados_h3.{h}"] = nv
                     self.auditoria['h3_alterados'] += 1
-            if pacote_atualizacao:
-                pacote_atualizacao["ultima_sincronizacao"] = firestore.SERVER_TIMESTAMP
-                if snapshot.exists: referencia.update(pacote_atualizacao)
-                else: referencia.set({"dados_h3": {k.split('.')[1]: v for k, v in pacote_atualizacao.items() if k != "ultima_sincronizacao"}, "ultima_sincronizacao": firestore.SERVER_TIMESTAMP})
+            if pac:
+                pac["ultima_sincronizacao"] = firestore.SERVER_TIMESTAMP
+                if snap.exists: ref.update(pac)
+                else: ref.set({"dados_h3": {k.split('.')[1]: v for k, v in pac.items() if k != "ultima_sincronizacao"}, "ultima_sincronizacao": firestore.SERVER_TIMESTAMP})
         if self.auditoria["estado_operacional"] == "REINICIALIZACAO_TOTAL":
             with open('datalake/metadados/bloqueio_inicial.lock', 'w') as f: f.write(str(datetime.now()))
         self.auditoria['h3_analisados'] = len(malha)
@@ -218,18 +218,27 @@ class AutobotSafeDriver:
         try:
             for ano in self.periodo_historico:
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                arquivo = self._baixar_dados(url)
-                df_temp = pd.read_excel(arquivo, skiprows=0, dtype=str)
-                df_temp.columns = [self._normalizar(c) for c in df_temp.columns]
-                df_temp = df_temp.loc[:, ~df_temp.columns.duplicated()].copy()
-                t, r = self._qualificar_dados(df_temp)
-                mestre = pd.concat([mestre, r])
-                self.auditoria['volume_bruto'] += len(df_temp)
-                self.auditoria['volume_refinado'] += len(r)
-            if not mestre.empty:
-                malha_h3 = self._processar_ia(mestre)
-                self._sincronizar(malha_h3)
+                try:
+                    arq = self._baixar_dados(url)
+                    df_raw = pd.read_excel(arq, dtype=str)
+                    df_raw.columns = [self._normalizar(c) for c in df_raw.columns]
+                    df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()].copy()
+                    df_raw.to_parquet(f'datalake/bruto/ssp_{ano}.parquet', index=False)
+                    self.auditoria['volume_bruto'] += len(df_raw)
+                    conf, ref = self._qualificar_dados(df_raw)
+                    conf.to_parquet(f'datalake/confiavel/ssp_{ano}.parquet', index=False)
+                    self.auditoria['volume_confiavel'] += len(conf)
+                    mestre = pd.concat([mestre, ref])
+                    self.auditoria['volume_refinado'] += len(ref)
+                except Exception as e_ano:
+                    print(f"Erro no ano {ano}: {e_ano}")
+                    continue
+            if not mestre.empty and len(mestre) > 5:
+                malha = self._processar_ia(mestre)
+                self._sincronizar(malha)
                 self._enviar_notificacao("SUCESSO")
+            else:
+                self._enviar_notificacao("ERRO", "Volume de dados insuficiente para predição.")
         except Exception as e:
             self._enviar_notificacao("ERRO", str(e))
             raise
