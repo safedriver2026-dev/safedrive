@@ -16,7 +16,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 class AutobotSafeDriver:
     def __init__(self, persistencia=True):
-        self.identidade = "Autobot SafeDriver v4.0"
+        self.identidade = "Autobot SafeDriver v4.1"
         self.ano_atual = datetime.now().year
         self.periodo_historico = range(2022, self.ano_atual + 1)
         self.persistencia_ativa = persistencia
@@ -71,10 +71,11 @@ class AutobotSafeDriver:
 
     def _gerar_sessao_resiliente(self):
         conexao = requests.Session()
-        tentativas = Retry(total=10, backoff_factor=3, status_forcelist=[403, 429, 500, 502, 503, 504])
-        conexao.mount("http://", HTTPAdapter(max_retries=tentativas))
-        conexao.mount("https://", HTTPAdapter(max_retries=tentativas))
-        conexao.headers.update({'User-Agent': 'AutobotSafeDriver/4.0'})
+        tentativas = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504], allowed_methods=["HEAD", "GET", "OPTIONS"])
+        adaptador = HTTPAdapter(max_retries=tentativas)
+        conexao.mount("http://", adaptador)
+        conexao.mount("https://", adaptador)
+        conexao.headers.update({'User-Agent': 'Mozilla/5.0'})
         return conexao
 
     def _enviar_notificacao(self, tipo, aviso=None):
@@ -126,13 +127,9 @@ class AutobotSafeDriver:
         except: return np.nan
 
     def _baixar_dados(self, link):
-        with self.sessao_rede.get(link, stream=True, timeout=300) as resposta:
-            resposta.raise_for_status()
-            fluxo = io.BytesIO()
-            for bloco in resposta.iter_content(chunk_size=1024 * 1024):
-                if bloco: fluxo.write(bloco)
-            fluxo.seek(0)
-            return fluxo
+        resposta = self.sessao_rede.get(link, timeout=120)
+        resposta.raise_for_status()
+        return io.BytesIO(resposta.content)
 
     def _qualificar_dados(self, df):
         copia = df.copy()
