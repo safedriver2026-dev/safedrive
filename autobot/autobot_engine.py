@@ -18,7 +18,7 @@ from sklearn.cluster import KMeans, DBSCAN
 
 class MotorSafeDriver:
     def __init__(self, persistencia=True):
-        self.identidade = "Autobot SafeDriver Engine v2.0"
+        self.identidade = "Autobot SafeDriver Engine v2.1"
         self.ano_vigente = datetime.now().year
         self.periodo_historico = range(2022, self.ano_vigente + 1)
         self.persistencia_ativa = persistencia
@@ -93,7 +93,7 @@ class MotorSafeDriver:
 
         if nivel == "OPERACIONAL":
             status = "Novos dados detectados na grade." if self.auditoria['dados_origem_atualizados'] else "Matriz preditiva retreinada sem alterações na fonte."
-            if self.auditoria["modo"] == "HARD_RESET": status = "Sincronização primária concluída (HARD_RESET)."
+            if self.auditoria["modo"] == "HARD_RESET": status = "Sincronização primária e expurgo de dados concluídos (HARD_RESET)."
             
             payload = {
                 "embeds": [{
@@ -292,8 +292,19 @@ class MotorSafeDriver:
             cluster=('vetor_comportamental', 'first')
         ).reset_index()
 
+    def _executar_expurgo_firestore(self):
+        if not self.banco_dados or not self.persistencia_ativa: return
+        colecao = self.banco_dados.collection('malha_preditiva_semanal')
+        lote = self.banco_dados.batch()
+        for doc in colecao.stream():
+            lote.delete(doc.reference)
+        lote.commit()
+
     def _exportar_dados_terminais(self, df_malha_h3):
         if not self.banco_dados or not self.persistencia_ativa: return
+        
+        if self.auditoria["modo"] == "HARD_RESET":
+            self._executar_expurgo_firestore()
         
         colecao = self.banco_dados.collection('malha_preditiva_semanal')
         turnos = df_malha_h3['turno_desc'].unique()
