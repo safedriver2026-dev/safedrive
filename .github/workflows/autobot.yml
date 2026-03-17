@@ -7,13 +7,13 @@ on:
 
 jobs:
   producao:
-    name: Ciclo de Inteligência Geoespacial
+    name: Ciclo de Inteligencia Geoespacial
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Sincronizar Repositório
+      - name: Sincronizar Repositorio
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -22,7 +22,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Instalar Dependências
+      - name: Instalar Dependencias
         run: pip install -r requirements.txt
 
       - name: Validar Contratos
@@ -39,6 +39,7 @@ jobs:
         run: |
           git config --global user.name "SafeDriver Core"
           git config --global user.email "core@safedriver.ia"
-          git add datalake/metadata/baseline.lock
-          git commit -m "Sistema: Atualização de Baseline [Automático]" || echo "Sem deltas"
+          git add datalake/metadata/
+          git add datalake/raw/
+          git commit -m "Sistema: Atualizacao de Baseline" || echo "Sem deltas"
           git push
