@@ -10,13 +10,12 @@ import h3
 from prophet import Prophet
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans, DBSCAN
+from sklearn.cluster import DBSCAN
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 class AutobotSafeDriver:
     def __init__(self, persistencia=True):
-        self.identidade = "Autobot SafeDriver v4.1"
+        self.identidade = "Autobot SafeDriver v4.2"
         self.ano_atual = datetime.now().year
         self.periodo_historico = range(2022, self.ano_atual + 1)
         self.persistencia_ativa = persistencia
@@ -71,10 +70,8 @@ class AutobotSafeDriver:
 
     def _gerar_sessao_resiliente(self):
         conexao = requests.Session()
-        tentativas = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504], allowed_methods=["HEAD", "GET", "OPTIONS"])
-        adaptador = HTTPAdapter(max_retries=tentativas)
-        conexao.mount("http://", adaptador)
-        conexao.mount("https://", adaptador)
+        tentativas = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
+        conexao.mount("https://", HTTPAdapter(max_retries=tentativas))
         conexao.headers.update({'User-Agent': 'Mozilla/5.0'})
         return conexao
 
@@ -156,7 +153,14 @@ class AutobotSafeDriver:
         df = df.explode('perfil_alvo')
         df['hotspot'] = DBSCAN(eps=0.001, min_samples=3).fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
         df = df[df['hotspot'] != -1].copy()
-        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=int(str(x).split(':')[0])<6 else 'Manha' if 6<=int(str(x).split(':')[0])<12 else 'Tarde' if 12<=int(str(x).split(':')[0])<18 else 'Noite')
+        
+        def obter_hora(x):
+            try:
+                parte = str(x).split(':')[0].strip()
+                return int(parte) if parte else 0
+            except: return 0
+            
+        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=obter_hora(x)<6 else 'Manha' if 6<=obter_hora(x)<12 else 'Tarde' if 12<=obter_hora(x)<18 else 'Noite')
         df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
         historico = df.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
         ia_temporal = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False).fit(historico)
