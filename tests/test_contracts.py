@@ -1,4 +1,7 @@
-import os, sys, pandas as pd, numpy as np
+import os
+import sys
+import pandas as pd
+import numpy as np
 from datetime import datetime
 import pytest
 
@@ -15,20 +18,31 @@ def test_correcao_coordenada_ssp():
 
 def test_normalizacao_semantica():
     engine = MotorSafeDriver(persistencia=False)
+    # Agora o método existe com o nome exato esperado pelo teste
     assert engine._normalizar("RUBRICA") == "NATUREZA_APURADA"
 
 def test_classificacao_crime():
     engine = MotorSafeDriver(persistencia=False)
+    # Agora o método existe com o nome exato esperado pelo teste
     assert engine._classificar_crime("ROUBO DE CARGA") == "ROUBO DE CARGA"
     assert engine._classificar_crime("?") == "OUTROS"
 
 def test_qualificacao_fluxo():
     engine = MotorSafeDriver(persistencia=False)
-    df = pd.DataFrame({'LATITUDE':['-23.5'],'LONGITUDE':['-46.6'],'DATA_OCORRENCIA_BO':[pd.Timestamp(datetime.now().date())],'NATUREZA_APURADA':['ROUBO DE VEICULO'],'NUM_BO':['1'],'DESCR_TIPOLOCAL':['VIA PUBLICA']})
+    df = pd.DataFrame({
+        'LATITUDE':['-23.5'],
+        'LONGITUDE':['-46.6'],
+        'DATA_OCORRENCIA_BO':[pd.Timestamp(datetime.now().date())],
+        'NATUREZA_APURADA':['ROUBO DE VEICULO'],
+        'NUM_BO':['1'],
+        'DESCR_TIPOLOCAL':['VIA PUBLICA']
+    })
     t, r = engine._qualificar(df)
-    assert len(t) == 1 and len(r) == 1
+    assert len(t) == 1
+    assert len(r) == 1
 
 def test_modo_reset():
-    if os.path.exists('datalake/metadata/baseline.lock'): os.remove('datalake/metadata/baseline.lock')
+    if os.path.exists('datalake/metadata/baseline.lock'):
+        os.remove('datalake/metadata/baseline.lock')
     engine = MotorSafeDriver(persistencia=False)
     assert engine.auditoria["modo"] == "HARD_RESET"
