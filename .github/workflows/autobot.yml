@@ -7,23 +7,23 @@ on:
     - cron: '0 3 * * *'
 
 jobs:
-  diagnostico_e_execucao:
+  missao_operacional:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
     - name: Setup Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10'
-    - name: Install Dependencies
+        python-version: '3.11' # Atualizado para versão mais estável
+    - name: Instalar Dependencias
       run: |
         python -m pip install --upgrade pip
         pip install pytest pandas numpy requests firebase-admin h3 prophet xgboost scikit-learn fastparquet openpyxl
-    - name: Run Tests
+    - name: Validar Contratos
       env:
         FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
       run: pytest tests/test_contracts.py -v
-    - name: Run Autobot Engine
+    - name: Acionar Autobot
       env:
         FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
         DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
