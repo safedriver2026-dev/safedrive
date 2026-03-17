@@ -32,7 +32,7 @@ def test_qualificacao_fluxo():
         'NATUREZA_APURADA': ['ROUBO DE VEICULO'],
         'NUM_BO': ['1']
     })
-    t, r = engine._qualificar(df, datetime.now().year)
+    t, r = engine._qualificar(df)
     assert len(t) == 1
     assert len(r) == 1
 
