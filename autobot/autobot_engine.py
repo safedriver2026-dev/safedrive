@@ -18,7 +18,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 class MotorSafeDriver:
     def __init__(self, persistencia=True):
-        self.identidade = "Autobot SafeDriver Engine v3.4"
+        self.identidade = "Autobot SafeDriver Engine v4.0"
         self.ano_vigente = datetime.now().year
         self.periodo_historico = range(2022, self.ano_vigente + 1)
         self.persistencia_ativa = persistencia
@@ -26,8 +26,8 @@ class MotorSafeDriver:
         self.sessao_http = self._configurar_sessao_resiliente()
         self.auditoria = {
             "volume_raw": 0, "volume_trusted": 0, "volume_refined": 0,
-            "manchas_identificadas": 0, "h3_avaliados": 0, "h3_mutados": 0,
-            "perfis_h3": {}, "dados_origem_atualizados": False, "modo": "OPERACIONAL",
+            "h3_avaliados": 0, "h3_mutados": 0, "perfis_h3": {},
+            "dados_origem_atualizados": False, "modo": "OPERACIONAL",
             "mae": 0.0, "rmse": 0.0
         }
         
@@ -60,29 +60,23 @@ class MotorSafeDriver:
             "DESCR_TIPOLOCAL": ["DESCR_TIPOLOCAL", "TIPOLOCAL", "LOCAL", "TIPO_LOCAL"]
         }
 
-        self._iniciar_sistemas_internos()
-
-    def _iniciar_sistemas_internos(self):
-        for pasta in ['raw', 'trusted', 'refined', 'metadata']:
-            os.makedirs(f'datalake/{pasta}', exist_ok=True)
-        if not os.path.exists('datalake/metadata/baseline.lock'):
-            self.auditoria["modo"] = "HARD_RESET"
+        for p in ['raw', 'trusted', 'refined', 'metadata']: os.makedirs(f'datalake/{p}', exist_ok=True)
+        if not os.path.exists('datalake/metadata/baseline.lock'): self.auditoria["modo"] = "HARD_RESET"
 
     def _estabelecer_conexao_firestore(self):
         chave_json = os.environ.get('FIREBASE_JSON')
-        if not chave_json or not firebase_admin._apps:
-            if chave_json:
-                credenciais = credentials.Certificate(json.loads(chave_json))
-                firebase_admin.initialize_app(credenciais)
-                return firestore.client()
+        if chave_json and not firebase_admin._apps:
+            credenciais = credentials.Certificate(json.loads(chave_json))
+            firebase_admin.initialize_app(credenciais)
+            return firestore.client()
         return None
 
     def _configurar_sessao_resiliente(self):
         sessao = requests.Session()
-        politica = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
+        politica = Retry(total=5, backoff_factor=3, status_forcelist=[403, 429, 500, 502, 503, 504])
         sessao.mount("http://", HTTPAdapter(max_retries=politica))
         sessao.mount("https://", HTTPAdapter(max_retries=politica))
-        sessao.headers.update({'User-Agent': self.identidade})
+        sessao.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
         return sessao
 
     def _comunicar_status(self, nivel, mensagem=None):
@@ -91,41 +85,34 @@ class MotorSafeDriver:
         if not self.persistencia_ativa: return
         
         if nivel == "OPERACIONAL" and webhook_sucesso:
-            distribuicao_perfis = "\n".join([f"**{k}:** {v}" for k, v in self.auditoria['perfis_h3'].items()])
+            dist_perfis = "\n".join([f"**{k}:** {v}" for k, v in self.auditoria['perfis_h3'].items()])
             payload = {
                 "embeds": [{
-                    "title": "📋 Documentação Técnica de Processamento",
-                    "description": f"**Status:** {self.auditoria['modo']}\n**Data:** {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+                    "title": "📋 SafeDriver Engine - Relatório de Inteligência",
+                    "description": f"**Status:** {self.auditoria['modo']}\n**Previsão:** Amanhã (D+1)",
                     "color": 3066993,
                     "fields": [
-                        {"name": "🌊 Camadas Data Lake", "value": f"**RAW:** {self.auditoria['volume_raw']:,}\n**TRUSTED:** {self.auditoria['volume_trusted']:,}\n**REFINED:** {self.auditoria['volume_refined']:,}", "inline": False},
-                        {"name": "🎯 Qualificação H3 por Perfil", "value": distribuicao_perfis or "Aguardando processamento", "inline": True},
-                        {"name": "☁️ Sincronização Firestore", "value": f"**H3 Avaliados:** {self.auditoria['h3_avaliados']:,}\n**H3 Mutados:** {self.auditoria['h3_mutados']:,}", "inline": True},
-                        {"name": "📈 Precisão Preditiva (IA)", "value": f"**MAE:** {self.auditoria['mae']}\n**RMSE:** {self.auditoria['rmse']}", "inline": False},
-                        {"name": "🧪 Validação", "value": "✅ Protocolos PyTest aprovados.", "inline": False}
+                        {"name": "🌊 Data Lake", "value": f"RAW: {self.auditoria['volume_raw']}\nREFINED: {self.auditoria['volume_refined']}", "inline": True},
+                        {"name": "☁️ Sincronização", "value": f"H3 Avaliados: {self.auditoria['h3_avaliados']}\nH3 Mutados: {self.auditoria['h3_mutados']}", "inline": True},
+                        {"name": "📈 Precisão (MAE/RMSE)", "value": f"{self.auditoria['mae']} / {self.auditoria['rmse']}", "inline": False},
+                        {"name": "🎯 Hexágonos por Perfil", "value": dist_perfis or "Processando...", "inline": False}
                     ],
                     "footer": {"text": self.identidade}
                 }]
             }
             requests.post(webhook_sucesso, json=payload)
         elif nivel == "FALHA" and webhook_erro:
-            payload = {"embeds": [{"title": "⚠️ Interrupção Crítica", "description": str(mensagem), "color": 15158332}]}
-            requests.post(webhook_erro, json=payload)
+            requests.post(webhook_erro, json={"content": f"⚠️ **FALHA NO SUBSISTEMA:** {mensagem}"})
 
     def _higienizar_string(self, texto):
         if pd.isna(texto) or not isinstance(texto, str): return str(texto) if not pd.isna(texto) else ""
         return "".join([c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c)]).upper().strip()
 
-    def _normalizar(self, coluna):
-        limpa = self._higienizar_string(coluna)
+    def _normalizar_coluna(self, col):
+        limpa = self._higienizar_string(col)
         for k, v in self.dicionario_semantico.items():
             if limpa in v: return k
         return limpa
-
-    def _classificar_crime(self, natureza):
-        if pd.isna(natureza): return np.nan
-        limpa = self._higienizar_string(natureza)
-        return limpa if limpa in self.catalogo_conhecimento else "OUTROS"
 
     def _corrigir_ponto_decimal(self, valor, is_lat=True):
         try:
@@ -136,17 +123,15 @@ class MotorSafeDriver:
             return v
         except: return np.nan
 
-    def _verificar_fonte(self, url, ano):
-        if self.auditoria["modo"] == "HARD_RESET": return True, 0
-        metadados = f"datalake/metadata/fonte_{ano}.json"
-        try:
-            cabecalho = self.sessao_http.head(url, timeout=30, allow_redirects=True)
-            tamanho = int(cabecalho.headers.get('Content-Length', 0))
-            if os.path.exists(metadados):
-                with open(metadados, 'r') as f:
-                    if json.load(f).get('tamanho') == tamanho: return False, tamanho
-            return True, tamanho
-        except: return True, 0
+    def _download_resiliente(self, url, caminho_destino):
+        """ Implementação de download via streaming para evitar TimeoutError em arquivos grandes. """
+        with self.sessao_http.get(url, stream=True, timeout=300) as r:
+            r.raise_for_status()
+            buffer = io.BytesIO()
+            for chunk in r.iter_content(chunk_size=1024 * 1024): # 1MB por vez
+                if chunk: buffer.write(chunk)
+            buffer.seek(0)
+            return buffer
 
     def _qualificar(self, df):
         df_bruto = df.copy()
@@ -162,68 +147,80 @@ class MotorSafeDriver:
             elif tipo == 'datetime': df_bruto[col] = pd.to_datetime(df_bruto[col], errors='coerce')
             elif tipo == 'int': df_bruto[col] = pd.to_numeric(df_bruto[col], errors='coerce').fillna(0).astype(int)
 
-        df_bruto['NATUREZA_APURADA'] = df_bruto['NATUREZA_APURADA'].apply(self._classificar_crime)
+        df_bruto['NATUREZA_APURADA'] = df_bruto['NATUREZA_APURADA'].apply(lambda x: self._higienizar_string(x) if x in self.catalogo_conhecimento else "OUTROS")
         mascara = (df_bruto['LATITUDE'].notna() & df_bruto['LONGITUDE'].notna() &
                    df_bruto['LATITUDE'].between(self.limites_territoriais['lat'][0], self.limites_territoriais['lat'][1]) &
                    df_bruto['LONGITUDE'].between(self.limites_territoriais['lon'][0], self.limites_territoriais['lon'][1]))
         
         df_trusted = df_bruto[mascara].copy()[list(self.esquema_canonico.keys())]
-        df_refined = df_trusted[df_trusted['NATUREZA_APURADA'].notna()].copy()
-        return df_trusted, df_refined
+        return df_trusted, df_trusted.copy()
 
-    def _mapear_territorio(self, df):
+    def _processar_ia_preditiva(self, df):
+        """ Transição do histórico (retrovisor) para o preditivo (amanhã). """
         df['perfil_alvo'] = df.apply(lambda r: [p for p, words in self.matriz_comportamental.items() if any(w in f"{r['NATUREZA_APURADA']} {r['DESCR_TIPOLOCAL']}".upper() for w in words)] or ['Geral'], axis=1)
         df = df.explode('perfil_alvo')
-        vetor = TfidfVectorizer(max_features=50).fit_transform(df['NATUREZA_APURADA'].fillna('') + " " + df['DESCR_TIPOLOCAL'].fillna(''))
-        df['vetor_comportamental'] = KMeans(n_clusters=4, random_state=42, n_init="auto").fit_predict(vetor)
-        df['gravidade'] = df['NATUREZA_APURADA'].apply(lambda x: self.catalogo_conhecimento.get(x, {}).get('peso', 1.0))
-        df['id_hotspot'] = DBSCAN(eps=0.001, min_samples=3, metric='euclidean').fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
-        return df[df['id_hotspot'] != -1].copy()
-
-    def _processar_predicao_diaria(self, df_hotspots):
-        df_hotspots['turno'] = df_hotspots['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=int(str(x).split(':')[0])<6 else 'Manha' if 6<=int(str(x).split(':')[0])<12 else 'Tarde' if 12<=int(str(x).split(':')[0])<18 else 'Noite')
-        enc_t, enc_p = LabelEncoder(), LabelEncoder()
-        df_hotspots['turno_enc'], df_hotspots['perfil_enc'] = enc_t.fit_transform(df_hotspots['turno']), enc_p.fit_transform(df_hotspots['perfil_alvo'])
-        df_hotspots['DATA_OCORRENCIA_BO'] = pd.to_datetime(df_hotspots['DATA_OCORRENCIA_BO'])
-        serie = df_hotspots.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
+        
+        # Clusterização Espacial (Hotspots)
+        df['id_hotspot'] = DBSCAN(eps=0.001, min_samples=3).fit_predict(df[['LATITUDE', 'LONGITUDE']].values)
+        df = df[df['id_hotspot'] != -1].copy()
+        
+        # Turnos e Sazonalidade
+        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(lambda x: 'Madrugada' if 0<=int(str(x).split(':')[0])<6 else 'Manha' if 6<=int(str(x).split(':')[0])<12 else 'Tarde' if 12<=int(str(x).split(':')[0])<18 else 'Noite')
+        df['DATA_OCORRENCIA_BO'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'])
+        
+        # Time Series com Prophet
+        serie = df.groupby('DATA_OCORRENCIA_BO').size().reset_index(name='y').rename(columns={'DATA_OCORRENCIA_BO': 'ds'})
         prophet = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False).fit(serie)
-        baseline = df_hotspots.groupby(['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc']).agg({'LATITUDE': 'mean', 'LONGITUDE': 'mean', 'gravidade': ['mean', 'count']}).reset_index()
-        baseline.columns = ['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc', 'lat', 'lon', 'risco_base', 'volume']
-        df_t = df_hotspots.groupby(['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc', 'DATA_OCORRENCIA_BO']).agg({'gravidade': 'sum'}).reset_index()
-        df_t = df_t.merge(baseline, on=['id_hotspot', 'perfil_enc', 'vetor_comportamental', 'turno_enc'])
+        
+        # Treinamento XGBoost (Aprende o erro e a tendência)
+        enc_t, enc_p = LabelEncoder(), LabelEncoder()
+        df['turno_enc'], df['perfil_enc'] = enc_t.fit_transform(df['turno']), enc_p.fit_transform(df['perfil_alvo'])
+        df['gravidade'] = df['NATUREZA_APURADA'].apply(lambda x: self.catalogo_conhecimento.get(x, {}).get('peso', 1.0))
+        
+        baseline = df.groupby(['id_hotspot', 'perfil_enc', 'turno_enc']).agg({'LATITUDE': 'mean', 'LONGITUDE': 'mean', 'gravidade': ['mean', 'count']}).reset_index()
+        baseline.columns = ['id_hotspot', 'perfil_enc', 'turno_enc', 'lat', 'lon', 'risco_base', 'volume']
+        
+        df_t = df.groupby(['id_hotspot', 'perfil_enc', 'turno_enc', 'DATA_OCORRENCIA_BO']).agg({'gravidade': 'sum'}).reset_index()
+        df_t = df_t.merge(baseline, on=['id_hotspot', 'perfil_enc', 'turno_enc'])
         df_t['sazonalidade'] = prophet.predict(df_t[['DATA_OCORRENCIA_BO']].rename(columns={'DATA_OCORRENCIA_BO': 'ds'}))['yhat'].values
-        X = df_t[['perfil_enc', 'vetor_comportamental', 'turno_enc', 'risco_base', 'sazonalidade']]
-        y = df_t['gravidade']
+        
+        X, y = df_t[['perfil_enc', 'turno_enc', 'risco_base', 'sazonalidade']], df_t['gravidade']
         model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100).fit(X, y)
+        
+        # Métricas de Validação
         self.auditoria['mae'] = round(mean_absolute_error(y, model.predict(X)), 3)
         self.auditoria['rmse'] = round(np.sqrt(mean_squared_error(y, model.predict(X))), 3)
+
+        # Predição Diária (Amanhã)
         amanha = datetime.now() + timedelta(days=1)
         df_f = baseline.copy()
         df_f['sazonalidade'] = prophet.predict(pd.DataFrame({'ds': [amanha]}))['yhat'].values[0]
-        df_f['pred'] = model.predict(df_f[['perfil_enc', 'vetor_comportamental', 'turno_enc', 'risco_base', 'sazonalidade']])
+        df_f['pred'] = model.predict(df_f[['perfil_enc', 'turno_enc', 'risco_base', 'sazonalidade']])
+        
         df_f['score'] = ((df_f['pred'] * df_f['volume']) / (df_f['pred'] * df_f['volume']).max() * 10).clip(0.5, 10.0).round(1)
         df_f['penalidade'] = (1 + (df_f['score'] * 0.2)).round(1)
         df_f['codigo_h3'] = df_f.apply(lambda r: h3.latlng_to_cell(r['lat'], r['lon'], 10), axis=1)
         df_f['turno_desc'] = enc_t.inverse_transform(df_f['turno_enc'])
         df_f['perfil_desc'] = enc_p.inverse_transform(df_f['perfil_enc'])
+        
         self.auditoria['perfis_h3'] = df_f.groupby('perfil_desc')['codigo_h3'].nunique().to_dict()
-        self.auditoria['manchas_identificadas'] = len(df_f['id_hotspot'].unique())
-        return df_f.groupby(['codigo_h3', 'turno_desc']).agg({'score': 'max', 'penalidade': 'max', 'vetor_comportamental': 'first'}).reset_index()
+        return df_f.groupby(['codigo_h3', 'turno_desc']).agg({'score': 'max', 'penalidade': 'max'}).reset_index()
 
     def _sincronizar_delta(self, df_h3):
-        if not self.banco_dados or not self.persistencia_ativa: return
+        if not self.banco_dados: return
         colecao = self.banco_dados.collection('malha_preditiva_diaria')
         if self.auditoria["modo"] == "HARD_RESET":
             for d in colecao.stream(): d.reference.delete()
-        for t in df_h3['turno_desc'].unique():
-            df_turno = df_h3[df_h3['turno_desc'] == t]
-            ref = colecao.document(f"turno_{t}")
+        
+        for turno in df_h3['turno_desc'].unique():
+            df_turno = df_h3[df_h3['turno_desc'] == turno]
+            ref = colecao.document(f"turno_{turno}")
             snap = ref.get()
             dn = snap.to_dict().get("h3_dados", {}) if snap.exists else {}
             pd = {}
             for _, r in df_turno.iterrows():
-                h, s, p, c = r['codigo_h3'], round(float(r['score']), 1), round(float(r['penalidade']), 1), int(r['vetor_comportamental'])
-                nv = {"score": s, "penalidade": p, "cluster": c}
+                h, s, p = r['codigo_h3'], round(float(r['score']), 1), round(float(r['penalidade']), 1)
+                nv = {"score": s, "penalidade": p}
                 if h not in dn or dn[h] != nv:
                     pd[f"h3_dados.{h}"] = nv
                     self.auditoria['h3_mutados'] += 1
@@ -231,9 +228,6 @@ class MotorSafeDriver:
                 pd["ultima_atualizacao"] = firestore.SERVER_TIMESTAMP
                 if snap.exists: ref.update(pd)
                 else: ref.set({"h3_dados": {k.split('.')[1]: v for k, v in pd.items() if k != "ultima_atualizacao"}, "ultima_atualizacao": firestore.SERVER_TIMESTAMP})
-        if self.auditoria["modo"] == "HARD_RESET":
-            with open('datalake/metadata/baseline.lock', 'w') as f: f.write(str(datetime.now()))
-            self.auditoria["modo"] = "OPERACIONAL"
         self.auditoria['h3_avaliados'] = len(df_h3)
 
     def rodar(self):
@@ -241,34 +235,23 @@ class MotorSafeDriver:
         try:
             for ano in self.periodo_historico:
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                baixar, tamanho = self._verificar_fonte(url, ano)
-                if baixar or not os.path.exists(f'datalake/raw/ssp_{ano}.parquet'):
-                    res = self.sessao_http.get(url, timeout=120)
-                    if res.status_code != 200: continue
-                    amostra = pd.read_excel(io.BytesIO(res.content), nrows=50, header=None)
-                    header = next((i for i, l in amostra.iterrows() if any(t in [self._higienizar_string(str(c)) for c in l.values] for t in ['NUM_BO', 'LATITUDE', 'NATUREZA_APURADA'])), None)
-                    if header is None: continue
-                    df_temp = pd.read_excel(io.BytesIO(res.content), skiprows=header, dtype=str)
-                    df_temp.columns = [self._normalizar(c) for c in df_temp.columns]
-                    # FIX: Remove colunas duplicadas geradas pela normalização semântica
-                    df_temp = df_temp.loc[:, ~df_temp.columns.duplicated()].copy()
-                    df_temp.to_parquet(f'datalake/raw/ssp_{ano}.parquet', index=False)
-                    with open(f"datalake/metadata/fonte_{ano}.json", 'w') as f: json.dump({'tamanho': tamanho}, f)
-                    self.auditoria['dados_origem_atualizados'] = True
-                else: df_temp = pd.read_parquet(f'datalake/raw/ssp_{ano}.parquet')
-                df_temp['ANO_BASE'] = ano
+                buffer = self._download_resiliente(url, f'datalake/raw/ssp_{ano}.parquet')
+                df_temp = pd.read_excel(buffer, skiprows=0, dtype=str)
+                df_temp.columns = [self._normalizar_coluna(c) for c in df_temp.columns]
+                df_temp = df_temp.loc[:, ~df_temp.columns.duplicated()].copy()
+                
                 t, r = self._qualificar(df_temp)
-                if self.persistencia_ativa: t.to_parquet(f'datalake/trusted/ssp_trusted_{ano}.parquet', index=False)
                 df_master = pd.concat([df_master, r])
-                self.auditoria['volume_raw'] += len(df_temp); self.auditoria['volume_trusted'] += len(t); self.auditoria['volume_refined'] += len(r)
+                self.auditoria['volume_raw'] += len(df_temp)
+                self.auditoria['volume_refined'] += len(r)
+
             if not df_master.empty:
-                malha_h3 = self._processar_predicao_diaria(self._mapear_territorio(df_master))
-                if self.persistencia_ativa: malha_h3.to_parquet("datalake/refined/malha_h3_diaria.parquet", index=False)
+                malha_h3 = self._processar_ia_preditiva(df_master)
                 self._sincronizar_delta(malha_h3)
                 self._comunicar_status("OPERACIONAL")
         except Exception as e:
-            self._comunicar_status("FALHA", str(e)); raise
+            self._comunicar_status("FALHA", str(e))
+            raise
 
 if __name__ == "__main__":
-    motor = MotorSafeDriver()
-    motor.rodar()
+    MotorSafeDriver().rodar()
