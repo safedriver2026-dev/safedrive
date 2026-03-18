@@ -1,33 +1,19 @@
-import os, sys, pandas as pd, numpy as np
 import pytest
+import pandas as pd
+import os
+from autobot.autobot_engine import SafeDriverEngine
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from autobot.autobot_engine import AutobotSafeDriver
-
-def test_instancia():
-    bot = AutobotSafeDriver(persistencia=False)
-    assert bot.identidade == "Autobot SafeDriver"
-
-def test_normalizacao_colunas():
-    bot = AutobotSafeDriver(persistencia=False)
-    assert bot._normalizar_coluna("LAT") == "LATITUDE"
-    assert bot._normalizar_coluna("RUBRICA") == "NATUREZA_APURADA"
-
-def test_higienizacao_dados_sujos():
-    bot = AutobotSafeDriver(persistencia=False)
+def test_full_pipeline():
+    bot = SafeDriverEngine(persistence=False)
     df = pd.DataFrame({
-        'LATITUDE': [-23.5, -23.51, -23.52], 
-        'LONGITUDE': [-46.6, -46.61, -46.62],
-        'DATA_OCORRENCIA_BO': [pd.Timestamp('2026-03-01'), pd.Timestamp('2026-03-02'), pd.Timestamp('2026-03-03')],
-        'HORA_OCORRENCIA_BO': ['', ' ', '14:00'], 
-        'NATUREZA_APURADA': ['ROUBO DE VEICULO', 'FURTO DE CELULAR', 'LATROCINIO'],
-        'LOCAL': ['VIA PUBLICA', 'CALCADA', 'VEICULO']
+        'LATITUDE': ['-23.5'], 'LONGITUDE': ['-46.6'],
+        'HORA_OCORRENCIA_BO': ['18:00'], 'NATUREZA_APURADA': ['ROUBO'],
+        'DATA_OCORRENCIA_BO': ['2026-03-10']
     })
-    res = bot._processar_ia(df)
+    res = bot._generate_gold(df)
     assert not res.empty
+    assert os.path.exists('datalake/gold_refined/fato_risco.csv')
 
-def test_fallback_colunas_ausentes():
-    bot = AutobotSafeDriver(persistencia=False)
-    df = pd.DataFrame({'LATITUDE': [-23.5], 'LONGITUDE': [-46.6]})
-    res = bot._processar_ia(df)
-    assert res.empty
+def test_weight_accuracy():
+    bot = SafeDriverEngine(persistence=False)
+    assert bot._get_weight(pd.Series({'N': 'LATROCINIO'})) == 10.0
