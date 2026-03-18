@@ -11,7 +11,7 @@ from prophet import Prophet
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split # Importação adicionada para o Split da IA
+from sklearn.model_selection import train_test_split
 
 class AutobotSafeDriver:
     def __init__(self, persistencia=True):
@@ -38,8 +38,8 @@ class AutobotSafeDriver:
         self.mapa_palavras_perfil = {
             "Pedestre": ["PEDESTRE", "TRANSEUNTE", "CELULAR", "CALCADA", "ONIBUS"],
             "Motorista": ["VEICULO", "CARRO", "CAMINHAO", "AUTOMOVEL", "CARGA", "MOTORISTA"],
-            "Ciclista": ["BICICLETA", "CICLO", "PEDALAR"],
-            "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY"]
+            "Ciclista": ["BICICLETA", "CICLISTA", "PEDALAR", "BICI"],
+            "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY", "MOTONETA"]
         }
         
         self.limites_sp = {"lat": (-24.5, -23.0), "lon": (-47.0, -45.5)}
@@ -88,14 +88,13 @@ class AutobotSafeDriver:
         except: return np.nan
 
     def _atribuir_perfis(self, linha):
-        # Correção 2: Higienizando a linha antes de buscar as palavras
-        natureza = self._higienizar(str(linha.get('NATUREZA_APURADA', '')))
-        local = self._higienizar(str(linha.get('LOCAL', '')))
-        texto = f"{natureza} {local}"
+        # Busca Global: Junta todas as colunas da linha em um texto só para não perder palavras escondidas
+        texto_global = " ".join([str(val) for val in linha.values if pd.notnull(val)])
+        texto_limpo = self._higienizar(texto_global)
         
         encontrados = []
         for p, palavras in self.mapa_palavras_perfil.items():
-            if any(re.search(rf'\b{w}\b', texto) for w in palavras):
+            if any(re.search(rf'\b{w}\b', texto_limpo) for w in palavras):
                 encontrados.append(p)
         return encontrados if encontrados else ["Geral"]
 
@@ -130,15 +129,14 @@ class AutobotSafeDriver:
             prev = m_p.predict(pd.DataFrame({'ds': [datetime.now() + timedelta(days=1)]}))
             f_saz = max(0.5, prev['yhat'].values[0] / hist['y'].mean())
 
-        enc_t, enc_p = LabelEncoder(), LabelEncoder()
+        enc_t = LabelEncoder()
         df['t_cod'] = enc_t.fit_transform(df['turno'])
-        df['p_cod'] = enc_p.fit_transform(df['perfis'])
         df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.pesos_crimes.get(x, 1.0))
         
-        X = df[['LATITUDE', 'LONGITUDE', 't_cod', 'p_cod']]
+        # Correção Data Leakage: A IA agora só usa Latitude, Longitude e Horário.
+        X = df[['LATITUDE', 'LONGITUDE', 't_cod']]
         y = df['peso']
         
-        # Correção 1: Treino e Teste Separados
         if len(X) > 50:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6).fit(X_train, y_train)
@@ -175,7 +173,7 @@ class AutobotSafeDriver:
         col = self.banco_nuvem.collection('malha_seguranca')
         batch = self.banco_nuvem.batch()
         count = 0
-        total_docs = 0 # Correção 3: Contador Total Separado
+        total_docs = 0
 
         for _, r in malha.iterrows():
             doc_id = f"{r['perfil'].lower()}_{r['h3']}"
@@ -193,7 +191,7 @@ class AutobotSafeDriver:
                 batch = self.banco_nuvem.batch()
                 count = 0
         batch.commit()
-        self.auditoria['nuvem']['documentos'] = total_docs + self.auditoria['nuvem']['documentos']
+        self.auditoria['nuvem']['documentos'] = total_docs
 
     def executar(self):
         mestre = pd.DataFrame()
@@ -270,12 +268,6 @@ class AutobotSafeDriver:
             self._notificar()
 
     def _notificar(self):
-        print(f"\n--- RESULTADO DO TREINAMENTO IA ---")
-        print(f"Taxa de Acerto do Modelo: {self.auditoria['metricas']['acerto']}%")
-        print(f"MAE: {self.auditoria['metricas']['mae']}")
-        print(f"RMSE: {self.auditoria['metricas']['rmse']}")
-        print(f"-----------------------------------\n")
-
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
         perf_str = "\n".join([f"**{k}:** {v} registros" for k, v in self.auditoria['perfis'].items()])
