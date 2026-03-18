@@ -82,7 +82,7 @@ class AutobotSafeDriver:
         except: return np.nan
 
     def _atribuir_perfis(self, linha):
-        texto_global = " ".join([str(val) for val in linha.values if pd.notnull(val)])
+        texto_global = " ".join(linha.dropna().astype(str).tolist())
         texto_limpo = self._higienizar(texto_global)
         
         encontrados = []
@@ -92,7 +92,7 @@ class AutobotSafeDriver:
         return encontrados if encontrados else ["Geral"]
 
     def _atribuir_peso(self, linha):
-        texto_global = " ".join([str(val) for val in linha.values if pd.notnull(val)])
+        texto_global = " ".join(linha.dropna().astype(str).tolist())
         t = self._higienizar(texto_global)
         
         if "LATROCINIO" in t or "SEQUESTRO" in t: return 10.0
@@ -119,8 +119,8 @@ class AutobotSafeDriver:
         
         if len(df) < min_linhas: return pd.DataFrame()
         
-        df['perfis'] = df.apply(self._atribuir_perfis, axis=1)
         df['peso'] = df.apply(self._atribuir_peso, axis=1)
+        df['perfis'] = df.apply(self._atribuir_perfis, axis=1)
         df = df.explode('perfis')
         
         def h_int(x):
