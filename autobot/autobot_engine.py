@@ -13,24 +13,24 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
-for camada in ['bronze_raw', 'silver_trusted', 'gold_refined', 'datalake']: 
-    os.makedirs(f'datalake/{camada}', exist_ok=True)
+for pasta in ['camada_bronze_bruta', 'camada_prata_confiavel', 'camada_ouro_refinada', 'camada_ouro_refinada/esquema_estrela', 'datalake']: 
+    os.makedirs(f'datalake/{pasta}', exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s [%(levelname)s] %(message)s', 
-    handlers=[logging.FileHandler("datalake/logs_sistema.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("datalake/logs_processamento.log"), logging.StreamHandler()]
 )
 
 class MotorSeguranca:
     def __init__(self, persistencia=True):
-        self.versao = "4.1"
+        self.identificador = "MOTOR-ESTATISTICO-AUTONOMO"
         self.persistencia = persistencia
-        self.banco = self._conectar_nuvem() if persistencia else None
+        self.banco = self._conectar_banco() if persistencia else None
         self.sessao = self._gerar_sessao()
-        self.auditoria = {"raw": 0, "trusted": 0, "refined": 0, "metricas": {}, "nuvem": {"total": 0, "delta": 0}}
+        self.auditoria = {"bruta": 0, "confiavel": 0, "refinada": 0, "ia": {}, "nuvem": {"total": 0, "delta": 0}}
 
-    def _conectar_nuvem(self):
+    def _conectar_banco(self):
         config = os.environ.get('FIREBASE_JSON')
         if config and not firebase_admin._apps:
             try:
@@ -60,18 +60,18 @@ class MotorSeguranca:
         if "FURTO" in t and any(w in t for w in ["VEICULO", "CARRO", "MOTO"]): return 4.0
         return 3.0 if "FURTO" in t else 1.0
 
-    def _gerar_camada_ouro(self, df):
-        df['id_h3'] = df.apply(lambda r: h3.latlng_to_cell(float(r['LATITUDE']), float(r['LONGITUDE']), 10), axis=1)
-        df['peso_calculado'] = df.apply(self._definir_peso, axis=1)
+    def _gerar_camada_ouro(self, dados):
+        dados['id_h3'] = dados.apply(lambda r: h3.latlng_to_cell(float(r['LATITUDE']), float(r['LONGITUDE']), 10), axis=1)
+        dados['peso_risco'] = dados.apply(self._definir_peso, axis=1)
         
-        filtros = {"Pedestre": ["CELULAR", "ONIBUS", "PEDESTRE"], "Motorista": ["VEICULO", "CARRO", "CARGA"], "Ciclista": ["BICI"], "Motociclista": ["MOTO"]}
+        perfis = {"Pedestre": ["CELULAR", "ONIBUS", "PEDESTRE"], "Motorista": ["VEICULO", "CARRO", "CARGA"], "Ciclista": ["BICI"], "Motociclista": ["MOTO"]}
         def classificar(r):
             t = self._limpar_texto(" ".join([str(v) for v in r.values if pd.api.types.is_scalar(v)]))
-            m = [p for p, words in filtros.items() if any(w in t for w in words)]
+            m = [p for p, palavras in perfis.items() if any(w in t for w in palavras)]
             return m if m else ["Geral"]
         
-        df['perfis'] = df.apply(classificar, axis=1)
-        df = df.explode('perfis')
+        dados['perfis_usuario'] = dados.apply(classificar, axis=1)
+        dados = dados.explode('perfis_usuario')
         
         def set_turno(h):
             try:
@@ -81,11 +81,11 @@ class MotorSeguranca:
                 if 12<=h<18: return 'Tarde'
                 return 'Noite'
             except: return 'Noite'
-        df['turno'] = df['HORA_OCORRENCIA_BO'].apply(set_turno)
+        dados['turno_dia'] = dados['HORA_OCORRENCIA_BO'].apply(set_turno)
         
         le = LabelEncoder()
-        df['turno_cod'] = le.fit_transform(df['turno'])
-        X, y = df[['LATITUDE', 'LONGITUDE', 'turno_cod']], df['peso_calculado']
+        dados['turno_cod'] = le.fit_transform(dados['turno_dia'])
+        X, y = dados[['LATITUDE', 'LONGITUDE', 'turno_cod']], dados['peso_risco']
         
         if len(X) >= 10:
             xt, xv, yt, yv = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -94,87 +94,85 @@ class MotorSeguranca:
             mae, r2 = mean_absolute_error(yv, yp), r2_score(yv, yp)
         else: mae, r2 = 0.0, 1.0
         
-        self.auditoria['metricas'] = {"mae": round(mae, 4), "r2": round(r2, 4), "acc": round(max(0.0, 100.0 - ((mae/10)*100)), 2)}
+        self.auditoria['ia'] = {"mae": round(mae, 4), "r2": round(r2, 4), "acerto": round(max(0.0, 100.0 - ((mae/10)*100)), 2)}
         
-        res = df.groupby(['id_h3', 'perfis', 'turno']).agg({'peso_calculado': ['mean', 'count'], 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
-        res.columns = ['h3', 'perfil', 'turno', 'peso_m', 'freq', 'lat', 'lon']
-        res['score'] = MinMaxScaler(feature_range=(0.5, 10.0)).fit_transform(res[['peso_m']]).round(1) if len(res)>1 else 5.0
+        res = dados.groupby(['id_h3', 'perfis_usuario', 'turno_dia']).agg({'peso_risco': ['mean', 'count'], 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
+        res.columns = ['h3', 'perfil', 'turno', 'peso_medio', 'frequencia', 'lat', 'lon']
+        res['score_final'] = MinMaxScaler(feature_range=(0.5, 10.0)).fit_transform(res[['peso_medio']]).round(1) if len(res)>1 else 5.0
 
-        res.to_parquet('datalake/gold_refined/mapa_risco_auditavel.parquet', index=False)
+        res.to_parquet('datalake/camada_ouro_refinada/malha_mapa_auditavel.parquet', index=False)
 
         dim_local = res[['h3', 'lat', 'lon']].drop_duplicates()
-        dim_perfil = pd.DataFrame({'id_perfil': range(len(res['perfil'].unique())), 'perfil': res['perfil'].unique()})
-        dim_tempo = pd.DataFrame({'id_tempo': range(len(res['turno'].unique())), 'turno': res['turno'].unique()})
+        dim_perfil = pd.DataFrame({'id_perfil': range(len(res['perfil'].unique())), 'nome_perfil': res['perfil'].unique()})
+        dim_tempo = pd.DataFrame({'id_tempo': range(len(res['turno'].unique())), 'nome_turno': res['turno'].unique()})
         
-        fato = res.merge(dim_perfil, left_on='perfil', right_on='perfil').merge(dim_tempo, left_on='turno', right_on='turno')
-        fato = fato[['h3', 'id_perfil', 'id_tempo', 'score', 'freq']]
-        fato['data_carga'] = datetime.now()
+        fato = res.merge(dim_perfil, left_on='perfil', right_on='nome_perfil').merge(dim_tempo, left_on='turno', right_on='nome_turno')
+        fato = fato[['h3', 'id_perfil', 'id_tempo', 'score_final', 'frequencia']]
+        fato['data_processamento'] = datetime.now()
         
-        dim_local.to_csv('datalake/gold_refined/dim_localizacao.csv', index=False)
-        dim_perfil.to_csv('datalake/gold_refined/dim_perfil.csv', index=False)
-        dim_tempo.to_csv('datalake/gold_refined/dim_tempo.csv', index=False)
-        fato.to_csv('datalake/gold_refined/fato_risco.csv', index=False)
+        dim_local.to_csv('datalake/camada_ouro_refinada/esquema_estrela/dim_localizacao.csv', index=False)
+        dim_perfil.to_csv('datalake/camada_ouro_refinada/esquema_estrela/dim_perfil.csv', index=False)
+        dim_tempo.to_csv('datalake/camada_ouro_refinada/esquema_estrela/dim_tempo.csv', index=False)
+        fato.to_csv('datalake/camada_ouro_refinada/esquema_estrela/fato_risco.csv', index=False)
         
         return res
 
-    def _sincronizar(self, df):
-        if not self.db or df.empty: return
-        ref = 'datalake/silver_trusted/referencia_delta.parquet'
-        delta = df.copy()
+    def _sincronizar_delta(self, dados):
+        if not self.banco or dados.empty: return
+        ref = 'datalake/camada_prata_confiavel/assinatura_anterior.parquet'
+        delta = dados.copy()
         if os.path.exists(ref):
             try:
                 hist = pd.read_parquet(ref)
-                df['sig'] = df['h3'] + df['perfil'] + df['turno'] + df['score'].astype(str)
-                hist['sig'] = hist['h3'] + hist['perfil'] + hist['turno'] + hist['score'].astype(str)
-                delta = df[~df['sig'].isin(hist['sig'])].copy()
-                df.drop(columns=['sig'], inplace=True)
+                dados['hash'] = dados['h3'] + dados['perfil'] + dados['turno'] + dados['score_final'].astype(str)
+                hist['hash'] = hist['h3'] + hist['perfil'] + hist['turno'] + hist['score_final'].astype(str)
+                delta = dados[~dados['hash'].isin(hist['hash'])].copy()
+                dados.drop(columns=['hash'], inplace=True)
             except: pass
             
-        lote = self.db.batch()
-        c, s = 0, 0
+        lote = self.banco.batch()
         for _, r in delta.iterrows():
-            lote.set(self.db.collection('risco_geografico').document(f"{r['perfil'].lower()}_{r['h3']}"), {
-                "h3": r['h3'], "perfil": r['perfil'],
-                f"turnos.{r['turno']}": {"score": r['score'], "ts": firestore.SERVER_TIMESTAMP}
+            lote.set(self.banco.collection('malha_risco').document(f"{r['perfil'].lower()}_{r['h3']}"), {
+                "id_h3": r['h3'], "perfil": r['perfil'],
+                f"turnos.{r['turno']}": {"nota": r['score_final'], "atualizado": firestore.SERVER_TIMESTAMP}
             }, merge=True)
-            c += 1; s += 1
-            if c >= 450: lote.commit(); lote = self.db.batch(); c = 0
-        if c > 0: lote.commit()
-        self.auditoria['nuvem'] = {"total": len(df), "delta": s}
+        lote.commit()
+        self.auditoria['nuvem'] = {"total": len(dados), "delta": len(delta)}
 
-    def iniciar(self):
+    def processar(self):
         try:
             mestre = pd.DataFrame()
-            meta_p, meta = 'datalake/bronze_raw/metadados.json', {}
+            meta_p, meta = 'datalake/camada_bronze_bruta/metadados.json', {}
             if os.path.exists(meta_p):
                 with open(meta_p, 'r') as f: meta = json.load(f)
             
-            for ano in range(2023, datetime.now().year + 1):
-                path_bruto = f'datalake/bronze_raw/ssp_{ano}.parquet'
+            ano_atual = datetime.now().year
+            for ano in range(2023, ano_atual + 1):
+                caminho = f'datalake/camada_bronze_bruta/ssp_{ano}.parquet'
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                 try:
-                    head = self.session.head(url, timeout=20)
+                    head = self.sessao.head(url, timeout=20)
                     tamanho = int(head.headers.get('Content-Length', 0))
-                    if os.path.exists(path_bruto) and meta.get(str(ano)) == tamanho:
-                        dados = pd.read_parquet(path_bruto)
+                    if os.path.exists(caminho) and meta.get(str(ano)) == tamanho:
+                        dados_ano = pd.read_parquet(caminho)
                     else:
-                        r = self.session.get(url, timeout=300)
-                        dados = pd.read_excel(io.BytesIO(r.content), dtype=str)
-                        dados.columns = [self._limpar_texto(c) for c in dados.columns]
-                        dados.to_parquet(path_bruto, index=False); meta[str(ano)] = tamanho
-                except: dados = pd.read_parquet(path_bruto) if os.path.exists(path_bruto) else pd.DataFrame()
-                if not dados.empty:
-                    self.auditoria['raw'] += len(dados)
-                    mestre = pd.concat([mestre, dados])
+                        r = self.sessao.get(url, timeout=300)
+                        dados_ano = pd.read_excel(io.BytesIO(r.content), dtype=str)
+                        dados_ano.columns = [self._limpar_texto(c) for c in dados_ano.columns]
+                        dados_ano.to_parquet(caminho, index=False); meta[str(ano)] = tamanho
+                except: dados_ano = pd.read_parquet(caminho) if os.path.exists(caminho) else pd.DataFrame()
+                if not dados_ano.empty:
+                    self.auditoria['bruta'] += len(dados_ano)
+                    mestre = pd.concat([mestre, dados_ano])
 
             if not mestre.empty:
-                trusted = mestre[mestre['LATITUDE'].notna()].copy()
-                self.auditoria['trusted'] = len(trusted)
-                refined = self._gerar_camada_ouro(trusted)
-                if not refined.empty:
-                    self.auditoria['refined'] = len(refined)
-                    self._sincronizar(refined)
-                    refined.to_parquet('datalake/silver_trusted/referencia_delta.parquet', index=False)
+                confiavel = mestre[mestre['LATITUDE'].notna()].copy()
+                self.auditoria['confiavel'] = len(confiavel)
+                refinada = self._gerar_camada_ouro(confiavel)
+                if not refinada.empty:
+                    self.auditoria['refinada'] = len(refinada)
+                    self._sincronizar_delta(refinada)
+                    refinada.to_parquet('datalake/camada_prata_confiavel/assinatura_anterior.parquet', index=False)
                     with open(meta_p, 'w') as f: json.dump(meta, f)
                     self._notificar(True)
         except Exception as e:
@@ -186,13 +184,13 @@ class MotorSeguranca:
         if ok:
             t, d = self.auditoria['nuvem']['total'], self.auditoria['nuvem']['delta']
             eco = ((t - d) / t * 100) if t > 0 else 0
-            corpo = {"embeds": [{"title": "✅ PIPELINE ATUALIZADO", "color": 3066993, "fields": [
-                {"name": "📉 MÉTRICAS IA", "value": f"Acurácia: {self.auditoria['metricas']['acc']}% | $R^2$: {self.auditoria['metricas']['r2']}", "inline": False},
-                {"name": "📦 MEDALHÃO", "value": f"Raw: {self.auditoria['raw']} | Trusted: {self.auditoria['trusted']} | Refined: {self.auditoria['refined']}", "inline": True},
-                {"name": "💰 ECONOMIA CLOUD", "value": f"Delta: {d} | Poupança: **{eco:.1f}%**", "inline": True}]}]}
+            corpo = {"embeds": [{"title": "✅ STATUS: EXECUÇÃO FINALIZADA", "color": 3066993, "fields": [
+                {"name": "📉 MODELAGEM IA", "value": f"Acerto: {self.auditoria['ia']['acerto']}% | $R^2$: {self.auditoria['ia']['r2']}", "inline": False},
+                {"name": "🏗️ ARQUITETURA MEDALHÃO", "value": f"Bruta: {self.auditoria['bruta']} | Confiavel: {self.auditoria['confiavel']} | Refinada: {self.auditoria['refinada']}", "inline": True},
+                {"name": "💰 ECONOMIA NUVEM", "value": f"Delta: {d} | Poupança: **{eco:.1f}%**", "inline": True}]}]}
         else:
-            corpo = {"embeds": [{"title": "❌ ERRO NO PIPELINE", "color": 15158332, "description": f"Log: `{err}`"}]}
+            corpo = {"embeds": [{"title": "❌ STATUS: ERRO DE PROCESSAMENTO", "color": 15158332, "description": f"Log: `{err}`"}]}
         requests.post(url, json=corpo)
 
 if __name__ == "__main__":
-    MotorSeguranca().iniciar()
+    MotorSeguranca().processar()
