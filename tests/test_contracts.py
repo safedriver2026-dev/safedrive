@@ -3,17 +3,17 @@ import pandas as pd
 import os
 from autobot.autobot_engine import MotorSeguranca
 
-def test_processamento_ouro():
-    bot = MotorSeguranca(persistencia=False)
-    amostra = pd.DataFrame({
-        'LATITUDE': ['-23.5'], 'LONGITUDE': ['-46.6'],
-        'HORA_OCORRENCIA_BO': ['15:00'], 'NATUREZA_APURADA': ['ROUBO'],
-        'DATA_OCORRENCIA_BO': ['2026-03-01']
+def test_processamento_camada_ouro():
+    motor = MotorSeguranca(persistencia=False)
+    dados = pd.DataFrame({
+        'LATITUDE': ['-23.55'], 'LONGITUDE': ['-46.63'],
+        'HORA_OCORRENCIA_BO': ['14:00'], 'NATUREZA_APURADA': ['ROUBO'],
+        'DATA_OCORRENCIA_BO': ['2026-03-18']
     })
-    resultado = bot._gerar_camada_ouro(amostra)
+    resultado = motor._gerar_camada_ouro(dados)
     assert not resultado.empty
-    assert os.path.exists('datalake/gold_refined/fato_risco.csv')
+    assert os.path.exists('datalake/camada_ouro_refinada/esquema_estrela/fato_risco.csv')
 
-def test_calculo_peso():
-    bot = MotorSeguranca(persistencia=False)
-    assert bot._definir_peso(pd.Series({'X': 'LATROCINIO'})) == 10.0
+def test_calculo_peso_risco():
+    motor = MotorSeguranca(persistencia=False)
+    assert motor._definir_peso(pd.Series({'X': 'LATROCINIO'})) == 10.0
