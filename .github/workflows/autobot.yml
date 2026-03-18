@@ -1,35 +1,35 @@
-name: Missão Diaria SafeDriver
+name: SAFE-DRIVER-SISTEMA-AUTONOMO
 on:
   schedule:
     - cron: '0 6 * * *'
   workflow_dispatch:
 jobs:
-  run-pipeline:
+  execucao:
     runs-on: ubuntu-latest
     steps:
-      - name: CHECKOUT
+      - name: SINCRONIZAR-CODIGO
         uses: actions/checkout@v3
-      - name: SETUP-PYTHON
+      - name: CONFIGURAR-PYTHON
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11' # Upgrade para evitar o fim do suporte
+          python-version: '3.11'
           cache: 'pip'
-      - name: INSTALL-DEPS
-        run: pip install pandas numpy firebase-admin h3 prophet xgboost scikit-learn requests openpyxl pyarrow fastparquet
-      - name: EXECUTE-ENGINE
+      - name: INSTALAR-BIBLIOTECAS
+        run: pip install pytest pandas numpy firebase-admin h3 prophet xgboost scikit-learn requests openpyxl pyarrow fastparquet
+      - name: RODAR-MOTOR-PRINCIPAL
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           PYTHONPATH: .
         run: python autobot/autobot_engine.py
-      - name: EXECUTE-TESTS
+      - name: VALIDAR-TESTES-CONTRATO
         env:
           PYTHONPATH: .
         run: pytest tests/test_contracts.py -v
-      - name: GITOPS-SYNC
+      - name: PERSISTIR-DADOS-LAKEHOUSE
         run: |
-          git config --global user.name "SAFE-DRIVER-BOT"
+          git config --global user.name "MOTOR-AUTONOMO"
           git config --global user.email "bot@safedriver.io"
-          git add datalake/gold_refined/* datalake/bronze_raw/metadados.json datalake/silver_trusted/referencia_delta.parquet datalake/logs_sistema.log
-          git commit -m "🤖 [AUTO] SYNC GOLD $(date +'%Y-%m-%d')" || exit 0
+          git add datalake/camada_ouro_refinada/* datalake/camada_bronze_bruta/metadados.json datalake/camada_prata_confiavel/assinatura_anterior.parquet datalake/logs_processamento.log
+          git commit -m "🤖 [SISTEMA] ATUALIZAÇÃO DA CAMADA REFINADA $(date +'%Y-%m-%d')" || exit 0
           git push
