@@ -88,7 +88,6 @@ class AutobotSafeDriver:
         except: return np.nan
 
     def _atribuir_perfis(self, linha):
-        # Busca Global: Junta todas as colunas da linha em um texto só para não perder palavras escondidas
         texto_global = " ".join([str(val) for val in linha.values if pd.notnull(val)])
         texto_limpo = self._higienizar(texto_global)
         
@@ -131,9 +130,10 @@ class AutobotSafeDriver:
 
         enc_t = LabelEncoder()
         df['t_cod'] = enc_t.fit_transform(df['turno'])
-        df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.pesos_crimes.get(x, 1.0))
         
-        # Correção Data Leakage: A IA agora só usa Latitude, Longitude e Horário.
+        # Correção do Bug de IA (Peso Constante): Higienizar a Natureza do Crime antes de buscar no dicionário
+        df['peso'] = df['NATUREZA_APURADA'].apply(lambda x: self.pesos_crimes.get(self._higienizar(str(x)), 1.0))
+        
         X = df[['LATITUDE', 'LONGITUDE', 't_cod']]
         y = df['peso']
         
@@ -270,16 +270,16 @@ class AutobotSafeDriver:
     def _notificar(self):
         webhook = os.environ.get('DISCORD_SUCESSO')
         if not webhook: return
-        perf_str = "\n".join([f"**{k}:** {v} registros" for k, v in self.auditoria['perfis'].items()])
+        perf_str = "\n".join([f"**{k}:** {v} células de risco" for k, v in self.auditoria['perfis'].items()])
         payload = {
             "embeds": [{
                 "title": f"🚀 {self.identidade} - Relatório de Missão",
                 "color": 3066993,
                 "fields": [
                     {"name": "🎯 Taxa de Acerto IA", "value": f"**{self.auditoria['metricas']['acerto']}%**", "inline": False},
-                    {"name": "🌊 Lakehouse", "value": f"Bruto: {self.auditoria['camadas']['bruta']}\nConfiavel: {self.auditoria['camadas']['confiavel']}\nRefinado: {self.auditoria['camadas']['refinada']}", "inline": True},
+                    {"name": "🌊 Lakehouse", "value": f"Bruto (Crimes): {self.auditoria['camadas']['bruta']}\nConfiavel (GPS): {self.auditoria['camadas']['confiavel']}\nCélulas Malha: {self.auditoria['camadas']['refinada']}", "inline": True},
                     {"name": "📉 Margem Erro", "value": f"MAE: {self.auditoria['metricas']['mae']}\nRMSE: {self.auditoria['metricas']['rmse']}", "inline": True},
-                    {"name": "👥 Perfis", "value": perf_str, "inline": False},
+                    {"name": "👥 Perfis na Malha", "value": perf_str, "inline": False},
                     {"name": "☁️ Nuvem", "value": f"{self.auditoria['nuvem']['documentos']} Docs Atualizados", "inline": True}
                 ]
             }]
