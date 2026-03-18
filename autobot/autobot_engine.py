@@ -11,6 +11,7 @@ from prophet import Prophet
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split # Importação adicionada para o Split da IA
 
 class AutobotSafeDriver:
     def __init__(self, persistencia=True):
@@ -37,8 +38,8 @@ class AutobotSafeDriver:
         self.mapa_palavras_perfil = {
             "Pedestre": ["PEDESTRE", "TRANSEUNTE", "CELULAR", "CALCADA", "ONIBUS"],
             "Motorista": ["VEICULO", "CARRO", "CAMINHAO", "AUTOMOVEL", "CARGA", "MOTORISTA"],
-            "Ciclista": ["BICICLETA", "CICLISTA", "PEDALAR"],
-            "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY", "MOTOCICLISTA"]
+            "Ciclista": ["BICICLETA", "CICLO", "PEDALAR"],
+            "Motociclista": ["MOTO", "MOTOCICLETA", "CAPACETE", "MOTOBOY"]
         }
         
         self.limites_sp = {"lat": (-24.5, -23.0), "lon": (-47.0, -45.5)}
@@ -87,9 +88,11 @@ class AutobotSafeDriver:
         except: return np.nan
 
     def _atribuir_perfis(self, linha):
-        natureza = str(linha.get('NATUREZA_APURADA', ''))
-        local = str(linha.get('LOCAL', ''))
-        texto = f"{natureza} {local}".upper()
+        # Correção 2: Higienizando a linha antes de buscar as palavras
+        natureza = self._higienizar(str(linha.get('NATUREZA_APURADA', '')))
+        local = self._higienizar(str(linha.get('LOCAL', '')))
+        texto = f"{natureza} {local}"
+        
         encontrados = []
         for p, palavras in self.mapa_palavras_perfil.items():
             if any(re.search(rf'\b{w}\b', texto) for w in palavras):
@@ -134,10 +137,18 @@ class AutobotSafeDriver:
         
         X = df[['LATITUDE', 'LONGITUDE', 't_cod', 'p_cod']]
         y = df['peso']
-        modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6).fit(X, y)
         
-        mae = float(mean_absolute_error(y, modelo.predict(X)))
-        rmse = float(np.sqrt(mean_squared_error(y, modelo.predict(X))))
+        # Correção 1: Treino e Teste Separados
+        if len(X) > 50:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6).fit(X_train, y_train)
+            mae = float(mean_absolute_error(y_test, modelo.predict(X_test)))
+            rmse = float(np.sqrt(mean_squared_error(y_test, modelo.predict(X_test))))
+        else:
+            modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6).fit(X, y)
+            mae = float(mean_absolute_error(y, modelo.predict(X)))
+            rmse = float(np.sqrt(mean_squared_error(y, modelo.predict(X))))
+            
         taxa_acerto = max(0.0, 100.0 - ((mae / 10.0) * 100.0))
         
         self.auditoria['metricas']['mae'] = round(mae, 4)
@@ -164,6 +175,7 @@ class AutobotSafeDriver:
         col = self.banco_nuvem.collection('malha_seguranca')
         batch = self.banco_nuvem.batch()
         count = 0
+        total_docs = 0 # Correção 3: Contador Total Separado
 
         for _, r in malha.iterrows():
             doc_id = f"{r['perfil'].lower()}_{r['h3']}"
@@ -175,12 +187,13 @@ class AutobotSafeDriver:
             }, merge=True)
             
             count += 1
+            total_docs += 1
             if count >= 400:
                 batch.commit()
                 batch = self.banco_nuvem.batch()
                 count = 0
         batch.commit()
-        self.auditoria['nuvem']['documentos'] = count + (self.auditoria['nuvem']['documentos'])
+        self.auditoria['nuvem']['documentos'] = total_docs + self.auditoria['nuvem']['documentos']
 
     def executar(self):
         mestre = pd.DataFrame()
