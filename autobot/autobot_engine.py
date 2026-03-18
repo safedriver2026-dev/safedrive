@@ -13,16 +13,22 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', handlers=[logging.FileHandler("datalake/logs_sistema.log"), logging.StreamHandler()])
+for camada in ['bronze_raw', 'silver_trusted', 'gold_refined', 'datalake']: 
+    os.makedirs(f'datalake/{camada}', exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s [%(levelname)s] %(message)s', 
+    handlers=[logging.FileHandler("datalake/logs_sistema.log"), logging.StreamHandler()]
+)
 
 class MotorSeguranca:
     def __init__(self, persistencia=True):
-        self.versao = "4.0"
+        self.versao = "4.1"
         self.persistencia = persistencia
         self.banco = self._conectar_nuvem() if persistencia else None
         self.sessao = self._gerar_sessao()
         self.auditoria = {"raw": 0, "trusted": 0, "refined": 0, "metricas": {}, "nuvem": {"total": 0, "delta": 0}}
-        for camada in ['bronze_raw', 'silver_trusted', 'gold_refined']: os.makedirs(f'datalake/{camada}', exist_ok=True)
 
     def _conectar_nuvem(self):
         config = os.environ.get('FIREBASE_JSON')
