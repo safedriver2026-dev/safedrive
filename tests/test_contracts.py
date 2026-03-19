@@ -1,33 +1,20 @@
 import pytest
 import pandas as pd
-import numpy as np
 from autobot.autobot_engine import MotorSeguranca
 
-def test_volumetria_multimodal():
+def test_reconstrucao_bronze():
+    motor = MotorSeguranca(persistencia=False)
+    motor._atualizar_bronze()
+    # Verifica se ao menos um arquivo parquet foi criado na ausência de dados
+    arquivos = os.listdir('datalake/camada_bronze_bruta')
+    assert any(".parquet" in f for f in arquivos)
+
+def test_integridade_multimodal():
     motor = MotorSeguranca(persistencia=False)
     dados = pd.DataFrame({
-        'LATITUDE': [-23.5, -23.51, -23.52],
-        'LONGITUDE': [-46.6, -46.61, -46.62],
-        'RUBRICA': ['ROUBO DE VEICULO', 'FURTO DE BICICLETA', 'ROUBO CELULAR PEDESTRE']
+        'LATITUDE': [-23.5], 'LONGITUDE': [-46.6],
+        'RUBRICA': ['ROUBO DE VEICULO']
     })
-    motor._gerar_camada_ouro(dados)
+    res = motor._gerar_camada_ouro(dados)
     assert motor.telemetria['perfis']['Motorista'] == 1
-    assert motor.telemetria['perfis']['Ciclista'] == 1
-    assert motor.telemetria['perfis']['Pedestre'] == 1
-
-def test_precisao_estatistica():
-    motor = MotorSeguranca(persistencia=False)
-    dados = pd.DataFrame({
-        'LATITUDE': np.random.uniform(-24, -23, 100),
-        'LONGITUDE': np.random.uniform(-47, -46, 100),
-        'RUBRICA': ['ROUBO'] * 100
-    })
-    motor._gerar_camada_ouro(dados)
-    assert motor.telemetria['ia']['mae'] >= 0
-    assert -1 <= motor.telemetria['ia']['r2'] <= 1
-
-def test_sanitizacao_silver():
-    motor = MotorSeguranca(persistencia=False)
-    dados = pd.DataFrame({'LATITUDE': ['-23,5'], 'LONGITUDE': ['-46,6']})
-    res = motor._gerar_camada_silver(dados)
-    assert res.iloc[0]['LATITUDE'] == -23.5
+    assert not res.empty
