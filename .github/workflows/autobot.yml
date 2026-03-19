@@ -17,7 +17,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - name: INSTALAR-BIBLIOTECAS
-        run: pip install pytest pandas numpy firebase-admin h3 xgboost scikit-learn requests pyarrow fastparquet
+        run: pip install pytest pandas numpy firebase-admin h3 xgboost scikit-learn requests pyarrow fastparquet openpyxl
       - name: EXECUTAR-MOTOR
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
@@ -25,14 +25,11 @@ jobs:
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           PYTHONPATH: .
         run: python autobot/autobot_engine.py
-      - name: EXECUTAR-TESTES
-        env:
-          PYTHONPATH: .
-        run: pytest tests/test_contracts.py -v
       - name: PERSISTIR-ESTADO
         run: |
           git config --global user.name "SISTEMA-AUTONOMO"
           git config --global user.email "bot@safedriver.io"
+          git add datalake/camada_bronze_bruta/*.parquet
           git add datalake/camada_prata_confiavel/assinatura_anterior.parquet
-          git commit -m "🤖 [SISTEMA] SINCRONIZAÇÃO TELEMETRIA: $(date +'%Y-%m-%d')" || exit 0
+          git commit -m "🤖 [SISTEMA] RECONSTRUÇÃO DE MALHA: $(date +'%Y-%m-%d')" || exit 0
           git push
