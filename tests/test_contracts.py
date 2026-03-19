@@ -1,10 +1,10 @@
 import pytest
 import pandas as pd
 import os
-from autobot.motor_seguranca import MotorSegurancaPublica
+from autobot.autobot_engine import MotorSeguranca
 
 def test_geracao_camada_ouro_refinada():
-    motor = MotorSegurancaPublica(persistencia=False)
+    motor = MotorSeguranca(persistencia=False)
     dados_teste = pd.DataFrame({
         'LATITUDE': ['-23.5505'], 'LONGITUDE': ['-46.6333'],
         'HORA_OCORRENCIA_BO': ['19:00'], 'NATUREZA_APURADA': ['ROUBO DE CARGA'],
@@ -14,6 +14,6 @@ def test_geracao_camada_ouro_refinada():
     assert not resultado.empty
     assert os.path.exists('datalake/camada_ouro_refinada/esquema_estrela/fato_risco.csv')
 
-def test_validacao_pesos_incidente():
-    motor = MotorSegurancaPublica(persistencia=False)
-    assert motor._atribuir_peso_crime(pd.Series({'X': 'LATROCINIO'})) == 10.0
+def test_atribuicao_pesos():
+    motor = MotorSeguranca(persistencia=False)
+    assert motor._atribuir_peso(pd.Series({'X': 'LATROCINIO'})) == 10.0
