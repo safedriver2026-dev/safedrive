@@ -4,32 +4,32 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch:
 jobs:
-  execucao_geral:
+  execucao_total:
     runs-on: ubuntu-latest
     steps:
       - name: BUSCAR-CODIGO
         uses: actions/checkout@v3
-      - name: PREPARAR-AMBIENTE-PYTHON
+      - name: CONFIGURAR-PYTHON
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
           cache: 'pip'
-      - name: INSTALAR-BIBLIOTECAS-MATEMATICAS
+      - name: INSTALAR-BIBLIOTECAS
         run: pip install pytest pandas numpy firebase-admin h3 prophet xgboost scikit-learn requests openpyxl pyarrow fastparquet
       - name: EXECUTAR-MOTOR-ESTATISTICO
         env:
           FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           PYTHONPATH: .
-        run: python autobot/motor_seguranca.py
+        run: python autobot/autobot_engine.py
       - name: EXECUTAR-TESTES-QUALIDADE
         env:
           PYTHONPATH: .
-        run: pytest tests/test_contratos.py -v
+        run: pytest tests/test_contracts.py -v
       - name: PERSISTIR-DADOS-NA-ARQUITETURA
         run: |
-          git config --global user.name "SISTEMA-AUTONOMO"
+          git config --global user.name "MOTOR-AUTONOMO"
           git config --global user.email "bot@safedriver.io"
-          git add datalake/camada_ouro_refinada/* datalake/camada_bronze_bruta/rastreio_arquivos.json datalake/camada_prata_confiavel/memoria_anterior.parquet datalake/diario_processamento.log
-          git commit -m "🤖 [SISTEMA] ATUALIZAÇÃO REFINADA (DATASET 2022-2026) $(date +'%Y-%m-%d')" || exit 0
+          git add datalake/camada_ouro_refinada/* datalake/camada_bronze_bruta/controle_sincronia.json datalake/camada_prata_confiavel/memoria_anterior.parquet datalake/registro_sistema.log
+          git commit -m "🤖 [SISTEMA] ATUALIZAÇÃO DA CAMADA REFINADA $(date +'%Y-%m-%d')" || exit 0
           git push
