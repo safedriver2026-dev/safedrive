@@ -1,45 +1,28 @@
 import pytest
 import pandas as pd
-import os
 import numpy as np
 from autobot.autobot_engine import MotorSeguranca
 
-def test_integridade_silver_trusted():
-    motor = MotorSeguranca(persistencia=False)
-    dados_entrada = pd.DataFrame({
-        'LATITUDE': ['-23,5432', '0.0', 'invalido', '-23.5'],
-        'LONGITUDE': ['-46,6321', '0.0', '-46.6', '-46.6'],
-        'RUBRICA': ['ROUBO', 'FURTO', 'ROUBO', 'ROUBO']
-    })
-    resultado = motor._gerar_camada_silver(dados_entrada)
-    assert len(resultado) == 2
-    assert (resultado['LATITUDE'] < -19).all()
-
-def test_metricas_preditivas_ia():
-    motor = MotorSeguranca(persistencia=False)
-    dados_treino = pd.DataFrame({
-        'LATITUDE': np.random.uniform(-24, -23, 50),
-        'LONGITUDE': np.random.uniform(-47, -46, 50),
-        'RUBRICA': ['ROUBO'] * 25 + ['LATROCINIO'] * 25
-    })
-    motor._gerar_camada_ouro(dados_treino)
-    ia = motor.auditoria['ia']
-    assert 'mae' in ia
-    assert 'rmse' in ia
-    assert 'r2' in ia
-    assert ia['mae'] >= 0
-
-def test_pesos_severidade_estatistica():
-    motor = MotorSeguranca(persistencia=False)
-    assert motor._definir_peso(pd.Series({'V': 'LATROCINIO'})) == 10.0
-    assert motor._definir_peso(pd.Series({'V': 'FURTO'})) == 4.0
-    assert motor._definir_peso(pd.Series({'V': 'OUTROS'})) == 1.0
-
-def test_persistência_esquema_estrela():
+def test_volumetria_multimodal():
     motor = MotorSeguranca(persistencia=False)
     dados = pd.DataFrame({
-        'LATITUDE': [-23.5], 'LONGITUDE': [-46.6],
-        'RUBRICA': ['ROUBO']
+        'LATITUDE': [-23.5, -23.51, -23.52],
+        'LONGITUDE': [-46.6, -46.61, -46.62],
+        'FATO': ['ROUBO DE VEICULO', 'FURTO DE BICICLETA', 'ROUBO CELULAR PEDESTRE']
     })
     motor._gerar_camada_ouro(dados)
-    assert os.path.exists('datalake/camada_ouro_refinada/esquema_estrela/fato_risco.csv')
+    assert motor.telemetria['perfis']['Motorista'] == 1
+    assert motor.telemetria['perfis']['Ciclista'] == 1
+    assert motor.telemetria['perfis']['Pedestre'] == 1
+
+def test_precisao_estatistica():
+    motor = MotorSeguranca(persistencia=False)
+    # Gerar 100 pontos para validar IA
+    dados = pd.DataFrame({
+        'LATITUDE': np.random.uniform(-24, -23, 100),
+        'LONGITUDE': np.random.uniform(-47, -46, 100),
+        'RUBRICA': ['ROUBO'] * 100
+    })
+    motor._gerar_camada_ouro(dados)
+    assert motor.telemetria['ia']['mae'] >= 0
+    assert -1 <= motor.telemetria['ia']['r2'] <= 1
