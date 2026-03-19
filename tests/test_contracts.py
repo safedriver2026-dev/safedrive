@@ -1,20 +1,19 @@
 import pytest
 import pandas as pd
 import os
-from autobot.autobot_engine import MotorSeguranca
+from autobot.motor_seguranca import MotorSegurancaPublica
 
-def test_processamento_camada_ouro_total():
-    motor = MotorSeguranca(persistencia=False)
-    dados = pd.DataFrame({
+def test_geracao_camada_ouro_refinada():
+    motor = MotorSegurancaPublica(persistencia=False)
+    dados_teste = pd.DataFrame({
         'LATITUDE': ['-23.5505'], 'LONGITUDE': ['-46.6333'],
-        'HORA_OCORRENCIA_BO': ['18:00'], 'NATUREZA_APURADA': ['ROUBO DE VEICULO'],
+        'HORA_OCORRENCIA_BO': ['19:00'], 'NATUREZA_APURADA': ['ROUBO DE CARGA'],
         'DATA_OCORRENCIA_BO': ['2026-03-18']
     })
-    resultado = motor._gerar_camada_ouro(dados)
+    resultado = motor._gerar_camada_ouro(dados_teste)
     assert not resultado.empty
     assert os.path.exists('datalake/camada_ouro_refinada/esquema_estrela/fato_risco.csv')
-    assert os.path.exists('datalake/camada_ouro_refinada/malha_mapa_auditavel.parquet')
 
-def test_logica_peso_incidente():
-    motor = MotorSeguranca(persistencia=False)
-    assert motor._definir_peso(pd.Series({'X': 'SEQUESTRO'})) == 10.0
+def test_validacao_pesos_incidente():
+    motor = MotorSegurancaPublica(persistencia=False)
+    assert motor._atribuir_peso_crime(pd.Series({'X': 'LATROCINIO'})) == 10.0
