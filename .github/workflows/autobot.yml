@@ -3,8 +3,12 @@ on:
   schedule:
     - cron: '0 6 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
+
 jobs:
-  execucao:
+  execucao_total:
     runs-on: ubuntu-latest
     steps:
       - name: BUSCAR-CODIGO
@@ -27,10 +31,10 @@ jobs:
         env:
           PYTHONPATH: .
         run: pytest tests/test_contracts.py -v
-      - name: PERSISTIR-ARQUITETURA
+      - name: PERSISTIR-DADOS
         run: |
           git config --global user.name "SISTEMA-AUTONOMO"
           git config --global user.email "bot@safedriver.io"
           git add datalake/camada_ouro_refinada/* datalake/camada_bronze_bruta/controle.json datalake/camada_prata_confiavel/assinatura_anterior.parquet datalake/registro_sistema.log
-          git commit -m "🤖 [SISTEMA] ATUALIZAÇÃO REFINADA $(date +'%Y-%m-%d')" || exit 0
+          git commit -m "🤖 [SISTEMA] ATUALIZAÇÃO DA CAMADA OURO $(date +'%Y-%m-%d')" || exit 0
           git push
