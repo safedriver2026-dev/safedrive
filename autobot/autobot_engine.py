@@ -24,7 +24,7 @@ logging.basicConfig(
 
 class MotorSeguranca:
     def __init__(self, persistencia=True):
-        self.identificador = "MOTOR-ESTATISTICO-AUTONOMO"
+        self.identificador = "SISTEMA-AUTONOMO-SAFE-DRIVER-V5"
         self.persistencia = persistencia
         self.banco = self._conectar_banco() if persistencia else None
         self.sessao = self._gerar_sessao()
@@ -61,7 +61,11 @@ class MotorSeguranca:
         return 3.0 if "FURTO" in t else 1.0
 
     def _gerar_camada_ouro(self, dados):
-        dados['id_h3'] = dados.apply(lambda r: h3.latlng_to_cell(float(r['LATITUDE']), float(r['LONGITUDE']), 10), axis=1)
+        dados['LATITUDE'] = pd.to_numeric(dados['LATITUDE'], errors='coerce')
+        dados['LONGITUDE'] = pd.to_numeric(dados['LONGITUDE'], errors='coerce')
+        dados = dados.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
+
+        dados['id_h3'] = dados.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
         dados['peso_risco'] = dados.apply(self._definir_peso, axis=1)
         
         perfis = {"Pedestre": ["CELULAR", "ONIBUS", "PEDESTRE"], "Motorista": ["VEICULO", "CARRO", "CARGA"], "Ciclista": ["BICI"], "Motociclista": ["MOTO"]}
@@ -89,7 +93,7 @@ class MotorSeguranca:
         
         if len(X) >= 10:
             xt, xv, yt, yv = train_test_split(X, y, test_size=0.2, random_state=42)
-            modelo = xgb.XGBRegressor(n_estimators=100).fit(xt, yt)
+            modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05).fit(xt, yt)
             yp = modelo.predict(xv)
             mae, r2 = mean_absolute_error(yv, yp), r2_score(yv, yp)
         else: mae, r2 = 0.0, 1.0
@@ -118,7 +122,7 @@ class MotorSeguranca:
         return res
 
     def _sincronizar_delta(self, dados):
-        if not self.banco or dados.empty: return
+        if not self.db or dados.empty: return
         ref = 'datalake/camada_prata_confiavel/assinatura_anterior.parquet'
         delta = dados.copy()
         if os.path.exists(ref):
@@ -130,13 +134,17 @@ class MotorSeguranca:
                 dados.drop(columns=['hash'], inplace=True)
             except: pass
             
-        lote = self.banco.batch()
+        lote = self.db.batch()
+        contador = 0
         for _, r in delta.iterrows():
-            lote.set(self.banco.collection('malha_risco').document(f"{r['perfil'].lower()}_{r['h3']}"), {
+            lote.set(self.db.collection('malha_risco').document(f"{r['perfil'].lower()}_{r['h3']}"), {
                 "id_h3": r['h3'], "perfil": r['perfil'],
                 f"turnos.{r['turno']}": {"nota": r['score_final'], "atualizado": firestore.SERVER_TIMESTAMP}
             }, merge=True)
-        lote.commit()
+            contador += 1
+            if contador >= 400:
+                lote.commit(); lote = self.db.batch(); contador = 0
+        if contador > 0: lote.commit()
         self.auditoria['nuvem'] = {"total": len(dados), "delta": len(delta)}
 
     def processar(self):
@@ -146,8 +154,8 @@ class MotorSeguranca:
             if os.path.exists(meta_p):
                 with open(meta_p, 'r') as f: meta = json.load(f)
             
-            ano_atual = datetime.now().year
-            for ano in range(2023, ano_atual + 1):
+            ano_limite = datetime.now().year
+            for ano in range(2022, ano_limite + 1):
                 caminho = f'datalake/camada_bronze_bruta/ssp_{ano}.parquet'
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                 try:
@@ -156,7 +164,7 @@ class MotorSeguranca:
                     if os.path.exists(caminho) and meta.get(str(ano)) == tamanho:
                         dados_ano = pd.read_parquet(caminho)
                     else:
-                        r = self.sessao.get(url, timeout=300)
+                        r = self.session.get(url, timeout=300)
                         dados_ano = pd.read_excel(io.BytesIO(r.content), dtype=str)
                         dados_ano.columns = [self._limpar_texto(c) for c in dados_ano.columns]
                         dados_ano.to_parquet(caminho, index=False); meta[str(ano)] = tamanho
@@ -184,12 +192,12 @@ class MotorSeguranca:
         if ok:
             t, d = self.auditoria['nuvem']['total'], self.auditoria['nuvem']['delta']
             eco = ((t - d) / t * 100) if t > 0 else 0
-            corpo = {"embeds": [{"title": "✅ STATUS: EXECUÇÃO FINALIZADA", "color": 3066993, "fields": [
-                {"name": "📉 MODELAGEM IA", "value": f"Acerto: {self.auditoria['ia']['acerto']}% | $R^2$: {self.auditoria['ia']['r2']}", "inline": False},
-                {"name": "🏗️ ARQUITETURA MEDALHÃO", "value": f"Bruta: {self.auditoria['bruta']} | Confiavel: {self.auditoria['confiavel']} | Refinada: {self.auditoria['refinada']}", "inline": True},
-                {"name": "💰 ECONOMIA NUVEM", "value": f"Delta: {d} | Poupança: **{eco:.1f}%**", "inline": True}]}]}
+            corpo = {"embeds": [{"title": "✅ STATUS: PIPELINE SAFE-DRIVER CONCLUÍDO", "color": 3066993, "fields": [
+                {"name": "📈 MÉTRICAS PREDITIVAS", "value": f"Acerto: {self.auditoria['ia']['acerto']}% | $R^2$: {self.auditoria['ia']['r2']}", "inline": False},
+                {"name": "🏗️ MEDALLION LAKEHOUSE", "value": f"Bronze (2022+): {self.auditoria['bruta']} | Refinada: {self.auditoria['refinada']}", "inline": True},
+                {"name": "💰 EFICIÊNCIA NUVEM", "value": f"Sincronizados: {d} | Economia: **{eco:.1f}%**", "inline": True}]}]}
         else:
-            corpo = {"embeds": [{"title": "❌ STATUS: ERRO DE PROCESSAMENTO", "color": 15158332, "description": f"Log: `{err}`"}]}
+            corpo = {"embeds": [{"title": "❌ STATUS: FALHA NO PROCESSAMENTO", "color": 15158332, "description": f"Erro: `{err}`"}]}
         requests.post(url, json=corpo)
 
 if __name__ == "__main__":
