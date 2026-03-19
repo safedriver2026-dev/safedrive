@@ -1,19 +1,17 @@
 import pandas as pd
 import numpy as np
-import os, io, requests, json, unicodedata, gc, re, logging
-from datetime import datetime, timedelta
+import os, io, requests, json, unicodedata, gc, logging
+from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import h3
-from prophet import Prophet
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
-# CONFIGURAÇÃO DO LAGO DE DADOS (MEDALHÃO)
 for pasta in ['camada_bronze_bruta', 'camada_prata_confiavel', 'camada_ouro_refinada', 'camada_ouro_refinada/esquema_estrela', 'datalake']: 
     os.makedirs(f'datalake/{pasta}', exist_ok=True)
 
@@ -65,23 +63,20 @@ class MotorSeguranca:
         dados['LATITUDE'] = pd.to_numeric(dados['LATITUDE'], errors='coerce')
         dados['LONGITUDE'] = pd.to_numeric(dados['LONGITUDE'], errors='coerce')
         dados = dados.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
-
+        dados = dados[(dados['LATITUDE'] < -19) & (dados['LATITUDE'] > -26) & 
+                     (dados['LONGITUDE'] < -44) & (dados['LONGITUDE'] > -54)]
         dados['id_geometria'] = dados.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
         dados['nota_perigo'] = dados.apply(self._definir_peso, axis=1)
-        
         perfis = {
             "Pedestre": ["CELULAR", "ONIBUS", "PEDESTRE"], "Motorista": ["VEICULO", "CARRO", "CARGA"], 
             "Ciclista": ["BICI", "BICICLETA", "BIKE"], "Motociclista": ["MOTO", "MOTOCICLETA"]
         }
-        
         def classificar(r):
             t = self._limpar_texto(" ".join([str(v) for v in r.values if pd.api.types.is_scalar(v)]))
             m = [p for p, palavras in perfis.items() if any(w in t for w in palavras)]
             return m if m else ["Geral"]
-        
         dados['perfil_usuario'] = dados.apply(classificar, axis=1)
         dados = dados.explode('perfil_usuario')
-        
         def definir_periodo(h):
             try:
                 h = int(str(h).split(':')[0])
@@ -90,40 +85,30 @@ class MotorSeguranca:
                 if 12<=h<18: return 'Tarde'
                 return 'Noite'
             except: return 'Noite'
-        
         dados['periodo_dia'] = dados['HORA_OCORRENCIA_BO'].apply(definir_periodo)
-        
         le = LabelEncoder()
         dados['periodo_cod'] = le.fit_transform(dados['periodo_dia'])
         X, y = dados[['LATITUDE', 'LONGITUDE', 'periodo_cod']], dados['nota_perigo']
-        
         if len(X) >= 10:
             xt, xv, yt, yv = train_test_split(X, y, test_size=0.2, random_state=42)
             modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05).fit(xt, yt)
             yp = modelo.predict(xv)
             mae, r2 = mean_absolute_error(yv, yp), r2_score(yv, yp)
         else: mae, r2 = 0.0, 1.0
-        
         self.auditoria['ia'] = {"acerto": round(max(0.0, 100.0 - ((mae/10)*100)), 2), "r2": round(r2, 4)}
-        
         res = dados.groupby(['id_geometria', 'perfil_usuario', 'periodo_dia']).agg({'nota_perigo': ['mean', 'count'], 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
         res.columns = ['geometria', 'perfil', 'periodo', 'media_peso', 'frequencia', 'lat', 'lon']
         res['nota_final'] = MinMaxScaler(feature_range=(0.5, 10.0)).fit_transform(res[['media_peso']]).round(1) if len(res)>1 else 5.0
-
         res.to_parquet('datalake/camada_ouro_refinada/mapa_auditavel.parquet', index=False)
-
-        # ESQUEMA ESTRELA PARA POWER BI
         dim_local = res[['geometria', 'lat', 'lon']].drop_duplicates()
         dim_perfil = pd.DataFrame({'id_p': range(len(res['perfil'].unique())), 'nome_p': res['perfil'].unique()})
         dim_tempo = pd.DataFrame({'id_t': range(len(res['periodo'].unique())), 'nome_t': res['periodo'].unique()})
         fato = res.merge(dim_perfil, left_on='perfil', right_on='nome_p').merge(dim_tempo, left_on='periodo', right_on='nome_t')
         fato = fato[['geometria', 'id_p', 'id_t', 'nota_final', 'frequencia']]
-        
         dim_local.to_csv('datalake/camada_ouro_refinada/esquema_estrela/dim_localizacao.csv', index=False)
         dim_perfil.to_csv('datalake/camada_ouro_refinada/esquema_estrela/dim_perfil.csv', index=False)
         dim_tempo.to_csv('datalake/camada_ouro_refinada/esquema_estrela/dim_tempo.csv', index=False)
         fato.to_csv('datalake/camada_ouro_refinada/esquema_estrela/fato_risco.csv', index=False)
-        
         return res
 
     def _sincronizar_nuvem(self, dados):
@@ -138,7 +123,6 @@ class MotorSeguranca:
                 delta = dados[~dados['hash'].isin(antigo['hash'])].copy()
                 dados.drop(columns=['hash'], inplace=True, errors='ignore')
             except: pass
-            
         lote = self.banco.batch()
         contador = 0
         for _, r in delta.iterrows():
@@ -160,7 +144,6 @@ class MotorSeguranca:
             meta_p, meta = 'datalake/camada_bronze_bruta/controle.json', {}
             if os.path.exists(meta_p):
                 with open(meta_p, 'r') as f: meta = json.load(f)
-            
             for ano in range(2022, datetime.now().year + 1):
                 cb = f'datalake/camada_bronze_bruta/ssp_{ano}.parquet'
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
@@ -177,7 +160,6 @@ class MotorSeguranca:
                 if not d.empty:
                     self.auditoria['bruta'] += len(d)
                     mestre = pd.concat([mestre, d])
-
             if not mestre.empty:
                 confiavel = mestre[mestre['LATITUDE'].notna()].copy()
                 self.auditoria['confiavel'] = len(confiavel)
