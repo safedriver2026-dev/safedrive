@@ -7,7 +7,7 @@ def test_geracao_camada_ouro_refinada():
     motor = MotorSeguranca(persistencia=False)
     dados_teste = pd.DataFrame({
         'LATITUDE': ['-23.5505'], 'LONGITUDE': ['-46.6333'],
-        'HORA_OCORRENCIA_BO': ['19:00'], 'NATUREZA_APURADA': ['ROUBO DE CARGA'],
+        'HORA_OCORRENCIA_BO': ['19:00'], 'NATUREZA_APURADA': ['ROUBO DE VEICULO'],
         'DATA_OCORRENCIA_BO': ['2026-03-18']
     })
     resultado = motor._gerar_camada_ouro(dados_teste)
@@ -16,4 +16,4 @@ def test_geracao_camada_ouro_refinada():
 
 def test_atribuicao_pesos():
     motor = MotorSeguranca(persistencia=False)
-    assert motor._atribuir_peso(pd.Series({'X': 'LATROCINIO'})) == 10.0
+    assert motor._atribuir_peso_incidente(pd.Series({'X': 'LATROCINIO'})) == 10.0
