@@ -11,9 +11,10 @@ from sklearn.model_selection import train_test_split
 
 class MotorSeguranca:
     def __init__(self, persistencia=True):
-        self.identificador = "PROTOCOLO-MONITORAMENTO-TOTAL"
+        self.identificador = "MOTOR-RECONSTRUTOR-AUTONOMO"
         self.persistencia = persistencia
         self.tokens = {"sucesso": os.environ.get('DISCORD_SUCESSO'), "erro": os.environ.get('DISCORD_ERRO')}
+        self.url_base = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{}.xlsx"
         self.perfis_alvo = {
             "Motorista": ["VEICULO", "CARRO", "AUTO", "CARGA", "CAMINHAO"],
             "Motociclista": ["MOTO", "MOTOCICLETA"],
@@ -25,7 +26,7 @@ class MotorSeguranca:
             "camadas": {"bronze": 0, "silver": 0, "gold": 0},
             "perfis": {p: 0 for p in self.perfis_alvo.keys()},
             "ia": {"mae": 0.0, "rmse": 0.0, "r2": 0.0, "c": 0.0},
-            "cloud": {"eco": 0.0, "delta": 0, "h3_ativos": 0}
+            "cloud": {"eco": 0.0, "delta": 0, "downloads": 0}
         }
 
     def _conectar_nuvem(self):
@@ -54,6 +55,21 @@ class MotorSeguranca:
         if "ROUBO" in t: return 8.5
         return 4.0 if "FURTO" in t else 1.5
 
+    def _atualizar_bronze(self):
+        os.makedirs('datalake/camada_bronze_bruta', exist_ok=True)
+        ano_atual = datetime.now().year
+        for ano in range(2024, ano_atual + 1):
+            caminho_parquet = f'datalake/camada_bronze_bruta/ssp_{ano}.parquet'
+            if not os.path.exists(caminho_parquet):
+                url = self.url_base.format(ano)
+                try:
+                    resp = requests.get(url, timeout=60)
+                    if resp.status_code == 200:
+                        df_tmp = pd.read_excel(io.BytesIO(resp.content))
+                        df_tmp.to_parquet(caminho_parquet, index=False)
+                        self.telemetria['cloud']['downloads'] += 1
+                except: pass
+
     def _gerar_camada_silver(self, df):
         df = df.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
         df['LATITUDE'] = pd.to_numeric(df['LATITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
@@ -62,30 +78,29 @@ class MotorSeguranca:
         self.telemetria["camadas"]["silver"] = len(df)
         return df
 
-    def _treinar_ia(self, dados):
-        X, y = dados[['LATITUDE', 'LONGITUDE']], dados['nota']
-        if len(X) > 50:
-            xt, xv, yt, yv = train_test_split(X, y, test_size=0.15, random_state=42)
-            m = xgb.XGBRegressor(objective='reg:absoluteerror', n_estimators=150, learning_rate=0.05)
-            m.fit(xt, yt)
-            p = m.predict(xv)
-            mae = mean_absolute_error(yv, p)
-            self.telemetria['ia'] = {
-                "mae": round(mae, 4),
-                "rmse": round(root_mean_squared_error(yv, p), 4),
-                "r2": round(r2_score(yv, p), 4),
-                "c": round(max(0.0, 100.0 - (mae * 10)), 2)
-            }
-
     def _gerar_camada_ouro(self, dados):
         dados = self._gerar_camada_silver(dados)
         if dados.empty: return pd.DataFrame()
         dados['perfil'] = dados.apply(self._classificar_perfil, axis=1)
         dados['id_h3'] = dados.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 8), axis=1)
         dados['nota'] = dados.apply(self._definir_peso, axis=1)
+        
         v_perfil = dados['perfil'].value_counts().to_dict()
         for p in self.telemetria['perfis']: self.telemetria['perfis'][p] = v_perfil.get(p, 0)
-        self._treinar_ia(dados)
+        
+        X, y = dados[['LATITUDE', 'LONGITUDE']], dados['nota']
+        if len(X) > 30:
+            xt, xv, yt, yv = train_test_split(X, y, test_size=0.2, random_state=42)
+            m = xgb.XGBRegressor(objective='reg:absoluteerror', n_estimators=100)
+            m.fit(xt, yt)
+            p_vals = m.predict(xv)
+            self.telemetria['ia'] = {
+                "mae": round(mean_absolute_error(yv, p_vals), 4),
+                "rmse": round(root_mean_squared_error(yv, p_vals), 4),
+                "r2": round(r2_score(yv, p_vals), 4),
+                "c": round(max(0.0, 100.0 - (mean_absolute_error(yv, p_vals) * 10)), 2)
+            }
+        
         res = dados.groupby(['id_h3', 'perfil']).agg({'nota': 'mean', 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
         res.columns = ['h3', 'p', 'r', 'lat', 'lon']
         self.telemetria["camadas"]["gold"] = len(res)
@@ -110,11 +125,10 @@ class MotorSeguranca:
                 doc_id = f"{r['h3']}_{r['p']}"
                 ref = self.banco.collection('malha_risco').document(doc_id)
                 lote.set(ref, {'r': round(r['r'], 2), 'p': r['p'], 'c': [r['lat'], r['lon']], 'u': firestore.SERVER_TIMESTAMP}, merge=True)
-                if (i + 1) % 450 == 0:
+                if (i + 1) % 400 == 0:
                     lote.commit(); lote = self.banco.batch()
             lote.commit()
         dados.to_parquet(ref_path, index=False)
-        self.telemetria['cloud']['h3_ativos'] = len(dados['h3'].unique())
 
     def _notificar(self, status, msg=None):
         url = self.tokens["sucesso"] if status else self.tokens["erro"]
@@ -122,35 +136,30 @@ class MotorSeguranca:
         p_info = "\n".join([f"🔹 **{k}:** {v}" for k, v in self.telemetria['perfis'].items()])
         c_info = f"📦 **Bronze:** {self.telemetria['camadas']['bronze']}\n🥈 **Silver:** {self.telemetria['camadas']['silver']}\n🏆 **Gold:** {self.telemetria['camadas']['gold']}"
         ia_info = f"📉 **MAE:** {self.telemetria['ia']['mae']} | **RMSE:** {self.telemetria['ia']['rmse']}\n📈 **R²:** {self.telemetria['ia']['r2']} | **Confiança:** {self.telemetria['ia']['c']}%"
-        cloud_info = f"💰 **Economia:** {self.telemetria['cloud']['eco']:.2f}%\n🆕 **Delta:** {self.telemetria['cloud']['delta']} | 📍 **Células H3:** {self.telemetria['cloud']['h3_ativos']}"
-        embed = {
-            "title": "🛡️ DASHBOARD DE INTEGRIDADE - SAFE DRIVER" if status else "🚨 FALHA NO MOTOR",
-            "color": 3066993 if status else 15158332,
-            "fields": [
-                {"name": "📊 VOLUMETRIA POR CAMADA", "value": c_info, "inline": False},
-                {"name": "👥 SEGMENTAÇÃO POR PERFIL", "value": p_info, "inline": True},
-                {"name": "🧠 PERFORMANCE DO MODELO", "value": ia_info, "inline": False},
-                {"name": "☁️ MÉTRICAS DE NUVEM", "value": cloud_info, "inline": True}
-            ],
-            "footer": {"text": f"ID Execução: {datetime.now().strftime('%Y%m%d%H%M')}"}
-        }
+        cloud_info = f"💰 **Economia:** {self.telemetria['cloud']['eco']:.2f}%\n🆕 **Delta:** {self.telemetria['cloud']['delta']} | 📥 **Downloads:** {self.telemetria['cloud']['downloads']}"
+        embed = {"title": "🛡️ DASHBOARD INTEGRAL - SAFE DRIVER", "color": 3066993 if status else 15158332, "fields": [
+            {"name": "📊 CAMADAS DE DADOS", "value": c_info, "inline": False},
+            {"name": "👥 PERFIS MONITORADOS", "value": p_info, "inline": True},
+            {"name": "🧠 INTELIGÊNCIA ARTIFICIAL", "value": ia_info, "inline": False},
+            {"name": "☁️ SINCRONIZAÇÃO NUVEM", "value": cloud_info, "inline": True}
+        ], "footer": {"text": f"Execução: {datetime.now().strftime('%Y%m%d%H%M')}"}}
         if msg: embed["description"] = f"**Status:** `{msg}`"
         requests.post(url, json={"embeds": [embed]})
 
     def processar(self):
         try:
+            self._atualizar_bronze()
             mestre = pd.DataFrame()
-            for ano in range(2022, datetime.now().year + 1):
+            for ano in range(2024, datetime.now().year + 1):
                 path = f'datalake/camada_bronze_bruta/ssp_{ano}.parquet'
-                if os.path.exists(path):
-                    mestre = pd.concat([mestre, pd.read_parquet(path)])
+                if os.path.exists(path): mestre = pd.concat([mestre, pd.read_parquet(path)])
             if mestre.empty:
-                self._notificar(True, msg="Monitoramento concluído: Base de dados vazia na origem.")
+                self._notificar(True, msg="Sistema reconstruído: Zero registros identificados no portal SSP.")
             else:
                 self.telemetria['camadas']['bronze'] = len(mestre)
                 ouro = self._gerar_camada_ouro(mestre)
                 self._sync_deltasync(ouro)
-                self._notificar(True, msg="Pipeline executado com sucesso.")
+                self._notificar(True, msg="Malha de segurança reconstruída e sincronizada.")
         except Exception as e:
             self._notificar(False, str(e))
 
