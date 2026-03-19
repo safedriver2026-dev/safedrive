@@ -50,7 +50,7 @@ class MotorSeguranca:
         if pd.isna(texto) or not isinstance(texto, str): return ""
         return "".join([c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c)]).upper().strip()
 
-    def _definir_peso_incidente(self, linha):
+    def _atribuir_peso_incidente(self, linha):
         conteudo = " ".join([str(v) for v in linha.values if pd.api.types.is_scalar(v) and pd.notnull(v)])
         t = self._limpar_texto(conteudo)
         if any(w in t for w in ["LATROCINIO", "SEQUESTRO"]): return 10.0
@@ -66,7 +66,7 @@ class MotorSeguranca:
         dados = dados.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
 
         dados['id_geometria'] = dados.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 10), axis=1)
-        dados['peso_final'] = dados.apply(self._definir_peso_incidente, axis=1)
+        dados['peso_final'] = dados.apply(self._atribuir_peso_incidente, axis=1)
         
         perfis = {"Pedestre": ["CELULAR", "ONIBUS", "PEDESTRE"], "Motorista": ["VEICULO", "CARRO", "CARGA"], "Ciclista": ["BICI"], "Motociclista": ["MOTO"]}
         def categorizar(r):
@@ -77,7 +77,7 @@ class MotorSeguranca:
         dados['perfis_usuario'] = dados.apply(categorizar, axis=1)
         dados = dados.explode('perfis_usuario')
         
-        def definir_turno(h):
+        def definir_periodo(h):
             try:
                 h = int(str(h).split(':')[0])
                 if 0<=h<6: return 'Madrugada'
@@ -85,7 +85,7 @@ class MotorSeguranca:
                 if 12<=h<18: return 'Tarde'
                 return 'Noite'
             except: return 'Noite'
-        dados['periodo_dia'] = dados['HORA_OCORRENCIA_BO'].apply(definir_turno)
+        dados['periodo_dia'] = dados['HORA_OCORRENCIA_BO'].apply(definir_periodo)
         
         codificador = LabelEncoder()
         dados['turno_cod'] = codificador.fit_transform(dados['periodo_dia'])
@@ -100,7 +100,7 @@ class MotorSeguranca:
         
         self.auditoria['estatisticas'] = {"mae": round(mae, 4), "r2": round(r2, 4), "acerto": round(max(0.0, 100.0 - ((mae/10)*100)), 2)}
         
-        res = dados.groupby(['id_geometria', 'perfis_usuario', 'turno_dia']).agg({'peso_final': ['mean', 'count'], 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
+        res = dados.groupby(['id_geometria', 'perfis_usuario', 'periodo_dia']).agg({'peso_final': ['mean', 'count'], 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
         res.columns = ['geometria', 'perfil', 'turno', 'peso_medio', 'frequencia', 'lat', 'lon']
         res['nota_final'] = MinMaxScaler(feature_range=(0.5, 10.0)).fit_transform(res[['peso_medio']]).round(1) if len(res)>1 else 5.0
 
@@ -190,11 +190,8 @@ class MotorSeguranca:
     def _enviar_alerta(self, sucesso, erro=None):
         webhook_sucesso = os.environ.get('DISCORD_SUCESSO')
         webhook_erro = os.environ.get('DISCORD_ERRO')
-        
-        # Define qual canal usar. Se der erro e houver canal de erro, usa ele. Caso contrário, tenta o de sucesso.
         url = webhook_erro if not sucesso and webhook_erro else webhook_sucesso
         if not url: return
-
         if sucesso:
             t, d = self.auditoria['nuvem']['total'], self.auditoria['nuvem']['diferencial']
             economia = ((t - d) / t * 100) if t > 0 else 0
@@ -203,8 +200,7 @@ class MotorSeguranca:
                 {"name": "🏗️ CAMADAS (2022-2026)", "value": f"Bruta: {self.auditoria['bruta']} | Refinada: {self.auditoria['refinada']}", "inline": True},
                 {"name": "💰 EFICIÊNCIA NUVEM", "value": f"Delta: {d} | Poupança: **{economia:.1f}%**", "inline": True}]}]}
         else:
-            corpo = {"embeds": [{"title": "🚨 MOTOR SAFE-DRIVER: FALHA CRÍTICA", "color": 15158332, "description": f"O processamento foi interrompido.\n**Erro detectado:** `{erro}`", "footer": {"text": "Verifique os logs do GitHub Actions para mais detalhes."}}]}
-        
+            corpo = {"embeds": [{"title": "🚨 MOTOR SAFE-DRIVER: FALHA CRÍTICA", "color": 15158332, "description": f"O processamento foi interrompido.\n**Erro detectado:** `{erro}`"}]}
         requests.post(url, json=corpo)
 
 if __name__ == "__main__":
