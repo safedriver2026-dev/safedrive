@@ -80,16 +80,12 @@ class MotorSeguranca:
     def _gerar_camada_ouro(self, dados):
         dados = self._gerar_camada_silver(dados)
         if dados.empty: return pd.DataFrame()
-        
         dados['perfil'] = dados.apply(self._classificar_perfil, axis=1)
         dados['id_h3'] = dados.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 8), axis=1)
         dados['nota'] = dados.apply(self._definir_peso, axis=1)
-        
         v_perfil = dados['perfil'].value_counts().to_dict()
         for p in self.telemetria['perfis']: self.telemetria['perfis'][p] = v_perfil.get(p, 0)
-        
         self._treinar_ia(dados)
-        
         res = dados.groupby(['id_h3', 'perfil']).agg({'nota': 'mean', 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
         res.columns = ['h3', 'p', 'r', 'lat', 'lon']
         self.telemetria["camadas"]["gold"] = len(res)
@@ -99,7 +95,6 @@ class MotorSeguranca:
         if not self.banco or dados.empty: return
         ref_path = 'datalake/camada_prata_confiavel/assinatura_anterior.parquet'
         dados['hash'] = dados.apply(lambda r: hashlib.sha256(f"{r['h3']}{r['p']}{r['r']}".encode()).hexdigest(), axis=1)
-        
         if os.path.exists(ref_path):
             antigo = pd.read_parquet(ref_path)
             delta = dados[~dados['hash'].isin(antigo['hash'])].copy()
@@ -109,7 +104,6 @@ class MotorSeguranca:
             delta = dados
             self.telemetria['cloud']['eco'] = 0.0
             self.telemetria['cloud']['delta'] = len(dados)
-
         if not delta.empty:
             lote = self.banco.batch()
             for i, r in delta.iterrows():
@@ -119,19 +113,16 @@ class MotorSeguranca:
                 if (i + 1) % 450 == 0:
                     lote.commit(); lote = self.banco.batch()
             lote.commit()
-        
         dados.to_parquet(ref_path, index=False)
         self.telemetria['cloud']['h3_ativos'] = len(dados['h3'].unique())
 
     def _notificar(self, status, msg=None):
         url = self.tokens["sucesso"] if status else self.tokens["erro"]
         if not url: return
-        
         p_info = "\n".join([f"🔹 **{k}:** {v}" for k, v in self.telemetria['perfis'].items()])
         c_info = f"📦 **Bronze:** {self.telemetria['camadas']['bronze']}\n🥈 **Silver:** {self.telemetria['camadas']['silver']}\n🏆 **Gold:** {self.telemetria['camadas']['gold']}"
         ia_info = f"📉 **MAE:** {self.telemetria['ia']['mae']} | **RMSE:** {self.telemetria['ia']['rmse']}\n📈 **R²:** {self.telemetria['ia']['r2']} | **Confiança:** {self.telemetria['ia']['c']}%"
         cloud_info = f"💰 **Economia:** {self.telemetria['cloud']['eco']:.2f}%\n🆕 **Delta:** {self.telemetria['cloud']['delta']} | 📍 **Células H3:** {self.telemetria['cloud']['h3_ativos']}"
-
         embed = {
             "title": "🛡️ DASHBOARD DE INTEGRIDADE - SAFE DRIVER" if status else "🚨 FALHA NO MOTOR",
             "color": 3066993 if status else 15158332,
@@ -143,7 +134,7 @@ class MotorSeguranca:
             ],
             "footer": {"text": f"ID Execução: {datetime.now().strftime('%Y%m%d%H%M')}"}
         }
-        if msg: embed["description"] = f"**Erro:** `{msg}`"
+        if msg: embed["description"] = f"**Status:** `{msg}`"
         requests.post(url, json={"embeds": [embed]})
 
     def processar(self):
@@ -152,13 +143,14 @@ class MotorSeguranca:
             for ano in range(2022, datetime.now().year + 1):
                 path = f'datalake/camada_bronze_bruta/ssp_{ano}.parquet'
                 if os.path.exists(path):
-                    d = pd.read_parquet(path)
-                    mestre = pd.concat([mestre, d])
-            if not mestre.empty:
+                    mestre = pd.concat([mestre, pd.read_parquet(path)])
+            if mestre.empty:
+                self._notificar(True, msg="Monitoramento concluído: Base de dados vazia na origem.")
+            else:
                 self.telemetria['camadas']['bronze'] = len(mestre)
                 ouro = self._gerar_camada_ouro(mestre)
                 self._sync_deltasync(ouro)
-                self._notificar(True)
+                self._notificar(True, msg="Pipeline executado com sucesso.")
         except Exception as e:
             self._notificar(False, str(e))
 
