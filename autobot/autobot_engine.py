@@ -11,15 +11,22 @@ from sklearn.model_selection import train_test_split
 
 class MotorSeguranca:
     def __init__(self, persistencia=True):
-        self.identificador = "SISTEMA-AUTONOMO-TELEMETRIA-AVANCADA"
+        self.identificador = "SISTEMA-AUTONOMO-MULTIMODAL"
         self.persistencia = persistencia
         self.tokens = {
             "sucesso": os.environ.get('DISCORD_SUCESSO'),
             "erro": os.environ.get('DISCORD_ERRO')
         }
+        self.perfis_alvo = {
+            "Motorista": ["VEICULO", "CARRO", "AUTO", "CARGA"],
+            "Motociclista": ["MOTO", "MOTOCICLETA"],
+            "Ciclista": ["BICI", "BICICLETA", "BIKE"],
+            "Pedestre": ["CELULAR", "ONIBUS", "TRANSEUNTE", "PEDESTRE"]
+        }
         self.banco = self._conectar_nuvem() if persistencia else None
         self.auditoria = {
             "v": {"b": 0, "s": 0, "g": 0},
+            "perfis": {p: 0 for p in self.perfis_alvo.keys()},
             "ia": {"mae": 0.0, "rmse": 0.0, "r2": 0.0, "c": 0.0},
             "sync": {"eco": 0.0, "delta": 0, "total": 0}
         }
@@ -38,12 +45,17 @@ class MotorSeguranca:
         if pd.isna(t) or not isinstance(t, str): return ""
         return "".join([c for c in unicodedata.normalize('NFKD', t) if not unicodedata.combining(c)]).upper().strip()
 
+    def _classificar_perfil(self, linha):
+        t = self._limpar_texto(" ".join([str(v) for v in linha.values if pd.api.types.is_scalar(v) and pd.notnull(v)]))
+        for p, keywords in self.perfis_alvo.items():
+            if any(k in t for k in keywords): return p
+        return "Geral"
+
     def _definir_peso(self, linha):
         t = self._limpar_texto(" ".join([str(v) for v in linha.values if pd.api.types.is_scalar(v) and pd.notnull(v)]))
         if any(w in t for w in ["LATROCINIO", "MORTE", "HOMICIDIO"]): return 10.0
         if "ROUBO" in t: return 8.0
-        if "FURTO" in t: return 4.0
-        return 1.0
+        return 4.0 if "FURTO" in t else 1.0
 
     def _gerar_camada_silver(self, df):
         df = df.dropna(subset=['LATITUDE', 'LONGITUDE']).copy()
@@ -58,29 +70,29 @@ class MotorSeguranca:
         dados = self._gerar_camada_silver(dados)
         if dados.empty: return pd.DataFrame()
         
+        dados['perfil'] = dados.apply(self._classificar_perfil, axis=1)
         dados['id_geo'] = dados.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 8), axis=1)
         dados['nota'] = dados.apply(self._definir_peso, axis=1)
+        
+        counts = dados['perfil'].value_counts().to_dict()
+        for p in self.auditoria['perfis']: self.auditoria['perfis'][p] = counts.get(p, 0)
         
         X, y = dados[['LATITUDE', 'LONGITUDE']], dados['nota']
         if len(X) > 20:
             xt, xv, yt, yv = train_test_split(X, y, test_size=0.2, random_state=42)
-            m = xgb.XGBRegressor(objective='reg:absoluteerror', n_estimators=100, learning_rate=0.1)
+            m = xgb.XGBRegressor(objective='reg:absoluteerror', n_estimators=100)
             m.fit(xt, yt)
-            p = m.predict(xv)
-            
-            mae = mean_absolute_error(yv, p)
-            rmse = root_mean_squared_error(yv, p)
-            r2 = r2_score(yv, p)
-            
+            p_vals = m.predict(xv)
+            mae = mean_absolute_error(yv, p_vals)
             self.auditoria['ia'] = {
                 "mae": round(mae, 4),
-                "rmse": round(rmse, 4),
-                "r2": round(r2, 4),
+                "rmse": round(root_mean_squared_error(yv, p_vals), 4),
+                "r2": round(r2_score(yv, p_vals), 4),
                 "c": round(max(0.0, 100.0 - (mae * 10)), 2)
             }
         
-        res = dados.groupby(['id_geo']).agg({'nota': 'mean', 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
-        res.columns = ['h3', 'risco', 'lat', 'lon']
+        res = dados.groupby(['id_geo', 'perfil']).agg({'nota': 'mean', 'LATITUDE': 'mean', 'LONGITUDE': 'mean'}).reset_index()
+        res.columns = ['h3', 'perfil', 'risco', 'lat', 'lon']
         
         os.makedirs('datalake/camada_ouro_refinada/esquema_estrela', exist_ok=True)
         res.to_csv('datalake/camada_ouro_refinada/esquema_estrela/fato_risco.csv', index=False)
@@ -89,7 +101,7 @@ class MotorSeguranca:
     def _sync_deltasync(self, dados):
         if not self.banco or dados.empty: return
         ref_path = 'datalake/camada_prata_confiavel/assinatura_anterior.parquet'
-        dados['hash'] = dados.apply(lambda r: hashlib.sha256(f"{r['h3']}{r['risco']}".encode()).hexdigest(), axis=1)
+        dados['hash'] = dados.apply(lambda r: hashlib.sha256(f"{r['h3']}{r['perfil']}{r['risco']}".encode()).hexdigest(), axis=1)
         
         if os.path.exists(ref_path):
             antigo = pd.read_parquet(ref_path)
@@ -104,9 +116,10 @@ class MotorSeguranca:
         if not delta.empty:
             lote = self.banco.batch()
             for i, r in delta.iterrows():
-                doc = self.banco.collection('malha_risco').document(r['h3'])
-                lote.set(doc, {'r': round(r['risco'], 2), 'l': [r['lat'], r['lon']], 'u': firestore.SERVER_TIMESTAMP}, merge=True)
-                if (i + 1) % 450 == 0:
+                doc_id = f"{r['h3']}_{r['perfil']}"
+                ref = self.banco.collection('malha_risco').document(doc_id)
+                lote.set(ref, {'r': round(r['risco'], 2), 'p': r['perfil'], 'l': [r['lat'], r['lon']], 'u': firestore.SERVER_TIMESTAMP}, merge=True)
+                if (i + 1) % 400 == 0:
                     lote.commit(); lote = self.banco.batch()
             lote.commit()
         
@@ -118,17 +131,17 @@ class MotorSeguranca:
         url = self.tokens["sucesso"] if ok else self.tokens["erro"]
         if not url: return
         
+        p_str = "\n".join([f"**{k}:** {v}" for k, v in self.auditoria['perfis'].items()])
+        
         embed = {
-            "title": "✅ RELATÓRIO DE INTEGRIDADE: MOTOR SAFE-DRIVER" if ok else "🚨 FALHA NO PROCESSAMENTO",
+            "title": "✅ RELATÓRIO DE SINCRONIZAÇÃO MULTIMODAL" if ok else "🚨 FALHA CRÍTICA",
             "color": 3066993 if ok else 15158332,
             "fields": [
-                {"name": "📦 VOLUMETRIA", "value": f"Bronze: {self.auditoria['v']['b']}\nSilver: {self.auditoria['v']['s']}\nGold: {self.auditoria['v']['g']}", "inline": False},
-                {"name": "🧠 MÉTRICAS DE IA", "value": f"**Confiança:** {self.auditoria['ia']['c']}%\n**MAE:** {self.auditoria['ia']['mae']}\n**RMSE:** {self.auditoria['ia']['rmse']}\n**R²:** {self.auditoria['ia']['r2']}", "inline": True},
-                {"name": "☁️ SINCRONIZAÇÃO NUVEM", "value": f"**Delta:** {self.auditoria['sync']['delta']}\n**Economia:** {self.auditoria['sync']['eco']:.2f}%\n**Total Cloud:** {self.auditoria['sync']['total']}", "inline": True}
-            ],
-            "footer": {"text": f"Execução Finalizada em: {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
+                {"name": "👥 VOLUMETRIA POR PERFIL", "value": p_str, "inline": False},
+                {"name": "🧠 MÉTRICAS DE IA", "value": f"MAE: {self.auditoria['ia']['mae']}\nRMSE: {self.auditoria['ia']['rmse']}\nR²: {self.auditoria['ia']['r2']}\nConfiança: {self.auditoria['ia']['c']}%", "inline": True},
+                {"name": "☁️ DELTASYNC", "value": f"Economia: {self.auditoria['sync']['eco']:.2f}%\nDelta: {self.auditoria['sync']['delta']}\nTotal: {self.auditoria['sync']['total']}", "inline": True}
+            ]
         }
-        if msg: embed["description"] = f"Detalhes: `{msg}`"
         requests.post(url, json={"embeds": [embed]})
 
     def processar(self):
@@ -136,8 +149,7 @@ class MotorSeguranca:
             mestre = pd.DataFrame()
             for ano in range(2022, datetime.now().year + 1):
                 path = f'datalake/camada_bronze_bruta/ssp_{ano}.parquet'
-                if os.path.exists(path):
-                    mestre = pd.concat([mestre, pd.read_parquet(path)])
+                if os.path.exists(path): mestre = pd.concat([mestre, pd.read_parquet(path)])
             
             if not mestre.empty:
                 self.auditoria['v']['b'] = len(mestre)
