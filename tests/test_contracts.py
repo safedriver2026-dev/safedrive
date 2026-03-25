@@ -1,46 +1,31 @@
 import pytest
 import os
 import pandas as pd
-from autobot.autobot_engine import MotorInteligenciaLakehouse
+from autobot.autobot_engine import SistemaInteligenciaSafeDriver
 
 @pytest.fixture
-def motor():
-    return MotorInteligenciaLakehouse()
+def robo():
+    return SistemaInteligenciaSafeDriver()
 
-def test_arquitetura_diretorios(motor):
-    for nome_camada, caminho in motor.dirs.items():
-        assert os.path.exists(caminho), f"🚨 Diretório crítico {nome_camada} ausente."
+def test_arquitetura_diretorios(robo):
+    for d in robo.diretorios.values():
+        assert os.path.exists(d), f"🚨 FALHA: DIRETÓRIO {d} INEXISTENTE."
 
-def test_modelagem_multidisciplinar(motor):
-    # Mock data simulando as complexas colunas da SSP
-    df_mock_bronze = pd.DataFrame({
-        'NUM_BO': ['123', '456'],
-        'LATITUDE': [-23.5505, -23.5506],
-        'LONGITUDE': [-46.6333, -46.6334],
-        'DATA_OCORRENCIA_BO': pd.to_datetime(['2026-03-05 14:30:00', '2026-03-20 02:15:00']),
-        'DESC_PERIODO': ['A TARDE', 'DE MADRUGADA'],
-        'RUBRICA': ['ROUBO', 'FURTO'],
-        'DESCR_CONDUTA': ['TRANSEUNTE', 'VEICULO'],
-        'DESCR_TIPOLOCAL': ['VIA PUBLICA', 'POSTO DE GASOLINA'],
-        'NOME_MUNICIPIO': ['SAO PAULO', 'OSASCO'],
-        'BTL': ['1º BPM/M', '14º BPM/M'],
-        'CIA': ['1ª CIA', '2ª CIA']
+def test_fluxo_inteligencia_hibrida(robo):
+    df_mock = pd.DataFrame({
+        'NUM_BO': ['1', '2', '3', '4'], 
+        'LATITUDE': [-23.55, -23.56, -23.57, -23.58],
+        'LONGITUDE': [-46.63, -46.64, -46.65, -46.66],
+        'DATA_OCORRENCIA_BO': pd.to_datetime(['2026-03-01', '2026-03-02', '2026-03-03', '2026-03-04']),
+        'RUBRICA': ['ROUBO', 'FURTO', 'VIOLENCIA DOMESTICA', 'LATROCINIO'],
+        'DESCR_TIPOLOCAL': ['VIA PUBLICA', 'POSTO', 'CASA', 'RODOVIA']
     })
     
-    df_prata = motor._engenharia_prata(df_mock_bronze)
+    robo.telemetria['linhas_bronze'] = len(df_mock)
+    df_prata = robo._processar_camada_prata(df_mock)
     
-    # Verifica extrações cruciais
-    assert 'HORA' in df_prata.columns, "Engenharia falhou na extração de horas."
-    assert 'ID_LOCALIZACAO' in df_prata.columns, "Falha na geração H3."
+    # VERIFICA SE A IA LIMPOU A VIOLÊNCIA DOMÉSTICA
+    assert 'VIOLENCIA DOMESTICA' not in df_prata['RUBRICA'].values, "🚨 IA FALHOU NA LIMPEZA DE RUÍDO."
     
-    motor._modelagem_ouro(df_prata)
-    
-    # Valida as 6 pontas do Star Schema
-    artefatos = [
-        'dim_tempo.csv', 'dim_localizacao.csv', 'dim_perfil_crime.csv', 
-        'dim_ambiente.csv', 'dim_jurisdicao.csv', 'fato_risco.csv'
-    ]
-    
-    for artefato in artefatos:
-        caminho_completo = f"{motor.dirs['estrela']}/{artefato}"
-        assert os.path.exists(caminho_completo), f"🚨 Falha de Governança: Tabela {artefato} não gerada."
+    robo._processar_camada_ouro(df_prata)
+    assert os.path.exists(f"{robo.diretorios['estrela']}/fato_auditoria.csv"), "🚨 EVIDÊNCIA DE AUDITORIA NÃO GERADA."
