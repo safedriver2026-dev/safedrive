@@ -1,151 +1,245 @@
 import pandas as pd
 import numpy as np
-import os, json, glob, logging, hashlib
+import os, requests, json, hashlib, traceback
 from datetime import datetime
 import h3
 import xgboost as xgb
-from sklearn.metrics import mean_absolute_error, r2_score
-import requests
+from sklearn.ensemble import RandomForestRegressor
+import holidays
+import warnings
+warnings.filterwarnings('ignore')
 
-# Configuração de Logs Profissionais
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("SafeDriver-Motor")
-
-class MotorEvolutivoSafeDriver:
+class MotorInteligenciaLakehouse:
     def __init__(self):
-        self.caminhos = {
-            "bronze": "datalake/bronze",
-            "silver": "datalake/silver",
-            "gold": "datalake/gold",
-            "audit": "datalake/audit"
-        }
-        self._inicializar_infraestrutura()
-        self.historico = self._carregar_memoria_auditavel()
-        self.telemetria = {"status": "INICIADO", "ia_performance": {}, "etapas": []}
-
-    def _inicializar_infraestrutura(self):
-        for pasta in self.caminhos.values():
-            os.makedirs(pasta, exist_ok=True)
-
-    def _carregar_memoria_auditavel(self):
-        """Lê manifestos anteriores para a IA aprender com a performance do passado."""
-        arquivos = glob.glob(f"{self.caminhos['audit']}/manifesto_*.json")
-        memoria = []
-        for f in arquivos:
-            with open(f, 'r') as m: memoria.append(json.load(m))
-        return memoria
-
-    def _auto_correcao_esquema(self, df):
-        """Sistema de Autocorreção: Mapeia colunas por similaridade funcional."""
-        mapeamento = {
-            "LATITUDE": ["LATITUDE", "LAT", "COORD_X", "LAT_Y"],
-            "LONGITUDE": ["LONGITUDE", "LONG", "COORD_Y", "LON_X"],
-            "CRIME": ["RUBRICA", "NATUREZA", "DESCR_CRIME", "TIPO_OCORRENCIA"]
-        }
-        colunas_reais = {c.upper(): c for c in df.columns}
-        mapa_final = {}
-        for alvo, variantes in mapeamento.items():
-            for v in variantes:
-                if v in colunas_reais:
-                    mapa_final[colunas_reais[v]] = alvo
-                    break
-        return df.rename(columns=mapa_final)
-
-    def treinar_ia_com_meta_learning(self, df):
-        """IA que analisa o erro histórico para decidir o nível de otimização."""
-        X = df[['LATITUDE', 'LONGITUDE']]
-        y = df['score']
+        self.identificador = "SAFE-DRIVER-LAKEHOUSE"
         
-        # Cálculo da média histórica de erro (MAE)
-        erros_passados = [m['ia_performance']['mae'] for m in self.historico if 'ia_performance' in m]
-        mae_medio = np.mean(erros_passados) if erros_passados else 1.0
-        
-        # Treinamento do Modelo Atual
-        modelo = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=5)
-        modelo.fit(X, y)
-        previsoes = modelo.predict(X)
-        mae_atual = mean_absolute_error(y, previsoes)
-        
-        # Decisão Evolutiva
-        tendencia = "ESTÁVEL"
-        if mae_atual > mae_medio * 1.15:
-            tendencia = "ALERTA: Degradação de Padrão detectada."
-        elif mae_atual < mae_medio:
-            tendencia = "EVOLUÇÃO: Modelo mais preciso que a média histórica."
-
-        self.telemetria["ia_performance"] = {
-            "mae": round(float(mae_atual), 4),
-            "r2": round(float(r2_score(y, previsoes)), 4),
-            "tendencia": tendencia
+        # Mapeamento estrito da sua estrutura de diretórios
+        self.dirs = {
+            'bronze': 'datalake/camada_bronze_bruta',
+            'prata': 'datalake/camada_prata_confiavel',
+            'ouro': 'datalake/camada_ouro_refinada',
+            'estrela': 'datalake/camada_ouro_refinada/esquema_estrela'
         }
-        return modelo
+        
+        for d in self.dirs.values(): os.makedirs(d, exist_ok=True)
+        
+        self.tokens = {
+            "sucesso": os.environ.get('DISCORD_SUCESSO'),
+            "erro": os.environ.get('DISCORD_ERRO')
+        }
+        
+        self.anos_alvo = [2025, 2026] # Escalável conforme a necessidade
+        self.url_ssp = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{}.xlsx"
+        self.feriados_sp = holidays.country_holidays('BR', subdiv='SP')
+        self.telemetria = {"linhas_bronze": 0, "linhas_prata": 0, "linhas_fato": 0}
 
-    def executar_pipeline(self):
+    def _registrar_log(self, mensagem):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_path = f"{self.dirs['prata']}/registro_sistema.log"
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {mensagem}\n")
+        print(mensagem)
+
+    def _notificar_discord(self, sucesso, detalhes=""):
+        url = self.tokens["sucesso"] if sucesso else self.tokens["erro"]
+        if not url: return
+        
+        embed = {
+            "title": "🛡️ SAFE DRIVER - DWH ATUALIZADO" if sucesso else "🚨 SAFE DRIVER - FALHA NO PIPELINE",
+            "color": 3066993 if sucesso else 15158332,
+            "description": detalhes,
+            "fields": [
+                {"name": "📦 Camada Bronze", "value": f"{self.telemetria['linhas_bronze']} registros", "inline": True},
+                {"name": "🥈 Camada Prata", "value": f"{self.telemetria['linhas_prata']} registros", "inline": True},
+                {"name": "⭐ Fato Risco (Ouro)", "value": f"{self.telemetria['linhas_fato']} agregações", "inline": True}
+            ],
+            "footer": {"text": f"Auditoria Multicamadas | Execução: {datetime.now().strftime('%Y-%m-%d %H:%M')}"}
+        }
+        try: requests.post(url, json={"embeds": [embed]})
+        except: pass
+
+    def _baixar_e_converter_ssp(self, ano):
+        url = self.url_ssp.format(ano)
+        self._registrar_log(f"📥 Baixando dados originais da SSP ({ano})...")
         try:
-            # 1. CAMADA BRONZE -> SILVER (Processamento de Dados Brutos)
-            arquivos_bronze = [f for f in os.listdir(self.caminhos["bronze"]) if f.endswith('.parquet')]
-            if not arquivos_bronze: raise Exception("Cofre Bronze vazio.")
-            
-            df_bruto = pd.concat([pd.read_parquet(os.path.join(self.caminhos["bronze"], f)) for f in arquivos_bronze])
-            df_silver = self._auto_correcao_esquema(df_bruto)
-            
-            # Limpeza e Scoring (Regra de Negócio de Risco)
-            df_silver['LATITUDE'] = pd.to_numeric(df_silver['LATITUDE'], errors='coerce')
-            df_silver['score'] = df_silver['CRIME'].apply(lambda x: 10.0 if 'MORTE' in str(x).upper() else 4.5)
-            df_silver = df_silver.dropna(subset=['LATITUDE', 'LONGITUDE'])
-            
-            df_silver.to_parquet(f"{self.caminhos['silver']}/base_confiavel.parquet", index=False)
-            
-            # 2. CAMADA SILVER -> GOLD (Inteligência e API)
-            modelo = self.treinar_ia_com_meta_learning(df_silver)
-            
-            # Indexação Espacial H3 (Resolução 8)
-            df_silver['h3_id'] = df_silver.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 8), axis=1)
-            
-            df_gold = df_silver.groupby('h3_id').agg({
-                'score': 'mean',
-                'LATITUDE': 'mean',
-                'LONGITUDE': 'mean'
-            }).reset_index()
-            
-            # Persistência para Consumo (Power BI e API Estática)
-            df_gold.to_parquet(f"{self.caminhos['gold']}/risco_geospatial.parquet", index=False)
-            df_gold.to_json(f"{self.caminhos['gold']}/api_risco_v1.json", orient="records", indent=2)
-            
-            self.telemetria["status"] = "SUCESSO"
-            self._gerar_auditoria()
-            self._notificar_discord()
-
+            resposta = requests.get(url, timeout=60, verify=False)
+            if resposta.status_code == 200:
+                df_temp = pd.read_excel(resposta.content)
+                df_temp.to_parquet(f"{self.dirs['bronze']}/ssp_{ano}.parquet", index=False)
+                return True
+            return False
         except Exception as e:
-            logger.error(f"Falha Crítica: {e}")
-            self.telemetria["status"] = f"ERRO: {str(e)}"
-            self._notificar_discord()
+            self._registrar_log(f"❌ Erro no download de {ano}: {e}")
+            return False
 
-    def _gerar_auditoria(self):
-        id_execucao = datetime.now().strftime('%Y%m%d_%H%M')
-        with open(f"{self.caminhos['audit']}/manifesto_{id_execucao}.json", "w") as f:
-            json.dump(self.telemetria, f, indent=4)
+    def _auditar_todas_camadas(self):
+        """
+        Analisa as 3 camadas para garantir que os dados legados sejam 
+        sobrescritos caso não possuam as novas lógicas do negócio.
+        """
+        status = {"reconstruir_bronze": [], "reconstruir_prata": False, "reconstruir_ouro": False}
+        self._registrar_log("🔍 Iniciando Auditoria Estrutural Completa...")
 
-    def _notificar_discord(self):
-        webhook = os.environ.get('DISCORD_WEBHOOK')
-        if not webhook: return
+        # 1. Auditoria Bronze (Validação de Origem)
+        for ano in self.anos_alvo:
+            arq_bronze = f"{self.dirs['bronze']}/ssp_{ano}.parquet"
+            if not os.path.exists(arq_bronze):
+                status["reconstruir_bronze"].append(ano)
+            else:
+                try:
+                    df = pd.read_parquet(arq_bronze)
+                    cols = [str(c).upper() for c in df.columns]
+                    if not any(c in cols for c in ['LATITUDE', 'LAT']) or not any(c in cols for c in ['DATA_OCORRENCIA', 'DATA_FATO', 'DATA']):
+                        status["reconstruir_bronze"].append(ano)
+                except:
+                    status["reconstruir_bronze"].append(ano)
+
+        # 2. Auditoria Prata (Validação de Engenharia de Features)
+        arq_prata = f"{self.dirs['prata']}/assinatura_anterior.parquet"
+        if not os.path.exists(arq_prata) or len(status["reconstruir_bronze"]) > 0:
+            status["reconstruir_prata"] = True
+        else:
+            try:
+                df_prata = pd.read_parquet(arq_prata)
+                colunas_esperadas = ['DIA_SEMANA', 'ID_LOCALIZACAO', 'LATITUDE', 'LONGITUDE']
+                if not all(col in df_prata.columns for col in colunas_esperadas):
+                    self._registrar_log("⚠️ Camada Prata desatualizada (faltam features da nova versão). Marcando para reconstrução.")
+                    status["reconstruir_prata"] = True
+            except:
+                status["reconstruir_prata"] = True
+
+        # 3. Auditoria Ouro (Validação do Esquema Estrela e IA)
+        arquivos_estrela = ['dim_tempo.csv', 'dim_localizacao.csv', 'dim_perfil.csv', 'fato_risco.csv']
+        for arq in arquivos_estrela:
+            if not os.path.exists(f"{self.dirs['estrela']}/{arq}"):
+                status["reconstruir_ouro"] = True
+                break
         
-        ia = self.telemetria.get('ia_performance', {})
-        cor = 3066993 if "SUCESSO" in self.telemetria["status"] else 15158332
+        if status["reconstruir_prata"]: 
+            status["reconstruir_ouro"] = True
+
+        return status
+
+    def _processar_bronze(self, anos_para_baixar):
+        """Reconstrói ou carrega a camada Bronze"""
+        df_mestre = pd.DataFrame()
+        for ano in self.anos_alvo:
+            arq_bronze = f"{self.dirs['bronze']}/ssp_{ano}.parquet"
+            if ano in anos_para_baixar:
+                self._baixar_e_converter_ssp(ano)
+            
+            if os.path.exists(arq_bronze):
+                df_mestre = pd.concat([df_mestre, pd.read_parquet(arq_bronze)])
+                
+        self.telemetria['linhas_bronze'] = len(df_mestre)
+        return df_mestre
+
+    def _engenharia_prata(self, df):
+        """Aplica as novas regras de negócio e limpeza"""
+        if df.empty: raise ValueError("Base Bronze está vazia.")
+        self._registrar_log("⚙️ Reconstruindo Camada Prata com novas features...")
         
-        payload = {
-            "embeds": [{
-                "title": "🛡️ SAFE-DRIVER | DATA LAKEHOUSE",
-                "color": cor,
-                "fields": [
-                    {"name": "📊 Status do Pipeline", "value": f"`{self.telemetria['status']}`", "inline": False},
-                    {"name": "📉 Erro Médio (MAE)", "value": f"`{ia.get('mae', 'N/A')}`", "inline": True},
-                    {"name": "🧠 Inteligência", "value": f"`{ia.get('tendencia', 'N/A')}`", "inline": True}
-                ],
-                "footer": {"text": f"Execução: {datetime.now().strftime('%Y-%m-%d %H:%M')}"}
-            }]
-        }
-        requests.post(webhook, json=payload)
+        df.columns = [str(c).upper().strip().replace(" ", "_") for c in df.columns]
+        
+        rename_map = {}
+        for col in df.columns:
+            if col in ['LAT', 'LATITUDE_Y', 'Y']: rename_map[col] = 'LATITUDE'
+            if col in ['LON', 'LONG', 'LONGITUDE_X', 'X']: rename_map[col] = 'LONGITUDE'
+            if col in ['DATA', 'DATA_FATO', 'DT_OCORRENCIA']: rename_map[col] = 'DATA_OCORRENCIA'
+            if col in ['RUBRICA', 'NATUREZA']: rename_map[col] = 'DESCRICAO'
+        df = df.rename(columns=rename_map)
+
+        df['LATITUDE'] = pd.to_numeric(df['LATITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
+        df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
+        df = df.dropna(subset=['LATITUDE', 'LONGITUDE'])
+        df = df[(df['LATITUDE'] < -19.0) & (df['LATITUDE'] > -26.0) & (df['LONGITUDE'] < -44.0) & (df['LONGITUDE'] > -55.0)]
+
+        df['DATA_OCORRENCIA'] = pd.to_datetime(df['DATA_OCORRENCIA'], errors='coerce')
+        df = df.dropna(subset=['DATA_OCORRENCIA'])
+        
+        df['DATA_REF'] = df['DATA_OCORRENCIA'].dt.date
+        df['ANO'] = df['DATA_OCORRENCIA'].dt.year
+        df['MES'] = df['DATA_OCORRENCIA'].dt.month
+        df['DIA'] = df['DATA_OCORRENCIA'].dt.day
+        df['DIA_SEMANA'] = df['DATA_OCORRENCIA'].dt.dayofweek
+        
+        df['ID_LOCALIZACAO'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 8), axis=1)
+        
+        self.telemetria['linhas_prata'] = len(df)
+        df.to_parquet(f"{self.dirs['prata']}/assinatura_anterior.parquet", index=False)
+        return df
+
+    def _modelagem_ouro(self, df):
+        """Reconstrói as dimensões e tabela fato usando ML"""
+        if df.empty: return
+        self._registrar_log("🧠 Aplicando IA e construindo Esquema Estrela (Ouro)...")
+        
+        df['PERFIL_ALVO'] = df['DESCRICAO'].apply(lambda x: "Motorista/Carga" if any(k in str(x).upper() for k in ["VEICULO", "CARRO", "CARGA", "CAMINHAO"]) else ("Pedestre/Delivery" if any(k in str(x).upper() for k in ["CELULAR", "MOTO", "PEDESTRE"]) else "Geral"))
+        df['ID_PERFIL'] = df['PERFIL_ALVO'].apply(lambda x: hashlib.md5(x.encode()).hexdigest()[:8])
+        df['GRAVIDADE'] = df['DESCRICAO'].apply(lambda x: 10 if isinstance(x, str) and any(c in x.upper() for c in ['LATROCINIO', 'HOMICIDIO', 'MORTE']) else (7 if 'ROUBO' in str(x).upper() else 3))
+
+        X = df[['LATITUDE', 'LONGITUDE', 'DIA_SEMANA', 'MES']]
+        y = df['GRAVIDADE']
+        if len(X) > 100:
+            m_xgb = xgb.XGBRegressor(n_estimators=50, max_depth=5, random_state=42).fit(X, y)
+            m_rf = RandomForestRegressor(n_estimators=30, max_depth=5, random_state=42).fit(X, y)
+            df['RISCO_CALCULADO'] = (m_xgb.predict(X) + m_rf.predict(X)) / 2
+        else:
+            df['RISCO_CALCULADO'] = df['GRAVIDADE']
+
+        dim_tempo = df[['DATA_REF', 'ANO', 'MES', 'DIA', 'DIA_SEMANA']].drop_duplicates().copy()
+        dim_tempo['ID_TEMPO'] = pd.to_datetime(dim_tempo['DATA_REF']).dt.strftime('%Y%m%d').astype(int)
+        dim_tempo['E_FERIADO'] = dim_tempo['DATA_REF'].apply(lambda d: 1 if d in self.feriados_sp else 0)
+        dim_tempo['E_PAGAMENTO'] = dim_tempo['DIA'].apply(lambda d: 1 if d == 5 or d == 20 else 0) 
+        dim_tempo.to_csv(f"{self.dirs['estrela']}/dim_tempo.csv", index=False)
+
+        dim_loc = df[['ID_LOCALIZACAO', 'LATITUDE', 'LONGITUDE']].groupby('ID_LOCALIZACAO').mean().reset_index()
+        dim_loc.to_csv(f"{self.dirs['estrela']}/dim_localizacao.csv", index=False)
+
+        dim_perfil = df[['ID_PERFIL', 'PERFIL_ALVO']].drop_duplicates()
+        dim_perfil.to_csv(f"{self.dirs['estrela']}/dim_perfil.csv", index=False)
+
+        df['ID_TEMPO'] = pd.to_datetime(df['DATA_REF']).dt.strftime('%Y%m%d').astype(int)
+        fato = df.groupby(['ID_TEMPO', 'ID_LOCALIZACAO', 'ID_PERFIL']).agg({
+            'RISCO_CALCULADO': 'mean',
+            'GRAVIDADE': 'count'
+        }).reset_index()
+        fato.rename(columns={'GRAVIDADE': 'QTD_OCORRENCIAS'}, inplace=True)
+        fato.to_csv(f"{self.dirs['estrela']}/fato_risco.csv", index=False)
+        self.telemetria['linhas_fato'] = len(fato)
+
+        df_consolidado = pd.merge(fato, dim_loc, on='ID_LOCALIZACAO')
+        df_consolidado.to_parquet(f"{self.dirs['ouro']}/mapa_auditavel.parquet", index=False)
+
+    def executar(self):
+        try:
+            self._registrar_log("🚀 INICIANDO ORQUESTRAÇÃO LAKEHOUSE...")
+            status_auditoria = self._auditar_todas_camadas()
+            
+            # Execução Condicional Inteligente
+            df_bronze = self._processar_bronze(status_auditoria["reconstruir_bronze"])
+            
+            if status_auditoria["reconstruir_prata"]:
+                df_prata = self._engenharia_prata(df_bronze)
+            else:
+                self._registrar_log("✅ Camada Prata está atualizada. Carregando dados...")
+                df_prata = pd.read_parquet(f"{self.dirs['prata']}/assinatura_anterior.parquet")
+                self.telemetria['linhas_prata'] = len(df_prata)
+                
+            if status_auditoria["reconstruir_ouro"]:
+                self._modelagem_ouro(df_prata)
+            else:
+                self._registrar_log("✅ Esquema Estrela (Ouro) está atualizado.")
+                fato = pd.read_csv(f"{self.dirs['estrela']}/fato_risco.csv")
+                self.telemetria['linhas_fato'] = len(fato)
+
+            self._registrar_log("✅ Pipeline finalizado com sucesso.")
+            self._notificar_discord(True, "Processamento Medallion e Machine Learning concluídos.")
+        except Exception as e:
+            erro_msg = f"Falha crítica: {str(e)}\n{traceback.format_exc()}"
+            self._registrar_log(f"❌ {erro_msg}")
+            self._notificar_discord(False, erro_msg)
+            raise e
 
 if __name__ == "__main__":
-    MotorEvolutivoSafeDriver().executar_pipeline()
+    MotorInteligenciaLakehouse().executar()
