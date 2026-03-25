@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import os, requests, json, hashlib, traceback
+import os, requests, json, hashlib, traceback, io
 from datetime import datetime
 import h3
 import xgboost as xgb
@@ -46,7 +46,7 @@ class MotorInteligenciaLakehouse:
         embed = {
             "title": "🛡️ SAFE DRIVER - DWH ATUALIZADO" if sucesso else "🚨 SAFE DRIVER - FALHA NO PIPELINE",
             "color": 3066993 if sucesso else 15158332,
-            "description": detalhes,
+            "description": detalhes[:2000], # Limite do Discord
             "fields": [
                 {"name": "📦 Camada Bronze", "value": f"{self.telemetria['linhas_bronze']} registros", "inline": True},
                 {"name": "🥈 Camada Prata", "value": f"{self.telemetria['linhas_prata']} registros", "inline": True},
@@ -60,13 +60,24 @@ class MotorInteligenciaLakehouse:
     def _baixar_e_converter_ssp(self, ano):
         url = self.url_ssp.format(ano)
         self._registrar_log(f"📥 Baixando dados originais da SSP ({ano})...")
+        
+        # Prevenção B: Disfarce de Navegador para evitar bloqueios do Governo (Erro 403)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/excel'
+        }
+        
         try:
-            resposta = requests.get(url, timeout=60, verify=False)
+            resposta = requests.get(url, headers=headers, timeout=90, verify=False)
             if resposta.status_code == 200:
-                df_temp = pd.read_excel(resposta.content)
+                # Prevenção A: Correção do erro de Buffer (BytesIO)
+                df_temp = pd.read_excel(io.BytesIO(resposta.content))
                 df_temp.to_parquet(f"{self.dirs['bronze']}/ssp_{ano}.parquet", index=False)
+                self._registrar_log(f"✅ Download {ano} concluído e convertido para Parquet.")
                 return True
-            return False
+            else:
+                self._registrar_log(f"⚠️ SSP retornou Status Code {resposta.status_code} para {ano}")
+                return False
         except Exception as e:
             self._registrar_log(f"❌ Erro no download de {ano}: {e}")
             return False
@@ -112,15 +123,20 @@ class MotorInteligenciaLakehouse:
         return status
 
     def _processar_bronze(self, anos_para_baixar):
-        df_mestre = pd.DataFrame()
+        dfs_para_concatenar = [] # Prevenção C: Evita memory leaks de DataFrames vazios
+        
         for ano in self.anos_alvo:
             arq_bronze = f"{self.dirs['bronze']}/ssp_{ano}.parquet"
             if ano in anos_para_baixar:
                 self._baixar_e_converter_ssp(ano)
             
             if os.path.exists(arq_bronze):
-                df_mestre = pd.concat([df_mestre, pd.read_parquet(arq_bronze)])
+                dfs_para_concatenar.append(pd.read_parquet(arq_bronze))
                 
+        if not dfs_para_concatenar:
+            raise ValueError("Falha crítica: Não foi possível obter ou carregar nenhum dado da camada Bronze.")
+            
+        df_mestre = pd.concat(dfs_para_concatenar, ignore_index=True)
         self.telemetria['linhas_bronze'] = len(df_mestre)
         return df_mestre
 
@@ -138,10 +154,19 @@ class MotorInteligenciaLakehouse:
             if col in ['RUBRICA', 'NATUREZA']: rename_map[col] = 'DESCRICAO'
         df = df.rename(columns=rename_map)
 
+        # Prevenção D: Trava de Segurança para Schema Dinâmico da SSP
+        if 'LATITUDE' not in df.columns or 'LONGITUDE' not in df.columns:
+            msg_erro = f"Mudança drástica no arquivo da SSP. Colunas encontradas: {df.columns.tolist()}"
+            self._registrar_log(f"❌ {msg_erro}")
+            raise KeyError(msg_erro)
+
         df['LATITUDE'] = pd.to_numeric(df['LATITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
         df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
         df = df.dropna(subset=['LATITUDE', 'LONGITUDE'])
         df = df[(df['LATITUDE'] < -19.0) & (df['LATITUDE'] > -26.0) & (df['LONGITUDE'] < -44.0) & (df['LONGITUDE'] > -55.0)]
+
+        if 'DATA_OCORRENCIA' not in df.columns:
+             raise KeyError(f"Coluna de Data não encontrada após padronização. Encontradas: {df.columns.tolist()}")
 
         df['DATA_OCORRENCIA'] = pd.to_datetime(df['DATA_OCORRENCIA'], errors='coerce')
         df = df.dropna(subset=['DATA_OCORRENCIA'])
@@ -153,6 +178,12 @@ class MotorInteligenciaLakehouse:
         df['DIA_SEMANA'] = df['DATA_OCORRENCIA'].dt.dayofweek
         
         df['ID_LOCALIZACAO'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 8), axis=1)
+        
+        # Trava de segurança para Descrição (pode vir como nulo do governo)
+        if 'DESCRICAO' not in df.columns:
+            df['DESCRICAO'] = 'NATUREZA_NAO_INFORMADA'
+        else:
+            df['DESCRICAO'] = df['DESCRICAO'].fillna('NATUREZA_NAO_INFORMADA')
         
         self.telemetria['linhas_prata'] = len(df)
         df.to_parquet(f"{self.dirs['prata']}/assinatura_anterior.parquet", index=False)
@@ -223,7 +254,7 @@ class MotorInteligenciaLakehouse:
             self._registrar_log("✅ Pipeline finalizado com sucesso.")
             self._notificar_discord(True, "Processamento Medallion e Machine Learning concluídos.")
         except Exception as e:
-            erro_msg = f"Falha crítica: {str(e)}\n{traceback.format_exc()}"
+            erro_msg = f"Falha crítica na orquestração: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             self._registrar_log(f"❌ {erro_msg}")
             self._notificar_discord(False, erro_msg)
             raise e
