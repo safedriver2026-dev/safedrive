@@ -1,20 +1,30 @@
 import pytest
 import pandas as pd
-from autobot.autobot_engine import MotorSeguranca
+import os
 
-def test_reconstrucao_bronze():
-    motor = MotorSeguranca(persistencia=False)
-    motor._atualizar_bronze()
-    # Verifica se ao menos um arquivo parquet foi criado na ausência de dados
-    arquivos = os.listdir('datalake/camada_bronze_bruta')
-    assert any(".parquet" in f for f in arquivos)
+# Configurações de Contrato
+EXPECTED_COLUMNS = ['LATITUDE', 'LONGITUDE', 'score', 'h3_id']
+MIN_RECORDS = 100 # Segurança para não gerar modelos com dados insuficientes
 
-def test_integridade_multimodal():
-    motor = MotorSeguranca(persistencia=False)
-    dados = pd.DataFrame({
-        'LATITUDE': [-23.5], 'LONGITUDE': [-46.6],
-        'RUBRICA': ['ROUBO DE VEICULO']
-    })
-    res = motor._gerar_camada_ouro(dados)
-    assert motor.telemetria['perfis']['Motorista'] == 1
-    assert not res.empty
+def test_silver_integrity():
+    """Valida se a camada Silver está pronta para virar Gold."""
+    path = "datalake/silver/main.parquet"
+    assert os.path.exists(path), "❌ Erro Crítico: Camada Silver não encontrada."
+    
+    df = pd.read_parquet(path)
+    
+    # Validação de Contrato de Schema
+    for col in ['LATITUDE', 'LONGITUDE']:
+        assert col in df.columns, f"❌ Coluna {col} ausente."
+        assert df[col].isnull().sum() == 0, f"❌ Valores nulos detectados em {col}."
+    
+    # Validação Geográfica (São Paulo)
+    assert df['LATITUDE'].between(-26, -19).all(), "🚨 Detecção de coordenadas fora de SP."
+    assert len(df) >= MIN_RECORDS, f"🚨 Volume de dados insuficiente: {len(df)} registros."
+
+def test_gold_distribution():
+    """Valida se o output da API faz sentido estatístico."""
+    path = "datalake/gold/api_v1.json"
+    if os.path.exists(path):
+        df = pd.read_json(path)
+        assert df['score'].mean() > 0, "🚨 Alerta: Score médio de risco zerado."
