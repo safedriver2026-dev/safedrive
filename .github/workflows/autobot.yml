@@ -25,7 +25,8 @@ jobs:
           pip install pytest pandas numpy xgboost scikit-learn requests pyarrow fastparquet openpyxl h3 holidays
 
       - name: VALIDAR-CONTRATOS-DE-DADOS
-        # Agora o GitHub Actions sabe exatamente onde procurar o teste!
+        env:
+          PYTHONPATH: .
         run: pytest tests/test_contracts.py -v
 
       - name: EXECUTAR-MOTOR-MEDALLION
@@ -33,7 +34,6 @@ jobs:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           PYTHONPATH: .
-        # Agora ele sabe exatamente onde está o robô!
         run: python autobot/autobot_engine.py
 
       - name: PERSISTIR-LAKEHOUSE
