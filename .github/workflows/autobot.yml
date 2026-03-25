@@ -22,7 +22,7 @@ jobs:
       - name: INSTALAR-BIBLIOTECAS
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pandas numpy xgboost scikit-learn requests pyarrow fastparquet openpyxl h3 holidays
+          pip install pytest pandas numpy xgboost scikit-learn requests pyarrow fastparquet openpyxl h3 holidays urllib3
 
       - name: VALIDAR-CONTRATOS-DE-DADOS
         env:
@@ -47,8 +47,8 @@ jobs:
           git add datalake/camada_ouro_refinada/esquema_estrela/*
           
           if ! git diff --staged --quiet; then
-            git commit -m "🤖 [SISTEMA] DWH Atualizado: Reconstrução Medallion $(date +'%Y-%m-%d')"
+            git commit -m "🤖 [SISTEMA] DWH Enterprise: Modelagem 360º $(date +'%Y-%m-%d')"
             git push origin main
           else
-            echo "✅ Nenhuma alteração nos dados. Lakehouse já está sincronizado."
+            echo "✅ Dados sincronizados."
           fi
