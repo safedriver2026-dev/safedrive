@@ -13,7 +13,6 @@ class MotorInteligenciaLakehouse:
     def __init__(self):
         self.identificador = "SAFE-DRIVER-LAKEHOUSE"
         
-        # Mapeamento EXATO da sua estrutura de diretórios da imagem
         self.dirs = {
             'bronze': 'datalake/camada_bronze_bruta',
             'prata': 'datalake/camada_prata_confiavel',
