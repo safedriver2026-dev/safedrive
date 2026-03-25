@@ -9,3 +9,5 @@ scikit-learn
 openpyxl
 pyarrow
 pytest
+holidays
+fastparquet
