@@ -13,7 +13,7 @@ class MotorInteligenciaLakehouse:
     def __init__(self):
         self.identificador = "SAFE-DRIVER-LAKEHOUSE"
         
-        # Mapeamento estrito da sua estrutura de diretórios
+        # Mapeamento EXATO da sua estrutura de diretórios da imagem
         self.dirs = {
             'bronze': 'datalake/camada_bronze_bruta',
             'prata': 'datalake/camada_prata_confiavel',
@@ -28,7 +28,7 @@ class MotorInteligenciaLakehouse:
             "erro": os.environ.get('DISCORD_ERRO')
         }
         
-        self.anos_alvo = [2025, 2026] # Escalável conforme a necessidade
+        self.anos_alvo = [2025, 2026]
         self.url_ssp = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{}.xlsx"
         self.feriados_sp = holidays.country_holidays('BR', subdiv='SP')
         self.telemetria = {"linhas_bronze": 0, "linhas_prata": 0, "linhas_fato": 0}
@@ -73,14 +73,9 @@ class MotorInteligenciaLakehouse:
             return False
 
     def _auditar_todas_camadas(self):
-        """
-        Analisa as 3 camadas para garantir que os dados legados sejam 
-        sobrescritos caso não possuam as novas lógicas do negócio.
-        """
         status = {"reconstruir_bronze": [], "reconstruir_prata": False, "reconstruir_ouro": False}
         self._registrar_log("🔍 Iniciando Auditoria Estrutural Completa...")
 
-        # 1. Auditoria Bronze (Validação de Origem)
         for ano in self.anos_alvo:
             arq_bronze = f"{self.dirs['bronze']}/ssp_{ano}.parquet"
             if not os.path.exists(arq_bronze):
@@ -94,7 +89,6 @@ class MotorInteligenciaLakehouse:
                 except:
                     status["reconstruir_bronze"].append(ano)
 
-        # 2. Auditoria Prata (Validação de Engenharia de Features)
         arq_prata = f"{self.dirs['prata']}/assinatura_anterior.parquet"
         if not os.path.exists(arq_prata) or len(status["reconstruir_bronze"]) > 0:
             status["reconstruir_prata"] = True
@@ -103,12 +97,10 @@ class MotorInteligenciaLakehouse:
                 df_prata = pd.read_parquet(arq_prata)
                 colunas_esperadas = ['DIA_SEMANA', 'ID_LOCALIZACAO', 'LATITUDE', 'LONGITUDE']
                 if not all(col in df_prata.columns for col in colunas_esperadas):
-                    self._registrar_log("⚠️ Camada Prata desatualizada (faltam features da nova versão). Marcando para reconstrução.")
                     status["reconstruir_prata"] = True
             except:
                 status["reconstruir_prata"] = True
 
-        # 3. Auditoria Ouro (Validação do Esquema Estrela e IA)
         arquivos_estrela = ['dim_tempo.csv', 'dim_localizacao.csv', 'dim_perfil.csv', 'fato_risco.csv']
         for arq in arquivos_estrela:
             if not os.path.exists(f"{self.dirs['estrela']}/{arq}"):
@@ -121,7 +113,6 @@ class MotorInteligenciaLakehouse:
         return status
 
     def _processar_bronze(self, anos_para_baixar):
-        """Reconstrói ou carrega a camada Bronze"""
         df_mestre = pd.DataFrame()
         for ano in self.anos_alvo:
             arq_bronze = f"{self.dirs['bronze']}/ssp_{ano}.parquet"
@@ -135,7 +126,6 @@ class MotorInteligenciaLakehouse:
         return df_mestre
 
     def _engenharia_prata(self, df):
-        """Aplica as novas regras de negócio e limpeza"""
         if df.empty: raise ValueError("Base Bronze está vazia.")
         self._registrar_log("⚙️ Reconstruindo Camada Prata com novas features...")
         
@@ -170,7 +160,6 @@ class MotorInteligenciaLakehouse:
         return df
 
     def _modelagem_ouro(self, df):
-        """Reconstrói as dimensões e tabela fato usando ML"""
         if df.empty: return
         self._registrar_log("🧠 Aplicando IA e construindo Esquema Estrela (Ouro)...")
         
@@ -216,7 +205,6 @@ class MotorInteligenciaLakehouse:
             self._registrar_log("🚀 INICIANDO ORQUESTRAÇÃO LAKEHOUSE...")
             status_auditoria = self._auditar_todas_camadas()
             
-            # Execução Condicional Inteligente
             df_bronze = self._processar_bronze(status_auditoria["reconstruir_bronze"])
             
             if status_auditoria["reconstruir_prata"]:
