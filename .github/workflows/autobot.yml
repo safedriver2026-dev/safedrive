@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 jobs:
-  processamento_total:
+  processamento_hibrido:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
