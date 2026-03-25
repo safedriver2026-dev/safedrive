@@ -1,35 +1,54 @@
 name: SAFE-DRIVER-SISTEMA-AUTONOMO
 on:
   schedule:
-    - cron: '0 6 * * *'
-  workflow_dispatch:
+    - cron: '0 5 * * *' # Executa diariamente às 05h00
+  workflow_dispatch: # Permite execução manual no GitHub
 permissions:
   contents: write
+
 jobs:
   execucao_total:
     runs-on: ubuntu-latest
     steps:
       - name: BUSCAR-CODIGO
         uses: actions/checkout@v3
+
       - name: CONFIGURAR-PYTHON
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
           cache: 'pip'
+
       - name: INSTALAR-BIBLIOTECAS
-        run: pip install pytest pandas numpy firebase-admin h3 xgboost scikit-learn requests pyarrow fastparquet openpyxl
-      - name: EXECUTAR-MOTOR
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pandas numpy xgboost scikit-learn requests pyarrow fastparquet openpyxl h3 holidays
+
+      - name: VALIDAR-CONTRATOS-DE-DADOS
+        run: pytest test_contracts.py -v
+
+      - name: EXECUTAR-MOTOR-MEDALLION
         env:
-          FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           PYTHONPATH: .
-        run: python autobot/autobot_engine.py
-      - name: PERSISTIR-ESTADO
+        run: python autobot.py
+
+      - name: PERSISTIR-LAKEHOUSE
         run: |
-          git config --global user.name "SISTEMA-AUTONOMO"
+          git config --global user.name "SISTEMA-AUTONOMO-SAFEDRIVER"
           git config --global user.email "bot@safedriver.io"
-          git add datalake/camada_bronze_bruta/*.parquet
-          git add datalake/camada_prata_confiavel/assinatura_anterior.parquet
-          git commit -m "🤖 [SISTEMA] RECONSTRUÇÃO DE MALHA: $(date +'%Y-%m-%d')" || exit 0
-          git push
+          
+          # Mapeia exatamente a sua estrutura de pastas para persistência
+          git add datalake/camada_bronze_bruta/*
+          git add datalake/camada_prata_confiavel/*
+          git add datalake/camada_ouro_refinada/*
+          git add datalake/camada_ouro_refinada/esquema_estrela/*
+          
+          # Verifica se há mudanças. Se houver, comita e faz o push.
+          if ! git diff --staged --quiet; then
+            git commit -m "🤖 [SISTEMA] DWH Atualizado: Reconstrução Medallion $(date +'%Y-%m-%d')"
+            git push origin main
+          else
+            echo "✅ Nenhuma alteração nos dados. Lakehouse já está sincronizado."
+          fi
