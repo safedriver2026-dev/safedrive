@@ -1,8 +1,8 @@
 name: SAFE-DRIVER-SISTEMA-AUTONOMO
 on:
   schedule:
-    - cron: '0 5 * * *' # Executa diariamente às 05h00
-  workflow_dispatch: # Permite execução manual no GitHub
+    - cron: '0 5 * * *' 
+  workflow_dispatch: 
 permissions:
   contents: write
 
@@ -25,27 +25,27 @@ jobs:
           pip install pytest pandas numpy xgboost scikit-learn requests pyarrow fastparquet openpyxl h3 holidays
 
       - name: VALIDAR-CONTRATOS-DE-DADOS
-        run: pytest test_contracts.py -v
+        # Agora o GitHub Actions sabe exatamente onde procurar o teste!
+        run: pytest tests/test_contracts.py -v
 
       - name: EXECUTAR-MOTOR-MEDALLION
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           PYTHONPATH: .
-        run: python autobot.py
+        # Agora ele sabe exatamente onde está o robô!
+        run: python autobot/autobot_engine.py
 
       - name: PERSISTIR-LAKEHOUSE
         run: |
           git config --global user.name "SISTEMA-AUTONOMO-SAFEDRIVER"
           git config --global user.email "bot@safedriver.io"
           
-          # Mapeia exatamente a sua estrutura de pastas para persistência
           git add datalake/camada_bronze_bruta/*
           git add datalake/camada_prata_confiavel/*
           git add datalake/camada_ouro_refinada/*
           git add datalake/camada_ouro_refinada/esquema_estrela/*
           
-          # Verifica se há mudanças. Se houver, comita e faz o push.
           if ! git diff --staged --quiet; then
             git commit -m "🤖 [SISTEMA] DWH Atualizado: Reconstrução Medallion $(date +'%Y-%m-%d')"
             git push origin main
