@@ -8,10 +8,12 @@ def motor():
     return MotorInteligenciaLakehouse()
 
 def test_arquitetura_diretorios(motor):
+    """Garante que a estrutura física do Data Lakehouse está intacta"""
     for nome_camada, caminho in motor.dirs.items():
         assert os.path.exists(caminho), f"🚨 FALHA CRÍTICA: Diretório '{nome_camada}' ausente em {caminho}"
 
 def test_engenharia_e_modelagem_estrela(motor):
+    """Testa a lógica de negócio (H3, Datas, IA) com dados simulados"""
     df_mock_bronze = pd.DataFrame({
         'LATITUDE': [-23.5505, -23.5506],
         'LONGITUDE': [-46.6333, -46.6334],
