@@ -1,295 +1,222 @@
 import pandas as pd
 import numpy as np
-import os, requests, json, hashlib, traceback, io
+import os, requests, json, hashlib, traceback, io, gc
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import h3
 import xgboost as xgb
-from sklearn.ensemble import RandomForestRegressor
+import lightgbm as lgb
+from catboost import CatBoostRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 import holidays
 import warnings
 warnings.filterwarnings('ignore')
 
-class MotorInteligenciaLakehouse:
+class SistemaInteligenciaSafeDriver:
     def __init__(self):
-        self.identificador = "SAFE-DRIVER-ENTERPRISE-V2"
-        
-        self.dirs = {
+        self.identificador = "SAFEDRIVER-MOTOR-HIBRIDO"
+        self.diretorios = {
             'bronze': 'datalake/camada_bronze_bruta',
             'prata': 'datalake/camada_prata_confiavel',
             'ouro': 'datalake/camada_ouro_refinada',
             'estrela': 'datalake/camada_ouro_refinada/esquema_estrela'
         }
+        for d in self.diretorios.values(): os.makedirs(d, exist_ok=True)
         
-        for d in self.dirs.values(): os.makedirs(d, exist_ok=True)
-        
-        self.tokens = {
-            "sucesso": os.environ.get('DISCORD_SUCESSO'),
-            "erro": os.environ.get('DISCORD_ERRO')
-        }
-        
-        self.anos_alvo = [2025, 2026]
+        self.tokens = {"sucesso": os.environ.get('DISCORD_SUCESSO'), "erro": os.environ.get('DISCORD_ERRO')}
+        self.ano_atual = datetime.now().year
+        self.anos_alvo = list(range(2022, self.ano_atual + 1))
         self.url_ssp = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{}.xlsx"
         self.feriados_sp = holidays.country_holidays('BR', subdiv='SP')
-        self.telemetria = {"linhas_bronze": 0, "linhas_prata": 0, "linhas_fato": 0}
+        
+        # MÉTRICAS DE EVIDÊNCIA E ASSERTIVIDADE
+        self.telemetria = {
+            "linhas_bronze": 0, "linhas_prata": 0, "linhas_fato": 0,
+            "conversao_pct": 0.0, "ruido_eliminado_pct": 0.0, 
+            "erro_absoluto_medio": 0.0, "erro_quadratico_medio": 0.0, "confianca_sistema_pct": 0.0
+        }
+        
+        # IA NÍVEL 1: CLASSIFICADOR SEMÂNTICO (NLP)
+        self.vetorizador_ia = TfidfVectorizer(max_features=500)
+        self.classificador_ia = LogisticRegression(max_iter=1000)
 
-    def _obter_sessao_resiliente(self):
+    def _conectar_ssp(self):
         sessao = requests.Session()
-        tentativas = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
-        adaptador = HTTPAdapter(max_retries=tentativas)
-        sessao.mount('http://', adaptador)
-        sessao.mount('https://', adaptador)
-        sessao.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        })
+        sessao.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=3)))
         return sessao
 
-    def _registrar_log(self, mensagem):
+    def _log(self, mensagem):
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        log_path = f"{self.dirs['prata']}/registro_sistema.log"
-        with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(f"[{timestamp}] {mensagem}\n")
-        print(mensagem)
+        print(f"[{timestamp}] {mensagem}")
 
-    def _notificar_discord(self, sucesso, detalhes=""):
-        url = self.tokens["sucesso"] if sucesso else self.tokens["erro"]
-        if not url: return
+    def _notificar_operador(self, status_sucesso, detalhes=""):
+        webhook = self.tokens["sucesso"] if status_sucesso else self.tokens["erro"]
+        if not webhook: return
+        cor = 3066993 if status_sucesso else 15158332
+        titulo = "🛡️ RELATÓRIO DE INTELIGÊNCIA HÍBRIDA" if status_sucesso else "🚨 FALHA NO PROTOCOLO"
         
-        embed = {
-            "title": "🛡️ SAFE DRIVER - LAKEHOUSE ATUALIZADO" if sucesso else "🚨 SAFE DRIVER - FALHA ESTRUTURAL",
-            "color": 3066993 if sucesso else 15158332,
-            "description": detalhes[:2000],
-            "fields": [
-                {"name": "📦 Eventos Brutos (Bronze)", "value": f"{self.telemetria['linhas_bronze']}", "inline": True},
-                {"name": "🥈 Eventos Limpos (Prata)", "value": f"{self.telemetria['linhas_prata']}", "inline": True},
-                {"name": "⭐ Malha de Risco (Ouro)", "value": f"{self.telemetria['linhas_fato']}", "inline": True}
-            ],
-            "footer": {"text": f"Inteligência Geocriminal | Execução: {datetime.now().strftime('%Y-%m-%d %H:%M')}"}
+        conteudo = {
+            "embeds": [{
+                "title": titulo,
+                "color": cor,
+                "description": detalhes[:2000],
+                "fields": [
+                    {"name": "📊 FUNIL DE DADOS", "value": f"📥 Bruto: {self.telemetria['linhas_bronze']}\n🧹 Ruído IA: {self.telemetria['ruido_eliminado_pct']}%\n🥈 Prata: {self.telemetria['linhas_prata']}", "inline": True},
+                    {"name": "🧠 MÉTRICAS HÍBRIDAS", "value": f"📉 Erro (MAE): {self.telemetria['erro_absoluto_medio']}\n✅ Confiança: {self.telemetria['confianca_sistema_pct']}%", "inline": True}
+                ],
+                "footer": {"text": f"SISTEMA SEGURO | CICLO HISTÓRICO 2022-{self.ano_atual}"}
+            }]
         }
-        try: requests.post(url, json={"embeds": [embed]})
+        try: requests.post(webhook, json=conteudo)
         except: pass
 
-    def _extrair_aba_correta_excel(self, conteudo_bytes):
-        arquivo_excel = pd.read_excel(io.BytesIO(conteudo_bytes), sheet_name=None)
-        for nome_aba, df_aba in arquivo_excel.items():
-            colunas_limpas = [str(c).upper().strip().replace(" ", "_") for c in df_aba.columns]
-            if any(chave in colunas_limpas for chave in ['NUM_BO', 'LATITUDE', 'RUBRICA']):
-                self._registrar_log(f"✅ Scanner de dados: Ignorando capas. Tabela real na aba: '{nome_aba}'")
-                return df_aba
-        return list(arquivo_excel.values())[-1]
-
-    def _baixar_e_converter_ssp(self, ano):
+    def _baixar_dados_ssp(self, ano):
         url = self.url_ssp.format(ano)
-        self._registrar_log(f"📥 Conectando à SSP-SP ({ano}) via rede resiliente...")
-        sessao = self._obter_sessao_resiliente()
-        
+        temp_file = f"{self.diretorios['bronze']}/fluxo_{ano}.xlsx"
+        self._log(f"SOLICITANDO ACESSO AOS DADOS DE {ano}...")
         try:
-            resposta = sessao.get(url, timeout=180, verify=False)
-            if resposta.status_code == 200:
-                df_temp = self._extrair_aba_correta_excel(resposta.content)
-                df_temp.to_parquet(f"{self.dirs['bronze']}/ssp_{ano}.parquet", index=False)
+            r = self._conectar_ssp().get(url, stream=True, timeout=600, verify=False)
+            if r.status_code == 200:
+                with open(temp_file, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024*1024): f.write(chunk)
+                
+                planilha = pd.read_excel(temp_file, sheet_name=None)
+                df_final = list(planilha.values())[-1]
+                for nome, d in planilha.items():
+                    if any(c in [str(x).upper() for x in d.columns] for x in ['NUM_BO', 'LATITUDE']):
+                        df_final = d; break
+                
+                df_final.to_parquet(f"{self.diretorios['bronze']}/ssp_{ano}.parquet", index=False)
+                del df_final, planilha; os.remove(temp_file); gc.collect()
                 return True
             return False
-        except Exception as e:
-            self._registrar_log(f"❌ Falha de rede no download de {ano}: {e}")
-            return False
+        except: return False
 
-    def _auditar_todas_camadas(self):
-        status = {"reconstruir_bronze": [], "reconstruir_prata": False, "reconstruir_ouro": False}
-        self._registrar_log("🔍 Auditoria de Contratos de Dados (Schema Enforcement)...")
+    def _treinar_ia_limpeza(self):
+        self._log("IA: INICIANDO TREINAMENTO DE CLASSIFICAÇÃO SEMÂNTICA...")
+        base_treino = pd.DataFrame([
+            {'t': 'ROUBO DE CARGA CAMINHAO', 'v': 1}, {'t': 'FURTO DE VEICULO', 'v': 1},
+            {'t': 'LATROCINIO MORTE', 'v': 1}, {'t': 'ROUBO CELULAR', 'v': 1},
+            {'t': 'VIOLENCIA DOMESTICA', 'v': 0}, {'t': 'BRIGA VIZINHO', 'v': 0},
+            {'t': 'CALUNIA INJURIA', 'v': 0}, {'t': 'ESTUPRO', 'v': 0}
+        ])
+        X = self.vetorizador_ia.fit_transform(base_treino['t'])
+        self.classificador_ia.fit(X, base_treino['v'])
 
-        for ano in self.anos_alvo:
-            arq_bronze = f"{self.dirs['bronze']}/ssp_{ano}.parquet"
-            if not os.path.exists(arq_bronze):
-                status["reconstruir_bronze"].append(ano)
-            else:
-                try:
-                    df = pd.read_parquet(arq_bronze)
-                    cols = [str(c).upper() for c in df.columns]
-                    if not any(c in cols for c in ['LATITUDE', 'LAT']) or not any(c in cols for c in ['DATA_OCORRENCIA_BO', 'DATA_OCORRENCIA']):
-                        status["reconstruir_bronze"].append(ano)
-                except:
-                    status["reconstruir_bronze"].append(ano)
-
-        arq_prata = f"{self.dirs['prata']}/assinatura_anterior.parquet"
-        if not os.path.exists(arq_prata) or len(status["reconstruir_bronze"]) > 0:
-            status["reconstruir_prata"] = True
-
-        # Verifica se o novo esquema estrela expandido existe
-        arquivos_estrela = ['dim_tempo.csv', 'dim_localizacao.csv', 'dim_perfil_crime.csv', 'dim_jurisdicao.csv', 'dim_ambiente.csv', 'fato_risco.csv']
-        for arq in arquivos_estrela:
-            if not os.path.exists(f"{self.dirs['estrela']}/{arq}"):
-                status["reconstruir_ouro"] = True
-                break
-        
-        if status["reconstruir_prata"]: 
-            status["reconstruir_ouro"] = True
-
-        return status
-
-    def _processar_bronze(self, anos_para_baixar):
-        dfs_para_concatenar = [] 
-        for ano in self.anos_alvo:
-            if ano in anos_para_baixar:
-                self._baixar_e_converter_ssp(ano)
-            arq_bronze = f"{self.dirs['bronze']}/ssp_{ano}.parquet"
-            if os.path.exists(arq_bronze):
-                dfs_para_concatenar.append(pd.read_parquet(arq_bronze))
-                
-        if not dfs_para_concatenar:
-            raise ValueError("Falha: Base Bronze indisponível.")
-            
-        df_mestre = pd.concat(dfs_para_concatenar, ignore_index=True)
-        self.telemetria['linhas_bronze'] = len(df_mestre)
-        return df_mestre
-
-    def _engenharia_prata(self, df):
-        self._registrar_log("⚙️ Engenharia de Features (Espacial, Temporal, Operacional)...")
+    def _processar_camada_prata(self, df):
+        self._log("IA: EXECUTANDO LIMPEZA E ENGENHARIA ESPACIAL...")
         df.columns = [str(c).upper().strip().replace(" ", "_") for c in df.columns]
-        
-        # Mapeamento do Dicionário de Segurança Pública
-        renames = {
-            'LATITUDE_Y': 'LATITUDE', 'LAT': 'LATITUDE', 'Y': 'LATITUDE',
-            'LONGITUDE_X': 'LONGITUDE', 'LON': 'LONGITUDE', 'X': 'LONGITUDE',
-            'DATA_OCORRENCIA_BO': 'DATA_OCORRENCIA', 'DATA_FATO': 'DATA_OCORRENCIA',
-            'NATUREZA_APURADA': 'RUBRICA', 'NATUREZA': 'RUBRICA'
-        }
-        df = df.rename(columns=renames)
+        mapeamento = {'LATITUDE_Y': 'LATITUDE', 'LAT': 'LATITUDE', 'LONGITUDE_X': 'LONGITUDE', 'LON': 'LONGITUDE', 'DATA_OCORRENCIA_BO': 'DATA_OCORRENCIA', 'DATA_FATO': 'DATA_OCORRENCIA', 'NATUREZA_APURADA': 'RUBRICA', 'NATUREZA': 'RUBRICA'}
+        df = df.rename(columns=mapeamento)
 
-        # 1. Tratamento Espacial Estrito
-        if 'LATITUDE' not in df.columns or 'LONGITUDE' not in df.columns:
-            raise KeyError("Colunas de coordenadas (Latitude/Longitude) não encontradas.")
+        # FILTRAGEM SEMÂNTICA IA (ELIMINAÇÃO DE RUÍDO)
+        self._treinar_ia_limpeza()
+        df['TEXTO_IA'] = df['RUBRICA'].fillna('') + ' ' + (df['DESCR_CONDUTA'].fillna('') if 'DESCR_CONDUTA' in df.columns else '')
+        df['IA_RELEVANTE'] = self.classificador_ia.predict(self.vetorizador_ia.transform(df['TEXTO_IA']))
         
+        total_antes = len(df)
+        df = df[df['IA_RELEVANTE'] == 1].copy()
+        self.telemetria['ruido_eliminado_pct'] = round(((total_antes - len(df))/total_antes)*100, 2) if total_antes > 0 else 0
+
+        # TRATAMENTO GEOGRÁFICO
         df['LATITUDE'] = pd.to_numeric(df['LATITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
         df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
         df = df.dropna(subset=['LATITUDE', 'LONGITUDE'])
         df = df[(df['LATITUDE'] < -19.0) & (df['LATITUDE'] > -26.0) & (df['LONGITUDE'] < -44.0) & (df['LONGITUDE'] > -55.0)]
         df['ID_LOCALIZACAO'] = df.apply(lambda r: h3.latlng_to_cell(r['LATITUDE'], r['LONGITUDE'], 8), axis=1)
 
-        # 2. Tratamento Temporal e Cronobiologia do Crime
+        # TEMPO
         df['DATA_OCORRENCIA'] = pd.to_datetime(df['DATA_OCORRENCIA'], errors='coerce')
         df = df.dropna(subset=['DATA_OCORRENCIA'])
         df['DATA_REF'] = df['DATA_OCORRENCIA'].dt.date
-        df['ANO'] = df['DATA_OCORRENCIA'].dt.year
-        df['MES'] = df['DATA_OCORRENCIA'].dt.month
-        df['DIA'] = df['DATA_OCORRENCIA'].dt.day
         df['DIA_SEMANA'] = df['DATA_OCORRENCIA'].dt.dayofweek
+        df['MES'] = df['DATA_OCORRENCIA'].dt.month
+        df['HORA'] = pd.to_numeric(df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(^\d{1,2})')[0], errors='coerce').fillna(-1).astype(int) if 'HORA_OCORRENCIA_BO' in df.columns else -1
         
-        if 'HORA_OCORRENCIA_BO' in df.columns:
-            df['HORA'] = pd.to_numeric(df['HORA_OCORRENCIA_BO'].astype(str).str.extract(r'(^\d{1,2})')[0], errors='coerce').fillna(-1).astype(int)
-        else:
-            df['HORA'] = -1
-            
-        df['PERIODO'] = df['DESC_PERIODO'].fillna('IGNORADO') if 'DESC_PERIODO' in df.columns else 'IGNORADO'
-
-        # 3. Tratamento de Atuária (O Quê e Como)
-        df['RUBRICA'] = df['RUBRICA'].fillna('NAO_INFORMADO')
-        df['CONDUTA'] = df['DESCR_CONDUTA'].fillna('NAO_INFORMADO') if 'DESCR_CONDUTA' in df.columns else 'NAO_INFORMADO'
+        # PESO DE GRAVIDADE (NEGÓCIOS)
+        df['GRAVIDADE'] = df['RUBRICA'].apply(lambda x: 10 if any(c in str(x).upper() for c in ['LATROCINIO', 'HOMICIDIO', 'MORTE']) else (7 if 'ROUBO' in str(x).upper() else 3))
         
-        # 4. Tratamento Ambiental (Terreno)
-        df['TIPO_LOCAL'] = df['DESCR_TIPOLOCAL'].fillna('NAO_INFORMADO') if 'DESCR_TIPOLOCAL' in df.columns else 'NAO_INFORMADO'
-        
-        # 5. Tratamento de Jurisdição Policial (Quem atende)
-        df['MUNICIPIO'] = df['NOME_MUNICIPIO'].fillna('NAO_INFORMADO') if 'NOME_MUNICIPIO' in df.columns else 'NAO_INFORMADO'
-        df['BTL'] = df['BTL'].fillna('IGNORADO') if 'BTL' in df.columns else 'IGNORADO'
-        df['CIA'] = df['CIA'].fillna('IGNORADO') if 'CIA' in df.columns else 'IGNORADO'
-        df['DELEGACIA'] = df['NOME_DELEGACIA'].fillna('IGNORADO') if 'NOME_DELEGACIA' in df.columns else 'IGNORADO'
-
         self.telemetria['linhas_prata'] = len(df)
-        df.to_parquet(f"{self.dirs['prata']}/assinatura_anterior.parquet", index=False)
+        df.to_parquet(f"{self.diretorios['prata']}/assinatura_anterior.parquet", index=False)
         return df
 
-    def _modelagem_ouro(self, df):
-        if df.empty: return
-        self._registrar_log("🧠 IA Ensemble e Geração de Star Schema Multidimensional...")
+    def _processar_camada_ouro(self, df):
+        self._log("IA HÍBRIDA: EXECUTANDO PROTOCOLO RADAR & BALANÇA...")
         
-        # Hash Keys para Modelagem Dimensional
-        def gerar_id(*args):
-            return hashlib.md5("".join([str(a) for a in args]).encode()).hexdigest()[:10]
-
-        # Classificação de Perfil (App Delivery / Transportadoras)
-        df['PERFIL_ALVO'] = df['CONDUTA'].apply(lambda x: "Motorista/Carga" if any(k in str(x).upper() for k in ["VEICULO", "CARGA", "TRANSPORTE"]) else ("Pedestre/Delivery" if any(k in str(x).upper() for k in ["CELULAR", "MOTO", "TRANSEUNTE"]) else "Geral"))
-        
-        df['ID_PERFIL'] = df.apply(lambda r: gerar_id(r['PERFIL_ALVO'], r['RUBRICA'], r['CONDUTA']), axis=1)
-        df['ID_AMBIENTE'] = df.apply(lambda r: gerar_id(r['TIPO_LOCAL']), axis=1)
-        df['ID_JURISDICAO'] = df.apply(lambda r: gerar_id(r['MUNICIPIO'], r['BTL'], r['CIA'], r['DELEGACIA']), axis=1)
-
-        # Regras de Negócio de Risco Atuarial
-        df['GRAVIDADE'] = df['RUBRICA'].apply(lambda x: 10 if any(c in str(x).upper() for c in ['LATROCINIO', 'HOMICIDIO']) else (7 if 'ROUBO' in str(x).upper() else 3))
-
-        # Motor Machine Learning (Treino e Predição)
         X = df[['LATITUDE', 'LONGITUDE', 'DIA_SEMANA', 'MES', 'HORA']]
         y = df['GRAVIDADE']
+        
         if len(X) > 100:
-            m_xgb = xgb.XGBRegressor(n_estimators=60, max_depth=6, random_state=42).fit(X, y)
-            m_rf = RandomForestRegressor(n_estimators=40, max_depth=6, random_state=42).fit(X, y)
-            df['RISCO_CALCULADO'] = (m_xgb.predict(X) + m_rf.predict(X)) / 2
+            X_treino, X_teste, y_treino, y_teste = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # RADAR (LOCALIZAÇÃO E FREQUÊNCIA) - HÍBRIDO 1
+            radar = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.05, verbose=-1).fit(X_treino, y_treino)
+            radar_aux = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05).fit(X_treino, y_treino)
+            
+            # BALANÇA (SEVERIDADE) - HÍBRIDO 2
+            balanca = CatBoostRegressor(iterations=100, learning_rate=0.05, silent=True).fit(X_treino, y_treino)
+            
+            # RESULTADO HÍBRIDO PONDERADO
+            predicoes = (radar.predict(X_teste) * 0.3) + (radar_aux.predict(X_teste) * 0.3) + (balanca.predict(X_teste) * 0.4)
+            
+            self.telemetria['erro_absoluto_medio'] = round(float(np.mean(np.abs(y_teste - predicoes))), 4)
+            self.telemetria['erro_quadratico_medio'] = round(float(np.sqrt(np.mean((y_teste - predicoes)**2))), 4)
+            self.telemetria['confianca_sistema_pct'] = round(max(0, (1 - (self.telemetria['erro_absoluto_medio']/y.mean()))*100), 2)
+            
+            df['RISCO_CALCULADO'] = (radar.predict(X) * 0.3) + (radar_aux.predict(X) * 0.3) + (balanca.predict(X) * 0.4)
         else:
             df['RISCO_CALCULADO'] = df['GRAVIDADE']
 
-        # === CONSTRUÇÃO DO STAR SCHEMA (POWER BI PRONTO) ===
-        
-        # 1. Dimensão Tempo
-        dim_tempo = df[['DATA_REF', 'ANO', 'MES', 'DIA', 'DIA_SEMANA']].drop_duplicates().copy()
-        dim_tempo['ID_TEMPO'] = pd.to_datetime(dim_tempo['DATA_REF']).dt.strftime('%Y%m%d').astype(int)
-        dim_tempo['E_FERIADO'] = dim_tempo['DATA_REF'].apply(lambda d: 1 if d in self.feriados_sp else 0)
-        dim_tempo['E_PAGAMENTO'] = dim_tempo['DIA'].apply(lambda d: 1 if d in [5, 6, 7, 20, 21] else 0)
-        dim_tempo.to_csv(f"{self.dirs['estrela']}/dim_tempo.csv", index=False)
-
-        # 2. Dimensão Localização Geográfica
-        dim_loc = df[['ID_LOCALIZACAO', 'LATITUDE', 'LONGITUDE', 'MUNICIPIO']].groupby('ID_LOCALIZACAO').first().reset_index()
-        dim_loc.to_csv(f"{self.dirs['estrela']}/dim_localizacao.csv", index=False)
-
-        # 3. Dimensão Perfil Criminal (O Quê)
-        dim_perfil = df[['ID_PERFIL', 'PERFIL_ALVO', 'RUBRICA', 'CONDUTA']].drop_duplicates()
-        dim_perfil.to_csv(f"{self.dirs['estrela']}/dim_perfil_crime.csv", index=False)
-
-        # 4. Dimensão Ambiente (Onde)
-        dim_ambiente = df[['ID_AMBIENTE', 'TIPO_LOCAL']].drop_duplicates()
-        dim_ambiente.to_csv(f"{self.dirs['estrela']}/dim_ambiente.csv", index=False)
-
-        # 5. Dimensão Jurisdição PM/PC (Quem atende)
-        dim_jur = df[['ID_JURISDICAO', 'MUNICIPIO', 'BTL', 'CIA', 'DELEGACIA']].drop_duplicates()
-        dim_jur.to_csv(f"{self.dirs['estrela']}/dim_jurisdicao.csv", index=False)
-
-        # 6. Tabela Fato Risco (A Alma do Negócio)
+        # ESQUEMA ESTRELA
         df['ID_TEMPO'] = pd.to_datetime(df['DATA_REF']).dt.strftime('%Y%m%d').astype(int)
-        fato = df.groupby(['ID_TEMPO', 'HORA', 'PERIODO', 'ID_LOCALIZACAO', 'ID_PERFIL', 'ID_AMBIENTE', 'ID_JURISDICAO']).agg({
-            'RISCO_CALCULADO': 'mean',
-            'GRAVIDADE': 'count'
-        }).reset_index()
+        df[['DATA_REF', 'MES', 'DIA_SEMANA']].drop_duplicates().to_csv(f"{self.diretorios['estrela']}/dim_tempo.csv", index=False)
+        df[['ID_LOCALIZACAO', 'LATITUDE', 'LONGITUDE']].groupby('ID_LOCALIZACAO').first().to_csv(f"{self.diretorios['estrela']}/dim_localizacao.csv", index=False)
+        
+        fato = df.groupby(['ID_TEMPO', 'HORA', 'ID_LOCALIZACAO']).agg({'RISCO_CALCULADO': 'mean', 'GRAVIDADE': 'count'}).reset_index()
         fato.rename(columns={'GRAVIDADE': 'QTD_OCORRENCIAS'}, inplace=True)
-        fato.to_csv(f"{self.dirs['estrela']}/fato_risco.csv", index=False)
+        fato.to_csv(f"{self.diretorios['estrela']}/fato_risco.csv", index=False)
         self.telemetria['linhas_fato'] = len(fato)
+        
+        # PERSISTÊNCIA DE EVIDÊNCIAS (AUDITORIA)
+        audit = pd.DataFrame([{
+            'DATA_EXECUCAO': datetime.now().isoformat(),
+            'MAE': self.telemetria['erro_absoluto_medio'],
+            'RMSE': self.telemetria['erro_quadratico_medio'],
+            'CONFIANCA_PCT': self.telemetria['confianca_sistema_pct'],
+            'REMOVIDOS_RUIDO_PCT': self.telemetria['ruido_eliminado_pct']
+        }])
+        audit.to_csv(f"{self.diretorios['estrela']}/fato_auditoria.csv", mode='a', index=False, header=not os.path.exists(f"{self.diretorios['estrela']}/fato_auditoria.csv"))
 
     def executar(self):
         try:
-            self._registrar_log("🚀 INICIANDO ORQUESTRAÇÃO LAKEHOUSE MULTIDISCIPLINAR...")
-            status_auditoria = self._auditar_todas_camadas()
+            self._log(f"INICIANDO PROTOCOLO DE TRANSMISSÃO DE DADOS (2022-{self.ano_atual})...")
             
-            df_bronze = self._processar_bronze(status_auditoria["reconstruir_bronze"])
+            lista_dfs = []
+            for ano in self.anos_alvo:
+                if not os.path.exists(f"{self.diretorios['bronze']}/ssp_{ano}.parquet"):
+                    self._baixar_dados_ssp(ano)
+                if os.path.exists(f"{self.diretorios['bronze']}/ssp_{ano}.parquet"):
+                    lista_dfs.append(pd.read_parquet(f"{self.diretorios['bronze']}/ssp_{ano}.parquet"))
             
-            if status_auditoria["reconstruir_prata"]:
-                df_prata = self._engenharia_prata(df_bronze)
-            else:
-                df_prata = pd.read_parquet(f"{self.dirs['prata']}/assinatura_anterior.parquet")
-                self.telemetria['linhas_prata'] = len(df_prata)
-                
-            if status_auditoria["reconstruir_ouro"]:
-                self._modelagem_ouro(df_prata)
-            else:
-                fato = pd.read_csv(f"{self.dirs['estrela']}/fato_risco.csv")
-                self.telemetria['linhas_fato'] = len(fato)
-
-            self._registrar_log("✅ Lakehouse SafeDriver Finalizado. Dados analíticos disponíveis.")
-            self._notificar_discord(True, "Star Schema 360º (Espacial, Atuarial, Operacional e IA) gerado com sucesso.")
+            df_bronze = pd.concat(lista_dfs, ignore_index=True)
+            self.telemetria['linhas_bronze'] = len(df_bronze)
+            del lista_dfs; gc.collect()
+            
+            df_prata = self._processar_camada_prata(df_bronze)
+            del df_bronze; gc.collect()
+            
+            self._processar_camada_ouro(df_prata)
+            
+            self.telemetria['conversao_pct'] = round((self.telemetria['linhas_prata'] / self.telemetria['linhas_bronze']) * 100, 2)
+            self._notificar_operador(True, "SISTEMA SEGURO. PROCESSAMENTO HÍBRIDO CONCLUÍDO COM SUCESSO.")
+            
         except Exception as e:
-            erro_msg = f"Falha Crítica do Sistema: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            self._registrar_log(f"❌ {erro_msg}")
-            self._notificar_discord(False, erro_msg)
+            self._notificar_operador(False, f"ERRO CRÍTICO NO SISTEMA: {str(e)}\n{traceback.format_exc()}")
             raise e
 
 if __name__ == "__main__":
-    MotorInteligenciaLakehouse().executar()
+    SistemaInteligenciaSafeDriver().executar()
