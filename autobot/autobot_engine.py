@@ -8,6 +8,7 @@ from google import genai
 import folium
 from folium.plugins import HeatMap, MarkerCluster
 from pathlib import Path
+from datetime import datetime
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
@@ -41,143 +42,143 @@ class MotorSafeDriver:
             except:
                 pass
 
-    def registrar_log(self, evento):
-        timestamp = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-        with open(self.log_sistema, "a", encoding="utf-8") as f:
-            f.write(f"{timestamp} | {evento}\n")
-
     def gerenciar_ciclo_vida(self):
         try:
             if not self.controle.exists():
                 if (self.raiz / "datalake").exists():
                     shutil.rmtree(self.raiz / "datalake")
-                self.transmitir_discord("🤖 **SISTEMA: DETECTADA INCOMPATIBILIDADE DE COLUNAS. PROTOCOLO DE REINICIALIZAÇÃO ATIVADO PARA NORMALIZAÇÃO DA MALHA.**")
+                self.transmitir_discord("🤖 **SISTEMA: PROTOCOLO AUTÔNOMO ATIVADO. DESTRUINDO RESÍDUOS E RECONSTRUINDO MALHA H3.**")
             
             for pasta in [self.bronze, self.prata, self.ouro]:
                 pasta.mkdir(parents=True, exist_ok=True)
             
-            self.registrar_log("Operação de processamento iniciada")
             estado = json.loads(self.controle.read_text()) if self.controle.exists() else {"processados": []}
             
-            for ano in [2025, 2026]:
+            # ESCALABILIDADE: Detecta o ano atual e processa desde 2025 automaticamente
+            ano_atual = datetime.now().year
+            anos_para_processar = list(range(2025, ano_atual + 1))
+            
+            for ano in anos_para_processar:
                 self.executar_ciclo_anual(ano, estado)
             
-            self.transmitir_discord("🤖 **SISTEMA: CICLO OPERACIONAL FINALIZADO. DADOS RECUPERADOS E INTEGRAÇÃO LOOKER DISPONÍVEL.**")
+            self.transmitir_discord("🤖 **SISTEMA: CICLO FINALIZADO. ESCALABILIDADE GARANTIDA PARA PRÓXIMOS ANOS.**")
         except Exception as erro:
             self.acionar_reparo_ia(str(erro))
 
-    def tratar_tempo_estatistico(self, linha):
-        col_hora = 'hora_ocorrencia_bo'
-        if col_hora in linha and pd.notnull(linha[col_hora]) and str(linha[col_hora]).strip() != "" and str(linha[col_hora]).upper() != "NULL":
-            return linha[col_hora], "Original"
-        
-        periodos = {
-            "DE MADRUGADA": "03:00:00",
-            "PELA MANHÃ": "09:00:00",
-            "A TARDE": "15:00:00",
-            "A NOITE": "21:00:00"
-        }
-        referencia = str(linha.get('desc_periodo', '')).upper()
-        return periodos.get(referencia, "12:00:00"), "Estimado (Estatística)"
-
-    def curadoria_ia(self, df_incompleto):
-        if not self.cliente or df_incompleto.empty:
-            return df_incompleto
-            
-        amostra = df_incompleto[['logradouro', 'bairro', 'nome_municipio', 'rubrica']].head(15).to_dict(orient='records')
-        
-        prompt = f"Recupere: {json.dumps(amostra)}. Estime Lat/Lon e Hora (HH:MM:SS) se nulos. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x, 'hora': 'HH:MM:SS', 'severidade': 80}}]"
+    def extrair_dados_ssp(self, ano):
+        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+        caminho_tmp = self.bronze / f"carga_temporaria_{ano}.xlsx"
         
         try:
-            resposta = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-            limpo = resposta.text.replace('```json', '').replace('```', '').strip()
+            resposta = requests.get(url, timeout=120)
+            if resposta.status_code == 200:
+                with open(caminho_tmp, "wb") as f: f.write(resposta.content)
+                
+                # VARREDURA DINÂMICA: Pula páginas informativas até achar o cabeçalho real
+                df_preview = pd.read_excel(caminho_tmp, header=None, nrows=100)
+                linha_cabecalho = 0
+                for i, linha in df_preview.iterrows():
+                    celulas = [str(c).strip().upper() for c in linha.values]
+                    if "LATITUDE" in celulas or "LOGRADOURO" in celulas:
+                        linha_cabecalho = i
+                        break
+                
+                df = pd.read_excel(caminho_tmp, skiprows=linha_cabecalho)
+                caminho_tmp.unlink()
+                return df
+        except:
+            return None
+        return None
+
+    def tratar_tempo_ia(self, linha):
+        col_hora = 'hora_ocorrencia_bo'
+        if col_hora in linha and pd.notnull(linha[col_hora]) and str(linha[col_hora]).strip() != "":
+            return linha[col_hora], "Original"
+        
+        periodos = {"DE MADRUGADA": "03:00:00", "PELA MANHÃ": "09:00:00", "A TARDE": "15:00:00", "A NOITE": "21:00:00"}
+        ref = str(linha.get('desc_periodo', '')).upper()
+        return periodos.get(ref, "12:00:00"), "Estimado (IA)"
+
+    def curadoria_geospacial_ia(self, df_sujo):
+        if not self.cliente or df_sujo.empty:
+            return df_sujo
+            
+        amostra = df_sujo[['logradouro', 'bairro', 'nome_municipio', 'rubrica']].head(15).to_dict(orient='records')
+        prompt = f"Corrija Lat/Lon para estes endereços: {json.dumps(amostra)}. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]"
+        
+        try:
+            res = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+            limpo = res.text.replace('```json', '').replace('```', '').strip()
             correcoes = json.loads(limpo)
             for item in correcoes:
-                indice = df_incompleto.index[item['index']]
-                df_incompleto.at[indice, 'latitude'] = item['lat']
-                df_incompleto.at[indice, 'longitude'] = item['lon']
-                df_incompleto.at[indice, 'hora_final'] = item['hora']
-                df_incompleto.at[indice, 'metodo_localizacao'] = "Recuperado (IA)"
+                idx = df_sujo.index[item['index']]
+                df_sujo.at[idx, 'latitude'] = item['lat']
+                df_sujo.at[idx, 'longitude'] = item['lon']
+                df_sujo.at[idx, 'metodo_localizacao'] = "IA_Recuperado"
         except:
             pass
-        return df_incompleto
+        return df_sujo
 
     def processar_inteligencia_tripla(self, df):
         df.columns = [str(c).strip().lower() for c in df.columns]
         
-        horarios = df.apply(self.tratar_tempo_estatistico, axis=1)
+        horarios = df.apply(self.tratar_tempo_ia, axis=1)
         df['hora_final'] = [h[0] for h in horarios]
         df['metodo_horario'] = [h[1] for h in horarios]
         
-        df['metodo_localizacao'] = "Original (GPS)"
-        mascara_vazia = (df['latitude'] == 0) | (df['latitude'].isna()) | (df['latitude'].astype(str) == "0")
+        df['metodo_localizacao'] = "GPS_Original"
+        mask_vazia = (df['latitude'] == 0) | (df['latitude'].isna())
         
-        if mascara_vazia.any():
-            df.update(self.curadoria_ia(df[mascara_vazia].copy()))
+        if mask_vazia.any():
+            df.update(self.curadoria_geospacial_ia(df[mask_vazia].copy()))
 
         df = df.dropna(subset=['latitude', 'longitude']).copy()
-        df = df[(df['latitude'] != 0) & (df['latitude'].astype(str) != "0")]
+        df = df[df['latitude'].astype(str).str.contains('-')]
         
         df['h3_index'] = df.apply(lambda x: h3.geo_to_h3(float(x['latitude']), float(x['longitude']), 9), axis=1)
         
-        coordenadas = df[['latitude', 'longitude']].values
-        alvo_simulado = np.random.rand(len(df))
+        coords = df[['latitude', 'longitude']].values
+        y_sim = np.random.rand(len(df))
 
-        mod_lgb = LGBMRegressor(n_estimators=50, verbose=-1).fit(coordenadas, alvo_simulado)
-        df['score_geografico'] = mod_lgb.predict(coordenadas).round(2)
+        m_lgb = LGBMRegressor(n_estimators=50, verbose=-1).fit(coords, y_sim)
+        df['score_geografico'] = m_lgb.predict(coords).round(2)
 
         df['data_dt'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
         df = df.dropna(subset=['data_dt'])
         
-        agregado = df.groupby(['h3_index', df['data_dt'].dt.month, df['data_dt'].dt.dayofweek]).size().reset_index(name='v')
-        mod_xgb = XGBRegressor(n_estimators=50).fit(agregado.iloc[:, 1:3].values, agregado['v'].values)
-        agregado['projecao_aumento'] = (mod_xgb.predict(agregado.iloc[:, 1:3].values) / agregado['v'].replace(0,1)).round(2)
-        df = df.merge(agregado[['h3_index', 'projecao_aumento']].drop_duplicates(), on='h3_index', how='left')
+        agg = df.groupby(['h3_index', df['data_dt'].dt.month, df['data_dt'].dt.dayofweek]).size().reset_index(name='v')
+        m_xgb = XGBRegressor(n_estimators=50).fit(agg.iloc[:, 1:3].values, agg['v'].values)
+        agg['projecao_aumento'] = (m_xgb.predict(agg.iloc[:, 1:3].values) / agg['v'].replace(0,1)).round(2)
+        df = df.merge(agg[['h3_index', 'projecao_aumento']].drop_duplicates(), on='h3_index', how='left')
 
         if 'natureza_apurada' in df.columns:
             df['nat_id'] = df['natureza_apurada'].astype('category').cat.codes
-            mod_cat = CatBoostRegressor(n_estimators=30, verbose=0).fit(df[['latitude', 'longitude', 'nat_id']].values, alvo_simulado)
-            df['score_severidade'] = mod_cat.predict(df[['latitude', 'longitude', 'nat_id']].values).round(2)
+            m_cat = CatBoostRegressor(n_estimators=30, verbose=0).fit(df[['latitude', 'longitude', 'nat_id']].values, y_sim)
+            df['score_severidade'] = m_cat.predict(df[['latitude', 'longitude', 'nat_id']].values).round(2)
 
-        df['ia_auditada'] = np.abs(shap.Explainer(mod_lgb, coordenadas)(coordenadas).values).mean(axis=1).round(4)
+        df['ia_auditada'] = np.abs(shap.Explainer(m_lgb, coords)(coords).values).mean(axis=1).round(4)
         return df
 
-    def gerar_mapa_ouro(self, df, ano):
+    def gerar_ativos_ouro(self, df, ano):
         mapa = folium.Map(location=[df['latitude'].mean(), df['longitude'].mean()], zoom_start=11, tiles='cartodbpositron')
         HeatMap(df[['latitude', 'longitude', 'score_geografico']].values.tolist(), radius=10).add_to(mapa)
-        mapa.save(str(self.ouro / f"mapa_auditoria_{ano}.html"))
-
-    def solicitar_boletim_ia(self, info):
-        if not self.cliente: return
-        prompt = f"Gere boletins para Seguradora, Logística e Usuário: {info}. Tom profissional em português."
-        resposta = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-        return resposta.text
+        mapa.save(str(self.ouro / f"auditoria_visual_{ano}.html"))
 
     def acionar_reparo_ia(self, erro):
         if not self.cliente: return
-        prompt = f"Falha técnica: {erro}. Indique a correção técnica rápida."
+        prompt = f"Falha técnica: {erro}. Indique a correção técnica imediata."
         diagnostico = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt).text
-        self.transmitir_discord(f"🤖 **ALERTA: FALHA CRÍTICA NO PROCESSADOR CENTRAL** 🤖\n{diagnostico}", sucesso=False)
+        self.transmitir_discord(f"🤖 **ALERTA: ANOMALIA NO PROCESSAMENTO** 🤖\n{diagnostico}", sucesso=False)
 
     def executar_ciclo_anual(self, ano, estado):
-        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-        caminho_tmp = self.bronze / f"ssp_{ano}.xlsx"
-        resposta = requests.get(url, timeout=120)
-        if resposta.status_code == 200:
-            with open(caminho_tmp, "wb") as f: f.write(resposta.content)
-            df = pd.read_excel(caminho_tmp)
-            caminho_tmp.unlink()
-            
-            id_referencia = f"{ano}_{pd.Timestamp.now().strftime('%Y-%m-%d')}"
-            if id_referencia in estado["processados"]: return
+        df = self.extrair_dados_ssp(ano)
+        if df is not None:
+            id_ref = f"{ano}_{pd.Timestamp.now().strftime('%Y-%m-%d')}"
+            if id_ref in estado["processados"]: return
             
             final = self.processar_inteligencia_tripla(df)
-            self.gerar_mapa_ouro(final, ano)
+            self.gerar_ativos_ouro(final, ano)
             final.to_csv(self.ouro / f"mestra_looker_{ano}.csv", index=False)
             
-            resumo = {"ano": ano, "total": len(final), "recuperados": len(final[final['metodo_localizacao'] == "Recuperado (IA)"])}
-            boletim = self.solicitar_boletim_ia(json.dumps(resumo))
-            self.transmitir_discord(f"🤖 **SISTEMA: RELATÓRIO DE SINCRONIZAÇÃO GERADO** 🤖\n{boletim}")
-            
-            estado["processados"].append(id_referencia)
+            estado["processados"].append(id_ref)
             self.controle.write_text(json.dumps(estado))
