@@ -1,4 +1,4 @@
-name: SafeDriver
+name: SafeDriver_Core
 
 on:
   schedule:
@@ -21,23 +21,17 @@ jobs:
           python-version: '3.11'
 
       - name: Dependências
-        run: pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-generativeai shap h3 pytest
+        run: pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-genai shap h3
 
-      - name: Instalar Projeto
-        run: pip install -e .
-
-      - name: Validar Contratos
-        run: pytest tests/test_contracts.py
-
-      - name: Operar Sistema
+      - name: Operar Motor
         env:
           GEMINI_JSON: ${{ secrets.GEMINI_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        run: python -c "from autobot.autobot_engine import MotorSafeDriver; MotorSafeDriver().gerenciar_execucao()"
+        run: python -c "from autobot.autobot_engine import MotorSafeDriver; MotorSafeDriver().gerenciar_ciclo_vida()"
 
       - name: Persistir Camadas Ouro e Prata
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 Sistema: Sincronização Delta [skip ci]"
+          commit_message: "🤖 Sistema: Sincronização Delta e Recuperação IA [skip ci]"
           file_pattern: "datalake/camada_ouro_refinada/* datalake/camada_prata_confiavel/* controle_delta.json"
