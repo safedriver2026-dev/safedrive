@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import requests
 import folium
+import google.generativeai as genai
 from folium.plugins import HeatMap
 from pathlib import Path
 from xgboost import XGBRegressor
@@ -19,9 +20,12 @@ class MotorSafeDriver:
         self.ouro = self.raiz / "datalake/camada_ouro_refinada"
         self.controle = self.bronze / "controle.json"
         self.log_path = self.prata / "registro_sistema.log"
+        self.api_key = os.getenv("GEMINI_API_KEY")
 
     def registrar(self, msg):
         ts = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        if not self.prata.exists():
+            self.prata.mkdir(parents=True, exist_ok=True)
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(f"{ts} | {msg}\n")
 
@@ -29,79 +33,93 @@ class MotorSafeDriver:
         if not self.controle.exists():
             if (self.raiz / "datalake").exists():
                 shutil.rmtree(self.raiz / "datalake")
-            
             for p in [self.bronze, self.prata, self.ouro / "esquema_estrela"]:
                 p.mkdir(parents=True, exist_ok=True)
-            
-            self.registrar("Reinicializacao total do sistema")
+            self.registrar("Reinicializacao total")
             self.executar_ciclo([2025, 2026])
         else:
-            self.registrar("Sincronizacao incremental")
+            self.registrar("Sincronizacao")
             self.executar_ciclo([2026])
 
     def extrair_dados(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         path_xlsx = self.bronze / f"temp_{ano}.xlsx"
-        
-        res = requests.get(url)
-        if res.status_code == 200:
-            with open(path_xlsx, "wb") as f:
-                f.write(res.content)
-            
-            df_capa = pd.read_excel(path_xlsx, nrows=20, header=None)
-            pulo = 0
-            for i, linha in df_capa.iterrows():
-                if any("LATITUDE" in str(celula).upper() for celula in linha):
-                    pulo = i
-                    break
-            
-            df = pd.read_excel(path_xlsx, skiprows=pulo)
-            path_xlsx.unlink()
-            return df
+        try:
+            res = requests.get(url, timeout=60)
+            if res.status_code == 200:
+                with open(path_xlsx, "wb") as f:
+                    f.write(res.content)
+                df_busca = pd.read_excel(path_xlsx, nrows=50, header=None)
+                pulo = 0
+                for i, linha in df_busca.iterrows():
+                    celulas = [str(c).upper() for c in linha.values]
+                    if any("LATITUDE" in c for c in celulas) and any("LONGITUDE" in c for c in celulas):
+                        pulo = i
+                        break
+                df = pd.read_excel(path_xlsx, skiprows=pulo)
+                path_xlsx.unlink()
+                return df
+        except Exception as e:
+            self.registrar(f"Erro extracao {ano}: {str(e)}")
+            if path_xlsx.exists(): path_xlsx.unlink()
         return None
 
     def aplicar_modelos(self, df):
+        df.columns = [c.lower() for c in df.columns]
+        if 'latitude' not in df.columns or 'longitude' not in df.columns:
+            return df
         df_ia = df.dropna(subset=['latitude', 'longitude']).copy()
+        df_ia = df_ia[(df_ia['latitude'] != 0) & (df_ia['longitude'] != 0)]
+        if df_ia.empty:
+            return df_ia
         X = df_ia[['latitude', 'longitude']].values
         y = np.random.rand(len(df_ia))
-
-        xgb = XGBRegressor(n_estimators=50).fit(X, y)
-        lgb = LGBMRegressor(n_estimators=50, verbose=-1).fit(X, y)
-        cat = CatBoostRegressor(n_estimators=50, verbose=0).fit(X, y)
-
+        xgb = XGBRegressor(n_estimators=30).fit(X, y)
+        lgb = LGBMRegressor(n_estimators=30, verbose=-1).fit(X, y)
+        cat = CatBoostRegressor(n_estimators=30, verbose=0).fit(X, y)
         df_ia['score_risco'] = (xgb.predict(X) + lgb.predict(X) + cat.predict(X)) / 3
         return df_ia
 
     def criar_mapa(self, df):
-        mapa = folium.Map(location=[df['latitude'].mean(), df['longitude'].mean()], zoom_start=11)
+        if 'latitude' not in df.columns or df.empty:
+            return
+        lat_m, lon_m = df['latitude'].mean(), df['longitude'].mean()
+        mapa = folium.Map(location=[lat_m, lon_m], zoom_start=11)
         HeatMap(df[['latitude', 'longitude', 'score_risco']].values.tolist()).add_to(mapa)
         mapa.save(str(self.ouro / "mapa_calor.html"))
+
+    def solicitar_ia(self, contexto):
+        if not self.api_key:
+            return "Chave IA ausente."
+        try:
+            genai.configure(api_key=self.api_key)
+            modelo = genai.GenerativeModel('gemini-1.5-flash')
+            prompt = f"Analise estes dados criminais e forneça: 1. Resumo Executivo. 2. Analise de crimes. 3. Top regioes perigosas. 4. Curiosidades.\nDados:\n{contexto}"
+            resposta = modelo.generate_content(prompt)
+            return resposta.text
+        except Exception as e:
+            return f"Erro IA: {str(e)}"
 
     def executar_ciclo(self, anos):
         for ano in anos:
             dados = self.extrair_dados(ano)
             if dados is not None:
                 dados.to_parquet(self.bronze / f"ssp_{ano}.parquet")
-                
-                dados.columns = [c.lower() for c in dados.columns]
-                dados = dados[dados['latitude'] != 0]
-                
                 final = self.aplicar_modelos(dados)
-                final.to_parquet(self.ouro / "mapa_auditavel.parquet")
-                
-                self.criar_mapa(final)
-                
-                with open(self.controle, "w") as f:
-                    json.dump({"ano": ano, "status": "atualizado"}, f)
-                
-                self.gerar_resumo(final, ano)
-
-    def gerar_resumo(self, df, ano):
-        resumo = {
-            "ano": ano,
-            "registros": len(df),
-            "risco_medio": float(df['score_risco'].mean()),
-            "coordenadas_validas": len(df[df['latitude'] != 0])
-        }
-        print(f"RESUMO ANALITICO {ano}")
-        print(json.dumps(resumo, indent=2))
+                if not final.empty:
+                    final.to_parquet(self.ouro / "mapa_auditavel.parquet")
+                    self.criar_mapa(final)
+                    
+                    top_regioes = final.groupby('nome_municipio').size().sort_values(ascending=False).head(5).to_string()
+                    crimes_comuns = final['natureza_apurada'].value_counts().head(5).to_string() if 'natureza_apurada' in final.columns else "N/A"
+                    
+                    contexto = f"Ano: {ano}\nTotal: {len(final)}\nTop Regioes:\n{top_regioes}\nCrimes:\n{crimes_comuns}"
+                    relatorio = self.solicitar_ia(contexto)
+                    
+                    with open(self.ouro / "relatorio_ia.txt", "w", encoding="utf-8") as f:
+                        f.write(relatorio)
+                    
+                    with open(self.controle, "w") as f:
+                        json.dump({"ano": ano, "status": "ok"}, f)
+                    
+                    print(relatorio)
