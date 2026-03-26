@@ -1,4 +1,4 @@
-name: SafeDriver_Elite_Pipeline
+name: SafeDriver
 
 on:
   schedule:
@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar Infraestrutura
+      - name: Instalar Ambiente
         run: |
           pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-genai shap h3
           pip install -e .
@@ -32,8 +32,8 @@ jobs:
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -c "from autobot.autobot_engine import MotorSafeDriver; MotorSafeDriver().gerenciar_ciclo_vida()"
 
-      - name: Persistir Camadas Ouro e Prata
+      - name: Persistir Dados
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 Sistema: Sincronização Delta e Ativos IA [skip ci]"
+          commit_message: "🤖 Sistema: Atualização Delta Sincronizada [skip ci]"
           file_pattern: "datalake/camada_ouro_refinada/* controle_delta.json"
