@@ -31,8 +31,8 @@ class MotorSafeDriver:
         self.webhook_sucesso = os.getenv("DISCORD_SUCESSO")
         self.webhook_erro = os.getenv("DISCORD_ERRO")
         
-        segredo = os.getenv("GEMINI_JSON")
-        self.token = segredo.strip().replace('"', '').replace("'", "") if segredo else None
+        raw_key = os.getenv("GEMINI_JSON")
+        self.token = raw_key.strip().replace('"', '').replace("'", "") if raw_key else None
         
         if self.token:
             self.ia = genai.Client(api_key=self.token)
@@ -52,7 +52,7 @@ class MotorSafeDriver:
             if not self.controle.exists():
                 if (self.raiz / "datalake").exists():
                     shutil.rmtree(self.raiz / "datalake")
-                self.avisar("🤖 **SISTEMA: PROTOCOLO DE RECUPERAÇÃO 2022-2026 INICIADO A 50% DE CAPACIDADE.**")
+                self.avisar("🤖 **SISTEMA: DOWNLOAD PERSISTENTE ATIVADO. VARREDURA 2022-2026.**")
             
             for p in [self.bronze, self.prata, self.ouro]:
                 p.mkdir(parents=True, exist_ok=True)
@@ -62,7 +62,7 @@ class MotorSafeDriver:
             ano_fim = datetime.now().year
             for ano in range(2022, ano_fim + 1):
                 if (datetime.now() - self.inicio) > self.limite_operacional:
-                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. SUSPENDENDO CICLO PARA PRESERVAR QUOTA.**")
+                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. SALVANDO ESTADO.**")
                     break
                 self.processar_ano(ano, estado)
         except Exception as e:
@@ -71,19 +71,31 @@ class MotorSafeDriver:
     def extrair_ssp(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         path_xlsx = self.bronze / f"ssp_{ano}.xlsx"
-        res = requests.get(url, timeout=180)
-        if res.status_code == 200:
-            with open(path_xlsx, "wb") as f: f.write(res.content)
-            previa = pd.read_excel(path_xlsx, header=None, nrows=50)
-            pulo = 0
-            for i, lin in previa.iterrows():
-                celulas = [str(c).upper().strip() for c in lin]
-                if "LATITUDE" in celulas or "LOGRADOURO" in celulas:
-                    pulo = i
-                    break
-            df = pd.read_excel(path_xlsx, skiprows=pulo)
-            path_xlsx.unlink()
-            return df
+        
+        # DOWNLOAD PERSISTENTE: Stream para arquivos grandes
+        for tentativa in range(5):
+            try:
+                with requests.get(url, stream=True, timeout=300) as r:
+                    r.raise_for_status()
+                    with open(path_xlsx, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk: f.write(chunk)
+                
+                # Leitura otimizada após download garantido
+                previa = pd.read_excel(path_xlsx, header=None, nrows=50)
+                pulo = 0
+                for i, lin in previa.iterrows():
+                    celulas = [str(c).upper().strip() for c in lin]
+                    if "LATITUDE" in celulas or "LOGRADOURO" in celulas:
+                        pulo = i
+                        break
+                
+                df = pd.read_excel(path_xlsx, skiprows=pulo)
+                path_xlsx.unlink() # Limpa o bronze para economizar espaço
+                return df
+            except Exception as e:
+                time.sleep(20 * (tentativa + 1))
+                if tentativa == 4: raise e
         return None
 
     def curadoria_ia(self, df_vazio):
@@ -91,19 +103,13 @@ class MotorSafeDriver:
             return df_vazio
             
         limite = max(1, int(len(df_vazio) * self.fator_capacidade))
-        
-        # Mapeamento dinâmico e robusto contra variações de cabeçalho
         cols_atuais = {str(c).upper().strip(): c for c in df_vazio.columns}
-        c_log = cols_atuais.get('LOGRADOURO')
-        c_bai = cols_atuais.get('BAIRRO')
-        c_mun = cols_atuais.get('NOME_MUNICIPIO')
-        c_rub = cols_atuais.get('RUBRICA')
+        c_log, c_bai, c_mun, c_rub = cols_atuais.get('LOGRADOURO'), cols_atuais.get('BAIRRO'), cols_atuais.get('NOME_MUNICIPIO'), cols_atuais.get('RUBRICA')
 
-        if not all([c_log, c_bai, c_mun, c_rub]):
-            return df_vazio
+        if not all([c_log, c_bai, c_mun, c_rub]): return df_vazio
 
         amostra = df_vazio[[c_log, c_bai, c_mun, c_rub]].head(limite)
-        prompt = f"Estime Lat/Lon para estes endereços criminais. Retorne apenas JSON puro: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
+        prompt = f"Converta endereços em Lat/Lon. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
         
         try:
             res = self.ia.models.generate_content(model="gemini-1.5-flash", contents=prompt)
@@ -118,7 +124,6 @@ class MotorSafeDriver:
         return df_vazio
 
     def processar_ia(self, df):
-        # Normalização forçada de colunas para minúsculas
         df.columns = [str(c).strip().lower() for c in df.columns]
         df['metodo_geo'] = "GPS_ORIGINAL"
         
@@ -155,8 +160,8 @@ class MotorSafeDriver:
 
     def diagnosticar(self, erro):
         if not self.ia: return
-        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Como líder de dados, qual a solução rápida em português?").text
-        self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR**\n{diag}", status=False)
+        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Solução em português?").text
+        self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR** 🚨\n{diag}", status=False)
 
     def processar_ano(self, ano, estado):
         df = self.extrair_ssp(ano)
