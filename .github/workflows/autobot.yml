@@ -1,41 +1,38 @@
-name: SAFEDRIVER-AUTOMACAO-DIARIA
-on:
-  schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+name: autobot
 
-permissions:
-  contents: write
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * 1'
 
 jobs:
-  ciclo_operacional:
+  execucao:
     runs-on: ubuntu-latest
     steps:
-      - name: Sincronizacao de Repositorio
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configuracao Python 3.11
-        uses: actions/setup-python@v5
+      - name: Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Instalacao de Dependencias
-        run: pip install pandas numpy h3 shap lightgbm google-generativeai requests openpyxl pyarrow pytest geopy
+      - name: Dependencias
+        run: |
+          pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium pytest
+          pip install -e .
 
-      - name: Testes de Integridade
+      - name: Testes
         run: pytest tests/test_contracts.py
 
-      - name: Execucao do Motor SafeDriver
-        env:
-          GEMINI_JSON: ${{ secrets.GEMINI_JSON }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: python autobot/autobot_engine.py
+      - name: Processamento
+        run: python -c "from autobot.autobot_engine import MotorSafeDriver; MotorSafeDriver().gerenciar_execucao()"
 
-      - name: Persistencia de Dados e Auditoria
-        run: |
-          git config --global user.name "SafeDriver-Robo"
-          git config --global user.email "robo@safedriver.ai"
-          git add datalake/*
-          git commit -m "🤖 [SISTEMA] Ciclo de Inteligencia e Recuperacao: $(date +'%Y-%m-%d')" || exit 0
-          git push
+      - name: Artefatos
+        uses: actions/upload-artifact@v4
+        with:
+          name: analise_safedrive
+          path: |
+            datalake/camada_ouro_refinada/mapa_calor.html
+            datalake/camada_prata_confiavel/registro_sistema.log
