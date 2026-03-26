@@ -35,10 +35,9 @@ class MotorSafeDriver:
         self.token = raw_key.strip().replace('"', '').replace("'", "") if raw_key else None
         
         if self.token:
-            # Conexão direta com o SDK v2
-            self.cliente = genai.Client(api_key=self.token)
+            self.ia = genai.Client(api_key=self.token)
         else:
-            self.cliente = None
+            self.ia = None
 
     def avisar(self, msg, status=True):
         url = self.webhook_sucesso if status else self.webhook_erro
@@ -50,22 +49,29 @@ class MotorSafeDriver:
 
     def gerenciar_ciclo_vida(self):
         try:
+            # PROTOCOLO DE LIMPEZA INICIAL (BOOTSTRAP)
             if not self.controle.exists():
+                self.avisar("🧹 **SISTEMA: PRIMEIRA EXECUÇÃO DETECTADA. INICIANDO LIMPEZA TOTAL E RECONSTRUÇÃO DA BASE HISTÓRICA.**")
                 if (self.raiz / "datalake").exists():
                     shutil.rmtree(self.raiz / "datalake")
-                self.avisar("🤖 **SISTEMA: PROTOCOLO H3-V4 ATIVADO. VARREDURA HISTÓRICA 2022-2026.**")
+                self.controle.write_text(json.dumps({"processados": [], "ultima_limpeza": str(datetime.now())}))
             
             for p in [self.bronze, self.prata, self.ouro]:
                 p.mkdir(parents=True, exist_ok=True)
             
-            estado = json.loads(self.controle.read_text()) if self.controle.exists() else {"processados": []}
+            estado = json.loads(self.controle.read_text())
             
+            # GESTÃO DELTA SYNC
             ano_fim = datetime.now().year
-            for ano in range(2022, ano_fim + 1):
+            anos_fluxo = list(range(2022, ano_fim + 1))
+            
+            for ano in anos_fluxo:
                 if (datetime.now() - self.inicio) > self.limite_operacional:
-                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. SALVANDO ESTADO.**")
+                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. ESTADO DELTA PRESERVADO.**")
                     break
                 self.processar_ano(ano, estado)
+                
+            self.controle.write_text(json.dumps(estado))
         except Exception as e:
             self.diagnosticar(str(e))
 
@@ -78,10 +84,11 @@ class MotorSafeDriver:
                 with requests.get(url, stream=True, timeout=300) as r:
                     r.raise_for_status()
                     with open(path_xlsx, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
+                        for chunk in r.iter_content(chunk_size=16384):
                             if chunk: f.write(chunk)
                 
-                previa = pd.read_excel(path_xlsx, header=None, nrows=50)
+                # VARREDURA DINÂMICA DE CABEÇALHO
+                previa = pd.read_excel(path_xlsx, header=None, nrows=60)
                 pulo = 0
                 for i, lin in previa.iterrows():
                     celulas = [str(c).upper().strip() for c in lin]
@@ -93,12 +100,12 @@ class MotorSafeDriver:
                 path_xlsx.unlink()
                 return df
             except Exception as e:
-                time.sleep(20 * (tentativa + 1))
+                time.sleep(30 * (tentativa + 1))
                 if tentativa == 4: raise e
         return None
 
     def curadoria_ia(self, df_vazio):
-        if not self.cliente or df_vazio.empty:
+        if not self.ia or df_vazio.empty:
             return df_vazio
             
         limite = max(1, int(len(df_vazio) * self.fator_capacidade))
@@ -108,11 +115,10 @@ class MotorSafeDriver:
         if not all([c_log, c_bai, c_mun, c_rub]): return df_vazio
 
         amostra = df_vazio[[c_log, c_bai, c_mun, c_rub]].head(limite)
-        prompt = f"Converta endereços em Lat/Lon. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
+        prompt = f"Corrija Latitude e Longitude para estes endereços criminais. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
         
         try:
-            # Chamada simplificada para evitar erro 404
-            res = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+            res = self.ia.models.generate_content(model="gemini-1.5-flash", contents=prompt)
             dados = json.loads(res.text.replace('```json', '').replace('```', '').strip())
             for item in dados:
                 idx = df_vazio.index[item['index']]
@@ -124,17 +130,19 @@ class MotorSafeDriver:
         return df_vazio
 
     def processar_ia(self, df):
+        # LIMPANDO DADOS E NORMALIZANDO ESQUEMA
         df.columns = [str(c).strip().lower() for c in df.columns]
+        df = df.drop_duplicates()
         df['metodo_geo'] = "GPS_ORIGINAL"
         
-        nulos = (df['latitude'] == 0) | (df['latitude'].isna()) | (df['latitude'].astype(str) == "0")
+        nulos = (df['latitude'] == 0) | (df['latitude'].isna()) | (df['latitude'].astype(str).isin(['0', '0.0', 'nan']))
         if nulos.any():
             df.update(self.curadoria_ia(df[nulos].copy()))
 
         df = df.dropna(subset=['latitude', 'longitude']).copy()
         df = df[(df['latitude'] != 0) & (df['latitude'].astype(str).str.contains('-'))]
         
-        # CORREÇÃO H3 V4: geo_to_h3 -> latlng_to_cell
+        # H3 V4 COMPATIBILIDADE
         df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
         
         coords = df[['latitude', 'longitude']].values
@@ -160,12 +168,12 @@ class MotorSafeDriver:
         mapa.save(str(self.ouro / f"analise_{ano}.html"))
 
     def diagnosticar(self, erro):
-        if not self.cliente: return
+        if not self.ia: return
         try:
-            diag = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Solução em português?").text
+            diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro: {erro}. Solução técnica em português?").text
             self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR** 🚨\n{diag}", status=False)
         except:
-            self.avisar(f"🚨 **ALERTA: ERRO CRÍTICO DE CONEXÃO/API**", status=False)
+            self.avisar(f"🚨 **ALERTA: ERRO CRÍTICO DE INFRAESTRUTURA**", status=False)
 
     def processar_ano(self, ano, estado):
         df = self.extrair_ssp(ano)
