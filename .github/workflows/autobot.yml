@@ -1,4 +1,4 @@
-name: SafeDriver_Core
+name: SafeDriver
 
 on:
   schedule:
@@ -7,23 +7,25 @@ on:
     branches: [ main ]
 
 jobs:
-  motor:
+  operacao_motor:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Sincronizar Código
+      - name: Sincronizar Repositório
         uses: actions/checkout@v4
 
-      - name: Python 3.11
+      - name: Configurar Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Dependências
-        run: pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-genai shap h3
+      - name: Instalar Dependências
+        run: |
+          pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-genai shap h3
+          pip install -e .
 
-      - name: Operar Motor
+      - name: Executar Motor Autônomo
         env:
           GEMINI_JSON: ${{ secrets.GEMINI_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
@@ -33,5 +35,5 @@ jobs:
       - name: Persistir Camadas Ouro e Prata
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 Sistema: Sincronização Delta e Recuperação IA [skip ci]"
+          commit_message: "🤖 Sistema: Sincronização Delta e Malha H3 [skip ci]"
           file_pattern: "datalake/camada_ouro_refinada/* datalake/camada_prata_confiavel/* controle_delta.json"
