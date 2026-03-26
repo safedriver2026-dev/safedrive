@@ -20,13 +20,15 @@ jobs:
 
       - name: Dependencias
         run: |
-          pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium pytest
+          pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-generativeai pytest
           pip install -e .
 
       - name: Testes
         run: pytest tests/test_contracts.py
 
       - name: Processamento
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python -c "from autobot.autobot_engine import MotorSafeDriver; MotorSafeDriver().gerenciar_execucao()"
 
       - name: Artefatos
@@ -35,4 +37,5 @@ jobs:
           name: analise_safedrive
           path: |
             datalake/camada_ouro_refinada/mapa_calor.html
+            datalake/camada_ouro_refinada/relatorio_ia.txt
             datalake/camada_prata_confiavel/registro_sistema.log
