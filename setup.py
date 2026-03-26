@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="safedrive",
-    version="0.1",
+    name="autobot",
+    version="2.0",
     packages=find_packages(),
 )
