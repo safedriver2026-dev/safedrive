@@ -1,14 +1,16 @@
-name: autobot
+name: SafeDriver_Global_Autonomous
 
 on:
+  schedule:
+    - cron: '0 3 * * *'
   push:
     branches: [ main ]
-  schedule:
-    - cron: '0 0 * * 1'
 
 jobs:
-  execucao:
+  run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,23 +21,17 @@ jobs:
           python-version: '3.11'
 
       - name: Dependencias
-        run: |
-          pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-generativeai pytest
-          pip install -e .
+        run: pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-generativeai shap h3
 
-      - name: Testes
-        run: pytest tests/test_contracts.py
-
-      - name: Processamento
+      - name: Operar
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python -c "from autobot.autobot_engine import MotorSafeDriver; MotorSafeDriver().gerenciar_execucao()"
+          GEMINI_JSON: ${{ secrets.GEMINI_JSON }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+        run: python -c "from motor_seguranca import MotorSafeDriver; MotorSafeDriver().executar_sistema()"
 
-      - name: Artefatos
-        uses: actions/upload-artifact@v4
+      - name: Persistir
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          name: analise_safedrive
-          path: |
-            datalake/camada_ouro_refinada/mapa_calor.html
-            datalake/camada_ouro_refinada/relatorio_ia.txt
-            datalake/camada_prata_confiavel/registro_sistema.log
+          commit_message: "Sistema: Atualização Diária Autônoma [skip ci]"
+          file_pattern: "datalake/ouro/* controle_delta.json"
