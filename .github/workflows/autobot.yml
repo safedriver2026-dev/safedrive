@@ -25,7 +25,7 @@ jobs:
           pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-genai shap h3
           pip install -e .
 
-      - name: Operar Motor (Capacidade 50%)
+      - name: Operar Motor (Persistência e Fluxo)
         env:
           GEMINI_JSON: ${{ secrets.GEMINI_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
