@@ -19,8 +19,8 @@ import h3
 class MotorSafeDriver:
     def __init__(self):
         self.inicio = datetime.now()
-        self.limite_tempo = timedelta(hours=3)
-        self.taxa_recuperacao = 0.5
+        self.limite_operacional = timedelta(hours=3)
+        self.fator_capacidade = 0.5
         
         self.raiz = Path(".")
         self.bronze = self.raiz / "datalake/camada_bronze_bruta"
@@ -52,17 +52,17 @@ class MotorSafeDriver:
             if not self.controle.exists():
                 if (self.raiz / "datalake").exists():
                     shutil.rmtree(self.raiz / "datalake")
-                self.avisar("🤖 **SISTEMA: INICIANDO VARREDURA HISTÓRICA (2022-2026). CAPACIDADE LIMITADA A 50% PARA PRESERVAÇÃO DE COTA.**")
+                self.avisar("🤖 **SISTEMA: INICIALIZANDO VARREDURA HISTÓRICA (2022-2026) A 50% DE CAPACIDADE.**")
             
             for p in [self.bronze, self.prata, self.ouro]:
                 p.mkdir(parents=True, exist_ok=True)
             
             estado = json.loads(self.controle.read_text()) if self.controle.exists() else {"processados": []}
             
-            ano_fim = datetime.now().year
-            for ano in range(2022, ano_fim + 1):
-                if (datetime.now() - self.inicio) > self.limite_tempo:
-                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. SALVANDO PROGRESSO PARA O PRÓXIMO CICLO.**")
+            ano_atual = datetime.now().year
+            for ano in range(2022, ano_atual + 1):
+                if (datetime.now() - self.inicio) > self.limite_operacional:
+                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. PAUSANDO PARA PRESERVAÇÃO DE RECURSOS.**")
                     break
                 self.processar_ano(ano, estado)
         except Exception as e:
@@ -74,7 +74,7 @@ class MotorSafeDriver:
         res = requests.get(url, timeout=180)
         if res.status_code == 200:
             with open(path_xlsx, "wb") as f: f.write(res.content)
-            previa = pd.read_excel(path_xlsx, header=None, nrows=100)
+            previa = pd.read_excel(path_xlsx, header=None, nrows=50)
             pulo = 0
             for i, lin in previa.iterrows():
                 if any("LATITUDE" in str(c).upper() for c in lin):
@@ -89,12 +89,18 @@ class MotorSafeDriver:
         if not self.ia or df_vazio.empty:
             return df_vazio
             
-        limite = max(1, int(len(df_vazio) * self.taxa_recuperacao))
-        amostra = df_vazio[['logradouro', 'bairro', 'nome_municipio', 'rubrica']].head(limite)
+        limite = max(1, int(len(df_vazio) * self.fator_capacidade))
+        # Mapeamento dinâmico para evitar KeyError
+        cols = {c.upper().strip(): c for c in df_vazio.columns}
+        c_log = cols.get('LOGRADOURO')
+        c_bai = cols.get('BAIRRO')
+        c_mun = cols.get('NOME_MUNICIPIO')
+        c_rub = cols.get('RUBRICA')
+
+        amostra = df_vazio[[c_log, c_bai, c_mun, c_rub]].head(limite)
+        self.avisar(f"🤖 **IA: RECUPERANDO {len(amostra)} COORDENADAS (META 50%).**")
         
-        self.avisar(f"🤖 **IA: RECUPERANDO {len(amostra)} REGISTROS (50% DA CARGA).**")
-        
-        prompt = f"Estime Lat/Lon para estes endereços. Retorne apenas JSON puro: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
+        prompt = f"Estime Lat/Lon para estes endereços. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
         
         try:
             res = self.ia.models.generate_content(model="gemini-1.5-flash", contents=prompt)
@@ -109,6 +115,7 @@ class MotorSafeDriver:
         return df_vazio
 
     def processar_ia(self, df):
+        # Normalização de colunas para garantir consistência
         df.columns = [str(c).strip().lower() for c in df.columns]
         df['metodo_geo'] = "GPS_ORIGINAL"
         
@@ -145,7 +152,7 @@ class MotorSafeDriver:
 
     def diagnosticar(self, erro):
         if not self.ia: return
-        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro: {erro}. Solução?").text
+        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro: {erro}. Como líder de dados, qual a solução rápida?").text
         self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR**\n{diag}", status=False)
 
     def processar_ano(self, ano, estado):
