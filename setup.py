@@ -2,6 +2,6 @@ from setuptools import setup, find_packages
 
 setup(
     name="autobot",
-    version="2.9",
+    version="3.0",
     packages=find_packages(),
 )
