@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  execucao_motor:
+  execucao:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -15,7 +15,7 @@ jobs:
       - name: Sincronizar Repositório
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
@@ -25,15 +25,15 @@ jobs:
           pip install pandas pyarrow openpyxl requests xgboost lightgbm catboost folium scikit-learn google-genai shap h3
           pip install -e .
 
-      - name: Operar Motor Autônomo
+      - name: Operar Motor (50% Capacidade)
         env:
           GEMINI_JSON: ${{ secrets.GEMINI_JSON }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        run: python -c "from autobot.motor_analitico import MotorSafeDriver; MotorSafeDriver().gerenciar_ciclo_operacional()"
+        run: python -c "from autobot.autobot_engine import MotorSafeDriver; MotorSafeDriver().gerenciar_ciclo_vida()"
 
       - name: Persistir Camadas Ouro e Prata
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 Sistema: Sincronização Histórica e Ativos IA [skip ci]"
-          file_pattern: "datalake/camada_ouro_refinada/* datalake/camada_prata_confiavel/* controle_delta.json"
+          commit_message: "🤖 Sistema: Sincronização Delta e Ativos IA [skip ci]"
+          file_pattern: "datalake/camada_ouro_refinada/* controle_delta.json"
