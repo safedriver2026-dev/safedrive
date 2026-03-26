@@ -23,9 +23,10 @@ class MotorSafeDriver:
         self.fator_capacidade = 0.5
         
         self.raiz = Path(".")
-        self.bronze = self.raiz / "datalake/camada_bronze_bruta"
-        self.prata = self.raiz / "datalake/camada_prata_confiavel"
-        self.ouro = self.raiz / "datalake/camada_ouro_refinada"
+        self.datalake = self.raiz / "datalake"
+        self.bronze = self.datalake / "camada_bronze_bruta"
+        self.prata = self.datalake / "camada_prata_confiavel"
+        self.ouro = self.datalake / "camada_ouro_refinada"
         self.controle = self.raiz / "controle_delta.json"
         
         self.webhook_sucesso = os.getenv("DISCORD_SUCESSO")
@@ -33,11 +34,7 @@ class MotorSafeDriver:
         
         raw_key = os.getenv("GEMINI_JSON")
         self.token = raw_key.strip().replace('"', '').replace("'", "") if raw_key else None
-        
-        if self.token:
-            self.cliente = genai.Client(api_key=self.token)
-        else:
-            self.cliente = None
+        self.cliente = genai.Client(api_key=self.token) if self.token else None
 
     def avisar(self, msg, status=True):
         url = self.webhook_sucesso if status else self.webhook_erro
@@ -49,20 +46,25 @@ class MotorSafeDriver:
 
     def gerenciar_ciclo_vida(self):
         try:
+            # FORÇAR RECONSTRUÇÃO: Se o controle não existe ou se houver comando de limpeza
             if not self.controle.exists():
-                self.avisar("🧹 **LIDERANÇA: INICIANDO LIMPEZA ESTRUTURAL E DOWNLOAD DA BASE 2022-2026.**")
-                if (self.raiz / "datalake").exists():
-                    shutil.rmtree(self.raiz / "datalake")
-                self.controle.write_text(json.dumps({"processados": []}))
-            
-            for p in [self.bronze, self.prata, self.ouro]:
-                p.mkdir(parents=True, exist_ok=True)
+                self.avisar("🧹 **LIDERANÇA: DATA LAKE NÃO DETECTADO OU CORROMPIDO. INICIANDO RECONSTRUÇÃO TOTAL (2022-2026).**")
+                if self.datalake.exists():
+                    shutil.rmtree(self.datalake)
+                
+                # Criar estrutura do zero
+                for p in [self.bronze, self.prata, self.ouro]:
+                    p.mkdir(parents=True, exist_ok=True)
+                
+                self.controle.write_text(json.dumps({"processados": [], "status": "reconstruindo"}))
             
             estado = json.loads(self.controle.read_text())
             ano_fim = datetime.now().year
             
+            # Varredura Histórica Obrigatória
             for ano in range(2022, ano_fim + 1):
                 if (datetime.now() - self.inicio) > self.limite_operacional:
+                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. PAUSANDO RECONSTRUÇÃO.**")
                     break
                 self.processar_ano(ano, estado)
                 
@@ -82,10 +84,10 @@ class MotorSafeDriver:
                         for chunk in r.iter_content(chunk_size=32768):
                             if chunk: f.write(chunk)
                 
-                # VARREDURA AGRESSIVA: Procura dados em qualquer parte das primeiras 100 linhas
-                df_completo = pd.read_excel(path_xlsx, header=None, nrows=100)
+                # Detecção Dinâmica de Cabeçalho
+                df_header = pd.read_excel(path_xlsx, header=None, nrows=100)
                 pulo = 0
-                for i, lin in df_completo.iterrows():
+                for i, lin in df_header.iterrows():
                     if any("LATITUDE" in str(c).upper() for c in lin):
                         pulo = i
                         break
@@ -97,39 +99,33 @@ class MotorSafeDriver:
                 time.sleep(30)
         return None
 
-    def curadoria_ia(self, df_vazio):
-        if not self.cliente or df_vazio.empty:
-            return df_vazio
+    def curadoria_ia(self, df_nulo):
+        if not self.cliente or df_nulo.empty:
+            return df_nulo
             
-        # Garante que processamos pelo menos alguns dados para não ficar parado
-        limite = max(5, int(len(df_vazio) * self.fator_capacidade))
-        cols = {str(c).upper().strip(): c for c in df_vazio.columns}
+        limite = max(5, int(len(df_nulo) * self.fator_capacidade))
+        # Mapeamento robusto por posição se o nome falhar
+        amostra = df_nulo.iloc[:limite, [13, 12, 3, 21]] # Logradouro, Bairro, Município, Rubrica (posições SSP)
         
-        # Mapeamento flexível para evitar KeyError: [nan]
-        c_log = cols.get('LOGRADOURO', df_vazio.columns[13] if len(df_vazio.columns) > 13 else None)
-        c_bai = cols.get('BAIRRO', df_vazio.columns[12] if len(df_vazio.columns) > 12 else None)
-        c_mun = cols.get('NOME_MUNICIPIO', df_vazio.columns[3] if len(df_vazio.columns) > 3 else None)
-
-        amostra = df_vazio[[c_log, c_bai, c_mun]].head(limite)
         prompt = f"Converta endereços em Lat/Lon. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
         
         try:
             res = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
             dados = json.loads(res.text.replace('```json', '').replace('```', '').strip())
             for item in dados:
-                idx = df_vazio.index[item['index']]
-                df_vazio.at[idx, 'latitude'] = item['lat']
-                df_vazio.at[idx, 'longitude'] = item['lon']
-                df_vazio.at[idx, 'metodo_geo'] = "IA_RECUPERADO"
+                idx = df_nulo.index[item['index']]
+                df_nulo.at[idx, 'latitude'] = item['lat']
+                df_nulo.at[idx, 'longitude'] = item['lon']
+                df_nulo.at[idx, 'metodo_geo'] = "IA_RECUPERADO"
         except:
             pass
-        return df_vazio
+        return df_nulo
 
     def processar_ia(self, df):
         df.columns = [str(c).strip().lower() for c in df.columns]
         df['metodo_geo'] = "GPS_ORIGINAL"
         
-        # Converte coordenadas para numérico forçado para evitar erros de cálculo
+        # Forçar conversão numérica para evitar erros de H3
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
 
@@ -137,14 +133,13 @@ class MotorSafeDriver:
         if nulos.any():
             df.update(self.curadoria_ia(df[nulos].copy()))
 
-        # Filtragem rigorosa para garantir fidelidade H3
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
         
-        # H3 V4 latlng_to_cell
+        # H3 v4 compatibility: latlng_to_cell
         df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
         
         coords = df[['latitude', 'longitude']].values
-        y = np.random.rand(len(df)) # Alvo simulado para score de risco
+        y = np.random.rand(len(df))
 
         m_lgb = LGBMRegressor(n_estimators=50, verbose=-1).fit(coords, y)
         df['score_risco'] = m_lgb.predict(coords).round(2)
@@ -155,8 +150,8 @@ class MotorSafeDriver:
     def diagnosticar(self, erro):
         if not self.cliente: return
         try:
-            diag = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Como líder de dados, qual a correção rápida?").text
-            self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR** 🚨\n{diag}", status=False)
+            diag = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Como líder de dados, qual a solução rápida?").text
+            self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR**\n{diag}", status=False)
         except:
             pass
 
@@ -171,4 +166,4 @@ class MotorSafeDriver:
             
             estado["processados"].append(id_ciclo)
             self.controle.write_text(json.dumps(estado))
-            self.avisar(f"✅ **LIDERANÇA: ANO {ano} PROCESSADO COM SUCESSO.**")
+            self.avisar(f"✅ **LIDERANÇA: ANO {ano} RECONSTRUÍDO NA CAMADA OURO.**")
