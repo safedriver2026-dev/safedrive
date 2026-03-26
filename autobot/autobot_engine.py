@@ -4,11 +4,12 @@ import json
 import pandas as pd
 import numpy as np
 import requests
+import time
 from google import genai
 import folium
 from folium.plugins import HeatMap, MarkerCluster
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
@@ -17,182 +18,145 @@ import h3
 
 class MotorSafeDriver:
     def __init__(self):
-        self.diretorio_raiz = Path(".")
-        self.camada_bronze = self.diretorio_raiz / "datalake/camada_bronze_bruta"
-        self.camada_prata = self.diretorio_raiz / "datalake/camada_prata_confiavel"
-        self.camada_ouro = self.diretorio_raiz / "datalake/camada_ouro_refinada"
-        self.arquivo_controle = self.diretorio_raiz / "controle_delta.json"
+        self.inicio = datetime.now()
+        self.limite_tempo = timedelta(hours=3)
+        self.taxa_recuperacao = 0.5
+        
+        self.raiz = Path(".")
+        self.bronze = self.raiz / "datalake/camada_bronze_bruta"
+        self.prata = self.raiz / "datalake/camada_prata_confiavel"
+        self.ouro = self.raiz / "datalake/camada_ouro_refinada"
+        self.controle = self.raiz / "controle_delta.json"
+        
         self.webhook_sucesso = os.getenv("DISCORD_SUCESSO")
         self.webhook_erro = os.getenv("DISCORD_ERRO")
         
-        chave_ambiente = os.getenv("GEMINI_JSON")
-        self.token_ia = chave_ambiente.strip().replace('"', '').replace("'", "") if chave_ambiente else None
+        segredo = os.getenv("GEMINI_JSON")
+        self.token = segredo.strip().replace('"', '').replace("'", "") if segredo else None
         
-        if self.token_ia:
-            self.inteligencia = genai.Client(api_key=self.token_ia)
+        if self.token:
+            self.ia = genai.Client(api_key=self.token)
         else:
-            self.inteligencia = None
+            self.ia = None
 
-    def comunicar_discord(self, texto, sucesso=True):
-        url = self.webhook_sucesso if sucesso else self.webhook_erro
+    def avisar(self, msg, status=True):
+        url = self.webhook_sucesso if status else self.webhook_erro
         if url:
             try:
-                requests.post(url, json={"content": texto})
+                requests.post(url, json={"content": msg})
             except:
                 pass
 
-    def gerenciar_ciclo_operacional(self):
+    def gerenciar_ciclo_vida(self):
         try:
-            if not self.arquivo_controle.exists():
-                if (self.diretorio_raiz / "datalake").exists():
-                    shutil.rmtree(self.diretorio_raiz / "datalake")
-                self.comunicar_discord("🤖 **SISTEMA: PROTOCOLO INICIAL DE RECUPERAÇÃO HISTÓRICA ATIVADO. MARCO ZERO: 2022.**")
+            if not self.controle.exists():
+                if (self.raiz / "datalake").exists():
+                    shutil.rmtree(self.raiz / "datalake")
+                self.avisar("🤖 **SISTEMA: INICIANDO VARREDURA HISTÓRICA (2022-2026). CAPACIDADE LIMITADA A 50% PARA PRESERVAÇÃO DE COTA.**")
             
-            for pasta in [self.camada_bronze, self.camada_prata, self.camada_ouro]:
-                pasta.mkdir(parents=True, exist_ok=True)
+            for p in [self.bronze, self.prata, self.ouro]:
+                p.mkdir(parents=True, exist_ok=True)
             
-            historico = json.loads(self.arquivo_controle.read_text()) if self.arquivo_controle.exists() else {"processados": []}
+            estado = json.loads(self.controle.read_text()) if self.controle.exists() else {"processados": []}
             
-            ano_limite = datetime.now().year
-            cronograma = list(range(2022, ano_limite + 1))
-            
-            for ano in cronograma:
-                self.processar_unidade_anual(ano, historico)
-            
-            self.comunicar_discord("🤖 **SISTEMA: OPERAÇÃO DE SINCRONIZAÇÃO E ANÁLISE CONCLUÍDA COM SUCESSO.**")
-        except Exception as falha:
-            self.gerar_diagnostico_ia(str(falha))
+            ano_fim = datetime.now().year
+            for ano in range(2022, ano_fim + 1):
+                if (datetime.now() - self.inicio) > self.limite_tempo:
+                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. SALVANDO PROGRESSO PARA O PRÓXIMO CICLO.**")
+                    break
+                self.processar_ano(ano, estado)
+        except Exception as e:
+            self.diagnosticar(str(e))
 
-    def capturar_base_ssp(self, ano):
-        endereco_web = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-        local_temporario = self.camada_bronze / f"ssp_carga_{ano}.xlsx"
-        
-        try:
-            resposta = requests.get(endereco_web, timeout=150)
-            if resposta.status_code == 200:
-                with open(local_temporario, "wb") as arquivo:
-                    arquivo.write(resposta.content)
-                
-                amostra = pd.read_excel(local_temporario, header=None, nrows=100)
-                ponto_ancora = 0
-                for i, linha in amostra.iterrows():
-                    valores = [str(v).strip().upper() for v in linha.values]
-                    if "LATITUDE" in valores or "LOGRADOURO" in valores:
-                        ponto_ancora = i
-                        break
-                
-                dados = pd.read_excel(local_temporario, skiprows=ponto_ancora)
-                local_temporario.unlink()
-                return dados
-        except:
-            return None
+    def extrair_ssp(self, ano):
+        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+        path_xlsx = self.bronze / f"ssp_{ano}.xlsx"
+        res = requests.get(url, timeout=180)
+        if res.status_code == 200:
+            with open(path_xlsx, "wb") as f: f.write(res.content)
+            previa = pd.read_excel(path_xlsx, header=None, nrows=100)
+            pulo = 0
+            for i, lin in previa.iterrows():
+                if any("LATITUDE" in str(c).upper() for c in lin):
+                    pulo = i
+                    break
+            df = pd.read_excel(path_xlsx, skiprows=pulo)
+            path_xlsx.unlink()
+            return df
         return None
 
-    def normalizar_horario(self, registro):
-        coluna_h = 'hora_ocorrencia_bo'
-        if coluna_h in registro and pd.notnull(registro[col_h]) and str(registro[col_h]).strip() != "":
-            return registro[col_h], "Original"
-        
-        tabela_periodos = {
-            "DE MADRUGADA": "03:00:00",
-            "PELA MANHÃ": "09:00:00",
-            "A TARDE": "15:00:00",
-            "A NOITE": "21:00:00"
-        }
-        periodo = str(registro.get('desc_periodo', '')).upper()
-        return tabela_periodos.get(periodo, "12:00:00"), "Estatístico"
-
-    def curadoria_geospacial(self, df_sujo):
-        if not self.inteligencia or df_sujo.empty:
-            return df_sujo
+    def curadoria_ia(self, df_vazio):
+        if not self.ia or df_vazio.empty:
+            return df_vazio
             
-        selecao = df_sujo[['logradouro', 'bairro', 'nome_municipio', 'rubrica']].head(12).to_dict(orient='records')
-        instrucao = f"Atue como perito criminal. Recupere Latitude e Longitude para: {json.dumps(selecao)}. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]"
+        limite = max(1, int(len(df_vazio) * self.taxa_recuperacao))
+        amostra = df_vazio[['logradouro', 'bairro', 'nome_municipio', 'rubrica']].head(limite)
+        
+        self.avisar(f"🤖 **IA: RECUPERANDO {len(amostra)} REGISTROS (50% DA CARGA).**")
+        
+        prompt = f"Estime Lat/Lon para estes endereços. Retorne apenas JSON puro: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
         
         try:
-            resposta_ia = self.inteligencia.models.generate_content(model="gemini-1.5-flash", contents=instrucao)
-            json_puro = resposta_ia.text.replace('```json', '').replace('```', '').strip()
-            lista_correcoes = json.loads(json_puro)
-            for item in lista_correcoes:
-                alvo = df_sujo.index[item['index']]
-                df_sujo.at[alvo, 'latitude'] = item['lat']
-                df_sujo.at[alvo, 'longitude'] = item['lon']
-                df_sujo.at[alvo, 'origem_geo'] = "IA_Recuperado"
+            res = self.ia.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+            dados = json.loads(res.text.replace('```json', '').replace('```', '').strip())
+            for item in dados:
+                idx = df_vazio.index[item['index']]
+                df_vazio.at[idx, 'latitude'] = item['lat']
+                df_vazio.at[idx, 'longitude'] = item['lon']
+                df_vazio.at[idx, 'metodo_geo'] = "IA_RECUPERADO"
         except:
             pass
-        return df_sujo
+        return df_vazio
 
-    def aplicar_modelagem_avancada(self, df):
+    def processar_ia(self, df):
         df.columns = [str(c).strip().lower() for c in df.columns]
+        df['metodo_geo'] = "GPS_ORIGINAL"
         
-        analise_tempo = df.apply(self.normalizar_horario, axis=1)
-        df['hora_final'] = [t[0] for t in analise_tempo]
-        df['metodo_hora'] = [t[1] for t in analise_tempo]
-        
-        df['origem_geo'] = "GPS_Oficial"
-        filtro_vazio = (df['latitude'] == 0) | (df['latitude'].isna()) | (df['latitude'].astype(str).str.startswith('0'))
-        
-        if filtro_vazio.any():
-            df.update(self.curadoria_geospacial(df[filtro_vazio].copy()))
+        nulos = (df['latitude'] == 0) | (df['latitude'].isna()) | (df['latitude'].astype(str) == "0")
+        if nulos.any():
+            df.update(self.curadoria_ia(df[nulos].copy()))
 
         df = df.dropna(subset=['latitude', 'longitude']).copy()
         df = df[(df['latitude'] != 0) & (df['latitude'].astype(str).str.contains('-'))]
         
         df['h3_index'] = df.apply(lambda x: h3.geo_to_h3(float(x['latitude']), float(x['longitude']), 9), axis=1)
         
-        vetor_coordenadas = df[['latitude', 'longitude']].values
-        alvo_treino = np.random.rand(len(df))
+        coords = df[['latitude', 'longitude']].values
+        y = np.random.rand(len(df))
 
-        modelo_geo = LGBMRegressor(n_estimators=50, verbose=-1).fit(vetor_coordenadas, alvo_treino)
-        df['risco_geografico'] = modelo_geo.predict(vetor_coordenadas).round(2)
+        m_lgb = LGBMRegressor(n_estimators=50, verbose=-1).fit(coords, y)
+        df['score_risco'] = m_lgb.predict(coords).round(2)
 
         df['data_dt'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
         df = df.dropna(subset=['data_dt'])
         
-        agregado = df.groupby(['h3_index', df['data_dt'].dt.month, df['data_dt'].dt.dayofweek]).size().reset_index(name='v')
-        modelo_tendencia = XGBRegressor(n_estimators=50).fit(agregado.iloc[:, 1:3].values, agregado['v'].values)
-        agregado['previsao_aumento'] = (modelo_tendencia.predict(agregado.iloc[:, 1:3].values) / agregado['v'].replace(0,1)).round(2)
-        df = df.merge(agregado[['h3_index', 'previsao_aumento']].drop_duplicates(), on='h3_index', how='left')
+        agg = df.groupby(['h3_index', df['data_dt'].dt.month, df['data_dt'].dt.dayofweek]).size().reset_index(name='v')
+        m_xgb = XGBRegressor(n_estimators=50).fit(agg.iloc[:, 1:3].values, agg['v'].values)
+        agg['tendencia'] = (m_xgb.predict(agg.iloc[:, 1:3].values) / agg['v'].replace(0,1)).round(2)
+        df = df.merge(agg[['h3_index', 'tendencia']].drop_duplicates(), on='h3_index', how='left')
 
-        if 'natureza_apurada' in df.columns:
-            df['cod_nat'] = df['natureza_apurada'].astype('category').cat.codes
-            modelo_severidade = CatBoostRegressor(n_estimators=30, verbose=0).fit(df[['latitude', 'longitude', 'cod_nat']].values, alvo_treino)
-            df['score_severidade'] = modelo_severidade.predict(df[['latitude', 'longitude', 'cod_nat']].values).round(2)
-
-        explainer = shap.Explainer(modelo_geo, vetor_coordenadas)
-        df['auditabilidade_ia'] = np.abs(explainer(vetor_coordenadas).values).mean(axis=1).round(4)
+        df['ia_auditoria'] = np.abs(shap.Explainer(m_lgb, coords)(coords).values).mean(axis=1).round(4)
         return df
 
-    def construir_ativos_ouro(self, df, ano):
-        visualizacao = folium.Map(location=[df['latitude'].mean(), df['longitude'].mean()], zoom_start=11, tiles='cartodbpositron')
-        HeatMap(df[['latitude', 'longitude', 'risco_geografico']].values.tolist(), radius=10).add_to(visualizacao)
-        visualizacao.save(str(self.camada_ouro / f"mapa_calor_{ano}.html"))
+    def gerar_ouro(self, df, ano):
+        mapa = folium.Map(location=[df['latitude'].mean(), df['longitude'].mean()], zoom_start=11, tiles='cartodbpositron')
+        HeatMap(df[['latitude', 'longitude', 'score_risco']].values.tolist(), radius=10).add_to(mapa)
+        mapa.save(str(self.ouro / f"analise_{ano}.html"))
 
-    def solicitar_relatorios_ia(self, resumo_dados):
-        if not self.inteligencia: return
-        comando = f"Gere relatórios humanizados para Executivos, Seguradoras e Logística com base nestes KPIs: {resumo_dados}. Use português profissional."
-        resposta = self.inteligencia.models.generate_content(model="gemini-1.5-flash", contents=comando)
-        return resposta.text
+    def diagnosticar(self, erro):
+        if not self.ia: return
+        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro: {erro}. Solução?").text
+        self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR**\n{diag}", status=False)
 
-    def gerar_diagnostico_ia(self, erro_tecnico):
-        if not self.inteligencia: return
-        comando = f"Analise o erro e indique correção imediata: {erro_tecnico}."
-        diagnostico = self.inteligencia.models.generate_content(model="gemini-1.5-flash", contents=comando).text
-        self.comunicar_discord(f"🚨 **ALERTA: FALHA NO PROCESSADOR CENTRAL** 🚨\n{diagnostico}", sucesso=False)
-
-    def processar_unidade_anual(self, ano, registro_estado):
-        df_bruto = self.capturar_base_ssp(ano)
-        if df_bruto is not None:
-            identificador = f"{ano}_{pd.Timestamp.now().strftime('%Y-%m-%d')}"
-            if identificador in registro_estado["processados"]: return
+    def processar_ano(self, ano, estado):
+        df = self.extrair_ssp(ano)
+        if df is not None:
+            id_ciclo = f"{ano}_{datetime.now().strftime('%Y-%m-%d')}"
+            if id_ciclo in estado["processados"]: return
             
-            df_final = self.aplicar_modelagem_avancada(df_bruto)
-            self.construir_ativos_ouro(df_final, ano)
-            df_final.to_csv(self.camada_ouro / f"mestra_looker_{ano}.csv", index=False)
+            final = self.processar_ia(df)
+            self.gerar_ouro(final, ano)
+            final.to_csv(self.ouro / f"mestra_{ano}.csv", index=False)
             
-            kpis = {"ano": ano, "volume": len(df_final), "recuperados": len(df_final[df_final['origem_geo'] == "IA_Recuperado"])}
-            boletim = self.solicitar_relatorios_ia(json.dumps(kpis))
-            self.comunicar_discord(f"📋 **BOLETIM ESTRATÉGICO DE SEGURANÇA** 📋\n{boletim}")
-            
-            registro_estado["processados"].append(identificador)
-            self.arquivo_controle.write_text(json.dumps(registro_estado))
+            estado["processados"].append(id_ciclo)
+            self.controle.write_text(json.dumps(estado))
