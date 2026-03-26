@@ -35,9 +35,10 @@ class MotorSafeDriver:
         self.token = raw_key.strip().replace('"', '').replace("'", "") if raw_key else None
         
         if self.token:
-            self.ia = genai.Client(api_key=self.token)
+            # Conexão direta com o SDK v2
+            self.cliente = genai.Client(api_key=self.token)
         else:
-            self.ia = None
+            self.cliente = None
 
     def avisar(self, msg, status=True):
         url = self.webhook_sucesso if status else self.webhook_erro
@@ -52,7 +53,7 @@ class MotorSafeDriver:
             if not self.controle.exists():
                 if (self.raiz / "datalake").exists():
                     shutil.rmtree(self.raiz / "datalake")
-                self.avisar("🤖 **SISTEMA: DOWNLOAD PERSISTENTE ATIVADO. VARREDURA 2022-2026.**")
+                self.avisar("🤖 **SISTEMA: PROTOCOLO H3-V4 ATIVADO. VARREDURA HISTÓRICA 2022-2026.**")
             
             for p in [self.bronze, self.prata, self.ouro]:
                 p.mkdir(parents=True, exist_ok=True)
@@ -72,7 +73,6 @@ class MotorSafeDriver:
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         path_xlsx = self.bronze / f"ssp_{ano}.xlsx"
         
-        # DOWNLOAD PERSISTENTE: Stream para arquivos grandes
         for tentativa in range(5):
             try:
                 with requests.get(url, stream=True, timeout=300) as r:
@@ -81,7 +81,6 @@ class MotorSafeDriver:
                         for chunk in r.iter_content(chunk_size=8192):
                             if chunk: f.write(chunk)
                 
-                # Leitura otimizada após download garantido
                 previa = pd.read_excel(path_xlsx, header=None, nrows=50)
                 pulo = 0
                 for i, lin in previa.iterrows():
@@ -91,7 +90,7 @@ class MotorSafeDriver:
                         break
                 
                 df = pd.read_excel(path_xlsx, skiprows=pulo)
-                path_xlsx.unlink() # Limpa o bronze para economizar espaço
+                path_xlsx.unlink()
                 return df
             except Exception as e:
                 time.sleep(20 * (tentativa + 1))
@@ -99,7 +98,7 @@ class MotorSafeDriver:
         return None
 
     def curadoria_ia(self, df_vazio):
-        if not self.ia or df_vazio.empty:
+        if not self.cliente or df_vazio.empty:
             return df_vazio
             
         limite = max(1, int(len(df_vazio) * self.fator_capacidade))
@@ -112,7 +111,8 @@ class MotorSafeDriver:
         prompt = f"Converta endereços em Lat/Lon. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
         
         try:
-            res = self.ia.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+            # Chamada simplificada para evitar erro 404
+            res = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
             dados = json.loads(res.text.replace('```json', '').replace('```', '').strip())
             for item in dados:
                 idx = df_vazio.index[item['index']]
@@ -134,7 +134,8 @@ class MotorSafeDriver:
         df = df.dropna(subset=['latitude', 'longitude']).copy()
         df = df[(df['latitude'] != 0) & (df['latitude'].astype(str).str.contains('-'))]
         
-        df['h3_index'] = df.apply(lambda x: h3.geo_to_h3(float(x['latitude']), float(x['longitude']), 9), axis=1)
+        # CORREÇÃO H3 V4: geo_to_h3 -> latlng_to_cell
+        df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
         
         coords = df[['latitude', 'longitude']].values
         y = np.random.rand(len(df))
@@ -159,9 +160,12 @@ class MotorSafeDriver:
         mapa.save(str(self.ouro / f"analise_{ano}.html"))
 
     def diagnosticar(self, erro):
-        if not self.ia: return
-        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Solução em português?").text
-        self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR** 🚨\n{diag}", status=False)
+        if not self.cliente: return
+        try:
+            diag = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Solução em português?").text
+            self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR** 🚨\n{diag}", status=False)
+        except:
+            self.avisar(f"🚨 **ALERTA: ERRO CRÍTICO DE CONEXÃO/API**", status=False)
 
     def processar_ano(self, ano, estado):
         df = self.extrair_ssp(ano)
