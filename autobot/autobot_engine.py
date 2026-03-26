@@ -7,7 +7,7 @@ import requests
 import time
 from google import genai
 import folium
-from folium.plugins import HeatMap, MarkerCluster
+from folium.plugins import HeatMap
 from pathlib import Path
 from datetime import datetime, timedelta
 from xgboost import XGBRegressor
@@ -52,17 +52,17 @@ class MotorSafeDriver:
             if not self.controle.exists():
                 if (self.raiz / "datalake").exists():
                     shutil.rmtree(self.raiz / "datalake")
-                self.avisar("🤖 **SISTEMA: INICIALIZANDO VARREDURA HISTÓRICA (2022-2026) A 50% DE CAPACIDADE.**")
+                self.avisar("🤖 **SISTEMA: PROTOCOLO DE RECUPERAÇÃO 2022-2026 INICIADO A 50% DE CAPACIDADE.**")
             
             for p in [self.bronze, self.prata, self.ouro]:
                 p.mkdir(parents=True, exist_ok=True)
             
             estado = json.loads(self.controle.read_text()) if self.controle.exists() else {"processados": []}
             
-            ano_atual = datetime.now().year
-            for ano in range(2022, ano_atual + 1):
+            ano_fim = datetime.now().year
+            for ano in range(2022, ano_fim + 1):
                 if (datetime.now() - self.inicio) > self.limite_operacional:
-                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. PAUSANDO PARA PRESERVAÇÃO DE RECURSOS.**")
+                    self.avisar("🤖 **SISTEMA: JANELA DE 3H ATINGIDA. SUSPENDENDO CICLO PARA PRESERVAR QUOTA.**")
                     break
                 self.processar_ano(ano, estado)
         except Exception as e:
@@ -77,7 +77,8 @@ class MotorSafeDriver:
             previa = pd.read_excel(path_xlsx, header=None, nrows=50)
             pulo = 0
             for i, lin in previa.iterrows():
-                if any("LATITUDE" in str(c).upper() for c in lin):
+                celulas = [str(c).upper().strip() for c in lin]
+                if "LATITUDE" in celulas or "LOGRADOURO" in celulas:
                     pulo = i
                     break
             df = pd.read_excel(path_xlsx, skiprows=pulo)
@@ -90,17 +91,19 @@ class MotorSafeDriver:
             return df_vazio
             
         limite = max(1, int(len(df_vazio) * self.fator_capacidade))
-        # Mapeamento dinâmico para evitar KeyError
-        cols = {c.upper().strip(): c for c in df_vazio.columns}
-        c_log = cols.get('LOGRADOURO')
-        c_bai = cols.get('BAIRRO')
-        c_mun = cols.get('NOME_MUNICIPIO')
-        c_rub = cols.get('RUBRICA')
+        
+        # Mapeamento dinâmico e robusto contra variações de cabeçalho
+        cols_atuais = {str(c).upper().strip(): c for c in df_vazio.columns}
+        c_log = cols_atuais.get('LOGRADOURO')
+        c_bai = cols_atuais.get('BAIRRO')
+        c_mun = cols_atuais.get('NOME_MUNICIPIO')
+        c_rub = cols_atuais.get('RUBRICA')
+
+        if not all([c_log, c_bai, c_mun, c_rub]):
+            return df_vazio
 
         amostra = df_vazio[[c_log, c_bai, c_mun, c_rub]].head(limite)
-        self.avisar(f"🤖 **IA: RECUPERANDO {len(amostra)} COORDENADAS (META 50%).**")
-        
-        prompt = f"Estime Lat/Lon para estes endereços. Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
+        prompt = f"Estime Lat/Lon para estes endereços criminais. Retorne apenas JSON puro: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}]. Dados: {json.dumps(amostra.to_dict(orient='records'))}"
         
         try:
             res = self.ia.models.generate_content(model="gemini-1.5-flash", contents=prompt)
@@ -115,7 +118,7 @@ class MotorSafeDriver:
         return df_vazio
 
     def processar_ia(self, df):
-        # Normalização de colunas para garantir consistência
+        # Normalização forçada de colunas para minúsculas
         df.columns = [str(c).strip().lower() for c in df.columns]
         df['metodo_geo'] = "GPS_ORIGINAL"
         
@@ -134,13 +137,13 @@ class MotorSafeDriver:
         m_lgb = LGBMRegressor(n_estimators=50, verbose=-1).fit(coords, y)
         df['score_risco'] = m_lgb.predict(coords).round(2)
 
-        df['data_dt'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
-        df = df.dropna(subset=['data_dt'])
-        
-        agg = df.groupby(['h3_index', df['data_dt'].dt.month, df['data_dt'].dt.dayofweek]).size().reset_index(name='v')
-        m_xgb = XGBRegressor(n_estimators=50).fit(agg.iloc[:, 1:3].values, agg['v'].values)
-        agg['tendencia'] = (m_xgb.predict(agg.iloc[:, 1:3].values) / agg['v'].replace(0,1)).round(2)
-        df = df.merge(agg[['h3_index', 'tendencia']].drop_duplicates(), on='h3_index', how='left')
+        if 'data_ocorrencia_bo' in df.columns:
+            df['data_dt'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
+            df = df.dropna(subset=['data_dt'])
+            agg = df.groupby(['h3_index', df['data_dt'].dt.month, df['data_dt'].dt.dayofweek]).size().reset_index(name='v')
+            m_xgb = XGBRegressor(n_estimators=50).fit(agg.iloc[:, 1:3].values, agg['v'].values)
+            agg['tendencia'] = (m_xgb.predict(agg.iloc[:, 1:3].values) / agg['v'].replace(0,1)).round(2)
+            df = df.merge(agg[['h3_index', 'tendencia']].drop_duplicates(), on='h3_index', how='left')
 
         df['ia_auditoria'] = np.abs(shap.Explainer(m_lgb, coords)(coords).values).mean(axis=1).round(4)
         return df
@@ -152,7 +155,7 @@ class MotorSafeDriver:
 
     def diagnosticar(self, erro):
         if not self.ia: return
-        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro: {erro}. Como líder de dados, qual a solução rápida?").text
+        diag = self.ia.models.generate_content(model="gemini-1.5-flash", contents=f"Erro técnico: {erro}. Como líder de dados, qual a solução rápida em português?").text
         self.avisar(f"🚨 **ALERTA: FALHA NO MOTOR**\n{diag}", status=False)
 
     def processar_ano(self, ano, estado):
