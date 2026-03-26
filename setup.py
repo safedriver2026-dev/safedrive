@@ -13,6 +13,7 @@ setup(
         "lightgbm",
         "catboost",
         "folium",
-        "scikit-learn"
+        "scikit-learn",
+        "google-generativeai"
     ],
 )
