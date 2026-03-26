@@ -1,4 +1,4 @@
-name: SafeDriver_Global_Autonomous
+name: SafeDriver
 
 on:
   schedule:
