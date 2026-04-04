@@ -1,201 +1,190 @@
 import os
-import shutil
 import json
+import time
+import requests
 import pandas as pd
 import numpy as np
-import requests
-import time
-from google import genai
-from pathlib import Path
-from datetime import datetime, timedelta
-from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
-from catboost import CatBoostRegressor
-import shap
 import h3
+import folium
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from datetime import datetime
+from geopy.geocoders import Nominatim
+from lightgbm import LGBMRegressor
 
-class MotorSafeDriver:
-    def __init__(self):
+app = FastAPI(title="SafeDriver API")
+BASE_OURO_CACHE = None
+
+class AutobotPipeline:
+    def __init__(self, ano_alvo):
+        self.ano_alvo = ano_alvo
         self.inicio = datetime.now()
-        self.limite_github = timedelta(hours=5)
-        self.max_chamadas_ia = 1400 
-        self.chamadas_realizadas = 0
-        
         self.raiz = Path(".")
-        self.datalake = self.raiz / "datalake"
-        self.bronze = self.datalake / "bronze"
-        self.prata = self.datalake / "prata"
-        self.ouro = self.datalake / "ouro"
-        self.controle = self.raiz / "controle_delta.json"
-        
-        self.webhook = os.getenv("DISCORD_SUCESSO")
-        self.token = os.getenv("GEMINI_JSON", "").strip().replace('"', '').replace("'", "")
-        
-        if self.token:
-            self.cliente = genai.Client(api_key=self.token)
-        else:
-            self.cliente = None
+        self.bronze = self.raiz / "datalake" / "bronze"
+        self.prata = self.raiz / "datalake" / "prata"
+        self.ouro = self.raiz / "datalake" / "ouro"
+        self.arquivo_cache_geo = self.raiz / "geo_cache.json"
+        self.geolocator = Nominatim(user_agent="safedriver_bot_v3")
 
-    def avisar(self, msg):
-        if self.webhook:
-            try: requests.post(self.webhook, json={"content": msg})
-            except: pass
+    def preparar_ambiente(self):
+        for diretorio in [self.bronze, self.prata, self.ouro]:
+            diretorio.mkdir(parents=True, exist_ok=True)
 
-    def gerenciar_ciclo_vida(self):
+    def ingerir_bronze(self):
+        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{self.ano_alvo}.xlsx"
+        arquivo_temp = self.bronze / f"download_{self.ano_alvo}.xlsx"
+        arquivo_parquet = self.bronze / f"bruto_{self.ano_alvo}.parquet"
+
+        if arquivo_parquet.exists():
+            return pd.read_parquet(arquivo_parquet)
+
         try:
-            # GARANTIA DE ESTRUTURA: Força a criação das pastas se não existirem
-            for p in [self.bronze, self.prata, self.ouro]:
-                p.mkdir(parents=True, exist_ok=True)
-
-            if not self.controle.exists():
-                self.avisar("🚀 **LIDERANÇA: INICIANDO RECONSTRUÇÃO DA BASE HISTÓRICA COMPLETA (2022-2026).**")
-                self.controle.write_text(json.dumps({"processados": {}}))
+            with requests.get(url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(arquivo_temp, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
             
-            estado = json.loads(self.controle.read_text())
-            ano_atual = datetime.now().year
-            
-            # VARREDURA OBRIGATÓRIA: Percorre todos os anos sem excessão
-            anos_para_processar = list(range(2022, ano_atual + 1))
-            
-            for ano in anos_para_processar:
-                # Verifica se ainda temos tempo de execução no GitHub
-                if (datetime.now() - self.inicio) > self.limite_github:
-                    self.avisar(f"⚠️ **SISTEMA: TEMPO LIMITE ATINGIDO. PARADO NO ANO {ano}. RETOMA NO PRÓXIMO CICLO.**")
-                    break
-                
-                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                tamanho_remoto = self.verificar_remoto(url)
-                info_local = estado["processados"].get(str(ano), {})
+            colunas_alvo = ['NOME_MUNICIPIO', 'BAIRRO', 'LOGRADOURO', 'NUMERO_LOGRADOURO', 'LATITUDE', 'LONGITUDE', 'RUBRICA', 'DATA_OCORRENCIA_BO']
+            df = pd.read_excel(arquivo_temp, usecols=lambda c: c in colunas_alvo)
+            df.to_parquet(arquivo_parquet, index=False)
+            arquivo_temp.unlink()
+            return df
+        except Exception:
+            return None
 
-                # Só pula se o tamanho for idêntico e maior que zero
-                if tamanho_remoto == info_local.get("tamanho", 0) and tamanho_remoto > 0:
-                    self.atualizar_inteligencia_diaria(ano)
-                else:
-                    self.avisar(f"📥 **SISTEMA: PROCESSANDO ANO {ano}...**")
-                    self.processar_fluxo_completo(url, ano, estado, tamanho_remoto)
-                
-            self.controle.write_text(json.dumps(estado))
-            self.avisar("🏁 **LIDERANÇA: CICLO DE SINCRONIZAÇÃO HISTÓRICA FINALIZADO.**")
-        except Exception as e:
-            self.gerar_boletim_erro(str(e))
+    def carregar_cache(self):
+        if self.arquivo_cache_geo.exists():
+            with open(self.arquivo_cache_geo, 'r') as f:
+                return json.load(f)
+        return {}
 
-    def verificar_remoto(self, url):
-        try:
-            res = requests.head(url, timeout=30)
-            return int(res.headers.get('Content-Length', 0))
-        except: return -1
+    def salvar_cache(self, cache):
+        with open(self.arquivo_cache_geo, 'w') as f:
+            json.dump(cache, f)
 
-    def extrair_ssp(self, url, ano):
-        xlsx = self.bronze / f"temp_{ano}.xlsx"
-        for tentativa in range(3):
-            try:
-                with requests.get(url, stream=True, timeout=300) as r:
-                    r.raise_for_status()
-                    with open(xlsx, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=65536): f.write(chunk)
-                
-                # Detecção dinâmica de cabeçalho
-                previa = pd.read_excel(xlsx, header=None, nrows=100)
-                pulo = 0
-                for i, lin in previa.iterrows():
-                    if any("LATITUDE" in str(c).upper() for c in lin):
-                        pulo = i; break
-                
-                df = pd.read_excel(xlsx, skiprows=pulo)
-                xlsx.unlink()
-                df.to_parquet(self.bronze / f"bruto_{ano}.parquet", index=False)
-                return df
-            except:
-                time.sleep(10)
-        return None
-
-    def curadoria_ia(self, df_nulo):
-        if not self.cliente or df_nulo.empty or self.chamadas_realizadas >= self.max_chamadas_ia:
-            return df_nulo
-        
-        cols = {str(c).upper().strip(): c for c in df_nulo.columns}
-        c_log, c_bai, c_mun = cols.get('LOGRADOURO'), cols.get('BAIRRO'), cols.get('NOME_MUNICIPIO')
-
-        if not all([c_log, c_bai, c_mun]): return df_nulo
-
-        batch_size = 15
-        for i in range(0, len(df_nulo), batch_size):
-            if self.chamadas_realizadas >= self.max_chamadas_ia: break
-            
-            lote = df_nulo.iloc[i:i+batch_size][[c_log, c_bai, c_mun]]
-            prompt = f"Retorne apenas JSON: [{{'index': 0, 'lat': -23.x, 'lon': -46.x}}] para endereços: {lote.to_dict('records')}"
-            
-            try:
-                res = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-                dados = json.loads(res.text.replace('```json', '').replace('```', '').strip())
-                for item in dados:
-                    idx = lote.index[item['index']]
-                    df_nulo.at[idx, 'latitude'] = item['lat']
-                    df_nulo.at[idx, 'longitude'] = item['lon']
-                    df_nulo.at[idx, 'metodo_geo'] = "IA_RECUPERADO"
-                self.chamadas_realizadas += 1
-                time.sleep(4) 
-            except: continue
-        return df_nulo
-
-    def processar_ia(self, df):
+    def refinar_prata(self, df_bronze):
+        df = df_bronze.copy()
         df.columns = [str(c).strip().lower() for c in df.columns]
-        df['metodo_geo'] = "GPS_ORIGINAL"
-        
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         
         nulos = (df['latitude'] == 0) | (df['latitude'].isna())
-        if nulos.any():
-            df.update(self.curadoria_ia(df[nulos].copy()))
+        df_nulos = df[nulos].copy()
+        
+        if not df_nulos.empty:
+            cache = self.carregar_cache()
+            recuperados = 0
+            limite_api = 100
+            
+            for idx, row in df_nulos.iterrows():
+                if recuperados >= limite_api: break
+                
+                endereco = f"{row.get('logradouro', '')}, {row.get('numero_logradouro', '')}, {row.get('bairro', '')}, {row.get('nome_municipio', '')}, SP"
+                
+                if endereco in cache:
+                    df.at[idx, 'latitude'] = cache[endereco]['lat']
+                    df.at[idx, 'longitude'] = cache[endereco]['lon']
+                else:
+                    try:
+                        time.sleep(1.5)
+                        loc = self.geolocator.geocode(endereco, timeout=5)
+                        if loc:
+                            cache[endereco] = {'lat': loc.latitude, 'lon': loc.longitude}
+                            df.at[idx, 'latitude'] = loc.latitude
+                            df.at[idx, 'longitude'] = loc.longitude
+                        recuperados += 1
+                    except: continue
+            
+            self.salvar_cache(cache)
 
-        df_final = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
+        arquivo_prata = self.prata / f"prata_{self.ano_alvo}.parquet"
+        df_limpo = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
+        df_limpo.to_parquet(arquivo_prata, index=False)
+        return df_limpo
+
+    def consolidar_ouro(self, df_prata):
+        df_prata['h3_index'] = df_prata.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
         
-        # H3 v4 latlng_to_cell
-        df_final['h3_index'] = df_final.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
+        dados = df_prata.groupby('h3_index').size().reset_index(name='crimes')
+        dados['lat'] = dados['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
+        dados['lon'] = dados['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
         
-        # Tríade de Modelos de ML
-        coords = df_final[['latitude', 'longitude']].values
-        y = np.random.rand(len(df_final))
+        X = dados[['lat', 'lon']]
+        y = dados['crimes']
         
-        lgb = LGBMRegressor(n_estimators=50, verbose=-1).fit(coords, y)
-        xgb = XGBRegressor(n_estimators=30).fit(coords, y)
-        cat = CatBoostRegressor(n_estimators=30, verbose=0).fit(coords, y)
+        modelo = LGBMRegressor(n_estimators=100, learning_rate=0.05, verbose=-1)
+        modelo.fit(X, y)
         
-        df_final['score_final'] = ((lgb.predict(coords) + xgb.predict(coords) + cat.predict(coords)) / 3).round(2)
+        preds = modelo.predict(X)
+        dados['score_risco'] = ((preds - preds.min()) / (preds.max() - preds.min()) * 100).round(2)
         
+        df_final = df_prata.merge(dados[['h3_index', 'score_risco']], on='h3_index', how='left')
+        
+        arquivo_ouro = self.ouro / f"ouro_{self.ano_alvo}.parquet"
+        df_final.to_parquet(arquivo_ouro, index=False)
         return df_final
 
-    def processar_fluxo_completo(self, url, ano, estado, tamanho):
-        raw_df = self.extrair_ssp(url, ano)
-        if raw_df is not None:
-            ouro_df = self.processar_ia(raw_df)
-            ouro_df.to_parquet(self.ouro / f"ouro_{ano}.parquet", index=False)
+    def renderizar_mapa(self, df_ouro):
+        df_mapa = df_ouro.drop_duplicates(subset=['h3_index']).copy()
+        mapa = folium.Map(location=[-23.5505, -46.6333], zoom_start=11, tiles='CartoDB dark_matter')
+        grupo = folium.FeatureGroup(name="Risco Preditivo")
+
+        for _, row in df_mapa.iterrows():
+            score = row.get('score_risco', 0)
+            cor = '#00FF00' if score < 5 else '#FF0000'
             
-            estado["processados"][str(ano)] = {"tamanho": tamanho, "data": str(datetime.now())}
-            
-            kpis = {"ano": ano, "total": len(ouro_df), "ia_recuperada": len(ouro_df[ouro_df['metodo_geo']=="IA_RECUPERADO"])}
-            self.gerar_boletim_executivo(kpis)
-
-    def atualizar_inteligencia_diaria(self, ano):
-        path = self.ouro / f"ouro_{ano}.parquet"
-        if path.exists():
-            df = pd.read_parquet(path)
-            y = np.random.rand(len(df))
-            lgb = LGBMRegressor(n_estimators=30, verbose=-1).fit(df[['latitude', 'longitude']].values, y)
-            df['score_final'] = lgb.predict(df[['latitude', 'longitude']].values).round(2)
-            df.to_parquet(path, index=False)
-
-    def gerar_boletim_executivo(self, kpis):
-        if self.cliente:
-            prompt = f"Gere um Relatório Executivo e de Integridade para estes KPIs criminais: {json.dumps(kpis)}. Use português fidedigno."
-            res = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-            self.avisar(res.text)
-
-    def gerar_boletim_erro(self, erro):
-        if self.cliente:
             try:
-                res = self.cliente.models.generate_content(model="gemini-1.5-flash", contents=f"Erro: {erro}. Como líder de dados, explique a solução.")
-                self.avisar(f"🚨 **ALERTA DE SISTEMA**\n{res.text}")
-            except:
-                self.avisar(f"🚨 **ERRO CRÍTICO: {erro}**")
+                lat, lon = h3.cell_to_latlng(row['h3_index'])
+                folium.CircleMarker(
+                    location=[lat, lon], radius=6, color=cor, fill=True, fill_opacity=0.7,
+                    tooltip=f"H3: {row['h3_index']} | Risco: {score}%"
+                ).add_to(grupo)
+            except: continue
+            
+        grupo.add_to(mapa)
+        caminho_mapa = self.ouro / "mapa_estrategico.html"
+        mapa.save(str(caminho_mapa))
+
+    def executar_pipeline(self):
+        self.preparar_ambiente()
+        df_bronze = self.ingerir_bronze()
+        if df_bronze is not None:
+            df_prata = self.refinar_prata(df_bronze)
+            df_ouro = self.consolidar_ouro(df_prata)
+            self.renderizar_mapa(df_ouro)
+            
+            global BASE_OURO_CACHE
+            BASE_OURO_CACHE = df_ouro.drop_duplicates(subset=['h3_index'])[['h3_index', 'score_risco']].set_index('h3_index').to_dict('index')
+
+@app.get("/")
+def status_api():
+    return {"status": "Online", "servico": "SafeDriver Risco Preditivo", "registros_ativos": len(BASE_OURO_CACHE) if BASE_OURO_CACHE else 0}
+
+@app.get("/risco/{lat}/{lon}")
+def consultar_risco(lat: float, lon: float):
+    if not BASE_OURO_CACHE:
+        raise HTTPException(status_code=503, detail="Banco Ouro não carregado.")
+        
+    try:
+        h3_idx = h3.latlng_to_cell(lat, lon, 9)
+        dados_hex = BASE_OURO_CACHE.get(h3_idx, {"score_risco": 0.0})
+        status = "SEGURO" if dados_hex['score_risco'] < 5 else "ALERTA"
+        
+        return {
+            "coordenadas": {"lat": lat, "lon": lon},
+            "h3_index": h3_idx,
+            "score_risco": dados_hex['score_risco'],
+            "status": status
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+if __name__ == "__main__":
+    ano_atual = int(os.getenv("ANO_PROCESSAMENTO", 2026))
+    bot = AutobotPipeline(ano_atual)
+    bot.executar_pipeline()
+    
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
