@@ -9,7 +9,6 @@ import folium
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pathlib import Path
-from datetime import datetime
 from geopy.geocoders import Nominatim
 from lightgbm import LGBMRegressor
 
@@ -25,33 +24,43 @@ class AutobotPipeline:
         self.prata = self.raiz / "datalake" / "prata"
         self.ouro = self.raiz / "datalake" / "ouro"
         self.arquivo_cache_geo = self.raiz / "geo_cache.json"
-        self.geolocator = Nominatim(user_agent="safedriver_bot_v5")
+        self.geolocator = Nominatim(user_agent="safedriver_bot_v6")
+        self.colunas_verificacao = ['LATITUDE', 'LONGITUDE', 'RUBRICA', 'NOME_MUNICIPIO', 'BAIRRO', 'LOGRADOURO']
 
     def preparar_ambiente(self):
         for diretorio in [self.bronze, self.prata, self.ouro]:
             diretorio.mkdir(parents=True, exist_ok=True)
 
+    def descobrir_cabecalho_robusto(self, caminho_arquivo):
+        previa = pd.read_excel(caminho_arquivo, header=None, nrows=50)
+        for i, linha in previa.iterrows():
+            valores_linha = [str(v).strip().upper() for v in linha.values if pd.notna(v)]
+            matches = len(set(self.colunas_verificacao).intersection(set(valores_linha)))
+            if matches >= 4:
+                return i
+        return 0
+
     def ingerir_bronze(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         arquivo_temp = self.bronze / f"download_{ano}.xlsx"
         arquivo_parquet = self.bronze / f"bruto_{ano}.parquet"
-
         if arquivo_parquet.exists():
             return pd.read_parquet(arquivo_parquet)
-
         try:
             with requests.get(url, stream=True, timeout=120) as r:
                 r.raise_for_status()
                 with open(arquivo_temp, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-            
-            colunas_alvo = ['NOME_MUNICIPIO', 'BAIRRO', 'LOGRADOURO', 'NUMERO_LOGRADOURO', 'LATITUDE', 'LONGITUDE', 'RUBRICA', 'DATA_OCORRENCIA_BO']
-            df = pd.read_excel(arquivo_temp, usecols=lambda c: c in colunas_alvo)
-            df.to_parquet(arquivo_parquet, index=False)
+            linha_header = self.descobrir_cabecalho_robusto(arquivo_temp)
+            df = pd.read_excel(arquivo_temp, header=linha_header)
+            df.columns = [str(c).strip().upper() for c in df.columns]
+            colunas_existentes = [c for c in self.colunas_verificacao if c in df.columns]
+            df_final = df[colunas_existentes].copy()
+            df_final.to_parquet(arquivo_parquet, index=False)
             arquivo_temp.unlink()
-            return df
-        except Exception:
+            return df_final
+        except:
             return None
 
     def carregar_cache(self):
@@ -66,130 +75,96 @@ class AutobotPipeline:
 
     def refinar_prata(self, df_bronze, ano):
         df = df_bronze.copy()
-        df.columns = [str(c).strip().lower() for c in df.columns]
+        df.columns = [str(c).lower() for c in df.columns]
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
-        
-        nulos = (df['latitude'] == 0) | (df['latitude'].isna())
-        df_nulos = df[nulos].copy()
-        
-        if not df_nulos.empty:
+        precisa_limpeza = (df['latitude'] == 0) | (df['latitude'].isna())
+        df_sujo = df[precisa_limpeza].copy()
+        if not df_sujo.empty:
             cache = self.carregar_cache()
             recuperados = 0
-            limite_api = 50
-            
-            for idx, row in df_nulos.iterrows():
-                if recuperados >= limite_api: break
-                endereco = f"{row.get('logradouro', '')}, {row.get('numero_logradouro', '')}, {row.get('bairro', '')}, {row.get('nome_municipio', '')}, SP"
-                
+            for idx, row in df_sujo.iterrows():
+                if recuperados >= 30: break
+                endereco = f"{row.get('logradouro', '')}, {row.get('bairro', '')}, {row.get('nome_municipio', '')}, SP"
                 if endereco in cache:
                     df.at[idx, 'latitude'] = cache[endereco]['lat']
                     df.at[idx, 'longitude'] = cache[endereco]['lon']
                 else:
                     try:
-                        time.sleep(1.5)
+                        time.sleep(1.1)
                         loc = self.geolocator.geocode(endereco, timeout=5)
                         if loc:
                             cache[endereco] = {'lat': loc.latitude, 'lon': loc.longitude}
                             df.at[idx, 'latitude'] = loc.latitude
                             df.at[idx, 'longitude'] = loc.longitude
-                        recuperados += 1
+                            recuperados += 1
                     except: continue
-            
             self.salvar_cache(cache)
-
-        arquivo_prata = self.prata / f"prata_{ano}.parquet"
         df_limpo = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
-        df_limpo.to_parquet(arquivo_prata, index=False)
+        df_limpo.to_parquet(self.prata / f"prata_{ano}.parquet", index=False)
         return df_limpo
 
     def consolidar_ouro(self, df_historico):
-        df_historico['h3_index'] = df_historico.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
-        
-        dados = df_historico.groupby('h3_index').size().reset_index(name='crimes')
-        dados['lat'] = dados['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
-        dados['lon'] = dados['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        
-        X = dados[['lat', 'lon']]
-        y = dados['crimes']
-        
-        modelo = LGBMRegressor(n_estimators=150, learning_rate=0.05, verbose=-1)
-        modelo.fit(X, y)
-        
-        preds = modelo.predict(X)
-        dados['score_risco'] = ((preds - preds.min()) / (preds.max() - preds.min()) * 100).round(2)
-        
-        df_final = df_historico.merge(dados[['h3_index', 'score_risco']], on='h3_index', how='left')
-        arquivo_ouro = self.ouro / "ouro_consolidado.parquet"
-        df_final.to_parquet(arquivo_ouro, index=False)
+        df_historico['h3_index'] = df_historico.apply(
+            lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1
+        )
+        analise = df_historico.groupby('h3_index').size().reset_index(name='contagem_crimes')
+        analise['lat'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
+        analise['lon'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
+        modelo = LGBMRegressor(n_estimators=100, learning_rate=0.08, verbose=-1)
+        modelo.fit(analise[['lat', 'lon']], analise['contagem_crimes'])
+        preds = modelo.predict(analise[['lat', 'lon']])
+        analise['score_risco'] = ((preds - preds.min()) / (preds.max() - preds.min()) * 100).round(2)
+        df_final = df_historico.merge(analise[['h3_index', 'score_risco']], on='h3_index', how='left')
+        df_final.to_parquet(self.ouro / "ouro_consolidado.parquet", index=False)
         return df_final
 
     def renderizar_mapa(self, df_ouro):
-        df_mapa = df_ouro.drop_duplicates(subset=['h3_index']).copy()
+        df_resumo = df_ouro.drop_duplicates(subset=['h3_index']).copy()
         mapa = folium.Map(location=[-23.5505, -46.6333], zoom_start=11, tiles='CartoDB dark_matter')
-        grupo = folium.FeatureGroup(name="Risco Preditivo Integrado")
-
-        for _, row in df_mapa.iterrows():
+        for _, row in df_resumo.iterrows():
             score = row.get('score_risco', 0)
             cor = '#00FF00' if score < 5 else '#FF0000'
-            
-            try:
-                lat, lon = h3.cell_to_latlng(row['h3_index'])
-                folium.CircleMarker(
-                    location=[lat, lon], radius=6, color=cor, fill=True, fill_opacity=0.7,
-                    tooltip=f"H3: {row['h3_index']} | Risco: {score}%"
-                ).add_to(grupo)
-            except: continue
-            
-        grupo.add_to(mapa)
-        caminho_mapa = self.ouro / "mapa_estrategico.html"
-        mapa.save(str(caminho_mapa))
+            lat, lon = h3.cell_to_latlng(row['h3_index'])
+            folium.CircleMarker(
+                location=[lat, lon], radius=5, color=cor, fill=True, fill_opacity=0.6,
+                tooltip=f"H3: {row['h3_index']} | Risco: {score}%"
+            ).add_to(mapa)
+        mapa.save(str(self.ouro / "mapa_estrategico.html"))
 
     def executar_pipeline(self):
         self.preparar_ambiente()
-        lista_prata = []
-        
+        colecao_prata = []
         for ano in self.anos_historico:
-            df_bronze = self.ingerir_bronze(ano)
-            if df_bronze is not None:
-                df_prata = self.refinar_prata(df_bronze, ano)
-                lista_prata.append(df_prata)
-                
-        if lista_prata:
-            df_historico_completo = pd.concat(lista_prata, ignore_index=True)
-            df_ouro = self.consolidar_ouro(df_historico_completo)
+            dados_brutos = self.ingerir_bronze(ano)
+            if dados_brutos is not None:
+                colecao_prata.append(self.refinar_prata(dados_brutos, ano))
+        if colecao_prata:
+            df_total = pd.concat(colecao_prata, ignore_index=True)
+            df_ouro = self.consolidar_ouro(df_total)
             self.renderizar_mapa(df_ouro)
-            
             global CACHE_OURO_CONSOLIDADO
             CACHE_OURO_CONSOLIDADO = df_ouro.drop_duplicates(subset=['h3_index'])[['h3_index', 'score_risco']].set_index('h3_index').to_dict('index')
 
 @app.get("/")
-def status_api():
-    return {"status": "Online", "servico": "SafeDriver Motor Central", "registros_h3": len(CACHE_OURO_CONSOLIDADO) if CACHE_OURO_CONSOLIDADO else 0}
+def status():
+    return {"status": "Operacional", "poligonos_h3": len(CACHE_OURO_CONSOLIDADO) if CACHE_OURO_CONSOLIDADO else 0}
 
 @app.get("/risco/{lat}/{lon}")
 def consultar_risco(lat: float, lon: float):
     if not CACHE_OURO_CONSOLIDADO:
-        raise HTTPException(status_code=503, detail="Banco Ouro Consolidado não carregado.")
-        
-    try:
-        h3_idx = h3.latlng_to_cell(lat, lon, 9)
-        dados_hex = CACHE_OURO_CONSOLIDADO.get(h3_idx, {"score_risco": 0.0})
-        status = "SEGURO" if dados_hex['score_risco'] < 5 else "ALERTA"
-        
-        return {
-            "coordenadas": {"lat": lat, "lon": lon},
-            "h3_index": h3_idx,
-            "score_risco": dados_hex['score_risco'],
-            "status": status
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=503)
+    h3_idx = h3.latlng_to_cell(lat, lon, 9)
+    info = CACHE_OURO_CONSOLIDADO.get(h3_idx, {"score_risco": 0.0})
+    return {
+        "h3_index": h3_idx,
+        "score_risco": info['score_risco'],
+        "classificacao": "SEGURO" if info['score_risco'] < 5 else "ALERTA"
+    }
 
 if __name__ == "__main__":
-    ano_atual = int(os.environ.get("ANO_PROCESSAMENTO", 2026))
-    bot = AutobotPipeline(ano_atual)
-    bot.executar_pipeline()
-    
+    ano = int(os.environ.get("ANO_PROCESSAMENTO", 2026))
+    pipeline = AutobotPipeline(ano)
+    pipeline.executar_pipeline()
     if os.getenv("GITHUB_ACTIONS") != "true":
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+        uvicorn.run(app, host="0.0.0.0", port=8000)
