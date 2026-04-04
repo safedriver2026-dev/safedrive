@@ -21,8 +21,8 @@ jobs:
 
       - name: Executar Testes de Contrato
         env:
-          PYTHONPATH: .
-        run: pytest tests/ -v
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/ -v
 
       - env:
           ANO_PROCESSAMENTO: $(date +'%Y') 
