@@ -2,44 +2,27 @@ name: Autobot Execução Diaria
 
 on:
   schedule:
-    - cron: '0 7 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
-  pipeline_historico:
+  pipeline:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Baixar Codigo Fonte
-        uses: actions/checkout@v4
-        
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-
-      - name: Instalar Bibliotecas
-        run: pip install -r requirements.txt
-
-      - name: Executar Auditoria e Contratos (Pytest)
-        env:
+      - run: pip install -r requirements.txt
+      - env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/ -v
-
-      - name: Processar Data Lake e Inteligencia Artificial
-        run: ANO_PROCESSAMENTO=$(date +'%Y') python autobot/autobot_engine.py
-
-      - name: Gerar Diagramas da Documentacao Oficial
-        run: python gerador_diagramas.py
-
-      - name: Salvar Resultados no Repositorio (Commit & Push)
-        run: |
+      - run: ANO_PROCESSAMENTO=$(date +'%Y') python autobot/autobot_engine.py
+      - run: python gerador_diagramas.py
+      - run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          
-          # Adiciona os arquivos do Data Lake, Cache e os Diagramas em imagem
           git add datalake/ouro/* geo_cache.json *.png
-          
-          git commit -m "Automação: Processamento de Dados Concluído e Diagramas Gerados" || echo "Sem mudanças para salvar"
+          git commit -m "update: dados e diagramas" || echo "no changes"
           git push
