@@ -7,13 +7,27 @@ import numpy as np
 import h3
 import folium
 import uvicorn
+import shap
+import matplotlib.pyplot as plt
 from fastapi import FastAPI, HTTPException
 from pathlib import Path
 from geopy.geocoders import Nominatim
-from lightgbm import LGBMRegressor
+from xgboost import XGBRegressor
+from catboost import CatBoostRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from datetime import datetime
 
 app = FastAPI(title="SafeDriver API")
 CACHE_OURO_CONSOLIDADO = None
+
+def notificar_discord(sucesso: bool, mensagem: str):
+    webhook_url = os.environ.get("DISCORD_SUCESSO") if sucesso else os.environ.get("DISCORD_ERRO")
+    if webhook_url:
+        try:
+            requests.post(webhook_url, json={"content": mensagem}, timeout=5)
+        except:
+            pass
 
 class AutobotPipeline:
     def __init__(self, ano_atual):
@@ -24,8 +38,8 @@ class AutobotPipeline:
         self.prata = self.raiz / "datalake" / "prata"
         self.ouro = self.raiz / "datalake" / "ouro"
         self.arquivo_cache_geo = self.raiz / "geo_cache.json"
-        self.geolocator = Nominatim(user_agent="safedriver_bot_v7")
-        self.colunas_verificacao = ['LATITUDE', 'LONGITUDE', 'RUBRICA', 'NOME_MUNICIPIO', 'BAIRRO', 'LOGRADOURO']
+        self.geolocator = Nominatim(user_agent="safedriver_bot_v11")
+        self.colunas_verificacao = ['LATITUDE', 'LONGITUDE', 'RUBRICA', 'NOME_MUNICIPIO', 'BAIRRO', 'LOGRADOURO', 'DESC_PERIODO']
 
     def preparar_ambiente(self):
         for diretorio in [self.bronze, self.prata, self.ouro]:
@@ -66,10 +80,7 @@ class AutobotPipeline:
                         break
             
             arquivo_temp.unlink()
-            
-            if df_final.empty:
-                return None
-                
+            if df_final.empty: return None
             df_final.to_parquet(arquivo_parquet, index=False)
             return df_final
         except:
@@ -77,21 +88,21 @@ class AutobotPipeline:
 
     def carregar_cache(self):
         if self.arquivo_cache_geo.exists():
-            with open(self.arquivo_cache_geo, 'r') as f:
-                return json.load(f)
+            with open(self.arquivo_cache_geo, 'r') as f: return json.load(f)
         return {}
 
     def salvar_cache(self, cache):
-        with open(self.arquivo_cache_geo, 'w') as f:
-            json.dump(cache, f)
+        with open(self.arquivo_cache_geo, 'w') as f: json.dump(cache, f)
 
     def refinar_prata(self, df_bronze, ano):
         df = df_bronze.copy()
         df.columns = [str(c).lower() for c in df.columns]
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
+        
         precisa_limpeza = (df['latitude'] == 0) | (df['latitude'].isna())
         df_sujo = df[precisa_limpeza].copy()
+        
         if not df_sujo.empty:
             cache = self.carregar_cache()
             recuperados = 0
@@ -112,6 +123,7 @@ class AutobotPipeline:
                             recuperados += 1
                     except: continue
             self.salvar_cache(cache)
+            
         df_limpo = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
         df_limpo.to_parquet(self.prata / f"prata_{ano}.parquet", index=False)
         return df_limpo
@@ -120,13 +132,59 @@ class AutobotPipeline:
         df_historico['h3_index'] = df_historico.apply(
             lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1
         )
-        analise = df_historico.groupby('h3_index').size().reset_index(name='contagem_crimes')
+        
+        if 'desc_periodo' not in df_historico.columns:
+            df_historico['desc_periodo'] = 'Desconhecido'
+            
+        analise = df_historico.groupby(['h3_index', 'desc_periodo']).size().reset_index(name='crimes')
         analise['lat'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
         analise['lon'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        modelo = LGBMRegressor(n_estimators=100, learning_rate=0.08, verbose=-1)
-        modelo.fit(analise[['lat', 'lon']], analise['contagem_crimes'])
-        preds = modelo.predict(analise[['lat', 'lon']])
-        analise['score_risco'] = ((preds - preds.min()) / (preds.max() - preds.min()) * 100).round(2)
+        analise['periodo_cat'] = analise['desc_periodo'].astype('category').cat.codes
+
+        X = analise[['lat', 'lon', 'periodo_cat']]
+        y = analise['crimes']
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        model_xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6, random_state=42)
+        model_cat = CatBoostRegressor(n_estimators=100, learning_rate=0.05, depth=6, verbose=0, random_state=42)
+        
+        model_xgb.fit(X_train, y_train)
+        model_cat.fit(X_train, y_train)
+
+        pred_xgb_test = model_xgb.predict(X_test)
+        pred_cat_test = model_cat.predict(X_test)
+        pred_ensemble_test = (pred_xgb_test * 0.5) + (pred_cat_test * 0.5)
+
+        mae = mean_absolute_error(y_test, pred_ensemble_test)
+        rmse = np.sqrt(mean_squared_error(y_test, pred_ensemble_test))
+        r2 = r2_score(y_test, pred_ensemble_test)
+
+        metricas = {
+            "MAE_Erro_Medio_Absoluto": round(mae, 2),
+            "RMSE_Raiz_Erro_Quadratico": round(rmse, 2),
+            "R2_Coeficiente_Determinacao": round(r2, 4),
+            "Ultima_Atualizacao": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        with open(self.ouro / "metricas_modelo.json", "w") as f:
+            json.dump(metricas, f, indent=4)
+
+        p_xgb = model_xgb.predict(X)
+        p_cat = model_cat.predict(X)
+        analise['score_bruto'] = (p_xgb * 0.5) + (p_cat * 0.5)
+        
+        analise['score_risco'] = ((analise['score_bruto'] - analise['score_bruto'].min()) / 
+                                 (analise['score_bruto'].max() - analise['score_bruto'].min()) * 100).round(2)
+
+        explainer = shap.TreeExplainer(model_xgb)
+        shap_values = explainer.shap_values(X)
+        
+        plt.figure()
+        shap.summary_plot(shap_values, X, show=False)
+        plt.savefig(self.ouro / "explica_ia_shap.png", bbox_inches='tight')
+        plt.close()
+
         df_final = df_historico.merge(analise[['h3_index', 'score_risco']], on='h3_index', how='left')
         df_final.to_parquet(self.ouro / "ouro_consolidado.parquet", index=False)
         return df_final
@@ -145,18 +203,24 @@ class AutobotPipeline:
         mapa.save(str(self.ouro / "mapa_estrategico.html"))
 
     def executar_pipeline(self):
-        self.preparar_ambiente()
-        colecao_prata = []
-        for ano in self.anos_historico:
-            dados_brutos = self.ingerir_bronze(ano)
-            if dados_brutos is not None:
-                colecao_prata.append(self.refinar_prata(dados_brutos, ano))
-        if colecao_prata:
-            df_total = pd.concat(colecao_prata, ignore_index=True)
-            df_ouro = self.consolidar_ouro(df_total)
-            self.renderizar_mapa(df_ouro)
-            global CACHE_OURO_CONSOLIDADO
-            CACHE_OURO_CONSOLIDADO = df_ouro.drop_duplicates(subset=['h3_index'])[['h3_index', 'score_risco']].set_index('h3_index').to_dict('index')
+        try:
+            self.preparar_ambiente()
+            colecao_prata = []
+            for ano in self.anos_historico:
+                dados_brutos = self.ingerir_bronze(ano)
+                if dados_brutos is not None:
+                    colecao_prata.append(self.refinar_prata(dados_brutos, ano))
+            if colecao_prata:
+                df_total = pd.concat(colecao_prata, ignore_index=True)
+                df_ouro = self.consolidar_ouro(df_total)
+                self.renderizar_mapa(df_ouro)
+                global CACHE_OURO_CONSOLIDADO
+                CACHE_OURO_CONSOLIDADO = df_ouro.drop_duplicates(subset=['h3_index'])[['h3_index', 'score_risco']].set_index('h3_index').to_dict('index')
+            
+            notificar_discord(sucesso=True, mensagem=f"✅ Pipeline SafeDriver finalizado com sucesso! Processado até o ano: {self.ano_atual}")
+        except Exception as e:
+            notificar_discord(sucesso=False, mensagem=f"🚨 ERRO CRÍTICO no Pipeline SafeDriver: {str(e)}")
+            raise e
 
 @app.get("/")
 def status():
@@ -175,7 +239,7 @@ def consultar_risco(lat: float, lon: float):
     }
 
 if __name__ == "__main__":
-    ano = int(os.environ.get("ANO_PROCESSAMENTO", 2026))
+    ano = int(os.environ.get("ANO_PROCESSAMENTO", datetime.now().year))
     pipeline = AutobotPipeline(ano)
     pipeline.executar_pipeline()
     if os.getenv("GITHUB_ACTIONS") != "true":
