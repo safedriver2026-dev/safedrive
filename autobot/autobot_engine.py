@@ -24,21 +24,12 @@ class AutobotPipeline:
         self.prata = self.raiz / "datalake" / "prata"
         self.ouro = self.raiz / "datalake" / "ouro"
         self.arquivo_cache_geo = self.raiz / "geo_cache.json"
-        self.geolocator = Nominatim(user_agent="safedriver_bot_v6")
+        self.geolocator = Nominatim(user_agent="safedriver_bot_v7")
         self.colunas_verificacao = ['LATITUDE', 'LONGITUDE', 'RUBRICA', 'NOME_MUNICIPIO', 'BAIRRO', 'LOGRADOURO']
 
     def preparar_ambiente(self):
         for diretorio in [self.bronze, self.prata, self.ouro]:
             diretorio.mkdir(parents=True, exist_ok=True)
-
-    def descobrir_cabecalho_robusto(self, caminho_arquivo):
-        previa = pd.read_excel(caminho_arquivo, header=None, nrows=50)
-        for i, linha in previa.iterrows():
-            valores_linha = [str(v).strip().upper() for v in linha.values if pd.notna(v)]
-            matches = len(set(self.colunas_verificacao).intersection(set(valores_linha)))
-            if matches >= 4:
-                return i
-        return 0
 
     def ingerir_bronze(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
@@ -52,13 +43,34 @@ class AutobotPipeline:
                 with open(arquivo_temp, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-            linha_header = self.descobrir_cabecalho_robusto(arquivo_temp)
-            df = pd.read_excel(arquivo_temp, header=linha_header)
-            df.columns = [str(c).strip().upper() for c in df.columns]
-            colunas_existentes = [c for c in self.colunas_verificacao if c in df.columns]
-            df_final = df[colunas_existentes].copy()
-            df_final.to_parquet(arquivo_parquet, index=False)
+            
+            xls = pd.ExcelFile(arquivo_temp)
+            df_final = pd.DataFrame()
+            
+            for sheet in xls.sheet_names:
+                previa = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=50)
+                linha_header = -1
+                for i, linha in previa.iterrows():
+                    valores_linha = [str(v).strip().upper() for v in linha.values if pd.notna(v)]
+                    matches = len(set(self.colunas_verificacao).intersection(set(valores_linha)))
+                    if matches >= 4:
+                        linha_header = i
+                        break
+                
+                if linha_header != -1:
+                    df = pd.read_excel(xls, sheet_name=sheet, header=linha_header)
+                    df.columns = [str(c).strip().upper() for c in df.columns]
+                    colunas_existentes = [c for c in self.colunas_verificacao if c in df.columns]
+                    if 'LATITUDE' in colunas_existentes and 'LONGITUDE' in colunas_existentes:
+                        df_final = df[colunas_existentes].copy()
+                        break
+            
             arquivo_temp.unlink()
+            
+            if df_final.empty:
+                return None
+                
+            df_final.to_parquet(arquivo_parquet, index=False)
             return df_final
         except:
             return None
