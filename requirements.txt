@@ -4,9 +4,13 @@ pandas
 numpy
 h3
 folium
-lightgbm
 geopy
 requests
 pyarrow
 openpyxl
 pytest
+xgboost
+catboost
+shap
+scikit-learn
+matplotlib
