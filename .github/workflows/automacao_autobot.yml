@@ -2,7 +2,7 @@ name: Autobot Execução Diaria
 
 on:
   schedule:
-    - cron: '0 7 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
@@ -24,11 +24,14 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/ -v
 
-      - env:
+      - name: Executar Motor Preditivo
+        env:
           ANO_PROCESSAMENTO: $(date +'%Y') 
-        run: python autobot_engine.py
+        # CORREÇÃO APLICADA AQUI: Apontando para a subpasta autobot
+        run: python autobot/autobot_engine.py
 
-      - run: |
+      - name: Commit e Push dos Dados
+        run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add datalake/ouro/* geo_cache.json
