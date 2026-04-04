@@ -2,8 +2,12 @@ import pytest
 import pandas as pd
 import sys
 import os
+from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+caminho_raiz = str(Path(__file__).parent.parent.absolute())
+if caminho_raiz not in sys.path:
+    sys.path.insert(0, caminho_raiz)
+
 from autobot_engine import AutobotPipeline
 
 @pytest.fixture
