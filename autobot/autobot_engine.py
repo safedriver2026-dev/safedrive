@@ -14,27 +14,27 @@ from geopy.geocoders import Nominatim
 from lightgbm import LGBMRegressor
 
 app = FastAPI(title="SafeDriver API")
-BASE_OURO_CACHE = None
+CACHE_OURO_CONSOLIDADO = None
 
 class AutobotPipeline:
-    def __init__(self, ano_alvo):
-        self.ano_alvo = ano_alvo
-        self.inicio = datetime.now()
+    def __init__(self, ano_atual):
+        self.ano_atual = ano_atual
+        self.anos_historico = list(range(2022, self.ano_atual + 1))
         self.raiz = Path(".")
         self.bronze = self.raiz / "datalake" / "bronze"
         self.prata = self.raiz / "datalake" / "prata"
         self.ouro = self.raiz / "datalake" / "ouro"
         self.arquivo_cache_geo = self.raiz / "geo_cache.json"
-        self.geolocator = Nominatim(user_agent="safedriver_bot_v3")
+        self.geolocator = Nominatim(user_agent="safedriver_bot_v5")
 
     def preparar_ambiente(self):
         for diretorio in [self.bronze, self.prata, self.ouro]:
             diretorio.mkdir(parents=True, exist_ok=True)
 
-    def ingerir_bronze(self):
-        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{self.ano_alvo}.xlsx"
-        arquivo_temp = self.bronze / f"download_{self.ano_alvo}.xlsx"
-        arquivo_parquet = self.bronze / f"bruto_{self.ano_alvo}.parquet"
+    def ingerir_bronze(self, ano):
+        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+        arquivo_temp = self.bronze / f"download_{ano}.xlsx"
+        arquivo_parquet = self.bronze / f"bruto_{ano}.parquet"
 
         if arquivo_parquet.exists():
             return pd.read_parquet(arquivo_parquet)
@@ -64,7 +64,7 @@ class AutobotPipeline:
         with open(self.arquivo_cache_geo, 'w') as f:
             json.dump(cache, f)
 
-    def refinar_prata(self, df_bronze):
+    def refinar_prata(self, df_bronze, ano):
         df = df_bronze.copy()
         df.columns = [str(c).strip().lower() for c in df.columns]
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
@@ -76,11 +76,10 @@ class AutobotPipeline:
         if not df_nulos.empty:
             cache = self.carregar_cache()
             recuperados = 0
-            limite_api = 100
+            limite_api = 50
             
             for idx, row in df_nulos.iterrows():
                 if recuperados >= limite_api: break
-                
                 endereco = f"{row.get('logradouro', '')}, {row.get('numero_logradouro', '')}, {row.get('bairro', '')}, {row.get('nome_municipio', '')}, SP"
                 
                 if endereco in cache:
@@ -99,37 +98,36 @@ class AutobotPipeline:
             
             self.salvar_cache(cache)
 
-        arquivo_prata = self.prata / f"prata_{self.ano_alvo}.parquet"
+        arquivo_prata = self.prata / f"prata_{ano}.parquet"
         df_limpo = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
         df_limpo.to_parquet(arquivo_prata, index=False)
         return df_limpo
 
-    def consolidar_ouro(self, df_prata):
-        df_prata['h3_index'] = df_prata.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
+    def consolidar_ouro(self, df_historico):
+        df_historico['h3_index'] = df_historico.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
         
-        dados = df_prata.groupby('h3_index').size().reset_index(name='crimes')
+        dados = df_historico.groupby('h3_index').size().reset_index(name='crimes')
         dados['lat'] = dados['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
         dados['lon'] = dados['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
         
         X = dados[['lat', 'lon']]
         y = dados['crimes']
         
-        modelo = LGBMRegressor(n_estimators=100, learning_rate=0.05, verbose=-1)
+        modelo = LGBMRegressor(n_estimators=150, learning_rate=0.05, verbose=-1)
         modelo.fit(X, y)
         
         preds = modelo.predict(X)
         dados['score_risco'] = ((preds - preds.min()) / (preds.max() - preds.min()) * 100).round(2)
         
-        df_final = df_prata.merge(dados[['h3_index', 'score_risco']], on='h3_index', how='left')
-        
-        arquivo_ouro = self.ouro / f"ouro_{self.ano_alvo}.parquet"
+        df_final = df_historico.merge(dados[['h3_index', 'score_risco']], on='h3_index', how='left')
+        arquivo_ouro = self.ouro / "ouro_consolidado.parquet"
         df_final.to_parquet(arquivo_ouro, index=False)
         return df_final
 
     def renderizar_mapa(self, df_ouro):
         df_mapa = df_ouro.drop_duplicates(subset=['h3_index']).copy()
         mapa = folium.Map(location=[-23.5505, -46.6333], zoom_start=11, tiles='CartoDB dark_matter')
-        grupo = folium.FeatureGroup(name="Risco Preditivo")
+        grupo = folium.FeatureGroup(name="Risco Preditivo Integrado")
 
         for _, row in df_mapa.iterrows():
             score = row.get('score_risco', 0)
@@ -149,27 +147,34 @@ class AutobotPipeline:
 
     def executar_pipeline(self):
         self.preparar_ambiente()
-        df_bronze = self.ingerir_bronze()
-        if df_bronze is not None:
-            df_prata = self.refinar_prata(df_bronze)
-            df_ouro = self.consolidar_ouro(df_prata)
+        lista_prata = []
+        
+        for ano in self.anos_historico:
+            df_bronze = self.ingerir_bronze(ano)
+            if df_bronze is not None:
+                df_prata = self.refinar_prata(df_bronze, ano)
+                lista_prata.append(df_prata)
+                
+        if lista_prata:
+            df_historico_completo = pd.concat(lista_prata, ignore_index=True)
+            df_ouro = self.consolidar_ouro(df_historico_completo)
             self.renderizar_mapa(df_ouro)
             
-            global BASE_OURO_CACHE
-            BASE_OURO_CACHE = df_ouro.drop_duplicates(subset=['h3_index'])[['h3_index', 'score_risco']].set_index('h3_index').to_dict('index')
+            global CACHE_OURO_CONSOLIDADO
+            CACHE_OURO_CONSOLIDADO = df_ouro.drop_duplicates(subset=['h3_index'])[['h3_index', 'score_risco']].set_index('h3_index').to_dict('index')
 
 @app.get("/")
 def status_api():
-    return {"status": "Online", "servico": "SafeDriver Risco Preditivo", "registros_ativos": len(BASE_OURO_CACHE) if BASE_OURO_CACHE else 0}
+    return {"status": "Online", "servico": "SafeDriver Motor Central", "registros_h3": len(CACHE_OURO_CONSOLIDADO) if CACHE_OURO_CONSOLIDADO else 0}
 
 @app.get("/risco/{lat}/{lon}")
 def consultar_risco(lat: float, lon: float):
-    if not BASE_OURO_CACHE:
-        raise HTTPException(status_code=503, detail="Banco Ouro não carregado.")
+    if not CACHE_OURO_CONSOLIDADO:
+        raise HTTPException(status_code=503, detail="Banco Ouro Consolidado não carregado.")
         
     try:
         h3_idx = h3.latlng_to_cell(lat, lon, 9)
-        dados_hex = BASE_OURO_CACHE.get(h3_idx, {"score_risco": 0.0})
+        dados_hex = CACHE_OURO_CONSOLIDADO.get(h3_idx, {"score_risco": 0.0})
         status = "SEGURO" if dados_hex['score_risco'] < 5 else "ALERTA"
         
         return {
@@ -182,7 +187,7 @@ def consultar_risco(lat: float, lon: float):
         raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
-    ano_atual = int(os.getenv("ANO_PROCESSAMENTO", 2026))
+    ano_atual = int(os.environ.get("ANO_PROCESSAMENTO", 2026))
     bot = AutobotPipeline(ano_atual)
     bot.executar_pipeline()
     
