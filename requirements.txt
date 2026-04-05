@@ -9,7 +9,7 @@ requests
 pyarrow
 openpyxl
 pytest
-xgboost
+lightgbm
 catboost
 shap
 scikit-learn
