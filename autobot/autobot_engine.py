@@ -11,7 +11,6 @@ from pathlib import Path
 from datetime import datetime
 from geopy.geocoders import Nominatim
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import KNeighborsRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 
@@ -28,11 +27,11 @@ class MotorSafeDriver:
             pasta.mkdir(parents=True, exist_ok=True)
             
         self.anos = [2024, 2025, 2026]
-        self.agente = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        self.geolocalizador = Nominatim(user_agent="safedriver_industrial_v6")
-        self.historico = []
+        self.agente = {'User-Agent': 'SafeDriver-Industrial-V8'}
+        self.geolocalizador = Nominatim(user_agent="safedriver_fatec_final")
+        self.logs = []
 
-    def notificar_discord(self, titulo, mensagem, cor):
+    def disparar_discord(self, titulo, mensagem, cor):
         webhook = os.environ.get("DISCORD_SUCESSO")
         if not webhook: return
         payload = {
@@ -40,52 +39,44 @@ class MotorSafeDriver:
                 "title": titulo,
                 "description": mensagem,
                 "color": cor,
-                "footer": {"text": f"Módulo: {datetime.now().strftime('%H:%M')}"}
+                "footer": {"text": f"Sincronização: {datetime.now().strftime('%H:%M')}"}
             }]
         }
         requests.post(webhook, json=payload, timeout=15)
 
-    def classificar_perfil(self, df):
-        # Busca a melhor coluna para a natureza do crime
-        col_natureza = next((c for c in ['natureza_apurada', 'rubrica', 'descr_conduta'] if c in df.columns), None)
-        col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), None)
-        
-        if not col_natureza:
-            df['perfil'] = 'Geral'
-            df['peso'] = 1.0
-            return df
+    def localizar_folha_dados(self, conteudo):
+        excel = pd.ExcelFile(io.BytesIO(conteudo))
+        for nome_aba in excel.sheet_names:
+            df_teste = excel.parse(nome_aba, nrows=5)
+            df_teste.columns = [str(c).upper().strip() for c in df_teste.columns]
+            if 'LATITUDE' in df_teste.columns or 'RUBRICA' in df_teste.columns:
+                return excel.parse(nome_aba)
+        return None
 
-        df['natureza_norm'] = df[col_natureza].fillna('').astype(str).upper()
-        df['local_norm'] = df[col_local].fillna('').astype(str).upper() if col_local else ""
-        
+    def classificar_perfis(self, df):
+        df.columns = [str(c).lower().strip() for c in df.columns]
+        col_nat = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), None)
         df['perfil'] = 'Geral'
-        df['peso'] = 2.0 # Peso padrão (Furto/Outros)
-
-        # Lógica de perfis e pesos (Roubo = 15)
-        moto_mask = df['natureza_norm'].str.contains('VEÍCULO|CARGA|AUTO|MOTO|CONDUZIR')
-        df.loc[moto_mask, 'perfil'] = 'Motorista'
-        df.loc[moto_mask, 'peso'] = 15.0
-        
-        bike_mask = df['natureza_norm'].str.contains('BICICLETA|BIKE')
-        df.loc[bike_mask, 'perfil'] = 'Ciclista'
-        df.loc[bike_mask, 'peso'] = 15.0
-        
-        ped_mask = df['natureza_norm'].str.contains('CELULAR|TRANSEUNTE|PESSOA')
-        df.loc[ped_mask, 'perfil'] = 'Pedestre'
-        df.loc[ped_mask, 'peso'] = 15.0
-        
+        if col_nat:
+            df['natureza_upper'] = df[col_nat].fillna('').astype(str).upper()
+            df.loc[df['natureza_upper'].str.contains('VEÍCULO|CARGA|AUTO|MOTO'), 'perfil'] = 'Motorista'
+            df.loc[df['natureza_upper'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
+            if 'descr_tipolocal' in df.columns:
+                loc_upper = df['descr_tipolocal'].fillna('').astype(str).upper()
+                ped_mask = (loc_upper.str.contains('VIA PÚBLICA|RUA')) & (df['natureza_upper'].str.contains('CELULAR|PESSOA'))
+                df.loc[ped_mask, 'perfil'] = 'Pedestre'
+            df['peso'] = df['natureza_upper'].apply(lambda x: 15 if 'ROUBO' in x else 2)
         return df
 
-    def geocodificar_lacunas(self, df):
-        alvos = df[df['latitude'].isna() | (df['latitude'] == 0) | (df['latitude'] == "0")].head(15)
-        if alvos.empty: return df
-        for i, linha in alvos.iterrows():
+    def geocodificar_falhas(self, df):
+        if 'latitude' not in df.columns: return df
+        faltas = df[df['latitude'].isna() | (df['latitude'] == 0) | (df['latitude'] == "0")].head(15)
+        for i, linha in faltas.iterrows():
             endereco = f"{linha.get('logradouro', '')}, {linha.get('numero_logradouro', '')}, SP, Brasil"
             try:
                 local = self.geolocalizador.geocode(endereco, timeout=10)
                 if local:
-                    df.at[i, 'latitude'] = local.latitude
-                    df.at[i, 'longitude'] = local.longitude
+                    df.at[i, 'latitude'], df.at[i, 'longitude'] = local.latitude, local.longitude
             except: continue
         return df
 
@@ -93,28 +84,27 @@ class MotorSafeDriver:
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         caminho_bruto = self.camadas["bronze"] / f"bruto_{ano}.parquet"
         caminho_meta = self.camadas["bronze"] / f"size_{ano}.txt"
-
         try:
-            head = requests.head(url, headers=self.agente, timeout=20)
-            tamanho_ssp = str(head.headers.get('Content-Length', '0'))
-
+            head = requests.head(url, headers=self.agente, timeout=30)
+            tam_nuvem = str(head.headers.get('Content-Length', '0'))
             if caminho_bruto.exists() and caminho_meta.exists():
                 with open(caminho_meta, "r") as f:
-                    if f.read() == tamanho_ssp:
-                        self.historico.append(f"🟢 {ano}: Camada Bronze atualizada")
+                    if f.read() == tam_nuvem:
+                        self.logs.append(f"🟢 {ano}: Camada Bronze atualizada")
                         return pd.read_parquet(caminho_bruto)
-
             res = requests.get(url, headers=self.agente, timeout=300)
-            df = pd.read_excel(io.BytesIO(res.content))
-            df.columns = [str(c).upper().strip() for c in df.columns]
-            df.to_parquet(caminho_bruto, index=False)
-            with open(caminho_meta, "w") as f: f.write(tamanho_ssp)
-            self.historico.append(f"📥 {ano}: Novos dados processados")
-            return df
-        except:
-            return pd.read_parquet(caminho_bruto) if caminho_bruto.exists() else None
+            df = self.localizar_folha_dados(res.content)
+            if df is not None:
+                df.columns = [str(c).upper().strip() for c in df.columns]
+                df.to_parquet(caminho_bruto, index=False)
+                with open(caminho_meta, "w") as f: f.write(tam_nuvem)
+                self.logs.append(f"📥 {ano}: Ingestão concluída")
+                return df
+        except Exception as e:
+            self.logs.append(f"🔥 {ano}: Erro - {str(e)}")
+        return pd.read_parquet(caminho_bruto) if caminho_bruto.exists() else None
 
-    def gerar_ouro(self, df):
+    def gerar_ia_explicavel(self, df):
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)]
@@ -130,20 +120,24 @@ class MotorSafeDriver:
         resumo['periodo_idx'] = resumo['desc_periodo'].astype('category').cat.codes
 
         X, y = resumo[['lat', 'lon', 'perfil_idx', 'periodo_idx']], resumo['peso']
-        modelo = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
+        lgb = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
         
-        plt.figure()
-        shap.summary_plot(shap.Explainer(modelo, X)(X), X, show=False)
+        # Correção Crítica do SHAP
+        plt.figure(figsize=(10, 6))
+        explainer = shap.TreeExplainer(lgb)
+        shap_values = explainer.shap_values(X)
+        
+        shap.summary_plot(shap_values, X, show=False, plot_type="bar")
+        plt.title("Fatores Determinantes do Risco (SHAP)")
         plt.savefig(self.camadas["docs"] / "explicabilidade_ia.png", bbox_inches='tight')
         plt.close()
 
-        resumo['score_risco'] = modelo.predict(X)
+        resumo['score_risco'] = lgb.predict(X)
         caminho_csv = self.camadas["ouro"] / "base_looker.csv"
         resumo.to_csv(caminho_csv, index=False)
         
-        assinatura = hashlib.sha256(open(caminho_csv, "rb").read()).hexdigest()
-        with open(self.camadas["ouro"] / "base_looker.sha256", "w") as f:
-            f.write(assinatura)
+        hash_val = hashlib.sha256(open(caminho_csv, "rb").read()).hexdigest()
+        with open(self.camadas["ouro"] / "base_looker.sha256", "w") as f: f.write(hash_val)
         return len(resumo)
 
     def iniciar(self):
@@ -151,17 +145,15 @@ class MotorSafeDriver:
         for ano in self.anos:
             dados = self.sincronizar_bronze(ano)
             if dados is not None:
-                dados.columns = [c.lower() for c in dados.columns]
-                dados = self.classificar_perfil(dados)
-                dados = self.geocodificar_lacunas(dados)
+                dados = self.classificar_perfis(dados)
+                dados = self.geocodificar_falhas(dados)
                 colecao.append(dados)
-
         if colecao:
-            total = self.gerar_ouro(pd.concat(colecao))
-            msg = "\n".join(self.historico) + f"\n📍 Células H3: {total}"
-            self.notificar_discord("SafeDriver: Pipeline Executado", msg, 3066993)
+            total = self.gerar_ia_explicavel(pd.concat(colecao))
+            msg = "\n".join(self.logs) + f"\n📍 Células de Risco: {total}"
+            self.disparar_discord("SafeDriver: Pipeline e SHAP OK", msg, 3066993)
         else:
-            self.notificar_discord("SafeDriver: Falha", "Sem dados capturados.", 15158332)
+            self.disparar_discord("SafeDriver: Falha", "Sem dados capturados.", 15158332)
 
 if __name__ == "__main__":
     MotorSafeDriver().iniciar()
