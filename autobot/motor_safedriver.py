@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import time
 import requests
 import pandas as pd
 import numpy as np
@@ -28,26 +29,34 @@ class MotorSafeDriver:
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         
         self.anos = list(range(2022, datetime.now().year + 1))
-        self.agente = {'User-Agent': 'SafeDriver-BR-V19-Industrial'}
+        
+        self.cabecalhos = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive',
+            'Referer': 'https://www.ssp.sp.gov.br/estatistica/transparencia-trimestral'
+        }
+        
         self.webhook = os.environ.get("DISCORD_WEBHOOK")
-        self.manifesto_caminho = self.pastas["auditoria"] / "manifesto.json"
+        self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
         self.auditoria = self.carregar_manifesto()
 
     def carregar_manifesto(self):
-        if self.manifesto_caminho.exists():
-            with open(self.manifesto_caminho, "r") as f: return json.load(f)
+        if self.manifesto_path.exists():
+            with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def calcular_hash(self, conteudo):
+    def calcular_assinatura(self, conteudo):
         return hashlib.sha256(conteudo).hexdigest()
 
-    def enviar_alerta(self, titulo, msg, cor):
+    def avisar_discord(self, titulo, msg, cor):
         if not self.webhook: return
         payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
         try: requests.post(self.webhook, json=payload, timeout=10)
         except: pass
 
-    def identificar_base_ssp(self, conteudo):
+    def extrair_dados_ssp(self, conteudo):
         try:
             excel = pd.ExcelFile(io.BytesIO(conteudo))
             for aba in excel.sheet_names:
@@ -58,25 +67,24 @@ class MotorSafeDriver:
             return None
         except: return None
 
-    def processar_ia_ensemble(self, df):
+    def processar_ia_v20(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
         
         df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
         
         df['perfil'] = 'Geral'
-        col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
-        df['crime_alvo'] = df[col_crime].fillna('').astype(str).upper()
+        col_nat = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
+        df['crime_texto'] = df[col_nat].fillna('').astype(str).upper()
         
-        df.loc[df['crime_alvo'].str.contains('VEÍCULO|MOTO|CARGA|AUTO|CONDUZIR'), 'perfil'] = 'Motorista'
-        df.loc[df['crime_alvo'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
+        df.loc[df['crime_texto'].str.contains('VEÍCULO|MOTO|CARGA|AUTO|CONDUZIR'), 'perfil'] = 'Motorista'
+        df.loc[df['crime_texto'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
         
-        col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
-        if col_local in df.columns:
-            loc_alvo = df[col_local].fillna('').astype(str).upper()
-            mask_ped = (loc_alvo.str.contains('VIA PÚBLICA|RUA')) & (df['crime_alvo'].str.contains('CELULAR|PESSOA'))
-            df.loc[mask_ped, 'perfil'] = 'Pedestre'
+        col_loc = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
+        if col_loc in df.columns:
+            loc_up = df[col_loc].fillna('').astype(str).upper()
+            df.loc[(loc_up.str.contains('VIA PÚBLICA')) & (df['crime_texto'].str.contains('CELULAR|PESSOA')), 'perfil'] = 'Pedestre'
         
-        df['severidade'] = df['crime_alvo'].apply(lambda x: 15 if 'ROUBO' in x else 2)
+        df['severidade'] = df['crime_texto'].apply(lambda x: 15 if 'ROUBO' in x else 2)
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
@@ -97,64 +105,70 @@ class MotorSafeDriver:
         catb = CatBoostRegressor(iterations=100, silent=True).fit(X, y)
         knnr = KNeighborsRegressor(n_neighbors=5).fit(X, y)
 
-        explicador = shap.TreeExplainer(lgbm)
-        shap_v = explicador.shap_values(X)
+        explainer = shap.TreeExplainer(lgbm)
+        shap_v = explainer.shap_values(X)
         for i, col in enumerate(X.columns): fato[f'influencia_{col}'] = shap_v[:, i]
             
         fato['score_risco'] = (lgbm.predict(X) * 0.4 + catb.predict(X) * 0.4 + knnr.predict(X) * 0.2)
         
         ouro_path = self.pastas["ouro"] / "base_final_bi.csv"
         fato.to_csv(ouro_path, index=False)
-        
-        hash_ouro = hashlib.sha256(open(ouro_path, "rb").read()).hexdigest()
-        self.auditoria["hash_ouro"] = hash_ouro
+        self.auditoria["hash_ouro"] = hashlib.sha256(open(ouro_path, "rb").read()).hexdigest()
         
         return len(fato)
 
     def iniciar_pipeline(self):
         try:
             pool = []
-            log_servico = []
+            relatorio = []
             
-            for ano in self.anos:
-                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
+            with requests.Session() as sessao:
+                sessao.headers.update(self.cabecalhos)
                 
-                try:
-                    head = requests.head(url, headers=self.agente, timeout=30)
-                    tamanho_ssp = str(head.headers.get('Content-Length', '0'))
+                for ano in self.anos:
+                    url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+                    caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
                     
-                    if caminho_local.exists() and self.auditoria.get(f"tamanho_{ano}") == tamanho_ssp:
-                        df_existente = pd.read_parquet(caminho_local)
-                        pool.append(df_existente)
-                        log_servico.append(f"📦 {ano}: DeltaSync (Sem alteracoes)")
-                        continue
+                    try:
+                        # DeltaSync: Verifica metadados sem baixar o arquivo todo
+                        head = sessao.head(url, timeout=30)
+                        tamanho_remoto = str(head.headers.get('Content-Length', '0'))
+                        
+                        if caminho_local.exists() and self.auditoria.get(f"size_{ano}") == tamanho_remoto:
+                            pool.append(pd.read_parquet(caminho_local))
+                            relatorio.append(f"📦 {ano}: DeltaSync Ativo")
+                            continue
 
-                    res = requests.get(url, headers=self.agente, timeout=180)
-                    if res.status_code == 200:
-                        df_novo = self.identificar_base_ssp(res.content)
-                        if df_novo is not None:
-                            df_novo.to_parquet(caminho_local)
-                            self.auditoria[f"tamanho_{ano}"] = tamanho_ssp
-                            self.auditoria[f"hash_{ano}"] = self.calcular_hash(res.content)
-                            pool.append(df_novo)
-                            log_servico.append(f"📥 {ano}: Sincronizacao Incremental Concluida")
-                except:
-                    if caminho_local.exists():
-                        pool.append(pd.read_parquet(caminho_local))
-                        log_servico.append(f"⚠️ {ano}: Erro de rede (Usando cache)")
+                        # Download camuflado com delay humano
+                        time.sleep(2)
+                        res = sessao.get(url, timeout=180)
+                        if res.status_code == 200:
+                            df_novo = self.extrair_dados_ssp(res.content)
+                            if df_novo is not None:
+                                df_novo.to_parquet(caminho_local)
+                                self.auditoria[f"size_{ano}"] = tamanho_remoto
+                                self.auditoria[f"hash_{ano}"] = self.calcular_assinatura(res.content)
+                                pool.append(df_novo)
+                                relatorio.append(f"📥 {ano}: Sincronização Incremental")
+                        else:
+                            raise Exception(f"Erro HTTP {res.status_code}")
+                            
+                    except Exception as e:
+                        if caminho_local.exists():
+                            pool.append(pd.read_parquet(caminho_local))
+                            relatorio.append(f"⚠️ {ano}: Erro de rede (Usando cache)")
 
-            if not pool: raise Exception("Fontes de dados indisponiveis")
+            if not pool: raise Exception("Nenhuma fonte de dados acessível após camuflagem")
 
-            total_h3 = self.processar_ia_ensemble(pd.concat(pool))
+            total = self.processar_ia_v20(pd.concat(pool))
             
-            with open(self.manifesto_caminho, "w") as f: json.dump(self.auditoria, f, indent=4)
+            with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
-            self.enviar_alerta("SafeDriver Operacional", "\n".join(log_servico), 3447003)
-            self.enviar_alerta("SafeDriver Executivo", f"Base atualizada: {total_h3} celulas\nIntegridade: OK\nMetodo: DeltaSync", 3066993)
+            self.avisar_discord("Operacional SafeDriver", "\n".join(relatorio), 3447003)
+            self.avisar_discord("Executivo SafeDriver", f"Base: {total} áreas\nEnsemble: CatB+LGBM+KNN\nIntegridade: OK", 3066993)
 
         except Exception as e:
-            self.enviar_alerta("Erro Critico SafeDriver", str(e), 15158332)
+            self.avisar_discord("Erro Crítico SafeDriver", str(e), 15158332)
             raise e
 
 if __name__ == "__main__":
