@@ -28,8 +28,8 @@ class MotorSafeDriver:
             pasta.mkdir(parents=True, exist_ok=True)
             
         self.anos = [2024, 2025, 2026]
-        self.cabecalhos = {'User-Agent': 'SafeDriver-Industrial-V5'}
-        self.geolocalizador = Nominatim(user_agent="safedriver_fatec_v5")
+        self.agente = {'User-Agent': 'SafeDriver-Industrial-V6'}
+        self.geolocalizador = Nominatim(user_agent="safedriver_fatec_final")
         self.logs = []
 
     def disparar_notificacao(self, titulo, mensagem, cor):
@@ -40,55 +40,69 @@ class MotorSafeDriver:
                 "title": titulo,
                 "description": mensagem,
                 "color": cor,
-                "footer": {"text": f"Sincronização: {datetime.now().strftime('%H:%M')}"}
+                "footer": {"text": f"Sincronização: {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
             }]
         }
         requests.post(webhook, json=payload, timeout=15)
 
-    def classificar_perfil(self, df):
-        df['natureza_str'] = df['natureza_apurada'].fillna(df.get('rubrica', '')).astype(str).upper()
-        df['local_str'] = df['descr_tipolocal'].fillna('').astype(str).upper()
+    def classificar_vetor_exposicao(self, df):
+        df['natureza_alvo'] = df['natureza_apurada'].fillna(df.get('rubrica', '')).astype(str).upper()
+        df['local_alvo'] = df['descr_tipolocal'].fillna('').astype(str).upper()
         
         df['perfil'] = 'Geral'
         
-        moto_mask = df['natureza_str'].str.contains('VEÍCULO|CARGA|AUTO|MOTO|CONDUZIR')
-        df.loc[moto_mask, 'perfil'] = 'Motorista'
+        motorista = df['natureza_alvo'].str.contains('VEÍCULO|CARGA|AUTO|MOTO|CONDUZIR')
+        df.loc[motorista, 'perfil'] = 'Motorista'
         
-        bike_mask = df['natureza_str'].str.contains('BICICLETA|BIKE')
-        df.loc[bike_mask, 'perfil'] = 'Ciclista'
+        ciclista = df['natureza_alvo'].str.contains('BICICLETA|BIKE')
+        df.loc[ciclista, 'perfil'] = 'Ciclista'
         
-        ped_mask = (df['local_str'].str.contains('VIA PÚBLICA|RUA|AVENIDA')) & \
-                   (df['natureza_str'].str.contains('CELULAR|TRANSEUNTE|PESSOA'))
-        df.loc[ped_mask, 'perfil'] = 'Pedestre'
+        pedestre = (df['local_alvo'].str.contains('VIA PÚBLICA|RUA|AVENIDA')) & \
+                   (df['natureza_alvo'].str.contains('CELULAR|TRANSEUNTE|PESSOA'))
+        df.loc[pedestre, 'perfil'] = 'Pedestre'
         
         return df
 
-    def gerenciar_delta(self, ano):
+    def geocodificar_lacunas(self, df):
+        faltantes = df[df['latitude'].isna() | (df['latitude'] == 0) | (df['latitude'] == "0")].head(20)
+        if faltantes.empty: return df
+        for i, linha in faltantes.iterrows():
+            endereco = f"{linha.get('logradouro', '')}, {linha.get('numero_logradouro', '')}, {linha.get('nome_municipio', 'São Bernardo do Campo')}, Brasil"
+            try:
+                local = self.geolocalizador.geocode(endereco, timeout=10)
+                if local:
+                    df.at[i, 'latitude'] = local.latitude
+                    df.at[i, 'longitude'] = local.longitude
+            except:
+                continue
+        return df
+
+    def sincronizar_bronze(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-        bronze_file = self.camadas["bronze"] / f"bruto_{ano}.parquet"
-        hash_file = self.camadas["bronze"] / f"size_{ano}.txt"
+        caminho_bruto = self.camadas["bronze"] / f"bruto_{ano}.parquet"
+        caminho_meta = self.camadas["bronze"] / f"size_{ano}.txt"
 
         try:
-            head = requests.head(url, headers=self.cabecalhos, timeout=30)
-            tamanho_nuvem = str(head.headers.get('Content-Length', '0'))
+            head = requests.head(url, headers=self.agente, timeout=30)
+            tamanho_ssp = str(head.headers.get('Content-Length', '0'))
 
-            if bronze_file.exists() and hash_file.exists():
-                with open(hash_file, "r") as f:
-                    if f.read() == tamanho_nuvem:
-                        self.logs.append(f"🟢 {ano}: Camada Bronze sincronizada")
-                        return pd.read_parquet(bronze_file)
+            if caminho_bruto.exists() and caminho_meta.exists():
+                with open(caminho_meta, "r") as f:
+                    if f.read() == tamanho_ssp:
+                        self.logs.append(f"🟢 {ano}: Sincronizado")
+                        return pd.read_parquet(caminho_bruto)
 
-            res = requests.get(url, headers=self.cabecalhos, timeout=300)
+            res = requests.get(url, headers=self.agente, timeout=300)
             df = pd.read_excel(io.BytesIO(res.content))
             df.columns = [str(c).upper().strip() for c in df.columns]
-            df.to_parquet(bronze_file, index=False)
-            with open(hash_file, "w") as f: f.write(tamanho_nuvem)
-            self.logs.append(f"📥 {ano}: Captura de novo volume concluída")
+            df.to_parquet(caminho_bruto, index=False)
+            with open(caminho_meta, "w") as f: f.write(tamanho_ssp)
+            self.logs.append(f"📥 {ano}: Ingestão Delta concluída")
             return df
         except:
-            return pd.read_parquet(bronze_file) if bronze_file.exists() else None
+            return pd.read_parquet(caminho_bruto) if caminho_bruto.exists() else None
 
-    def executar_ia(self, df):
+    def processar_ia_ouro(self, df):
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)]
@@ -97,14 +111,13 @@ class MotorSafeDriver:
 
         df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
         
-        resumo = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['peso'].sum().reset_index()
-        resumo['lat'] = resumo['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
-        resumo['lon'] = resumo['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        resumo['perfil_idx'] = resumo['perfil'].astype('category').cat.codes
-        resumo['periodo_idx'] = resumo['desc_periodo'].astype('category').cat.codes
+        agrupado = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['peso'].sum().reset_index()
+        agrupado['lat'] = agrupado['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
+        agrupado['lon'] = agrupado['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
+        agrupado['perfil_idx'] = agrupado['perfil'].astype('category').cat.codes
+        agrupado['periodo_idx'] = agrupado['desc_periodo'].astype('category').cat.codes
 
-        X = resumo[['lat', 'lon', 'perfil_idx', 'periodo_idx']]
-        y = resumo['peso']
+        X, y = agrupado[['lat', 'lon', 'perfil_idx', 'periodo_idx']], agrupado['peso']
         
         lgb = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
         cat = CatBoostRegressor(n_estimators=100, verbose=0).fit(X, y)
@@ -113,34 +126,34 @@ class MotorSafeDriver:
         plt.savefig(self.camadas["docs"] / "explicabilidade_ia.png", bbox_inches='tight')
         plt.close()
 
-        resumo['score_risco'] = (lgb.predict(X) * 0.5 + cat.predict(X) * 0.5)
+        agrupado['score_risco'] = (lgb.predict(X) * 0.5 + cat.predict(X) * 0.5)
         
-        ouro_path = self.camadas["ouro"] / "base_looker.csv"
-        resumo.to_csv(ouro_path, index=False)
+        caminho_csv = self.camadas["ouro"] / "base_looker.csv"
+        agrupado.to_csv(caminho_csv, index=False)
         
-        with open(ouro_path, "rb") as f:
-            check = hashlib.sha256(f.read()).hexdigest()
+        assinatura = hashlib.sha256(open(caminho_csv, "rb").read()).hexdigest()
         with open(self.camadas["ouro"] / "base_looker.sha256", "w") as f:
-            f.write(check)
+            f.write(assinatura)
             
-        return len(resumo)
+        return len(agrupado)
 
     def iniciar(self):
-        acumulado = []
+        coleta = []
         for ano in self.anos:
-            dados = self.gerenciar_delta(ano)
+            dados = self.sincronizar_bronze(ano)
             if dados is not None:
                 dados.columns = [c.lower() for c in dados.columns]
-                dados = self.classificar_perfil(dados)
-                dados['peso'] = dados['natureza_str'].apply(lambda x: 15 if 'ROUBO' in str(x) else 2)
-                acumulado.append(dados)
+                dados = self.classificar_vetor_exposicao(dados)
+                dados['peso'] = dados['natureza_alvo'].apply(lambda x: 15 if 'ROUBO' in str(x) else 2)
+                dados = self.geocodificar_lacunas(dados)
+                coleta.append(dados)
 
-        if acumulado:
-            total_h3 = self.executar_ia(pd.concat(acumulado))
-            msg = "\n".join(self.logs) + f"\n📍 Células Ativas: {total_h3}"
-            self.disparar_notificacao("SafeDriver Core: Pipeline OK", msg, 3066993)
+        if coleta:
+            total = self.processar_ia_ouro(pd.concat(coleta))
+            msg = "\n".join(self.logs) + f"\n📍 Células de Risco: {total}"
+            self.disparar_notificacao("SafeDriver: Pipeline Executado", msg, 3066993)
         else:
-            self.disparar_notificacao("SafeDriver: Falha de Ingestão", "Nenhum dado capturado.", 15158332)
+            self.disparar_notificacao("SafeDriver: Falha", "Nenhum dado capturado.", 15158332)
 
 if __name__ == "__main__":
     MotorSafeDriver().iniciar()
