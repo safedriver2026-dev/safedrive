@@ -1,4 +1,4 @@
-import base64, zlib, requests
+import base64, zlib, requests, os
 from pathlib import Path
 
 def salvar_diagrama(mermaid, nome):
@@ -9,26 +9,26 @@ def salvar_diagrama(mermaid, nome):
 
 Path("documentacao").mkdir(exist_ok=True)
 
-arq = """
+arq_mermaid = """
 graph TD
-    A[SSP-SP] -->|Bronze| B(Data Lakehouse)
-    B -->|Prata| C{Limpeza/GPS}
-    C -->|Ouro| D[Ensemble IA: LGBM+CAT+KNN]
-    D --> E[API Real-time]
-    D --> F[Looker Dashboard]
-    D --> G[SHAP Audit]
+    A[SSP-SP Portal] -->|Bronze| B(Data Lakehouse Parquet)
+    B -->|Prata| C{Refinamento & GPS}
+    C -->|Ouro| D[Ensemble AI: LGBM+CAT+KNN]
+    D --> E[Looker Studio CSV]
+    D --> F[SHAP Auditoria PNG]
+    D --> G[Notificacao Discord]
 """
 
-dados = """
+dados_mermaid = """
 erDiagram
-    FATO_CRIMES ||--o{ DIM_TEMPO : ocorre
-    FATO_CRIMES ||--o{ DIM_GEO : localiza
-    FATO_CRIMES {
-        string h3_index
+    CRIME_FATO ||--o{ TEMPO_DIM : registra
+    CRIME_FATO ||--o{ GEO_DIM : localiza
+    CRIME_FATO {
+        string h3_index PK
         float score_risco
-        int volume
+        int volume_crimes
     }
 """
 
-salvar_diagrama(arq, "arquitetura_automacao")
-salvar_diagrama(dados, "modelo_dados_star")
+salvar_diagrama(arq_mermaid, "arquitetura_automacao")
+salvar_diagrama(dados_mermaid, "modelo_dados_star")
