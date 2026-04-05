@@ -1,20 +1,18 @@
-import pytest
 import hashlib
 from pathlib import Path
 
-def test_integridade_ouro():
+def test_integridade_assinatura_digital():
     csv = Path("datalake/ouro/base_looker.csv")
     sha = Path("datalake/ouro/base_looker.sha256")
-    
     assert csv.exists()
     assert sha.exists()
-    
-    with open(csv, "rb") as f:
-        check = hashlib.sha256(f.read()).hexdigest()
-    with open(sha, "r") as f:
-        original = f.read().strip()
-        
-    assert check == original
+    calculado = hashlib.sha256(open(csv, "rb").read()).hexdigest()
+    original = open(sha, "r").read().strip()
+    assert calculado == original
 
-def test_modelo_shap():
+def test_evidencia_grafica_ia():
     assert Path("documentacao/explicabilidade_ia.png").exists()
+
+def test_diagramas_gerados():
+    for d in ["automacao", "dados", "api"]:
+        assert Path(f"documentacao/arquitetura_{d}.png").exists()
