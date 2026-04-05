@@ -1,56 +1,54 @@
 import base64, zlib, requests
 from pathlib import Path
 
-def salvar_diagrama(mermaid, nome):
-    id_kroki = base64.urlsafe_b64encode(zlib.compress(mermaid.encode('utf-8'), 9)).decode('ascii')
-    res = requests.get(f"https://kroki.io/mermaid/png/{id_kroki}")
+def produzir_imagem(mermaid, nome):
+    cod = base64.urlsafe_b64encode(zlib.compress(mermaid.encode('utf-8'), 9)).decode('ascii')
+    res = requests.get(f"https://kroki.io/mermaid/png/{cod}")
     if res.status_code == 200:
         Path("documentacao").mkdir(exist_ok=True)
         with open(f"documentacao/diag_{nome}.png", "wb") as f: f.write(res.content)
 
-# DIAGRAMA 1: AUTOMAÇÃO E DESCOBERTA DINÂMICA
+# FUNCIONAMENTO DA AUTOMAÇÃO MLOPS
 salvar_diagrama("""
 graph TD
-    A[Gatilho: GitHub Actions] --> B[Motor V21: Carregar Auditoria]
-    B --> C[Scraping: Buscar Links em /estatistica/consultas]
-    C --> D{Link Encontrado?}
-    D -- Sim --> E[DeltaSync: Comparar Content-Length]
-    D -- Não --> F[Tentar Link Estático Padronizado]
-    E -- Mudou --> G[Download Camuflado Chrome]
-    E -- Igual --> H[Acessar Cache Bronze Parquet]
-    G --> I[Sheet Scan: Localizar Dados Criminais]
-    I --> J[Treino Ensemble: LGBM + CatB + KNN]
-    J --> K[Assinatura SHA256 e Notificação Discord]
-""", "automacao_dinamica")
+    A[Início: GitHub Action] --> B[Criação de Pastas Datalake]
+    B --> C[Leitura de manifesto.json]
+    C --> D[Loop: Download Camuflado SSP]
+    D --> E{DeltaSync: Tamanho Mudou?}
+    E -- Sim --> F[Download Incremental XLSX]
+    E -- Não --> G[Carregar Parquet Bronze Local]
+    F --> H[Deduplicação por PK Composta]
+    H --> I[Treino Ensemble: LGBM + CatB + KNN]
+    I --> J[Cálculo de SHAP para Looker]
+    J --> K[Gravação Camada Ouro e Manifesto]
+    K --> L[Git Push: Auditoria e Dados]
+""", "automacao_detalhada")
 
-# DIAGRAMA 2: MODELO DE DADOS LAKEHOUSE (STAR SCHEMA)
+# MODELO DE DADOS E STAR SCHEMA
 
 salvar_diagrama("""
 graph LR
-    subgraph Camada_Bronze
-        A[Parquet Bruto 2022-2026]
+    subgraph Datalake_Bronze
+        A[Arquivos Parquet Anuais]
     end
-    subgraph Camada_Prata
-        A --> B[Deduplicação por PK Composta]
-        B --> C[Vetorização de Perfis]
+    subgraph Transformacao_Deduplicacao
+        A --> B[PK: NUM_BO + ANO_BO + MUNICIPIO]
     end
-    subgraph Camada_Ouro
-        C --> D(TABELA_FATO_RISCO)
-        D --> E[DIM_GEOGRAFIA: H3]
-        D --> F[DIM_PERFIL: Categórico]
-        D --> G[DIM_TEMPO: Período]
-        D --> H[VALORES_SHAP: Influência]
+    subgraph Datalake_Ouro
+        B --> C(FATO_RISCO)
+        C --> D[DIM_GEOGRAFIA: H3 Resolution 9]
+        C --> E[DIM_PERFIL: Motorista/Pedestre/Ciclista]
+        C --> F[DIM_TEMPO: Madrugada/Manhã/Tarde/Noite]
     end
 """, "modelo_dados_estrela")
 
-# DIAGRAMA 3: FUNCIONAMENTO DA API E LOOKER
+# FUNCIONAMENTO DA API E INTEGRAÇÃO
 salvar_diagrama("""
 graph TD
-    U[Usuário/App] -->|Chave X-API-KEY| API[FastAPI Gateway]
+    U[Usuário/Dashboard] -->|Chave API| API[FastAPI Gateway]
     API -->|Validação| S{Integridade SHA256}
     S -- OK --> D[Consulta Ouro CSV]
-    D --> J[Retorno JSON: Score + Causa]
-    API -->|Alimentação| GAS[Google Apps Script]
-    GAS -->|Append| Sheet[Google Sheets]
-    Sheet -->|Sync| Looker[Looker Studio BI]
+    D --> J[Retorno JSON: Score + Causa Dominante]
+    API -->|Trigger| GAS[Google Apps Script]
+    GAS -->|AppendRow| Looker[Looker Studio BI]
 """, "api_e_looker")
