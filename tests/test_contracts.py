@@ -1,27 +1,20 @@
 import pytest
 import pandas as pd
-import sys
-import os
+import json
+from pathlib import Path
 
-caminho_raiz = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-if caminho_raiz not in sys.path:
-    sys.path.insert(0, caminho_raiz)
+def test_metricas_existentes():
+    caminho = Path("datalake/ouro/metricas.json")
+    assert caminho.exists()
+    with open(caminho, 'r') as f:
+        data = json.load(f)
+        assert "R2" in data
+        assert data["R2"] <= 1.0
 
-try:
-    from autobot.autobot_engine import AutobotPipeline
-except:
-    from autobot_engine import AutobotPipeline
-
-@pytest.fixture
-def motor():
-    return AutobotPipeline(2026)
-
-def test_contrato_colunas(motor):
-    df = pd.DataFrame({'LATITUDE': [-23.5], 'LONGITUDE': [-46.6]})
-    df.columns = [str(c).lower() for c in df.columns]
-    assert 'latitude' in df.columns
-
-def test_contrato_risco():
-    scores = pd.Series([0.0, 50.0, 100.0])
-    assert scores.min() >= 0.0
-    assert scores.max() <= 100.0
+def test_base_looker_formatacao():
+    caminho = Path("datalake/ouro/base_looker.csv")
+    assert caminho.exists()
+    df = pd.read_csv(caminho)
+    assert "score_risco" in df.columns
+    assert df["score_risco"].max() <= 100.0
+    assert df["score_risco"].min() >= 0.0
