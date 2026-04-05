@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from geopy.geocoders import Nominatim
 from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
 
 class MotorSafeDriver:
     def __init__(self):
@@ -25,18 +26,18 @@ class MotorSafeDriver:
         }
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         
-        # ESCALABILIDADE: Intervalo dinâmico de anos
-        self.anos = list(range(2022, datetime.now().year + 1))
-        self.agente = {'User-Agent': 'SafeDriver-Industrial-V12'}
+        ano_inicial = 2022
+        self.anos = list(range(ano_inicial, datetime.now().year + 1))
+        self.agente = {'User-Agent': 'SafeDriver-Industrial-V14'}
         self.webhook = os.environ.get("DISCORD_WEBHOOK")
         self.manifesto_auditoria = {}
 
-    def gerar_hash(self, caminho_ficheiro):
-        sha256_hash = hashlib.sha256()
-        with open(caminho_ficheiro, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
+    def calcular_assinatura(self, caminho):
+        sha256 = hashlib.sha256()
+        with open(caminho, "rb") as f:
+            for bloco in iter(lambda: f.read(4096), b""):
+                sha256.update(bloco)
+        return sha256.hexdigest()
 
     def enviar_discord(self, titulo, mensagem, cor):
         if not self.webhook: return
@@ -45,105 +46,101 @@ class MotorSafeDriver:
                 "title": titulo,
                 "description": mensagem,
                 "color": cor,
-                "timestamp": datetime.now().isoformat(),
-                "footer": {"text": "Monitorização SafeDriver"}
+                "timestamp": datetime.now().isoformat()
             }]
         }
         requests.post(self.webhook, json=payload, timeout=10)
 
-    def extrair_dados_reais(self, conteudo_excel):
-        excel = pd.ExcelFile(io.BytesIO(conteudo_excel))
+    def filtrar_planilha_util(self, conteudo):
+        excel = pd.ExcelFile(io.BytesIO(conteudo))
         for aba in excel.sheet_names:
-            df_teste = excel.parse(aba, nrows=10)
-            df_teste.columns = [str(c).upper().strip() for c in df_teste.columns]
-            if any(k in df_teste.columns for k in ['LATITUDE', 'NATUREZA_APURADA', 'RUBRICA']):
+            df_temp = excel.parse(aba, nrows=10)
+            df_temp.columns = [str(c).upper().strip() for c in df_temp.columns]
+            if any(k in df_temp.columns for k in ['LATITUDE', 'NATUREZA_APURADA', 'RUBRICA']):
                 return excel.parse(aba)
         return None
 
-    def processar_camada_ouro(self, df):
+    def processar_ia_explicavel(self, df):
         df.columns = [c.lower().strip() for c in df.columns]
         
-        # 1. Classificação de Perfis (Vetor de Exposição)
         df['perfil'] = 'Geral'
         col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
-        df['crime_texto'] = df[col_crime].fillna('').astype(str).upper()
+        df['crime_limpo'] = df[col_crime].fillna('').astype(str).upper()
         
-        df.loc[df['crime_texto'].str.contains('VEÍCULO|MOTO|CARRO|CARGA'), 'perfil'] = 'Motorista'
-        df.loc[df['crime_texto'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
+        df.loc[df['crime_limpo'].str.contains('VEÍCULO|MOTO|CARGA|AUTO'), 'perfil'] = 'Motorista'
+        df.loc[df['crime_limpo'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
         
         col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
         if col_local in df.columns:
-            local_texto = df[col_local].fillna('').astype(str).upper()
-            mask_pedestre = (local_texto.str.contains('VIA PÚBLICA')) & (df['crime_texto'].str.contains('CELULAR|PESSOA'))
-            df.loc[mask_pedestre, 'perfil'] = 'Pedestre'
+            local_limpo = df[col_local].fillna('').astype(str).upper()
+            df.loc[(local_limpo.str.contains('VIA PÚBLICA')) & (df['crime_limpo'].str.contains('CELULAR|PESSOA')), 'perfil'] = 'Pedestre'
         
-        df['peso_severidade'] = df['crime_texto'].apply(lambda x: 15 if 'ROUBO' in x else 2)
+        df['peso_severidade'] = df['crime_limpo'].apply(lambda x: 15 if 'ROUBO' in x else 2)
 
-        # 2. Filtragem Geográfica
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
         
-        # 3. Agregação H3 e Modelo Estrela
+        if df.empty: raise ValueError("Dados geograficos insuficientes")
+
         df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
-        fato_risco = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['peso_severidade'].sum().reset_index()
-        fato_risco['lat'] = fato_risco['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
-        fato_risco['lon'] = fato_risco['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        fato_risco['perfil_idx'] = fato_risco['perfil'].astype('category').cat.codes
-        fato_risco['periodo_idx'] = fato_risco['desc_periodo'].astype('category').cat.codes
+        fato = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['peso_severidade'].sum().reset_index()
+        fato['lat'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
+        fato['lon'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
+        fato['perfil_idx'] = fato['perfil'].astype('category').cat.codes
+        fato['periodo_idx'] = fato['desc_periodo'].astype('category').cat.codes
 
-        # 4. IA Explicável (SHAP)
-        X = fato_risco[['lat', 'lon', 'perfil_idx', 'periodo_idx']]
-        y = fato_risco['peso_severidade']
-        modelo = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
+        X = fato[['lat', 'lon', 'perfil_idx', 'periodo_idx']]
+        y = fato['peso_severidade']
         
-        valores_shap = shap.TreeExplainer(modelo).shap_values(X)
+        modelo_lgb = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
+        modelo_cat = CatBoostRegressor(iterations=100, silent=True).fit(X, y)
+
+        explicador = shap.TreeExplainer(modelo_lgb)
+        valores_shap = explicador.shap_values(X)
         for i, col in enumerate(X.columns):
-            fato_risco[f'shap_{col}'] = valores_shap[:, i]
+            fato[f'influencia_{col}'] = valores_shap[:, i]
             
-        fato_risco['score_predito'] = modelo.predict(X)
+        fato['score_risco'] = (modelo_lgb.predict(X) + modelo_cat.predict(X)) / 2
 
-        # 5. Exportação e Trilha de Auditoria
-        caminho_ouro = self.pastas["ouro"] / "base_final.csv"
-        fato_risco.to_csv(caminho_ouro, index=False)
-        self.manifesto_auditoria["ouro"] = self.gerar_hash(caminho_ouro)
+        caminho_ouro = self.pastas["ouro"] / "base_final_looker.csv"
+        fato.to_csv(caminho_ouro, index=False)
+        self.manifesto_auditoria["camada_ouro"] = self.calcular_assinatura(caminho_ouro)
         
-        return len(fato_risco)
+        return len(fato)
 
     def iniciar(self):
         try:
-            acumulado = []
-            log_operacional = []
+            pool = []
+            relatorio_op = []
             
             for ano in self.anos:
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                 try:
                     res = requests.get(url, headers=self.agente, timeout=120)
                     if res.status_code == 200:
-                        df = self.extrair_dados_reais(res.content)
+                        df = self.filtrar_planilha_util(res.content)
                         if df is not None:
                             caminho_bruto = self.pastas["bronze"] / f"bruto_{ano}.parquet"
                             df.to_parquet(caminho_bruto)
-                            self.manifesto_auditoria[f"bronze_{ano}"] = self.gerar_hash(caminho_bruto)
-                            acumulado.append(df)
-                            log_operacional.append(f"✅ {ano}: {len(df)} registos processados.")
+                            self.manifesto_auditoria[f"bronze_{ano}"] = self.calcular_assinatura(caminho_bruto)
+                            pool.append(df)
+                            relatorio_op.append(f"Sucesso {ano}: {len(df)} registros")
                 except:
-                    log_operacional.append(f"⚠️ {ano}: Erro na captura.")
+                    relatorio_op.append(f"Falha {ano}: Conexao recusada")
 
-            if not acumulado: raise Exception("Bases de dados inacessíveis.")
+            if not pool: raise Exception("Sem dados disponiveis")
 
-            total = self.processar_camada_ouro(pd.concat(acumulado))
+            total = self.processar_ia_explicavel(pd.concat(pool))
             
-            # Grava Manifesto de Auditoria
             with open(self.pastas["auditoria"] / "manifesto.json", "w") as f:
                 json.dump(self.manifesto_auditoria, f, indent=4)
 
-            # Relatórios Discord
-            self.enviar_discord("📊 Relatório Operacional", "\n".join(log_operacional), 3447003)
-            self.enviar_discord("🚀 Relatório Executivo", f"Pipeline concluído com sucesso.\n📍 Áreas Geográficas: {total}\n🔒 Trilha de Auditoria: Gerada.", 3066993)
+            self.enviar_discord("Relatorio Operacional", "\n".join(relatorio_op), 3447003)
+            self.enviar_discord("Relatorio Executivo", f"Areas Monitoradas: {total}\nAuditagem: Concluida\nModelos: LGBM + CatBoost", 3066993)
 
         except Exception as e:
-            self.enviar_discord("🚨 Erro Crítico", f"Falha no processamento: `{str(e)}`", 15158332)
+            self.enviar_discord("Relatorio de Erro Critico", str(e), 15158332)
             raise e
 
 if __name__ == "__main__":
