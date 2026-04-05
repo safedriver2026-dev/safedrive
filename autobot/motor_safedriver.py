@@ -31,13 +31,15 @@ class MotorSafeDriver:
         
         self.anos = list(range(2022, datetime.now().year + 1))
         self.sessao = requests.Session()
+        
+        self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
+        self.webhook_erro = os.environ.get("DISCORD_ERRO")
+        
         self.agentes = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         ]
         
-        self.webhook = os.environ.get("DISCORD_WEBHOOK")
         self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
         self.auditoria = self.carregar_manifesto()
 
@@ -46,23 +48,27 @@ class MotorSafeDriver:
             with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def configurar_headers(self):
+    def configurar_sessao(self):
         self.sessao.headers.update({
             'User-Agent': random.choice(self.agentes),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://www.ssp.sp.gov.br/estatistica/consultas',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Referer': 'https://www.ssp.sp.gov.br/estatistica/consultas'
         })
 
-    def extrair_aba_correta(self, conteudo):
+    def enviar_notificacao(self, titulo, msg, cor, sucesso=True):
+        webhook = self.webhook_sucesso if sucesso else self.webhook_erro
+        if not webhook: return
+        payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
+        try: requests.post(webhook, json=payload, timeout=10)
+        except: pass
+
+    def extrair_dados_validos(self, conteudo):
         try:
             excel = pd.ExcelFile(io.BytesIO(conteudo))
             for aba in excel.sheet_names:
-                df_amostra = excel.parse(aba, nrows=30)
-                df_amostra.columns = [str(c).upper().strip() for c in df_amostra.columns]
-                if all(k in df_amostra.columns for k in ['NUM_BO', 'ANO_BO', 'NOME_MUNICIPIO', 'LATITUDE']):
+                df = excel.parse(aba, nrows=40)
+                df.columns = [str(c).upper().strip() for c in df.columns]
+                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'LONGITUDE']):
                     return excel.parse(aba)
             return None
         except: return None
@@ -70,20 +76,19 @@ class MotorSafeDriver:
     def processar_ia_v22(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
         
-        df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro', 'hora_ocorrencia_bo'])
+        df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
         
         df['perfil'] = 'Geral'
         col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
         df['crime_alvo'] = df[col_crime].fillna('').astype(str).upper()
         
-        df.loc[df['crime_alvo'].str.contains('VEÍCULO|MOTO|CARGA|AUTO|CONDUZIR'), 'perfil'] = 'Motorista'
+        df.loc[df['crime_alvo'].str.contains('VEÍCULO|MOTO|CARGA|AUTO'), 'perfil'] = 'Motorista'
         df.loc[df['crime_alvo'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
         
         col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
         if col_local in df.columns:
             loc_alvo = df[col_local].fillna('').astype(str).upper()
-            mask_ped = (loc_alvo.str.contains('VIA PÚBLICA|RUA')) & (df['crime_alvo'].str.contains('CELULAR|PESSOA'))
-            df.loc[mask_ped, 'perfil'] = 'Pedestre'
+            df.loc[(loc_alvo.str.contains('VIA PÚBLICA')) & (df['crime_alvo'].str.contains('CELULAR|PESSOA')), 'perfil'] = 'Pedestre'
         
         df['severidade'] = df['crime_alvo'].apply(lambda x: 15 if 'ROUBO' in x else 2)
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
@@ -112,7 +117,7 @@ class MotorSafeDriver:
             
         fato['score_risco'] = (lgbm.predict(X) * 0.4 + catb.predict(X) * 0.4 + knnr.predict(X) * 0.2)
         
-        ouro_path = self.pastas["ouro"] / "base_final_bi.csv"
+        ouro_path = self.pastas["ouro"] / "base_final_looker.csv"
         fato.to_csv(ouro_path, index=False)
         self.auditoria["hash_ouro"] = hashlib.sha256(open(ouro_path, "rb").read()).hexdigest()
         
@@ -121,53 +126,50 @@ class MotorSafeDriver:
     def iniciar_pipeline(self):
         try:
             pool = []
-            resumo = []
+            log_op = []
+            mudanca = False
             
             for ano in self.anos:
-                self.configurar_headers()
+                self.configurar_sessao()
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                 caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
                 
                 try:
-                    head = self.sessao.head(url, timeout=30, allow_redirects=True)
+                    head = self.sessao.head(url, timeout=30)
                     tamanho_remoto = str(head.headers.get('Content-Length', '0'))
                     
                     if caminho_local.exists() and self.auditoria.get(f"size_{ano}") == tamanho_remoto:
                         pool.append(pd.read_parquet(caminho_local))
-                        resumo.append(f"📦 {ano}: DeltaSync Ativo")
+                        log_op.append(f"📦 {ano}: DeltaSync Inalterado")
                         continue
 
-                    time.sleep(random.uniform(5, 10))
-                    res = self.sessao.get(url, timeout=300)
-                    
+                    time.sleep(random.uniform(3, 7))
+                    res = self.sessao.get(url, timeout=240)
                     if res.status_code == 200:
-                        df_dados = self.extrair_aba_correta(res.content)
-                        if df_dados is not None:
-                            df_dados.to_parquet(caminho_local)
+                        df_novo = self.extrair_dados_validos(res.content)
+                        if df_novo is not None:
+                            df_novo.to_parquet(caminho_local)
                             self.auditoria[f"size_{ano}"] = tamanho_remoto
                             self.auditoria[f"hash_{ano}"] = hashlib.sha256(res.content).hexdigest()
-                            pool.append(df_dados)
-                            resumo.append(f"📥 {ano}: Sincronizado com Sucesso")
-                        else:
-                            raise Exception(f"Estrutura de dados inválida em {ano}")
-                    else:
-                        raise Exception(f"HTTP {res.status_code} no link oficial")
-                        
-                except Exception as e:
+                            pool.append(df_novo)
+                            log_op.append(f"📥 {ano}: Sincronizado via DeltaSync")
+                            mudanca = True
+                except:
                     if caminho_local.exists():
                         pool.append(pd.read_parquet(caminho_local))
-                        resumo.append(f"⚠️ {ano}: Erro Conexão (Modo Cache)")
+                        log_op.append(f"⚠️ {ano}: Erro Conexao (Usando Cache)")
 
-            if not pool: raise Exception("Bloqueio Total SSP: Sem acesso aos dados criminais")
+            if not pool: raise Exception("Bloqueio SSP: Sem acesso aos dados criminais")
 
             total = self.processar_ia_v22(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
-            
-            if self.webhook:
-                requests.post(self.webhook, json={"content": f"🛡️ **SafeDriver V22**: {total} áreas mapeadas.\nEstratégia: Deduplicação Incremental."})
+
+            self.enviar_notificacao("SafeDriver: Monitor Operacional", "\n".join(log_op), 3447003, sucesso=True)
+            if mudanca:
+                self.enviar_notificacao("SafeDriver: Relatorio Executivo", f"Areas Mapeadas: {total}\nEnsemble: Ativo\nIntegridade: SHA256", 3066993, sucesso=True)
 
         except Exception as e:
-            if self.webhook: requests.post(self.webhook, json={"content": f"🚨 **Falha Crítica**: {str(e)}"})
+            self.enviar_notificacao("SafeDriver: Alerta de Erro Critico", str(e), 15158332, sucesso=False)
             raise e
 
 if __name__ == "__main__":
