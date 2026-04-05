@@ -31,42 +31,55 @@ class MotorSafeDriver:
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         
         self.anos = list(range(2022, datetime.now().year + 1))
-        self.sessao = requests.Session()
         self.feriados_sp = holidays.Brazil(state='SP')
         
         self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
         self.webhook_erro = os.environ.get("DISCORD_ERRO")
         self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
         self.auditoria = self.carregar_manifesto()
+        self.driver = None
 
     def carregar_manifesto(self):
         if self.manifesto_path.exists():
             with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def forjar_credenciais_acesso(self):
+    def configurar_navegador_nativo(self):
         opcoes = Options()
         opcoes.add_argument('--headless=new')
         opcoes.add_argument('--no-sandbox')
         opcoes.add_argument('--disable-dev-shm-usage')
         opcoes.add_argument('--disable-blink-features=AutomationControlled')
         
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opcoes)
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        prefs = {
+            "download.default_directory": str(self.pastas["raw"].absolute()),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": False,
+            "profile.default_content_settings.popups": 0
+        }
+        opcoes.add_experimental_option("prefs", prefs)
         
-        driver.get("https://www.ssp.sp.gov.br/")
-        time.sleep(5)
-        
-        agente = driver.execute_script("return navigator.userAgent;")
-        cookies = driver.get_cookies()
-        driver.quit()
-        
-        self.sessao.headers.update({
-            'User-Agent': agente,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Referer': 'https://www.ssp.sp.gov.br/'
-        })
-        for c in cookies: self.sessao.cookies.set(c['name'], c['value'])
+        self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opcoes)
+        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    def aguardar_download_concluir(self, timeout=600):
+        inicio = time.time()
+        while time.time() - inicio < timeout:
+            arquivos_crdownload = list(self.pastas["raw"].glob("*.crdownload"))
+            arquivos_xlsx = list(self.pastas["raw"].glob("*.xlsx"))
+            
+            if not arquivos_crdownload and arquivos_xlsx:
+                return arquivos_xlsx[0]
+            time.sleep(3)
+        return None
+
+    def calcular_hash_arquivo(self, caminho):
+        sha256 = hashlib.sha256()
+        with open(caminho, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
 
     def processar_planilha_bruta(self, caminho_xlsx):
         try:
@@ -85,6 +98,11 @@ class MotorSafeDriver:
         payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
         try: requests.post(webhook, json=payload, timeout=10)
         except: pass
+
+    def limpar_pasta_raw(self):
+        for f in self.pastas["raw"].glob("*"):
+            try: f.unlink()
+            except: pass
 
     def compilar_inteligencia(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
@@ -140,72 +158,70 @@ class MotorSafeDriver:
         
         ouro_path = self.pastas["ouro"] / "base_final_looker.csv"
         fato.to_csv(ouro_path, index=False)
-        self.auditoria["hash_ouro"] = hashlib.sha256(open(ouro_path, "rb").read()).hexdigest()
+        self.auditoria["hash_ouro"] = self.calcular_hash_arquivo(ouro_path)
         
         return len(fato)
 
     def executar(self):
         try:
-            self.forjar_credenciais_acesso()
+            self.configurar_navegador_nativo()
             pool = []
             log_op = []
             mudanca = False
             
             for ano in self.anos:
+                self.limpar_pasta_raw()
                 url_direta = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                caminho_xlsx = self.pastas["raw"] / f"bruto_{ano}.xlsx"
                 caminho_parquet = self.pastas["bronze"] / f"limpo_{ano}.parquet"
                 
                 try:
-                    res = self.sessao.get(url_direta, stream=True, timeout=120)
-                    res.raise_for_status()
+                    self.driver.get(url_direta)
+                    arquivo_baixado = self.aguardar_download_concluir()
                     
-                    tamanho_atual = str(res.headers.get('Content-Length', '0'))
-                    
-                    if caminho_parquet.exists() and self.auditoria.get(f"size_{ano}") == tamanho_atual:
-                        res.close()
-                        pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"📦 {ano}: DeltaSync OK (S/ Alterações)")
-                        continue
+                    if not arquivo_baixado:
+                        raise Exception("Timeout na recepção do arquivo via navegador")
 
-                    sha256 = hashlib.sha256()
-                    with open(caminho_xlsx, 'wb') as f:
-                        for chunk in res.iter_content(chunk_size=1048576):
-                            if chunk:
-                                f.write(chunk)
-                                sha256.update(chunk)
+                    hash_atual = self.calcular_hash_arquivo(arquivo_baixado)
                     
-                    df_novo = self.processar_planilha_bruta(caminho_xlsx)
+                    if caminho_parquet.exists() and self.auditoria.get(f"hash_{ano}") == hash_atual:
+                        pool.append(pd.read_parquet(caminho_parquet))
+                        log_op.append(f"📦 {ano}: Sincronização Ignorada (Hash Idêntico)")
+                        self.limpar_pasta_raw()
+                        continue
+                    
+                    df_novo = self.processar_planilha_bruta(arquivo_baixado)
                     
                     if df_novo is not None:
                         df_novo.to_parquet(caminho_parquet)
-                        self.auditoria[f"size_{ano}"] = tamanho_atual
-                        self.auditoria[f"hash_{ano}"] = sha256.hexdigest()
+                        self.auditoria[f"hash_{ano}"] = hash_atual
                         pool.append(df_novo)
-                        log_op.append(f"📥 {ano}: Streaming Concluído via Link Direto")
+                        log_op.append(f"📥 {ano}: Processamento Nativo Concluído")
                         mudanca = True
                     else:
-                        raise Exception(f"Layout do Excel inválido {ano}")
+                        raise Exception(f"Layout estrutural inválido em {ano}")
                         
-                    if caminho_xlsx.exists(): os.remove(caminho_xlsx)
+                    self.limpar_pasta_raw()
                         
                 except Exception as e:
-                    if caminho_xlsx.exists(): os.remove(caminho_xlsx)
+                    self.limpar_pasta_raw()
                     if caminho_parquet.exists():
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"⚠️ {ano}: Falha de Conexão. Usando Cache Parquet")
+                        log_op.append(f"⚠️ {ano}: Erro de Extração. Base de Cache Aplicada")
 
-            if not pool: raise Exception("Falha Catastrófica: Nenhuma base acessível através dos links fornecidos.")
+            if self.driver: self.driver.quit()
+
+            if not pool: raise Exception("Falha Crítica: Fontes de dados indisponíveis para o ciclo atual.")
 
             total = self.compilar_inteligencia(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
-            self.despachar_alerta("Log Operacional SafeDriver V28", "\n".join(log_op), 3447003, sucesso=True)
+            self.despachar_alerta("SafeDriver: Status Operacional", "\n".join(log_op), 3447003, sucesso=True)
             if mudanca:
-                self.despachar_alerta("Relatório IA SafeDriver", f"Pipeline Direto Finalizado.\nÁreas: {total}\nSHAP Auditado", 3066993, sucesso=True)
+                self.despachar_alerta("SafeDriver: Relatório Analítico", f"Pipeline Atualizado.\nÁreas Mapeadas: {total}\nFatores Comportamentais: Ativos", 3066993, sucesso=True)
 
         except Exception as e:
-            self.despachar_alerta("Incidente Crítico V28", str(e), 15158332, sucesso=False)
+            if self.driver: self.driver.quit()
+            self.despachar_alerta("SafeDriver: Incidente Crítico", str(e), 15158332, sucesso=False)
             raise e
 
 if __name__ == "__main__":
