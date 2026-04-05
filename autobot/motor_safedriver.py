@@ -1,26 +1,27 @@
 import os
-import io
-import json
 import time
-import random
+import json
 import requests
 import pandas as pd
 import numpy as np
 import h3
 import shap
-import matplotlib.pyplot as plt
 import hashlib
 from pathlib import Path
 from datetime import datetime
-from bs4 import BeautifulSoup
 from sklearn.neighbors import KNeighborsRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 
 class MotorSafeDriver:
     def __init__(self):
         self.raiz = Path(".")
         self.pastas = {
+            "raw": self.raiz / "datalake" / "raw",
             "bronze": self.raiz / "datalake" / "bronze",
             "prata": self.raiz / "datalake" / "prata",
             "ouro": self.raiz / "datalake" / "ouro",
@@ -35,11 +36,6 @@ class MotorSafeDriver:
         self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
         self.webhook_erro = os.environ.get("DISCORD_ERRO")
         
-        self.agentes = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-        ]
-        
         self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
         self.auditoria = self.carregar_manifesto()
 
@@ -48,32 +44,63 @@ class MotorSafeDriver:
             with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def configurar_sessao(self):
+    def inicializar_auth_hibrida(self):
+        opcoes = Options()
+        opcoes.add_argument('--headless=new')
+        opcoes.add_argument('--no-sandbox')
+        opcoes.add_argument('--disable-dev-shm-usage')
+        opcoes.add_argument('--disable-blink-features=AutomationControlled')
+        
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opcoes)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        driver.get("https://www.ssp.sp.gov.br/estatistica/consultas")
+        time.sleep(8)
+        
+        agente = driver.execute_script("return navigator.userAgent;")
+        cookies = driver.get_cookies()
+        driver.quit()
+        
         self.sessao.headers.update({
-            'User-Agent': random.choice(self.agentes),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Referer': 'https://www.ssp.sp.gov.br/estatistica/consultas'
+            'User-Agent': agente,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Referer': 'https://www.ssp.sp.gov.br/'
         })
+        
+        for c in cookies:
+            self.sessao.cookies.set(c['name'], c['value'])
 
-    def enviar_notificacao(self, titulo, msg, cor, sucesso=True):
+    def baixar_arquivo_gigante(self, url, caminho_destino):
+        res = self.sessao.get(url, stream=True, timeout=600)
+        res.raise_for_status()
+        
+        sha256 = hashlib.sha256()
+        with open(caminho_destino, 'wb') as f:
+            for chunk in res.iter_content(chunk_size=1048576):
+                if chunk:
+                    f.write(chunk)
+                    sha256.update(chunk)
+        return sha256.hexdigest()
+
+    def extrair_converter_dados(self, caminho_xlsx):
+        try:
+            excel = pd.ExcelFile(caminho_xlsx)
+            for aba in excel.sheet_names:
+                df = excel.parse(aba, nrows=40)
+                df.columns = [str(c).upper().strip() for c in df.columns]
+                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE']):
+                    return excel.parse(aba)
+            return None
+        except: return None
+
+    def enviar_alerta(self, titulo, msg, cor, sucesso=True):
         webhook = self.webhook_sucesso if sucesso else self.webhook_erro
         if not webhook: return
         payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
         try: requests.post(webhook, json=payload, timeout=10)
         except: pass
 
-    def extrair_dados_validos(self, conteudo):
-        try:
-            excel = pd.ExcelFile(io.BytesIO(conteudo))
-            for aba in excel.sheet_names:
-                df = excel.parse(aba, nrows=40)
-                df.columns = [str(c).upper().strip() for c in df.columns]
-                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'LONGITUDE']):
-                    return excel.parse(aba)
-            return None
-        except: return None
-
-    def processar_ia_v22(self, df):
+    def processar_ia_core(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
         
         df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
@@ -123,54 +150,63 @@ class MotorSafeDriver:
         
         return len(fato)
 
-    def iniciar_pipeline(self):
+    def executar(self):
         try:
+            self.inicializar_auth_hibrida()
+            
             pool = []
             log_op = []
             mudanca = False
             
             for ano in self.anos:
-                self.configurar_sessao()
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
+                caminho_xlsx = self.pastas["raw"] / f"bruto_{ano}.xlsx"
+                caminho_parquet = self.pastas["bronze"] / f"limpo_{ano}.parquet"
                 
                 try:
                     head = self.sessao.head(url, timeout=30)
-                    tamanho_remoto = str(head.headers.get('Content-Length', '0'))
+                    tamanho_atual = str(head.headers.get('Content-Length', '0'))
                     
-                    if caminho_local.exists() and self.auditoria.get(f"size_{ano}") == tamanho_remoto:
-                        pool.append(pd.read_parquet(caminho_local))
-                        log_op.append(f"📦 {ano}: DeltaSync Inalterado")
+                    if caminho_parquet.exists() and self.auditoria.get(f"size_{ano}") == tamanho_atual:
+                        pool.append(pd.read_parquet(caminho_parquet))
+                        log_op.append(f"📦 {ano}: DeltaSync OK (Cache Parquet)")
                         continue
 
-                    time.sleep(random.uniform(3, 7))
-                    res = self.sessao.get(url, timeout=240)
-                    if res.status_code == 200:
-                        df_novo = self.extrair_dados_validos(res.content)
-                        if df_novo is not None:
-                            df_novo.to_parquet(caminho_local)
-                            self.auditoria[f"size_{ano}"] = tamanho_remoto
-                            self.auditoria[f"hash_{ano}"] = hashlib.sha256(res.content).hexdigest()
-                            pool.append(df_novo)
-                            log_op.append(f"📥 {ano}: Sincronizado via DeltaSync")
-                            mudanca = True
-                except:
-                    if caminho_local.exists():
-                        pool.append(pd.read_parquet(caminho_local))
-                        log_op.append(f"⚠️ {ano}: Erro Conexao (Usando Cache)")
+                    hash_arquivo = self.baixar_arquivo_gigante(url, caminho_xlsx)
+                    
+                    df_novo = self.extrair_converter_dados(caminho_xlsx)
+                    
+                    if df_novo is not None:
+                        df_novo.to_parquet(caminho_parquet)
+                        self.auditoria[f"size_{ano}"] = tamanho_atual
+                        self.auditoria[f"hash_{ano}"] = hash_arquivo
+                        pool.append(df_novo)
+                        log_op.append(f"📥 {ano}: Streaming 300MB+ Concluído")
+                        mudanca = True
+                    else:
+                        raise Exception(f"Estrutura tabular invalida {ano}")
+                        
+                    if caminho_xlsx.exists():
+                        os.remove(caminho_xlsx)
+                        
+                except Exception as e:
+                    if caminho_xlsx.exists(): os.remove(caminho_xlsx)
+                    if caminho_parquet.exists():
+                        pool.append(pd.read_parquet(caminho_parquet))
+                        log_op.append(f"⚠️ {ano}: Falha de Download (Forçando Cache)")
 
-            if not pool: raise Exception("Bloqueio SSP: Sem acesso aos dados criminais")
+            if not pool: raise Exception("Falha Catastrófica: Dados Indisponíveis")
 
-            total = self.processar_ia_v22(pd.concat(pool))
+            total = self.processar_ia_core(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
-            self.enviar_notificacao("SafeDriver: Monitor Operacional", "\n".join(log_op), 3447003, sucesso=True)
+            self.enviar_alerta("Log Operacional SafeDriver", "\n".join(log_op), 3447003, sucesso=True)
             if mudanca:
-                self.enviar_notificacao("SafeDriver: Relatorio Executivo", f"Areas Mapeadas: {total}\nEnsemble: Ativo\nIntegridade: SHA256", 3066993, sucesso=True)
+                self.enviar_alerta("Relatório IA SafeDriver", f"Atualização Big Data concluída.\nÁreas: {total}\nSHAP Auditado", 3066993, sucesso=True)
 
         except Exception as e:
-            self.enviar_notificacao("SafeDriver: Alerta de Erro Critico", str(e), 15158332, sucesso=False)
+            self.enviar_alerta("Incidente Crítico", str(e), 15158332, sucesso=False)
             raise e
 
 if __name__ == "__main__":
-    MotorSafeDriver().iniciar_pipeline()
+    MotorSafeDriver().executar()
