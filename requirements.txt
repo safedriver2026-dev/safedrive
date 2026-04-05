@@ -4,6 +4,7 @@ h3
 requests
 pyarrow
 openpyxl
+python-calamine
 pytest
 scikit-learn
 catboost
