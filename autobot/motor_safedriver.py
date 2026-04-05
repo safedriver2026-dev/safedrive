@@ -90,17 +90,25 @@ class MotorSafeDriver:
         print(f"[PROCESSAMENTO] Iniciando leitura do Excel: {caminho_xlsx}")
         try:
             excel = pd.ExcelFile(caminho_xlsx)
+            abas_compiladas = []
+            
             for aba in excel.sheet_names:
                 print(f"  -> Analisando aba: {aba}")
-                df = excel.parse(aba, nrows=40)
-                df.columns = [str(c).upper().strip() for c in df.columns]
-                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'DATA_OCORRENCIA_BO']):
-                    print(f"  -> Aba valida encontrada: {aba}. Padronizando tipos para Parquet...")
+                df_amostra = excel.parse(aba, nrows=40)
+                df_amostra.columns = [str(c).upper().strip() for c in df_amostra.columns]
+                
+                if all(k in df_amostra.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'DATA_OCORRENCIA_BO']):
+                    print(f"  -> Aba valida encontrada: {aba}. Extraindo e padronizando...")
                     df_completo = excel.parse(aba)
                     df_completo.columns = [str(c).upper().strip() for c in df_completo.columns]
-                    return df_completo.astype(str)
-            print(f"  -> [ERRO] Nenhuma aba possui a estrutura tabular exigida.")
-            return None
+                    abas_compiladas.append(df_completo.astype(str))
+            
+            if abas_compiladas:
+                print(f"  -> [SUCESSO] Consolidando {len(abas_compiladas)} aba(s) para este ano.")
+                return pd.concat(abas_compiladas, ignore_index=True)
+            else:
+                print(f"  -> [ERRO] Nenhuma aba possui a estrutura tabular exigida.")
+                return None
         except Exception as e:
             print(f"  -> [ERRO FATAL NO PANDAS] Nao foi possivel ler o arquivo Excel: {e}")
             return None
@@ -113,7 +121,7 @@ class MotorSafeDriver:
     def compilar_inteligencia(self, df):
         print("\n[IA ENSEMBLE] Iniciando compilacao e feature engineering...")
         df.columns = [str(c).lower().strip() for c in df.columns]
-        df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
+        df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro']).copy()
         
         df['data_ocorrencia'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
         df = df.dropna(subset=['data_ocorrencia']).copy()
@@ -127,14 +135,14 @@ class MotorSafeDriver:
         
         df['perfil'] = 'Geral'
         col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
-        df['crime_alvo'] = df[col_crime].fillna('').astype(str).upper()
+        df['crime_alvo'] = df[col_crime].fillna('').astype(str).str.upper()
         
         df.loc[df['crime_alvo'].str.contains('VEÍCULO|MOTO|CARGA|AUTO'), 'perfil'] = 'Motorista'
         df.loc[df['crime_alvo'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
         
         col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
         if col_local in df.columns:
-            loc_alvo = col_local.fillna('').astype(str).upper()
+            loc_alvo = df[col_local].fillna('').astype(str).str.upper()
             df.loc[(loc_alvo.str.contains('VIA PÚBLICA')) & (df['crime_alvo'].str.contains('CELULAR|PESSOA')), 'perfil'] = 'Pedestre'
         
         df['severidade'] = df['crime_alvo'].apply(lambda x: 15 if 'ROUBO' in x else 2)
