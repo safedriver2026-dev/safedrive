@@ -1,7 +1,7 @@
-name: SafeDriver MLOps Industrial V22
+name: Autobot Execução Diaria
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 jobs:
   pipeline:
@@ -14,8 +14,12 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
+      - name: Setup Chrome para Sessao Hibrida
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
       - run: pip install -r requirements.txt
-      - name: Motor IA e Auditoria
+      - name: Motor Streaming de Lote e IA
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -23,12 +27,12 @@ jobs:
         run: |
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
-      - name: Validar Seguranca
+      - name: Auditoria Pytest
         run: python -m pytest tests/test_seguranca.py
-      - name: Sincronizar Repositorio
+      - name: Commit e Sincronizacao Datalake
         run: |
           git config --local user.email "bot@safedriver.com"
-          git config --local user.name "SafeDriver Bot"
+          git config --local user.name "SafeDriver AutoBot"
           git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv documentacao/*.png
-          git commit -m "auto: v22 industrial dual-monitor [skip ci]" || echo "Sem mudanças"
+          git commit -m "auto: streaming bigdata v24 [skip ci]" || echo "Sem mudanças"
           git push
