@@ -10,9 +10,9 @@ def salvar_png(mermaid, nome):
 
 salvar_png("""
 graph TD
-    A[Início do Fluxo] --> B[Selenium Headless Auth]
-    B --> C[Loop Anual Links SSP]
-    C --> D[Download Nativo Direto no Disco]
+    A[Início do Fluxo] --> B[Requests Session com Retry]
+    B --> C[Loop Anual Links Diretos SSP]
+    C --> D[Download Chunked Resiliente 1MB]
     D --> E{Verificação Criptográfica SHA256}
     E -- Hash Inalterado --> F[Abortar Processamento + Cache Parquet]
     E -- Hash Alterado --> G[Extração e Limpeza Otimizada]
