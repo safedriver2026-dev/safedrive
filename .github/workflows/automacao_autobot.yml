@@ -1,43 +1,33 @@
-name: Autobot Execução Diaria
+name: SafeDriver MLOps V22
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 9 * * *'
   workflow_dispatch:
 jobs:
-  fluxo_principal:
+  pipeline:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout do Codigo
-        uses: actions/checkout@v4
-
-      - name: Configurar Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-
-      - name: Instalar Dependencias
-        run: pip install -r requirements.txt
-
-      - name: Execucao do Motor e Gerador de Diagramas
+      - run: pip install -r requirements.txt
+      - name: Motor DeltaSync e IA
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           API_KEY: ${{ secrets.API_KEY }}
         run: |
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
-
-      - name: Validar Integridade e Auditoria
+      - name: Testes de Auditoria
         run: python -m pytest tests/test_seguranca.py
-
-      - name: Sincronizar Datalake e Documentacao
+      - name: Sincronizar Repositório
         run: |
           git config --local user.email "bot@safedriver.com"
-          git config --local user.name "SafeDriver AutoBot"
-          git add datalake/auditoria/manifesto.json
-          git add datalake/ouro/base_final_looker.csv
-          git add documentacao/*.png
-          git commit -m "auto:  sincronizacao  [skip ci]" || echo "Sem alteracoes"
+          git config --local user.name "SafeDriver Bot"
+          git add datalake/auditoria/manifesto.json datalake/ouro/base_final_bi.csv documentacao/*.png
+          git commit -m "auto: v22 industrial integridade [skip ci]" || echo "Sem mudanças"
           git push
