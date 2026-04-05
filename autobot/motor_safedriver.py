@@ -50,7 +50,7 @@ class MotorSafeDriver:
 
     def despachar_alerta_operacional(self, msg, cor=3447003):
         if not self.webhook_sucesso: return
-        payload = {"embeds": [{"title": "⚙️ Log Operacional", "description": msg, "color": cor}]}
+        payload = {"embeds": [{"title": "⚡ Log de Alta Performance", "description": msg, "color": cor}]}
         try: requests.post(self.webhook_sucesso, json=payload, timeout=5)
         except: pass
 
@@ -93,7 +93,8 @@ class MotorSafeDriver:
 
     def processar_planilha_bruta(self, caminho_xlsx):
         try:
-            excel = pd.ExcelFile(caminho_xlsx)
+            # Lendo com Calamine (Rust Engine) para velocidade extrema
+            excel = pd.ExcelFile(caminho_xlsx, engine='calamine')
             abas_compiladas = []
             
             for aba in excel.sheet_names:
@@ -160,7 +161,8 @@ class MotorSafeDriver:
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
 
-        df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
+        # Otimização extrema de H3 substituindo .apply por List Comprehension (Velocidade C)
+        df['h3_index'] = [h3.latlng_to_cell(lat, lon, 9) for lat, lon in zip(df['latitude'], df['longitude'])]
         
         caminho_detalhes = self.pastas["ouro"] / "base_crimes_detalhados.csv"
         cols_exportacao = ['num_bo', 'data_ocorrencia', 'perfil', 'crime_alvo', 'latitude', 'longitude', 'h3_index']
@@ -168,8 +170,13 @@ class MotorSafeDriver:
         df[cols_presentes].to_csv(caminho_detalhes, index=False)
         
         fato = df.groupby(['h3_index', 'desc_periodo', 'perfil', 'is_feriado', 'is_pagamento', 'is_fim_semana'])['severidade'].sum().reset_index()
-        fato['lat'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0]).astype(np.float32)
-        fato['lon'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1]).astype(np.float32)
+        
+        # Otimização nas decodificações do H3
+        fato['lat'] = [h3.cell_to_latlng(cell)[0] for cell in fato['h3_index']]
+        fato['lon'] = [h3.cell_to_latlng(cell)[1] for cell in fato['h3_index']]
+        
+        fato['lat'] = fato['lat'].astype(np.float32)
+        fato['lon'] = fato['lon'].astype(np.float32)
         fato['perfil_idx'] = fato['perfil'].astype('category').cat.codes.astype(np.int8)
         fato['periodo_idx'] = fato['desc_periodo'].astype('category').cat.codes.astype(np.int8)
 
@@ -178,9 +185,9 @@ class MotorSafeDriver:
         
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
         
-        lgbm = LGBMRegressor(n_estimators=100, verbose=-1).fit(X_train, y_train)
-        catb = CatBoostRegressor(iterations=100, silent=True).fit(X_train, y_train)
-        knnr = KNeighborsRegressor(n_neighbors=5).fit(X_train, y_train)
+        lgbm = LGBMRegressor(n_estimators=100, verbose=-1, n_jobs=-1).fit(X_train, y_train)
+        catb = CatBoostRegressor(iterations=100, silent=True, thread_count=-1).fit(X_train, y_train)
+        knnr = KNeighborsRegressor(n_neighbors=5, n_jobs=-1).fit(X_train, y_train)
 
         pred_test = (lgbm.predict(X_test) * 0.4 + catb.predict(X_test) * 0.4 + knnr.predict(X_test) * 0.2)
         score_r2 = r2_score(y_test, pred_test)
@@ -213,7 +220,7 @@ class MotorSafeDriver:
             log_op = []
             mudanca = False
             
-            self.despachar_alerta_operacional("Iniciando ingestão de dados e validação de chaves primárias.")
+            self.despachar_alerta_operacional("Iniciando ingestão de dados em Alta Velocidade (Engine Rust/Calamine).")
             
             for ano in self.anos:
                 self.limpar_pasta_raw()
@@ -237,7 +244,7 @@ class MotorSafeDriver:
                         self.auditoria[f"hash_{ano}"] = hash_arquivo
                         self.auditoria[f"size_{ano}"] = tamanho_atual
                         pool.append(df_novo)
-                        log_op.append(f"📥 {ano}: Processado e Otimizado em Memória")
+                        log_op.append(f"⚡ {ano}: Extraído em Velocidade Otimizada")
                         mudanca = True
                     else:
                         raise Exception("Estrutura tabular inválida")
@@ -254,7 +261,7 @@ class MotorSafeDriver:
             if not pool: raise Exception("Falha Crítica: Fontes de dados indisponíveis.")
 
             self.despachar_alerta_operacional("\n".join(log_op))
-            self.despachar_alerta_operacional("Ingestão concluída. Iniciando divisão Treino/Teste e cálculo SHAP.")
+            self.despachar_alerta_operacional("Ingestão concluída. Processando matriz H3 com vetorização...")
 
             df_consolidado = pd.concat(pool, ignore_index=True)
             df_consolidado = df_consolidado.drop_duplicates(subset=['NUM_BO'])
@@ -273,7 +280,7 @@ class MotorSafeDriver:
                     "Margem de Erro Média": f"± {margem_erro:.2f} pontos de severidade",
                     "Tempo de Execução": f"{tempo_total} minutos"
                 }
-                self.despachar_alerta_executivo("📊 SafeDriver: Relatório Executivo de IA", kpis, 3066993)
+                self.despachar_alerta_executivo("🚀 SafeDriver: Relatório IA (Alta Performance)", kpis, 3066993)
 
         except Exception as e:
             self.despachar_alerta_executivo("🚨 SafeDriver: Incidente Crítico", str(e), 15158332, False)
