@@ -6,8 +6,8 @@ from fastapi.security.api_key import APIKeyHeader
 from pathlib import Path
 
 app = FastAPI(title="SafeDriver API")
-API_TOKEN = os.environ.get("API_KEY", "fatec_2026_v6")
-header_auth = APIKeyHeader(name="X-API-KEY")
+TOKEN = os.environ.get("API_KEY", "fatec_2026_industrial")
+auth_header = APIKeyHeader(name="X-API-KEY")
 
 def validar_integridade():
     csv = Path("datalake/ouro/base_looker.csv")
@@ -18,12 +18,11 @@ def validar_integridade():
         return check == f.read().strip()
 
 @app.get("/v1/risco/{perfil}/{h3_index}")
-def consultar_risco(perfil: str, h3_index: str, api_key: str = Security(header_auth)):
-    if api_key != API_TOKEN: raise HTTPException(status_code=403)
+def consultar_risco(perfil: str, h3_index: str, api_key: str = Security(auth_header)):
+    if api_key != TOKEN: raise HTTPException(status_code=403)
     if not validar_integridade(): raise HTTPException(status_code=500, detail="Integridade Violada")
     
     df = pd.read_csv("datalake/ouro/base_looker.csv")
     dado = df[(df['h3_index'] == h3_index) & (df['perfil'].str.lower() == perfil.lower())]
-    
     if dado.empty: raise HTTPException(status_code=404)
     return {"perfil": perfil, "h3": h3_index, "score": float(dado['score_risco'].mean())}
