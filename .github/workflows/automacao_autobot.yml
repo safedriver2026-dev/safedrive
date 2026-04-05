@@ -35,6 +35,6 @@ jobs:
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver AutoBot"
-          git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv documentacao/*.png
-          git commit -m "auto: sincronizacao industrial e diagnostico [skip ci]" || echo "Sem mudanças"
+          git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv datalake/ouro/base_crimes_detalhados.csv documentacao/*.png
+          git commit -m "auto: otimizacao de memoria e split de treino [skip ci]" || echo "Sem mudanças"
           git push
