@@ -10,38 +10,41 @@ def salvar_png(mermaid, nome):
 
 salvar_png("""
 graph TD
-    A[Início do Fluxo] --> B[Requests Session com Retry]
-    B --> C[Loop Anual Links Diretos SSP]
-    C --> D[Download Chunked Resiliente 1MB]
-    D --> E{Verificação Criptográfica SHA256}
-    E -- Hash Inalterado --> F[Abortar Processamento + Cache Parquet]
-    E -- Hash Alterado --> G[Extração e Limpeza Otimizada]
-    G --> H[Conversão Parquet /datalake/bronze/]
-    F --> I[Deduplicação Composta]
-    H --> I
-    I --> J[Feature Engineering: Feriados/Pagamento]
-    J --> K[Agrupamento H3 Geoespacial]
-    K --> L[Ensemble IA e Cálculo SHAP]
-    L --> M[Exportar base_final_looker.csv e Manifesto]
+    A[Início do Fluxo] --> B[Download Chunked Resiliente 1MB]
+    B --> C{Verificação Criptográfica SHA256}
+    C -- Hash Inalterado --> D[Abortar Processamento + Cache Parquet]
+    C -- Hash Alterado --> E[Extração Otimizada - Descarte Vertical]
+    E --> F[Deduplicação por NUM_BO]
+    D --> F
+    F --> G[Agrupamento H3 Geoespacial]
+    G --> H[Train/Test Split 80/20]
+    H --> I[Ensemble IA e Cálculo SHAP]
+    I --> J[Alertas Discord: Operacional e Executivo]
+    I --> K[Exportar base_final_looker.csv]
+    F --> L[Exportar base_crimes_detalhados.csv]
 """, "arquitetura_safedriver")
 
 salvar_png("""
 erDiagram
-    FATO_RISCO {
+    BASE_FINAL_LOOKER {
         string h3_index
         float score_risco
-        float influencia_perfil
+        float influencia_is_pagamento
     }
-    DIM_GEOGRAFIA ||--o{ FATO_RISCO : "h3"
-    DIM_PERFIL ||--o{ FATO_RISCO : "idx"
-    DIM_CALENDARIO ||--o{ FATO_RISCO : "sazonalidade"
+    BASE_CRIMES_DETALHADOS {
+        string num_bo
+        string h3_index
+        string crime_alvo
+        date data_ocorrencia
+    }
+    BASE_FINAL_LOOKER ||--o{ BASE_CRIMES_DETALHADOS : "h3_index (Looker Join)"
 """, "modelo_dados_safedriver")
 
 salvar_png("""
 graph TD
     API[FastAPI Gateway] -->|Validacao X-API-KEY| S{Integridade SHA256}
-    S -->|Auditoria| M[manifesto.json]
+    S -->|Audita hash_ouro_ia| M[manifesto.json]
     S -- Sucesso --> D[Consulta base_final_looker.csv]
     D --> J[JSON Payload: Fatores de Risco]
-    J --> L[Integração Looker Studio]
+    J --> L[Aplicações Externas]
 """, "fluxo_api_safedriver")
