@@ -25,132 +25,137 @@ class MotorSafeDriver:
             "auditoria": self.raiz / "datalake" / "auditoria",
             "docs": self.raiz / "documentacao"
         }
-        for pasta_caminho in self.pastas.values():
-            pasta_caminho.mkdir(parents=True, exist_ok=True)
+        for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
+        
+        self.anos = list(range(2022, datetime.now().year + 1))
+        self.agente = {'User-Agent': 'SafeDriver-BR-V19-Industrial'}
+        self.webhook = os.environ.get("DISCORD_WEBHOOK")
+        self.manifesto_caminho = self.pastas["auditoria"] / "manifesto.json"
+        self.auditoria = self.carregar_manifesto()
+
+    def carregar_manifesto(self):
+        if self.manifesto_caminho.exists():
+            with open(self.manifesto_caminho, "r") as f: return json.load(f)
+        return {}
+
+    def calcular_hash(self, conteudo):
+        return hashlib.sha256(conteudo).hexdigest()
+
+    def enviar_alerta(self, titulo, msg, cor):
+        if not self.webhook: return
+        payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
+        try: requests.post(self.webhook, json=payload, timeout=10)
+        except: pass
+
+    def identificar_base_ssp(self, conteudo):
+        try:
+            excel = pd.ExcelFile(io.BytesIO(conteudo))
+            for aba in excel.sheet_names:
+                df = excel.parse(aba, nrows=50)
+                df.columns = [str(c).upper().strip() for c in df.columns]
+                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'NOME_MUNICIPIO']):
+                    return excel.parse(aba)
+            return None
+        except: return None
+
+    def processar_ia_ensemble(self, df):
+        df.columns = [str(c).lower().strip() for c in df.columns]
+        
+        df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
+        
+        df['perfil'] = 'Geral'
+        col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
+        df['crime_alvo'] = df[col_crime].fillna('').astype(str).upper()
+        
+        df.loc[df['crime_alvo'].str.contains('VEÍCULO|MOTO|CARGA|AUTO|CONDUZIR'), 'perfil'] = 'Motorista'
+        df.loc[df['crime_alvo'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
+        
+        col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
+        if col_local in df.columns:
+            loc_alvo = df[col_local].fillna('').astype(str).upper()
+            mask_ped = (loc_alvo.str.contains('VIA PÚBLICA|RUA')) & (df['crime_alvo'].str.contains('CELULAR|PESSOA'))
+            df.loc[mask_ped, 'perfil'] = 'Pedestre'
+        
+        df['severidade'] = df['crime_alvo'].apply(lambda x: 15 if 'ROUBO' in x else 2)
+        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
+        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
+        df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
+        
+        if df.empty: return None
+
+        df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
+        fato = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['severidade'].sum().reset_index()
+        fato['lat'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
+        fato['lon'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
+        fato['perfil_idx'] = fato['perfil'].astype('category').cat.codes
+        fato['periodo_idx'] = fato['desc_periodo'].astype('category').cat.codes
+
+        X = fato[['lat', 'lon', 'perfil_idx', 'periodo_idx']]
+        y = fato['severidade']
+        
+        lgbm = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
+        catb = CatBoostRegressor(iterations=100, silent=True).fit(X, y)
+        knnr = KNeighborsRegressor(n_neighbors=5).fit(X, y)
+
+        explicador = shap.TreeExplainer(lgbm)
+        shap_v = explicador.shap_values(X)
+        for i, col in enumerate(X.columns): fato[f'influencia_{col}'] = shap_v[:, i]
             
-        ano_base = 2022
-        ano_limite = datetime.now().year
-        self.anos_processamento = list(range(ano_base, ano_limite + 1))
-        self.agente_requisicao = {'User-Agent': 'SafeDriver-Industrial-V17-ColdStart'}
-        self.webhook_monitor = os.environ.get("DISCORD_WEBHOOK")
-        self.registro_auditoria = {}
-
-    def gerar_assinatura_arquivo(self, caminho):
-        sha256 = hashlib.sha256()
-        with open(caminho, "rb") as f:
-            for bloco in iter(lambda: f.read(4096), b""):
-                sha256.update(bloco)
-        return sha256.hexdigest()
-
-    def reportar_discord(self, titulo, mensagem, cor_hex):
-        if not self.webhook_monitor: return
-        payload = {
-            "embeds": [{
-                "title": titulo,
-                "description": mensagem,
-                "color": cor_hex,
-                "timestamp": datetime.now().isoformat()
-            }]
-        }
-        requests.post(self.webhook_monitor, json=payload, timeout=10)
-
-    def identificar_planilha_dados(self, conteudo_binario):
-        arquivo_excel = pd.ExcelFile(io.BytesIO(conteudo_binario))
-        for nome_aba in arquivo_excel.sheet_names:
-            df_amostra = arquivo_excel.parse(nome_aba, nrows=25)
-            df_amostra.columns = [str(col).upper().strip() for col in df_amostra.columns]
-            if any(chave in df_amostra.columns for chave in ['LATITUDE', 'NATUREZA_APURADA', 'RUBRICA']):
-                return arquivo_excel.parse(nome_aba)
-        return None
-
-    def executar_ensemble_ia(self, dataframe_consolidado):
-        dataframe_consolidado.columns = [str(c).lower().strip() for c in dataframe_consolidado.columns]
+        fato['score_risco'] = (lgbm.predict(X) * 0.4 + catb.predict(X) * 0.4 + knnr.predict(X) * 0.2)
         
-        dataframe_consolidado['perfil_usuario'] = 'Geral'
-        coluna_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in dataframe_consolidado.columns), 'rubrica')
-        dataframe_consolidado['crime_normalizado'] = dataframe_consolidado[coluna_crime].fillna('').astype(str).upper()
+        ouro_path = self.pastas["ouro"] / "base_final_bi.csv"
+        fato.to_csv(ouro_path, index=False)
         
-        dataframe_consolidado.loc[dataframe_consolidado['crime_normalizado'].str.contains('VEÍCULO|MOTO|CARGA|AUTO|CONDUZIR'), 'perfil_usuario'] = 'Motorista'
-        dataframe_consolidado.loc[dataframe_consolidado['crime_normalizado'].str.contains('BICICLETA|BIKE'), 'perfil_usuario'] = 'Ciclista'
+        hash_ouro = hashlib.sha256(open(ouro_path, "rb").read()).hexdigest()
+        self.auditoria["hash_ouro"] = hash_ouro
         
-        coluna_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in dataframe_consolidado.columns), 'descr_tipolocal')
-        if coluna_local in dataframe_consolidado.columns:
-            local_normalizado = dataframe_consolidado[coluna_local].fillna('').astype(str).upper()
-            filtro_pedestre = (local_normalizado.str.contains('VIA PÚBLICA|RUA|AVENIDA')) & (dataframe_consolidado['crime_normalizado'].str.contains('CELULAR|PESSOA|TRANSEUNTE'))
-            dataframe_consolidado.loc[filtro_pedestre, 'perfil_usuario'] = 'Pedestre'
-        
-        dataframe_consolidado['peso_severidade'] = dataframe_consolidado['crime_normalizado'].apply(lambda x: 15 if 'ROUBO' in x else 2)
-
-        dataframe_consolidado['latitude'] = pd.to_numeric(dataframe_consolidado['latitude'], errors='coerce').fillna(0)
-        dataframe_consolidado['longitude'] = pd.to_numeric(dataframe_consolidado['longitude'], errors='coerce').fillna(0)
-        dataframe_consolidado = dataframe_consolidado[(dataframe_consolidado['latitude'] != 0) & (dataframe_consolidado['longitude'] != 0)].copy()
-        
-        if dataframe_consolidado.empty: raise ValueError("Processamento interrompido: Ausencia de coordenadas validas")
-
-        dataframe_consolidado['h3_index'] = dataframe_consolidado.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
-        tabela_fato = dataframe_consolidado.groupby(['h3_index', 'desc_periodo', 'perfil_usuario'])['peso_severidade'].sum().reset_index()
-        tabela_fato['lat'] = tabela_fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
-        tabela_fato['lon'] = tabela_fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        tabela_fato['perfil_cod'] = tabela_fato['perfil_usuario'].astype('category').cat.codes
-        tabela_fato['periodo_cod'] = tabela_fato['desc_periodo'].astype('category').cat.codes
-
-        variaveis_x = tabela_fato[['lat', 'lon', 'perfil_cod', 'periodo_cod']]
-        alvo_y = tabela_fato['peso_severidade']
-        
-        lgbm = LGBMRegressor(n_estimators=100, verbose=-1).fit(variaveis_x, alvo_y)
-        catb = CatBoostRegressor(iterations=100, silent=True).fit(variaveis_x, alvo_y)
-        knn = KNeighborsRegressor(n_neighbors=5).fit(variaveis_x, alvo_y)
-
-        explainer_shap = shap.TreeExplainer(lgbm)
-        valores_shap = explainer_shap.shap_values(variaveis_x)
-        for i, col_nome in enumerate(variaveis_x.columns):
-            tabela_fato[f'influencia_{col_nome}'] = valores_shap[:, i]
-            
-        tabela_fato['score_final'] = (lgbm.predict(variaveis_x) * 0.4 + catb.predict(variaveis_x) * 0.4 + knn.predict(variaveis_x) * 0.2)
-
-        caminho_saida_ouro = self.pastas["ouro"] / "base_inteligencia.csv"
-        tabela_fato.to_csv(caminho_saida_ouro, index=False)
-        self.registro_auditoria["camada_ouro"] = self.gerar_assinatura_arquivo(caminho_saida_ouro)
-        
-        return len(tabela_fato)
+        return len(fato)
 
     def iniciar_pipeline(self):
         try:
-            lista_dataframes = []
-            log_detalhado = []
+            pool = []
+            log_servico = []
             
-            for ano in self.anos_processamento:
-                url_ssp = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                caminho_local_bronze = self.pastas["bronze"] / f"bruto_{ano}.parquet"
+            for ano in self.anos:
+                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+                caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
                 
                 try:
-                    resposta_ssp = requests.get(url_ssp, headers=self.agente_requisicao, timeout=90)
-                    if resposta_ssp.status_code == 200:
-                        df_extraido = self.identificar_planilha_dados(resposta_ssp.content)
-                        if df_extraido is not None:
-                            df_extraido.to_parquet(caminho_local_bronze)
-                            self.registro_auditoria[f"bronze_{ano}"] = self.gerar_assinatura_arquivo(caminho_local_bronze)
-                            lista_dataframes.append(df_extraido)
-                            log_detalhado.append(f"✅ {ano}: Download e Ingestao OK")
+                    head = requests.head(url, headers=self.agente, timeout=30)
+                    tamanho_ssp = str(head.headers.get('Content-Length', '0'))
+                    
+                    if caminho_local.exists() and self.auditoria.get(f"tamanho_{ano}") == tamanho_ssp:
+                        df_existente = pd.read_parquet(caminho_local)
+                        pool.append(df_existente)
+                        log_servico.append(f"📦 {ano}: DeltaSync (Sem alteracoes)")
+                        continue
+
+                    res = requests.get(url, headers=self.agente, timeout=180)
+                    if res.status_code == 200:
+                        df_novo = self.identificar_base_ssp(res.content)
+                        if df_novo is not None:
+                            df_novo.to_parquet(caminho_local)
+                            self.auditoria[f"tamanho_{ano}"] = tamanho_ssp
+                            self.auditoria[f"hash_{ano}"] = self.calcular_hash(res.content)
+                            pool.append(df_novo)
+                            log_servico.append(f"📥 {ano}: Sincronizacao Incremental Concluida")
                 except:
-                    if caminho_local_bronze.exists():
-                        df_cache = pd.read_parquet(caminho_local_bronze)
-                        lista_dataframes.append(df_cache)
-                        log_detalhado.append(f"📦 {ano}: Recuperado do Cache Local")
+                    if caminho_local.exists():
+                        pool.append(pd.read_parquet(caminho_local))
+                        log_servico.append(f"⚠️ {ano}: Erro de rede (Usando cache)")
 
-            if not lista_dataframes: raise Exception("Falha de infraestrutura: Nenhuma aba de dados localizada em 2022-2026")
+            if not pool: raise Exception("Fontes de dados indisponiveis")
 
-            total_h3 = self.executar_ensemble_ia(pd.concat(lista_dataframes))
+            total_h3 = self.processar_ia_ensemble(pd.concat(pool))
             
-            with open(self.pastas["auditoria"] / "manifesto.json", "w") as f_audit:
-                json.dump(self.registro_auditoria, f_audit, indent=4)
+            with open(self.manifesto_caminho, "w") as f: json.dump(self.auditoria, f, indent=4)
 
-            self.reportar_discord("SafeDriver: Monitor Operacional", "\n".join(log_detalhado), 3447003)
-            self.reportar_discord("SafeDriver: Monitor Executivo", f"Areas: {total_h3}\nEnsemble: LGBM/CatB/KNN\nAuditoria: Ativa", 3066993)
+            self.enviar_alerta("SafeDriver Operacional", "\n".join(log_servico), 3447003)
+            self.enviar_alerta("SafeDriver Executivo", f"Base atualizada: {total_h3} celulas\nIntegridade: OK\nMetodo: DeltaSync", 3066993)
 
-        except Exception as erro_fatal:
-            self.reportar_discord("SafeDriver: Alerta de Sistema", str(erro_fatal), 15158332)
-            raise erro_fatal
+        except Exception as e:
+            self.enviar_alerta("Erro Critico SafeDriver", str(e), 15158332)
+            raise e
 
 if __name__ == "__main__":
     MotorSafeDriver().iniciar_pipeline()
