@@ -13,6 +13,4 @@ geopy
 matplotlib
 fastapi
 uvicorn
-selenium
-webdriver-manager
 holidays
