@@ -1,4 +1,4 @@
-name: SafeDriver Atualização Diária
+name: SafeDriver Atualização Diaria
 on:
   schedule:
     - cron: '0 0 * * *'
@@ -16,7 +16,7 @@ jobs:
           cache: 'pip'
       - name: Instalar Dependencias
         run: pip install -r requirements.txt
-      - name: Rodar Motor de Dados
+      - name: Rodar Motor
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -24,12 +24,12 @@ jobs:
         run: |
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
-      - name: Auditoria de Segurança
+      - name: Auditoria Pytest
         run: python -m pytest tests/test_seguranca.py
-      - name: Salvar Mudanças no Repositório
+      - name: Git Push
         run: |
           git config --local user.email "bot@safedriver.com"
-          git config --local user.name "SafeDriver AutoBot"
-          git add datalake/auditoria/*.json datalake/ouro/*.csv documentacao/*.png
-          git commit -m "sincronização automática: dados auditados e limpos [skip ci]" || echo "Sem mudanças"
+          git config --local user.name "SafeDriver Bot"
+          git add datalake/auditoria/*.json datalake/ouro/*.csv datalake/ouro/*.parquet documentacao/*.png
+          git commit -m "auto: sync auditado [skip ci]" || echo "nada para subir"
           git push
