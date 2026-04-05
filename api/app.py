@@ -6,8 +6,8 @@ from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from pathlib import Path
 
-app = FastAPI(title="SafeDriver API V20 Industrial")
-CHAVE_PROD = os.environ.get("API_KEY", "fatec_safe_2026_industrial")
+app = FastAPI(title="SafeDriver API")
+CHAVE_PROD = os.environ.get("API_KEY", "fatec_safedriver_auth")
 auth_header = APIKeyHeader(name="X-API-KEY")
 
 def verificar_auditagem():
@@ -27,18 +27,15 @@ def verificar_auditagem():
 @app.get("/v1/risco/{perfil}/{h3_index}")
 def consultar_risco(perfil: str, h3_index: str, api_key: str = Security(auth_header)):
     if api_key != CHAVE_PROD: raise HTTPException(status_code=403)
-    if not verificar_auditagem(): raise HTTPException(status_code=500, detail="Trilha de Auditoria Violada")
+    if not verificar_auditagem(): raise HTTPException(status_code=500)
     
     df = pd.read_csv("datalake/ouro/base_final_looker.csv")
     dado = df[(df['h3_index'] == h3_index) & (df['perfil'].str.lower() == perfil.lower())]
     
     if dado.empty: raise HTTPException(status_code=404)
     
-    pior_fator = "Perfil" if abs(dado['influencia_perfil_idx'].mean()) > abs(dado['influencia_periodo_idx'].mean()) else "Horário"
-    
     return {
         "h3": h3_index,
         "perfil": perfil,
-        "score": round(float(dado['score_risco'].mean()), 2),
-        "fator_dominante": pior_fator
+        "score_agregado": round(float(dado['score_risco'].mean()), 2)
     }
