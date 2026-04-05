@@ -4,7 +4,7 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 jobs:
-  pipeline:
+  pipeline_extracao:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -16,14 +16,15 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
           
-      - name: Setup Chrome para Auth Hibrida
+      - name: Provisionar Navegador Chrome Nativo
         run: |
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
           
-      - run: pip install -r requirements.txt
-      
-      - name: Motor Streaming Abortivo e IA
+      - name: Configurar Pacotes Python
+        run: pip install -r requirements.txt
+        
+      - name: Executar Motor de Extração e ML
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -32,13 +33,13 @@ jobs:
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
           
-      - name: Auditoria Pytest
+      - name: Validar Camada de Segurança e Auditoria
         run: python -m pytest tests/test_seguranca.py
         
-      - name: Commit Datalake
+      - name: Persistir Artefatos e Datalake
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver AutoBot"
           git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv documentacao/*.png
-          git commit -m "auto:streaming abortivo [skip ci]" || echo "Sem mudanças"
+          git commit -m "auto: sincronizacao industrial [skip ci]" || echo "Sem mudanças"
           git push
