@@ -1,8 +1,8 @@
-name: Autobot Fluxo Diario 
+name: Autobot Execução Diaria
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 7 * * *'
   workflow_dispatch:
 
 jobs:
@@ -10,24 +10,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-      - name: Install Libs
+
+      - name: Instalar Dependências
         run: pip install -r requirements.txt
-      - name: Execute Engine and Docs
+
+      - name: Executando Testes e Pipeline
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: |
           python autobot/autobot_engine.py
-          python gerador_diagramas.py
           python -m pytest tests/test_contracts.py
-      - name: Commit Results
+
+      - name: Comentando e fazendo DeltaSync
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
-          git add datalake/ouro/* documentacao/*.png
-          git commit -m "Update: Pipeline Results and Documentation [skip ci]" || echo "No changes"
+          git add datalake/ouro/* datalake/bronze/*.parquet datalake/prata/*.parquet
+          git commit -m "update: delta sync and metrics [skip ci]" || echo "No changes to commit"
           git push
