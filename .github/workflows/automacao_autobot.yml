@@ -4,7 +4,7 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 jobs:
-  pipeline:
+  execucao:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -14,18 +14,18 @@ jobs:
         with:
           python-version: '3.10'
       - run: pip install -r requirements.txt
-      - name: Processamento e Documentação
+      - name: Motor e Documentação
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
         run: |
           python autobot/autobot_engine.py
           python gerador_diagramas.py
-      - name: Auditoria de Segurança
+      - name: Validar Segurança
         run: python -m pytest tests/test_seguranca.py
       - name: Sincronizar Repositório
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
           git add datalake/* documentacao/*.png
-          git commit -m "auto: v6 industrial sync [skip ci]" || echo "Sem mudanças"
+          git commit -m "auto: mlops sync completa [skip ci]" || echo "No changes"
           git push
