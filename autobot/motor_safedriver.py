@@ -51,25 +51,23 @@ class MotorSafeDriver:
         opcoes.add_argument('--disable-dev-shm-usage')
         opcoes.add_argument('--disable-blink-features=AutomationControlled')
         
-        prefs = {
-            "download.default_directory": str(self.pastas["raw"].absolute()),
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": False,
-            "profile.default_content_settings.popups": 0
-        }
-        opcoes.add_experimental_option("prefs", prefs)
-        
         self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opcoes)
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        self.driver.execute_cdp_cmd('Page.setDownloadBehavior', {
+            'behavior': 'allow',
+            'downloadPath': str(self.pastas["raw"].resolve())
+        })
 
     def aguardar_download_concluir(self, timeout=600):
         inicio = time.time()
         while time.time() - inicio < timeout:
             arquivos_crdownload = list(self.pastas["raw"].glob("*.crdownload"))
+            arquivos_tmp = list(self.pastas["raw"].glob("*.tmp"))
             arquivos_xlsx = list(self.pastas["raw"].glob("*.xlsx"))
             
-            if not arquivos_crdownload and arquivos_xlsx:
+            if not arquivos_crdownload and not arquivos_tmp and arquivos_xlsx:
+                time.sleep(2)
                 return arquivos_xlsx[0]
             time.sleep(3)
         return None
@@ -168,6 +166,9 @@ class MotorSafeDriver:
             pool = []
             log_op = []
             mudanca = False
+            
+            self.driver.get("https://www.ssp.sp.gov.br/estatistica/consultas")
+            time.sleep(5)
             
             for ano in self.anos:
                 self.limpar_pasta_raw()
