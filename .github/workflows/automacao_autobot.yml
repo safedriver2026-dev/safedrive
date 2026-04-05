@@ -6,31 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-run:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Instalar Dependências
-        run: pip install -r requirements.txt
-
-      - name: Executando Testes e Pipeline
+        with: { python-version: '3.10', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - name: Executa Pipeline
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: |
           python autobot/autobot_engine.py
+          python gerador_diagramas.py
           python -m pytest tests/test_contracts.py
-
-      - name: Comentando e fazendo DeltaSync
+      - name: Atualiza Delta
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
-          git add datalake/ouro/* datalake/bronze/*.parquet datalake/prata/*.parquet
-          git commit -m "update: delta sync and metrics [skip ci]" || echo "No changes to commit"
+          git add datalake/ouro/* documentacao/*.png
+          git commit -m "update: delta results [skip ci]" || echo "No changes"
           git push
