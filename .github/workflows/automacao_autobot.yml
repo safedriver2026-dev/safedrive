@@ -1,4 +1,4 @@
-name: SafeDriver MLOps V22
+name: SafeDriver MLOps Industrial V22
 on:
   schedule:
     - cron: '0 9 * * *'
@@ -15,19 +15,20 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
       - run: pip install -r requirements.txt
-      - name: Motor DeltaSync e IA
+      - name: Motor IA e Auditoria
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           API_KEY: ${{ secrets.API_KEY }}
         run: |
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
-      - name: Testes de Auditoria
+      - name: Validar Seguranca
         run: python -m pytest tests/test_seguranca.py
-      - name: Sincronizar Repositório
+      - name: Sincronizar Repositorio
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
-          git add datalake/auditoria/manifesto.json datalake/ouro/base_final_bi.csv documentacao/*.png
-          git commit -m "auto: v22 industrial integridade [skip ci]" || echo "Sem mudanças"
+          git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv documentacao/*.png
+          git commit -m "auto: v22 industrial dual-monitor [skip ci]" || echo "Sem mudanças"
           git push
