@@ -1,28 +1,31 @@
 import base64, zlib, requests
 from pathlib import Path
 
-def produzir_diagrama(mermaid, nome):
+def salvar_png(mermaid, nome):
     cod = base64.urlsafe_b64encode(zlib.compress(mermaid.encode('utf-8'), 9)).decode('ascii')
     res = requests.get(f"https://kroki.io/mermaid/png/{cod}")
     if res.status_code == 200:
         Path("documentacao").mkdir(exist_ok=True)
         with open(f"documentacao/diag_{nome}.png", "wb") as f: f.write(res.content)
 
-produzir_diagrama("""
+salvar_png("""
 graph TD
-    A[Gatilho: GitHub Action] --> B[Motor V22: Carregar Manifesto]
-    B --> C[Loop de Anos: 2022-2026]
-    C --> D{DeltaSync: Tamanho Mudou?}
-    D -- Sim --> E[Download Camuflado Chrome]
-    D -- Não --> F[Carregar Cache Bronze Parquet]
-    E --> G[Deduplicacao por Chave Primaria Composta]
-    G --> H[Ensemble IA: LGBM + CatB + KNN]
-    H --> I[Explicabilidade SHAP para Looker]
-    I --> J[Monitoramento: Webhooks Sucesso/Erro]
-    J --> K[Sincronizar Repositorio e Auditoria]
-""", "funcionamento_automacao")
+    A[Gatilho Actions] --> B[Selenium Headless Auth]
+    B --> C[Requests Session + Cookies]
+    C --> D{DeltaSync: Content-Length Check}
+    D -- Alterado --> E[Streaming Download 300MB+ Chunked]
+    E --> F[Salvar Temp /datalake/raw/.xlsx]
+    F --> G[Extração de Aba Correta e Parse]
+    G --> H[Salvar Otimizado /datalake/bronze/.parquet]
+    H --> I[Exclusão do XLSX Temp I/O Free]
+    D -- Inalterado --> J[Carregar Parquet Direto]
+    I --> K[Deduplicação Composta]
+    J --> K
+    K --> L[Treino Ensemble e SHAP]
+    L --> M[Exportar base_final_looker.csv]
+""", "arquitetura_bigdata_streaming")
 
-produzir_diagrama("""
+salvar_png("""
 erDiagram
     FATO_RISCO {
         string h3_index
@@ -32,13 +35,13 @@ erDiagram
     DIM_GEOGRAFIA ||--o{ FATO_RISCO : "h3"
     DIM_PERFIL ||--o{ FATO_RISCO : "idx"
     DIM_TEMPO ||--o{ FATO_RISCO : "idx"
-""", "modelo_dados_estrela")
+""", "modelo_dados")
 
-produzir_diagrama("""
+salvar_png("""
 graph TD
-    API[FastAPI Gateway] -->|Chave X-API-KEY| S{Validar Integridade}
-    S -->|SHA256| M[Manifesto Auditoria]
-    S -- OK --> D[Consulta Camada Ouro CSV]
-    D --> J[Retorno JSON: Score + Fator Dominante]
-    J --> L[Looker Studio BI Dashboard]
-""", "fluxo_api_integracao")
+    API[FastAPI Gateway] -->|Validacao X-API-KEY| S{Integridade SHA256}
+    S -->|Verifica| M[manifesto.json]
+    S -- OK --> D[Consulta base_final_looker.csv]
+    D --> J[JSON Payload: SHAP e Score]
+    J --> L[Looker Studio BI]
+""", "funcionamento_api")
