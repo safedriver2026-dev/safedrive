@@ -4,28 +4,37 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 jobs:
-  pipeline:
+  execucao_total:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: pip install -r requirements.txt
-      - name: Motor e Auditoria
+
+      - name: Dependencias
+        run: pip install -r requirements.txt
+
+      - name: Pipeline de Dados e Auditoria
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          API_KEY: ${{ secrets.API_KEY }}
         run: |
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
-      - name: Validar Integridade
+
+      - name: Auditoria (Pytest)
         run: python -m pytest tests/test_seguranca.py
-      - name: Sincronizar Datalake
+
+      - name: Sincronizar Repositorio
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
           git add datalake/auditoria/* datalake/ouro/* documentacao/*.png
-          git commit -m "auto: v14 industrial sync [skip ci]" || echo "Sem mudanças"
+          git commit -m "auto: industrial coldstart  [skip ci]" || echo "Sem alteracoes"
           git push
