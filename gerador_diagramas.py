@@ -10,38 +10,26 @@ def salvar_png(mermaid, nome):
 
 salvar_png("""
 graph TD
-    A[Gatilho Actions] --> B[Selenium Headless Auth]
-    B --> C[Requests Session + Cookies]
-    C --> D{DeltaSync: Content-Length Check}
-    D -- Alterado --> E[Streaming Download 300MB+ Chunked]
-    E --> F[Salvar Temp /datalake/raw/.xlsx]
-    F --> G[Extração de Aba Correta e Parse]
-    G --> H[Salvar Otimizado /datalake/bronze/.parquet]
-    H --> I[Exclusão do XLSX Temp I/O Free]
-    D -- Inalterado --> J[Carregar Parquet Direto]
-    I --> K[Deduplicação Composta]
-    J --> K
-    K --> L[Treino Ensemble e SHAP]
-    L --> M[Exportar base_final_looker.csv]
-""", "arquitetura_bigdata_streaming")
+    A[Camada Bronze Parquet] --> B[Extração: data_ocorrencia_bo]
+    B --> C{Feature Engineering}
+    C -->|holidays.Brazil| D[is_feriado]
+    C -->|dt.day in 5,6,7,20,21| E[is_pagamento]
+    C -->|dt.dayofweek >= 5| F[is_fim_semana]
+    D & E & F --> G[Ensemble: XGBoost/CatB/KNN]
+    G --> H[SHAP Values: Qual impacto do Feriado?]
+    H --> I[Camada Ouro: base_final_looker.csv]
+""", "arquitetura_feature_engineering")
 
 salvar_png("""
 erDiagram
     FATO_RISCO {
         string h3_index
         float score_risco
-        float influencia_perfil
+        int is_feriado
+        int is_pagamento
+        float shap_influencia_pagamento
     }
     DIM_GEOGRAFIA ||--o{ FATO_RISCO : "h3"
     DIM_PERFIL ||--o{ FATO_RISCO : "idx"
-    DIM_TEMPO ||--o{ FATO_RISCO : "idx"
-""", "modelo_dados")
-
-salvar_png("""
-graph TD
-    API[FastAPI Gateway] -->|Validacao X-API-KEY| S{Integridade SHA256}
-    S -->|Verifica| M[manifesto.json]
-    S -- OK --> D[Consulta base_final_looker.csv]
-    D --> J[JSON Payload: SHAP e Score]
-    J --> L[Looker Studio BI]
-""", "funcionamento_api")
+    DIM_CALENDARIO ||--o{ FATO_RISCO : "sazonalidade"
+""", "modelo_dados_comportamental")
