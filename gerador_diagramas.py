@@ -10,19 +10,20 @@ def salvar_png(mermaid, nome):
 
 salvar_png("""
 graph TD
-    A[Gatilho Actions] --> B[Selenium Headless Auth]
-    B --> C[Requests Session + Cookies Forjados]
-    C --> D[Loop Links Diretos 2022-2026]
-    D --> E{Streaming Abortivo: Leitura de Headers}
-    E -- Tamanho Inalterado --> F[Abortar Download + Cache Parquet]
-    E -- Tamanho Alterado --> G[Download Chunked 300MB+]
-    G --> H[Processamento e Conversao Parquet]
-    F --> I[Deduplicacao Rigorosa]
+    A[Início do Fluxo] --> B[Selenium Headless Auth]
+    B --> C[Loop Anual Links SSP]
+    C --> D[Download Nativo Direto no Disco]
+    D --> E{Verificação Criptográfica SHA256}
+    E -- Hash Inalterado --> F[Abortar Processamento + Cache Parquet]
+    E -- Hash Alterado --> G[Extração e Limpeza Otimizada]
+    G --> H[Conversão Parquet /datalake/bronze/]
+    F --> I[Deduplicação Composta]
     H --> I
     I --> J[Feature Engineering: Feriados/Pagamento]
-    J --> K[Ensemble IA e Explicabilidade SHAP]
-    K --> L[Exportar base_final_looker.csv e Manifesto]
-""", "arquitetura_v28_direta")
+    J --> K[Agrupamento H3 Geoespacial]
+    K --> L[Ensemble IA e Cálculo SHAP]
+    L --> M[Exportar base_final_looker.csv e Manifesto]
+""", "arquitetura_safedriver")
 
 salvar_png("""
 erDiagram
@@ -34,13 +35,13 @@ erDiagram
     DIM_GEOGRAFIA ||--o{ FATO_RISCO : "h3"
     DIM_PERFIL ||--o{ FATO_RISCO : "idx"
     DIM_CALENDARIO ||--o{ FATO_RISCO : "sazonalidade"
-""", "modelo_dados")
+""", "modelo_dados_safedriver")
 
 salvar_png("""
 graph TD
     API[FastAPI Gateway] -->|Validacao X-API-KEY| S{Integridade SHA256}
-    S -->|Verifica| M[manifesto.json]
-    S -- OK --> D[Consulta base_final_looker.csv]
-    D --> J[JSON Payload: SHAP e Score]
-    J --> L[Looker Studio BI]
-""", "funcionamento_api")
+    S -->|Auditoria| M[manifesto.json]
+    S -- Sucesso --> D[Consulta base_final_looker.csv]
+    D --> J[JSON Payload: Fatores de Risco]
+    J --> L[Integração Looker Studio]
+""", "fluxo_api_safedriver")
