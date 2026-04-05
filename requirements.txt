@@ -13,4 +13,5 @@ geopy
 matplotlib
 fastapi
 uvicorn
-beautifulsoup4
+selenium
+webdriver-manager
