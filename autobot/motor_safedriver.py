@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import hashlib
 from pathlib import Path
 from datetime import datetime
-from geopy.geocoders import Nominatim
+from bs4 import BeautifulSoup
 from sklearn.neighbors import KNeighborsRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
@@ -29,14 +29,13 @@ class MotorSafeDriver:
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         
         self.anos = list(range(2022, datetime.now().year + 1))
-        
-        self.cabecalhos = {
+        self.sessao = requests.Session()
+        self.sessao.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Connection': 'keep-alive',
-            'Referer': 'https://www.ssp.sp.gov.br/'
-        }
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8',
+            'Referer': 'https://www.ssp.sp.gov.br/estatistica/consultas'
+        })
         
         self.webhook = os.environ.get("DISCORD_WEBHOOK")
         self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
@@ -47,29 +46,22 @@ class MotorSafeDriver:
             with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def calcular_assinatura(self, conteudo):
-        return hashlib.sha256(conteudo).hexdigest()
-
-    def enviar_notificacao(self, titulo, msg, cor):
-        if not self.webhook: return
-        payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
-        try: requests.post(self.webhook, json=payload, timeout=10)
-        except: pass
-
-    def extrair_aba_dados(self, conteudo):
+    def buscar_link_ssp(self, ano):
         try:
-            excel = pd.ExcelFile(io.BytesIO(conteudo))
-            for aba in excel.sheet_names:
-                df = excel.parse(aba, nrows=50)
-                df.columns = [str(c).upper().strip() for c in df.columns]
-                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'NOME_MUNICIPIO']):
-                    return excel.parse(aba)
-            return None
-        except: return None
+            url_base = "https://www.ssp.sp.gov.br/estatistica/consultas"
+            res = self.sessao.get(url_base, timeout=30)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if f"SPDadosCriminais_{ano}" in href and href.endswith('.xlsx'):
+                    if href.startswith('http'): return href
+                    return f"https://www.ssp.sp.gov.br{href}"
+            return f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+        except:
+            return f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
 
-    def processar_ia_treinamento(self, df):
+    def processar_ia_ensemble(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
-        
         df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
         
         df['perfil'] = 'Geral'
@@ -122,53 +114,54 @@ class MotorSafeDriver:
             pool = []
             relatorio = []
             
-            with requests.Session() as sessao:
-                sessao.headers.update(self.cabecalhos)
+            for ano in self.anos:
+                url = self.buscar_link_ssp(ano)
+                caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
                 
-                for ano in self.anos:
-                    url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                    caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
+                try:
+                    head = self.sessao.head(url, timeout=20)
+                    tamanho_remoto = str(head.headers.get('Content-Length', '0'))
                     
-                    try:
-                        head = sessao.head(url, timeout=30)
-                        tamanho_remoto = str(head.headers.get('Content-Length', '0'))
+                    if caminho_local.exists() and self.auditoria.get(f"size_{ano}") == tamanho_remoto:
+                        pool.append(pd.read_parquet(caminho_local))
+                        relatorio.append(f"📦 {ano}: DeltaSync (Inalterado)")
+                        continue
+
+                    time.sleep(3)
+                    res = self.sessao.get(url, timeout=240)
+                    if res.status_code == 200:
+                        excel = pd.ExcelFile(io.BytesIO(res.content))
+                        df_novo = None
+                        for aba in excel.sheet_names:
+                            df_teste = excel.parse(aba, nrows=30)
+                            df_teste.columns = [str(c).upper().strip() for c in df_teste.columns]
+                            if 'LATITUDE' in df_teste.columns:
+                                df_novo = excel.parse(aba)
+                                break
                         
-                        if caminho_local.exists() and self.auditoria.get(f"size_{ano}") == tamanho_remoto:
-                            pool.append(pd.read_parquet(caminho_local))
-                            relatorio.append(f"📦 {ano}: DeltaSync Ativo")
-                            continue
-
-                        time.sleep(3)
-                        res = sessao.get(url, timeout=240)
-                        if res.status_code == 200:
-                            df_novo = self.aba_dados(res.content)
-                            if df_novo is not None:
-                                df_novo.to_parquet(caminho_local)
-                                self.auditoria[f"size_{ano}"] = tamanho_remoto
-                                self.auditoria[f"hash_{ano}"] = self.calcular_assinatura(res.content)
-                                pool.append(df_novo)
-                                relatorio.append(f"📥 {ano}: Sincronização Realizada")
-                            else:
-                                raise Exception(f"Aba de dados não localizada em {ano}")
+                        if df_novo is not None:
+                            df_novo.to_parquet(caminho_local)
+                            self.auditoria[f"size_{ano}"] = tamanho_remoto
+                            self.auditoria[f"hash_{ano}"] = hashlib.sha256(res.content).hexdigest()
+                            pool.append(df_novo)
+                            relatorio.append(f"📥 {ano}: Sincronizado via Link Dinâmico")
                         else:
-                            raise Exception(f"Erro HTTP {res.status_code}")
-                            
-                    except Exception as e:
-                        if caminho_local.exists():
-                            pool.append(pd.read_parquet(caminho_local))
-                            relatorio.append(f"⚠️ {ano}: Erro de rede (Cache Ativo)")
+                            raise Exception(f"Aba de coordenadas não encontrada em {ano}")
+                except:
+                    if caminho_local.exists():
+                        pool.append(pd.read_parquet(caminho_local))
+                        relatorio.append(f"⚠️ {ano}: Erro Conexão (Usando Local)")
 
-            if not pool: raise Exception("Bloqueio Crítico: Nenhuma fonte de dados acessível")
+            if not pool: raise Exception("Bloqueio SSP: Nenhuma fonte de dados acessível via Scraping")
 
-            total = self.processar_ia_treinamento(pd.concat(pool))
-            
+            total = self.processar_ia_ensemble(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
-
-            self.enviar_notificacao("SafeDriver Operacional", "\n".join(relatorio), 3447003)
-            self.enviar_notificacao("SafeDriver Executivo", f"Inteligência Atualizada: {total} áreas\nEnsemble: LGBM+CatB+KNN\nAuditoria: SHA256", 3066993)
+            
+            if self.webhook:
+                requests.post(self.webhook, json={"content": f"🚀 **SafeDriver V21**: {total} áreas atualizadas.\nIntegridade: OK."})
 
         except Exception as e:
-            self.enviar_notificacao("SafeDriver: Erro Crítico", str(e), 15158332)
+            if self.webhook: requests.post(self.webhook, json={"content": f"🚨 **Erro Crítico**: {str(e)}"})
             raise e
 
 if __name__ == "__main__":
