@@ -1,26 +1,29 @@
 name: Autobot Execução Diaria
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *' 
+  workflow_dispatch: 
+
 jobs:
-  execucao_total:
+  pipeline_integridade:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write 
+      
     steps:
-      - name: Checkout
+      - name: Checkout do Repositório
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Configurar Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      - name: Dependencias
+      - name: Instalar Dependências
         run: pip install -r requirements.txt
 
-      - name: Pipeline de Dados e Auditoria
+      - name: Executar Motor DeltaSync e IA
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           API_KEY: ${{ secrets.API_KEY }}
@@ -28,13 +31,16 @@ jobs:
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
 
-      - name: Auditoria (Pytest)
+      - name: Validar Trilha de Auditoria (Pytest)
         run: python -m pytest tests/test_seguranca.py
 
-      - name: Sincronizar Repositorio
+      - name: Sincronizar Datalake e Documentação
         run: |
           git config --local user.email "bot@safedriver.com"
-          git config --local user.name "SafeDriver Bot"
-          git add datalake/auditoria/* datalake/ouro/* documentacao/*.png
-          git commit -m "auto: industrial coldstart  [skip ci]" || echo "Sem alteracoes"
+          git config --local user.name "SafeDriver AutoBot"
+          # Adiciona apenas ficheiros essenciais para evitar inchar o repo
+          git add datalake/auditoria/manifesto.json
+          git add datalake/ouro/base_final_bi.csv
+          git add documentacao/*.png
+          git commit -m "auto: sincronização incremental v19 + trilha de auditoria [skip ci]" || echo "Sem alterações detetadas"
           git push
