@@ -1,56 +1,31 @@
-name: SafeDriver MLOps Pipeline
-
+name: Autobot Execução Diaria
 on:
   schedule:
-    - cron: '0 0 * * *' 
+    - cron: '0 0 * * *'
   workflow_dispatch:
-
 jobs:
-  build-and-run:
+  pipeline:
     runs-on: ubuntu-latest
-    
-   
     permissions:
       contents: write
-    
     steps:
-      - name: Checkout do Código
-        uses: actions/checkout@v4
-
-      - name: Configurar Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
-
-      - name: Instalar Dependências
-        run: pip install -r requirements.txt
-
-      - name: Executar SafeDriver Engine (IA + Pesos Penais)
+      - run: pip install -r requirements.txt
+      - name: Executar Core e IA
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: |
           python autobot/autobot_engine.py
           python gerador_diagramas.py
-          python -m pytest tests/test_contracts.py
-
-      - name: Persistir Camadas no Data Lake (Delta Sync)
+      - name: Validar Integridade
+        run: python -m pytest tests/test_seguranca.py
+      - name: Persistir Pipeline
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
-          
-          # Adicionando Bronze (Dados Brutos Compactados)
-          git add datalake/bronze/*.parquet || echo "Nenhum dado novo na Bronze"
-          
-          # Adicionando Prata (Dados Limpos com Pesos Penais)
-          git add datalake/prata/*.parquet || echo "Nenhum dado novo na Prata"
-          
-          # Adicionando Ouro (Inteligência e CSV para Looker)
-          git add datalake/ouro/*
-          
-          # Adicionando Documentação (Diagramas PNG)
-          git add documentacao/*.png
-          
-          git commit -m "update: delta sync full layers (bronze/prata/ouro) [skip ci]" || echo "Sem alterações para commit"
+          git add datalake/* documentacao/*.png
+          git commit -m "auto: mlops sync [skip ci]" || echo "Sem mudanças"
           git push
