@@ -16,15 +16,10 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
           
-      - name: Provisionar Navegador Chrome Nativo
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-          
       - name: Configurar Pacotes Python
         run: pip install -r requirements.txt
         
-      - name: Executar Motor de Extração e ML
+      - name: Executar Motor de Extracao e ML
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -33,7 +28,7 @@ jobs:
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
           
-      - name: Validar Camada de Segurança e Auditoria
+      - name: Validar Camada de Seguranca e Auditoria
         run: python -m pytest tests/test_seguranca.py
         
       - name: Persistir Artefatos e Datalake
@@ -41,5 +36,5 @@ jobs:
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver AutoBot"
           git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv documentacao/*.png
-          git commit -m "auto: sincronizacao  [skip ci]" || echo "Sem mudanças"
+          git commit -m "auto: sincronizacao [skip ci]" || echo "Sem mudanças"
           git push
