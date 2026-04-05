@@ -31,11 +31,11 @@ class MotorSafeDriver:
         self.anos = list(range(2022, datetime.now().year + 1))
         
         self.cabecalhos = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
             'Connection': 'keep-alive',
-            'Referer': 'https://www.ssp.sp.gov.br/estatistica/transparencia-trimestral'
+            'Referer': 'https://www.ssp.sp.gov.br/'
         }
         
         self.webhook = os.environ.get("DISCORD_WEBHOOK")
@@ -50,13 +50,13 @@ class MotorSafeDriver:
     def calcular_assinatura(self, conteudo):
         return hashlib.sha256(conteudo).hexdigest()
 
-    def avisar_discord(self, titulo, msg, cor):
+    def enviar_notificacao(self, titulo, msg, cor):
         if not self.webhook: return
         payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
         try: requests.post(self.webhook, json=payload, timeout=10)
         except: pass
 
-    def extrair_dados_ssp(self, conteudo):
+    def extrair_aba_dados(self, conteudo):
         try:
             excel = pd.ExcelFile(io.BytesIO(conteudo))
             for aba in excel.sheet_names:
@@ -67,7 +67,7 @@ class MotorSafeDriver:
             return None
         except: return None
 
-    def processar_ia_v20(self, df):
+    def processar_ia_treinamento(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
         
         df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
@@ -111,7 +111,7 @@ class MotorSafeDriver:
             
         fato['score_risco'] = (lgbm.predict(X) * 0.4 + catb.predict(X) * 0.4 + knnr.predict(X) * 0.2)
         
-        ouro_path = self.pastas["ouro"] / "base_final_bi.csv"
+        ouro_path = self.pastas["ouro"] / "base_final_looker.csv"
         fato.to_csv(ouro_path, index=False)
         self.auditoria["hash_ouro"] = hashlib.sha256(open(ouro_path, "rb").read()).hexdigest()
         
@@ -130,7 +130,6 @@ class MotorSafeDriver:
                     caminho_local = self.pastas["bronze"] / f"bruto_{ano}.parquet"
                     
                     try:
-                        # DeltaSync: Verifica metadados sem baixar o arquivo todo
                         head = sessao.head(url, timeout=30)
                         tamanho_remoto = str(head.headers.get('Content-Length', '0'))
                         
@@ -139,36 +138,37 @@ class MotorSafeDriver:
                             relatorio.append(f"📦 {ano}: DeltaSync Ativo")
                             continue
 
-                        # Download camuflado com delay humano
-                        time.sleep(2)
-                        res = sessao.get(url, timeout=180)
+                        time.sleep(3)
+                        res = sessao.get(url, timeout=240)
                         if res.status_code == 200:
-                            df_novo = self.extrair_dados_ssp(res.content)
+                            df_novo = self.aba_dados(res.content)
                             if df_novo is not None:
                                 df_novo.to_parquet(caminho_local)
                                 self.auditoria[f"size_{ano}"] = tamanho_remoto
                                 self.auditoria[f"hash_{ano}"] = self.calcular_assinatura(res.content)
                                 pool.append(df_novo)
-                                relatorio.append(f"📥 {ano}: Sincronização Incremental")
+                                relatorio.append(f"📥 {ano}: Sincronização Realizada")
+                            else:
+                                raise Exception(f"Aba de dados não localizada em {ano}")
                         else:
                             raise Exception(f"Erro HTTP {res.status_code}")
                             
                     except Exception as e:
                         if caminho_local.exists():
                             pool.append(pd.read_parquet(caminho_local))
-                            relatorio.append(f"⚠️ {ano}: Erro de rede (Usando cache)")
+                            relatorio.append(f"⚠️ {ano}: Erro de rede (Cache Ativo)")
 
-            if not pool: raise Exception("Nenhuma fonte de dados acessível após camuflagem")
+            if not pool: raise Exception("Bloqueio Crítico: Nenhuma fonte de dados acessível")
 
-            total = self.processar_ia_v20(pd.concat(pool))
+            total = self.processar_ia_treinamento(pd.concat(pool))
             
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
-            self.avisar_discord("Operacional SafeDriver", "\n".join(relatorio), 3447003)
-            self.avisar_discord("Executivo SafeDriver", f"Base: {total} áreas\nEnsemble: CatB+LGBM+KNN\nIntegridade: OK", 3066993)
+            self.enviar_notificacao("SafeDriver Operacional", "\n".join(relatorio), 3447003)
+            self.enviar_notificacao("SafeDriver Executivo", f"Inteligência Atualizada: {total} áreas\nEnsemble: LGBM+CatB+KNN\nAuditoria: SHA256", 3066993)
 
         except Exception as e:
-            self.avisar_discord("Erro Crítico SafeDriver", str(e), 15158332)
+            self.enviar_notificacao("SafeDriver: Erro Crítico", str(e), 15158332)
             raise e
 
 if __name__ == "__main__":
