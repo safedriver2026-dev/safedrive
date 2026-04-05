@@ -1,42 +1,31 @@
 name: Autobot Execução Diaria
 on:
   schedule:
-    - cron: '0 0 * * *' # Executa todos os dias às 09:00
-  workflow_dispatch: # Permite execução manual
-
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 jobs:
-  pipeline_executivo:
+  execucao:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      
     steps:
-      - name: Checkout do Repositório
-        uses: actions/checkout@v4
-
-      - name: Configurar Ambiente Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
-
-      - name: Instalar Dependências Industriais
-        run: pip install -r requirements.txt
-
-      - name: Executar Motor de IA e Gerador de Diagramas
+      - run: pip install -r requirements.txt
+      - name: Motor de Dados e Auditoria
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
-
-      - name: Auditoria de Segurança e Qualidade (Pytest)
+      - name: Auditoria de Integridade (Pytest)
         run: python -m pytest tests/test_seguranca.py
-
-      - name: Sincronizar Datalake e Documentação no Git
+      - name: Sincronizar Datalake
         run: |
           git config --local user.email "bot@safedriver.com"
-          git config --local user.name "SafeDriver Auto-Bot"
-          git add datalake/ouro/* documentacao/*.png
-          git commit -m "auto: atualização de inteligência e diagramas [skip ci]" || echo "Sem alterações"
+          git config --local user.name "SafeDriver Bot"
+          git add datalake/auditoria/* datalake/ouro/* documentacao/*.png
+          git commit -m "auto: v12 industrial sync [skip ci]" || echo "No changes"
           git push
