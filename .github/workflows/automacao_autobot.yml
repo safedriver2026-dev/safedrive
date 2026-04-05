@@ -1,29 +1,32 @@
-name: Autobot Execução Diaria
+name: SafeDriver MLOps Pipeline
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 0 * * *' 
   workflow_dispatch:
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
     
-
+   
     permissions:
       contents: write
     
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.10
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Instalando Dependências
+      - name: Instalar Dependências
         run: pip install -r requirements.txt
 
-      - name: Execute SafeDriver Engine
+      - name: Executar SafeDriver Engine (IA + Pesos Penais)
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -32,10 +35,22 @@ jobs:
           python gerador_diagramas.py
           python -m pytest tests/test_contracts.py
 
-      - name: Realizando DeltaSync
+      - name: Persistir Camadas no Data Lake (Delta Sync)
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
-          git add datalake/ouro/* documentacao/*.png
-          git commit -m "update: delta results and diagrams [skip ci]" || echo "No changes"
+          
+          # Adicionando Bronze (Dados Brutos Compactados)
+          git add datalake/bronze/*.parquet || echo "Nenhum dado novo na Bronze"
+          
+          # Adicionando Prata (Dados Limpos com Pesos Penais)
+          git add datalake/prata/*.parquet || echo "Nenhum dado novo na Prata"
+          
+          # Adicionando Ouro (Inteligência e CSV para Looker)
+          git add datalake/ouro/*
+          
+          # Adicionando Documentação (Diagramas PNG)
+          git add documentacao/*.png
+          
+          git commit -m "update: delta sync full layers (bronze/prata/ouro) [skip ci]" || echo "Sem alterações para commit"
           git push
