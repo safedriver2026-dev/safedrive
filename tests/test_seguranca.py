@@ -1,25 +1,29 @@
 import hashlib
 import json
+import pandas as pd
 from pathlib import Path
 
-def test_verificar_selos_digitais():
-    controle_path = Path("datalake/auditoria/controle_integridade.json")
-    ia_path = Path("datalake/ouro/predicao_risco_mapa.csv")
-    detalhes_path = Path("datalake/ouro/crimes_detalhados.csv")
+def test_auditoria_criptografica():
+    manifesto = Path("datalake/auditoria/controle_integridade.json")
+    base_ia = Path("datalake/ouro/predicao_risco_mapa.csv")
+    base_detalhes = Path("datalake/ouro/crimes_detalhados.parquet")
     
-    assert controle_path.exists()
-    with open(controle_path, "r") as f: controle = json.load(f)
+    assert manifesto.exists(), "ERRO: Manifesto de integridade nao encontrado"
+    with open(manifesto, "r") as f: controle = json.load(f)
     
-    def calcular(p):
-        h = hashlib.sha256()
-        with open(p, "rb") as f:
-            for b in iter(lambda: f.read(4096), b""): h.update(b)
-        return h.hexdigest()
+    def gerar_hash(caminho):
+        sha = hashlib.sha256()
+        with open(caminho, "rb") as f:
+            for bloco in iter(lambda: f.read(4096), b""): sha.update(bloco)
+        return sha.hexdigest()
     
-    assert calcular(ia_path) == controle.get("selo_ia")
-    assert calcular(detalhes_path) == controle.get("selo_detalhes")
+    assert gerar_hash(base_ia) == controle.get("selo_ia"), "ERRO: Base de IA violada"
+    assert gerar_hash(base_detalhes) == controle.get("selo_detalhes"), "ERRO: Base de Detalhes violada"
 
-def test_validar_chaves_unicas():
-    import pandas as pd
-    df = pd.read_csv("datalake/ouro/crimes_detalhados.csv")
-    assert df['num_bo'].is_unique
+def test_qualidade_dados_ouro():
+    df_ia = pd.read_csv("datalake/ouro/predicao_risco_mapa.csv")
+    df_detalhes = pd.read_parquet("datalake/ouro/crimes_detalhados.parquet")
+    
+    assert 'score_risco' in df_ia.columns
+    assert 'inf_hora' in df_ia.columns
+    assert df_detalhes['num_bo'].is_unique, "ERRO: Existem duplicatas na camada ouro"
