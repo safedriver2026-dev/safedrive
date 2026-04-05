@@ -8,6 +8,7 @@ import h3
 import shap
 import hashlib
 import holidays
+import gc
 from pathlib import Path
 from datetime import datetime
 from sklearn.neighbors import KNeighborsRegressor
@@ -34,6 +35,12 @@ class MotorSafeDriver:
         self.webhook_erro = os.environ.get("DISCORD_ERRO")
         self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
         self.auditoria = self.carregar_manifesto()
+
+        self.colunas_taticas = [
+            'NUM_BO', 'ANO_BO', 'NOME_MUNICIPIO', 'DATA_REGISTRO', 
+            'DATA_OCORRENCIA_BO', 'RUBRICA', 'NATUREZA_APURADA', 
+            'DESCR_TIPOLOCAL', 'DESCR_LOCAL', 'LATITUDE', 'LONGITUDE', 'DESC_PERIODO'
+        ]
 
     def carregar_manifesto(self):
         if self.manifesto_path.exists():
@@ -98,14 +105,24 @@ class MotorSafeDriver:
                 df_amostra.columns = [str(c).upper().strip() for c in df_amostra.columns]
                 
                 if all(k in df_amostra.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'DATA_OCORRENCIA_BO']):
-                    print(f"  -> Aba valida encontrada: {aba}. Extraindo e padronizando...")
+                    print(f"  -> Aba valida encontrada: {aba}. Extraindo apenas colunas alvo...")
                     df_completo = excel.parse(aba)
                     df_completo.columns = [str(c).upper().strip() for c in df_completo.columns]
-                    abas_compiladas.append(df_completo.astype(str))
+                    
+                    colunas_presentes = [c for c in self.colunas_taticas if c in df_completo.columns]
+                    df_reduzido = df_completo[colunas_presentes].astype(str).copy()
+                    
+                    abas_compiladas.append(df_reduzido)
+                    
+                    del df_completo
+                    gc.collect()
             
             if abas_compiladas:
-                print(f"  -> [SUCESSO] Consolidando {len(abas_compiladas)} aba(s) para este ano.")
-                return pd.concat(abas_compiladas, ignore_index=True)
+                print(f"  -> [SUCESSO] Consolidando {len(abas_compiladas)} aba(s) otimizadas.")
+                df_final = pd.concat(abas_compiladas, ignore_index=True)
+                del abas_compiladas
+                gc.collect()
+                return df_final
             else:
                 print(f"  -> [ERRO] Nenhuma aba possui a estrutura tabular exigida.")
                 return None
@@ -224,6 +241,7 @@ class MotorSafeDriver:
                         raise Exception(f"Estrutura tabular invalida retornada no processamento de {ano}")
                         
                     self.limpar_pasta_raw()
+                    gc.collect()
                         
                 except Exception as e:
                     print(f"\n[ERRO CRITICO EM LOTE] Falha total ao obter/processar dados de {ano}: {e}")
@@ -239,7 +257,7 @@ class MotorSafeDriver:
                 print("\n🚨 DIAGNOSTICO FINAL: Nenhum dado de nenhum ano conseguiu ser carregado no pool.")
                 raise Exception("Falha Critica: Fontes de dados indisponiveis para o ciclo atual.")
 
-            total = self.compilar_inteligencia(pd.concat(pool))
+            total = self.compilar_inteligencia(pd.concat(pool, ignore_index=True))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
             self.despachar_alerta("SafeDriver: Status Operacional", "\n".join(log_op), 3447003, sucesso=True)
