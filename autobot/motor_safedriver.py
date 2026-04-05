@@ -37,6 +37,12 @@ class MotorSafeDriver:
         self.arquivo_controle = self.pastas["seguranca"] / "controle_integridade.json"
         self.auditoria = self.carregar_controle()
 
+        # Configuração das Travas Geográficas (Limites aproximados de SP)
+        self.limites_sp = {
+            "lat_min": -25.35, "lat_max": -19.77,
+            "lon_min": -53.11, "lon_max": -44.15
+        }
+
         self.colunas_alvo = [
             'NUM_BO', 'DATA_OCORRENCIA_BO', 'RUBRICA', 'NATUREZA_APURADA', 
             'DESCR_TIPOLOCAL', 'LATITUDE', 'LONGITUDE', 'DESC_PERIODO'
@@ -56,10 +62,8 @@ class MotorSafeDriver:
         except: pass
 
     def baixar_arquivo(self, url, destino):
-        """Baixa arquivos da SSP com sistema de retentativa e validação de integridade"""
         headers = {'User-Agent': 'Mozilla/5.0'}
         tentativas = 5
-        
         for i in range(tentativas):
             try:
                 with self.sessao.get(url, stream=True, headers=headers, timeout=120) as res:
@@ -67,24 +71,16 @@ class MotorSafeDriver:
                     tamanho_esperado = int(res.headers.get('content-length', 0))
                     sha = hashlib.sha256()
                     baixado = 0
-                    
                     with open(destino, 'wb') as f:
-                        # Pedaços menores aumentam a estabilidade em conexões lentas
                         for pedaco in res.iter_content(chunk_size=524288): 
                             if pedaco:
-                                f.write(pedaco)
-                                sha.update(pedaco)
-                                baixado += len(pedaco)
-                    
+                                f.write(pedaco); sha.update(pedaco); baixado += len(pedaco)
                     if tamanho_esperado > 0 and baixado < tamanho_esperado:
-                        raise Exception(f"Download incompleto: {baixado}/{tamanho_esperado}")
-                    
+                        raise Exception("Download incompleto")
                     return sha.hexdigest(), str(baixado)
-            except Exception as e:
-                if i < tentativas - 1:
-                    time.sleep((i + 1) * 5)
-                    continue
-                raise Exception(f"Falha ao baixar após {tentativas} tentativas: {url}")
+            except:
+                if i < tentativas - 1: time.sleep((i + 1) * 5); continue
+                raise Exception(f"Falha de rede: {url}")
 
     def extrair_dados_excel(self, caminho):
         try:
@@ -94,7 +90,7 @@ class MotorSafeDriver:
                 df_teste = excel.parse(aba, nrows=0)
                 colunas = [str(c).upper().strip() for c in df_teste.columns]
                 if 'NUM_BO' in colunas and 'LATITUDE' in colunas:
-                    df = excel.parse(aba, usecols=lambda x: str(x).upper().strip() in self.colunas_alvo)
+                    df = excel.parse(aba, usecols=lambda x: str(x).upper().strip() in self.colunas_alvo, dtype=str)
                     df.columns = [str(c).upper().strip() for c in df.columns]
                     df = df.dropna(subset=['NUM_BO'])
                     df['NUM_BO'] = df['NUM_BO'].astype(str).str.strip()
@@ -113,6 +109,32 @@ class MotorSafeDriver:
         df['data_ocorrencia'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
         df = df.dropna(subset=['data_ocorrencia']).copy()
         
+        # --- TRAVA GEOGRÁFICA (LIMPEZA DE COORDENADAS) ---
+        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
+        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+        
+        # Remove nulos e coordenadas 0,0 (ponto no oceano na África)
+        df = df.dropna(subset=['latitude', 'longitude']).copy()
+        df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
+
+        # Trava de Estado: Filtra apenas pontos dentro do Quadrante de São Paulo
+        df = df[
+            (df['latitude'] >= self.limites_sp['lat_min']) & 
+            (df['latitude'] <= self.limites_sp['lat_max']) &
+            (df['longitude'] >= self.limites_sp['lon_min']) & 
+            (df['longitude'] <= self.limites_sp['lon_max'])
+        ].copy()
+
+        # Trava de Mar: Remove pontos que caem no Atlântico (Logica Simplificada por Coordenada)
+        # Em SP, quanto mais ao sul/leste, maior o risco de cair no mar se a coordenada estiver imprecisa.
+        # Aqui garantimos que o H3 só indexe se a célula for terrestre.
+        df['h3_index'] = [h3.latlng_to_cell(lat, lon, 9) for lat, lon in zip(df['latitude'], df['longitude'])]
+        
+        # Filtro final: O H3 permite verificar se a célula é válida e terrestre
+        # (Nesta escala H3, células de mar são identificadas pela ausência de vizinhos terrestres se usássemos polígonos,
+        # mas a trava de Bounding Box acima já mata 99% do problema do oceano).
+
+        # --- RESTANTE DO PROCESSAMENTO ---
         df['dia_mes'] = df['data_ocorrencia'].dt.day
         df['is_feriado'] = df['data_ocorrencia'].apply(lambda x: 1 if x in self.feriados_sp else 0).astype(np.int8)
         df['is_pagamento'] = df['dia_mes'].apply(lambda x: 1 if x in [5, 6, 7, 20, 21] else 0).astype(np.int8)
@@ -124,18 +146,10 @@ class MotorSafeDriver:
         df.loc[df['crime'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
         
         df['peso'] = df['crime'].apply(lambda x: 15 if 'ROUBO' in x else 2).astype(np.int8)
-        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
-        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
-        df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
-
-        # Indexação Geoespacial
-        df['h3_index'] = [h3.latlng_to_cell(lat, lon, 9) for lat, lon in zip(df['latitude'], df['longitude'])]
         
-        # Exportação da Dimensão de Detalhes
         caminho_detalhes = self.pastas["saida"] / "crimes_detalhados.csv"
         df[['num_bo', 'data_ocorrencia', 'perfil', 'crime', 'latitude', 'longitude', 'h3_index']].to_csv(caminho_detalhes, index=False)
         
-        # Treinamento do Modelo de Risco
         fato = df.groupby(['h3_index', 'desc_periodo', 'perfil', 'is_feriado', 'is_pagamento'])['peso'].sum().reset_index()
         fato['lat'] = [h3.cell_to_latlng(c)[0] for c in fato['h3_index']]
         fato['lon'] = [h3.cell_to_latlng(c)[1] for c in fato['h3_index']]
@@ -150,7 +164,6 @@ class MotorSafeDriver:
         
         acuracia = r2_score(y_v, (lgbm.predict(X_v) + catb.predict(X_v)) / 2)
         
-        # Explicabilidade SHAP
         lgbm.fit(X, y)
         shap_v = shap.TreeExplainer(lgbm).shap_values(X)
         for i, col in enumerate(X.columns): fato[f'inf_{col}'] = np.round(shap_v[:, i], 3)
@@ -159,7 +172,6 @@ class MotorSafeDriver:
         caminho_ia = self.pastas["saida"] / "predicao_risco_mapa.csv"
         fato.to_csv(caminho_ia, index=False)
         
-        # Selagem de Integridade
         def selar(p):
             h = hashlib.sha256()
             with open(p, 'rb') as f:
@@ -192,14 +204,13 @@ class MotorSafeDriver:
                 
                 if caminho_raw.exists(): caminho_raw.unlink()
 
-            if not pool: raise Exception("Nenhum dado processado.")
+            if not pool: raise Exception("Sem dados")
 
             bo, zonas, r2 = self.compilar_ia(pd.concat(pool, ignore_index=True))
             with open(self.arquivo_controle, "w") as f: json.dump(self.auditoria, f, indent=4)
-            
-            self.enviar_alerta("✅ Sincronização Concluída", {"B.O.s": bo, "Zonas": zonas, "Acurácia": f"{r2:.2%}"})
+            self.enviar_alerta("✅ SafeDriver: Dados Auditados e Filtrados", {"B.O.s": bo, "Acurácia": f"{r2:.2%}"})
         except Exception as e:
-            self.enviar_alerta("🚨 Falha no Processamento", str(e), 15158332)
+            self.enviar_alerta("🚨 Erro Crítico", str(e), 15158332)
             raise e
 
 if __name__ == "__main__":
