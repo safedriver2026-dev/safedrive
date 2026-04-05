@@ -22,7 +22,7 @@ def verificar_auditagem():
     with open(ouro_path, "rb") as f:
         for bloco in iter(lambda: f.read(4096), b""): sha256.update(bloco)
     
-    return sha256.hexdigest() == manifesto.get("hash_ouro")
+    return sha256.hexdigest() == manifesto.get("hash_ouro_ia")
 
 @app.get("/v1/risco/{perfil}/{h3_index}")
 def consultar_risco(perfil: str, h3_index: str, api_key: str = Security(auth_header)):
