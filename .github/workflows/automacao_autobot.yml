@@ -1,10 +1,10 @@
 name: Autobot Execução Diaria
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 jobs:
-  pipeline_comportamental:
+  pipeline:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -16,15 +16,14 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
           
-      - name: Setup Infraestrutura Selenium
+      - name: Setup Chrome para Auth Hibrida
         run: |
           sudo apt-get update
           sudo apt-get install -y google-chrome-stable
           
-      - name: Instalar Dependencias
-        run: pip install -r requirements.txt
-        
-      - name: Motor Hibrido e Feature Engineering
+      - run: pip install -r requirements.txt
+      
+      - name: Motor Streaming Abortivo e IA
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -33,13 +32,13 @@ jobs:
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
           
-      - name: Testes de Integridade e Auditoria
+      - name: Auditoria Pytest
         run: python -m pytest tests/test_seguranca.py
         
-      - name: Sincronizar Datalake e Documentacao
+      - name: Commit Datalake
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver AutoBot"
           git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv documentacao/*.png
-          git commit -m "auto: sazonalidade e auth hibrida [skip ci]" || echo "Sem alteracoes"
+          git commit -m "auto:streaming abortivo [skip ci]" || echo "Sem mudanças"
           git push
