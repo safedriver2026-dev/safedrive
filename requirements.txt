@@ -13,3 +13,4 @@ geopy
 matplotlib
 fastapi
 uvicorn
+beautifulsoup4
