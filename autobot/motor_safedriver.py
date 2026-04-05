@@ -13,10 +13,6 @@ from datetime import datetime
 from sklearn.neighbors import KNeighborsRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
 
 class MotorSafeDriver:
     def __init__(self):
@@ -32,52 +28,51 @@ class MotorSafeDriver:
         
         self.anos = list(range(2022, datetime.now().year + 1))
         self.feriados_sp = holidays.Brazil(state='SP')
+        self.sessao = requests.Session()
         
         self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
         self.webhook_erro = os.environ.get("DISCORD_ERRO")
         self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
         self.auditoria = self.carregar_manifesto()
-        self.driver = None
 
     def carregar_manifesto(self):
         if self.manifesto_path.exists():
             with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def configurar_navegador_nativo(self):
-        opcoes = Options()
-        opcoes.add_argument('--headless=new')
-        opcoes.add_argument('--no-sandbox')
-        opcoes.add_argument('--disable-dev-shm-usage')
-        opcoes.add_argument('--disable-blink-features=AutomationControlled')
-        
-        self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opcoes)
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        self.driver.execute_cdp_cmd('Page.setDownloadBehavior', {
-            'behavior': 'allow',
-            'downloadPath': str(self.pastas["raw"].resolve())
-        })
+    def despachar_alerta(self, titulo, msg, cor, sucesso=True):
+        webhook = self.webhook_sucesso if sucesso else self.webhook_erro
+        if not webhook: return
+        payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
+        try: requests.post(webhook, json=payload, timeout=10)
+        except: pass
 
-    def aguardar_download_concluir(self, timeout=600):
-        inicio = time.time()
-        while time.time() - inicio < timeout:
-            arquivos_crdownload = list(self.pastas["raw"].glob("*.crdownload"))
-            arquivos_tmp = list(self.pastas["raw"].glob("*.tmp"))
-            arquivos_xlsx = list(self.pastas["raw"].glob("*.xlsx"))
-            
-            if not arquivos_crdownload and not arquivos_tmp and arquivos_xlsx:
-                time.sleep(2)
-                return arquivos_xlsx[0]
-            time.sleep(3)
-        return None
+    def baixar_dados_resiliente(self, url, caminho_destino):
+        retries = 5
+        backoff_factor = 0.5
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        }
 
-    def calcular_hash_arquivo(self, caminho):
-        sha256 = hashlib.sha256()
-        with open(caminho, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                sha256.update(chunk)
-        return sha256.hexdigest()
+        for attempt in range(retries):
+            try:
+                res = self.sessao.get(url, stream=True, headers=headers, timeout=(60, 1800))
+                res.raise_for_status()
+                
+                sha256 = hashlib.sha256()
+                with open(caminho_destino, 'wb') as f:
+                    for chunk in res.iter_content(chunk_size=1048576):
+                        if chunk:
+                            f.write(chunk)
+                            sha256.update(chunk)
+                return sha256.hexdigest(), str(res.headers.get('Content-Length', '0'))
+                
+            except requests.exceptions.RequestException:
+                if attempt < retries - 1:
+                    time.sleep(backoff_factor * (2 ** attempt))
+                else:
+                    raise
 
     def processar_planilha_bruta(self, caminho_xlsx):
         try:
@@ -89,13 +84,6 @@ class MotorSafeDriver:
                     return excel.parse(aba)
             return None
         except: return None
-
-    def despachar_alerta(self, titulo, msg, cor, sucesso=True):
-        webhook = self.webhook_sucesso if sucesso else self.webhook_erro
-        if not webhook: return
-        payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
-        try: requests.post(webhook, json=payload, timeout=10)
-        except: pass
 
     def limpar_pasta_raw(self):
         for f in self.pastas["raw"].glob("*"):
@@ -156,50 +144,46 @@ class MotorSafeDriver:
         
         ouro_path = self.pastas["ouro"] / "base_final_looker.csv"
         fato.to_csv(ouro_path, index=False)
-        self.auditoria["hash_ouro"] = self.calcular_hash_arquivo(ouro_path)
+        
+        sha256 = hashlib.sha256()
+        with open(ouro_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""): sha256.update(chunk)
+        self.auditoria["hash_ouro"] = sha256.hexdigest()
         
         return len(fato)
 
     def executar(self):
         try:
-            self.configurar_navegador_nativo()
             pool = []
             log_op = []
             mudanca = False
             
-            self.driver.get("https://www.ssp.sp.gov.br/estatistica/consultas")
-            time.sleep(5)
-            
             for ano in self.anos:
                 self.limpar_pasta_raw()
                 url_direta = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+                caminho_xlsx = self.pastas["raw"] / f"bruto_{ano}.xlsx"
                 caminho_parquet = self.pastas["bronze"] / f"limpo_{ano}.parquet"
                 
                 try:
-                    self.driver.get(url_direta)
-                    arquivo_baixado = self.aguardar_download_concluir()
+                    hash_arquivo, tamanho_atual = self.baixar_dados_resiliente(url_direta, caminho_xlsx)
                     
-                    if not arquivo_baixado:
-                        raise Exception("Timeout na recepção do arquivo via navegador")
-
-                    hash_atual = self.calcular_hash_arquivo(arquivo_baixado)
-                    
-                    if caminho_parquet.exists() and self.auditoria.get(f"hash_{ano}") == hash_atual:
+                    if caminho_parquet.exists() and self.auditoria.get(f"hash_{ano}") == hash_arquivo:
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"📦 {ano}: Sincronização Ignorada (Hash Idêntico)")
+                        log_op.append(f"📦 {ano}: Sincronizacao Ignorada (Hash Identico)")
                         self.limpar_pasta_raw()
                         continue
                     
-                    df_novo = self.processar_planilha_bruta(arquivo_baixado)
+                    df_novo = self.processar_planilha_bruta(caminho_xlsx)
                     
                     if df_novo is not None:
                         df_novo.to_parquet(caminho_parquet)
-                        self.auditoria[f"hash_{ano}"] = hash_atual
+                        self.auditoria[f"hash_{ano}"] = hash_arquivo
+                        self.auditoria[f"size_{ano}"] = tamanho_atual
                         pool.append(df_novo)
-                        log_op.append(f"📥 {ano}: Processamento Nativo Concluído")
+                        log_op.append(f"📥 {ano}: Processamento Nativo Concluido")
                         mudanca = True
                     else:
-                        raise Exception(f"Layout estrutural inválido em {ano}")
+                        raise Exception(f"Layout estrutural invalido em {ano}")
                         
                     self.limpar_pasta_raw()
                         
@@ -207,22 +191,19 @@ class MotorSafeDriver:
                     self.limpar_pasta_raw()
                     if caminho_parquet.exists():
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"⚠️ {ano}: Erro de Extração. Base de Cache Aplicada")
+                        log_op.append(f"⚠️ {ano}: Erro de Extracao ({str(e)}). Base de Cache Aplicada")
 
-            if self.driver: self.driver.quit()
-
-            if not pool: raise Exception("Falha Crítica: Fontes de dados indisponíveis para o ciclo atual.")
+            if not pool: raise Exception("Falha Critica: Fontes de dados indisponiveis para o ciclo atual.")
 
             total = self.compilar_inteligencia(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
             self.despachar_alerta("SafeDriver: Status Operacional", "\n".join(log_op), 3447003, sucesso=True)
             if mudanca:
-                self.despachar_alerta("SafeDriver: Relatório Analítico", f"Pipeline Atualizado.\nÁreas Mapeadas: {total}\nFatores Comportamentais: Ativos", 3066993, sucesso=True)
+                self.despachar_alerta("SafeDriver: Relatorio Analitico", f"Pipeline Atualizado.\nAreas Mapeadas: {total}\nFatores Comportamentais: Ativos", 3066993, sucesso=True)
 
         except Exception as e:
-            if self.driver: self.driver.quit()
-            self.despachar_alerta("SafeDriver: Incidente Crítico", str(e), 15158332, sucesso=False)
+            self.despachar_alerta("SafeDriver: Incidente Critico", str(e), 15158332, sucesso=False)
             raise e
 
 if __name__ == "__main__":
