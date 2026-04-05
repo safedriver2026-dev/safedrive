@@ -95,8 +95,10 @@ class MotorSafeDriver:
                 df = excel.parse(aba, nrows=40)
                 df.columns = [str(c).upper().strip() for c in df.columns]
                 if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'DATA_OCORRENCIA_BO']):
-                    print(f"  -> Aba valida encontrada: {aba}. Carregando base completa...")
-                    return excel.parse(aba)
+                    print(f"  -> Aba valida encontrada: {aba}. Padronizando tipos para Parquet...")
+                    df_completo = excel.parse(aba)
+                    df_completo.columns = [str(c).upper().strip() for c in df_completo.columns]
+                    return df_completo.astype(str)
             print(f"  -> [ERRO] Nenhuma aba possui a estrutura tabular exigida.")
             return None
         except Exception as e:
