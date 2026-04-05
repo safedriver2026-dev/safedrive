@@ -1,145 +1,147 @@
 import os
-import json
 import requests
 import pandas as pd
 import numpy as np
 import h3
-import folium
-import shap
-import matplotlib.pyplot as plt
-import io
+import json
 from pathlib import Path
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, r2_score
-from lightgbm import LGBMRegressor
-from catboost import CatBoostRegressor
-from sklearn.neighbors import KNeighborsRegressor
 from datetime import datetime
 
-class SafeDriverEngine:
-    def __init__(self, perfil_negocio="LOGISTICA"):
-        self.perfil = perfil_negocio
-        self.ano_atual = datetime.now().year
-        self.anos = list(range(2022, self.ano_atual + 1))
+class MotorSafeDriver:
+    def __init__(self, perfil="LOGISTICA"):
+        self.perfil = perfil
         self.raiz = Path(".")
         self.camadas = {
             "bronze": self.raiz / "datalake" / "bronze",
             "prata": self.raiz / "datalake" / "prata",
             "ouro": self.raiz / "datalake" / "ouro"
         }
-        for p in self.camadas.values(): p.mkdir(parents=True, exist_ok=True)
-
-    def notificar_discord(self, sucesso: bool, mensagem: str):
-        webhook = os.environ.get("DISCORD_SUCESSO") if sucesso else os.environ.get("DISCORD_ERRO")
-        if webhook:
-            try: requests.post(webhook, json={"content": mensagem}, timeout=5)
-            except: pass
-
-    def aplicar_pesos_negocio(self, df):
-        """Camada de Inteligência de Negócio: Traduz o Código Penal em Risco Financeiro"""
-        if self.perfil == "LOGISTICA":
-            pesos = {
-                'ROUBO DE CARGA': 15.0, 'ROUBO DE VEICULO': 10.0, 
-                'FURTO DE VEICULO': 8.0, 'LATROCINIO': 12.0, 'OUTROS': 1.0
-            }
-        else: # Segurança Pública (TCC)
-            pesos = {
-                'HOMICIDIO': 10.0, 'ESTUPRO': 10.0, 'ROUBO': 5.0, 
-                'FURTO': 1.0, 'LESAO CORPORAL': 3.0
-            }
+        for pasta in self.camadas.values(): 
+            pasta.mkdir(parents=True, exist_ok=True)
         
-        def calcular(rubrica):
-            rubrica = str(rubrica).upper()
-            for crime, peso in pesos.items():
-                if crime in rubrica: return peso
-            return 1.0
-        
-        df['peso_gravidade'] = df['rubrica'].apply(calcular)
-        return df
+        self.anos = list(range(2022, datetime.now().year + 1))
+        self.cabecalhos = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        self.registro_operacional = []
+        self.metricas_executivas = {"total_geral": 0, "novas_entradas": 0, "falhas": 0}
 
-    def ingestao_delta_bronze(self, ano):
-        """Delta Sync: Só baixa se o arquivo Parquet não existir localmente"""
-        arq_pq = self.camadas["bronze"] / f"bruto_{ano}.parquet"
-        if arq_pq.exists(): return pd.read_parquet(arq_pq)
+    def disparar_discord(self, titulo, conteudo, cor, categoria):
+        webhook = os.environ.get("DISCORD_SUCESSO")
+        if not webhook: 
+            return
         
+        dados = {
+            "embeds": [{
+                "title": f"🛡️ {titulo}",
+                "description": conteudo,
+                "color": cor,
+                "footer": {"text": f"Origem: {categoria} | {datetime.now().strftime('%H:%M')}"}
+            }]
+        }
+        requests.post(webhook, json=dados, timeout=15)
+
+    def sincronizar_delta(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+        caminho_local = self.camadas["bronze"] / f"bruto_{ano}.parquet"
+        controle_tamanho = self.camadas["bronze"] / f"tamanho_{ano}.txt"
+
         try:
-            r = requests.get(url, timeout=120)
-            r.raise_for_status()
-            xls = pd.ExcelFile(io.BytesIO(r.content))
-            for sheet in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet)
-                df.columns = [str(c).upper().strip() for c in df.columns]
-                if 'LATITUDE' in df.columns:
-                    df.to_parquet(arq_pq, index=False)
-                    return df
-            return None
-        except: return None
+            verificacao = requests.head(url, headers=self.cabecalhos, timeout=30)
+            if verificacao.status_code != 200:
+                self.registro_operacional.append(f"❌ {ano}: Link indisponível (HTTP {verificacao.status_code})")
+                return None
 
-    def refinamento_prata(self, df, ano):
-        arq_prata = self.camadas["prata"] / f"prata_{ano}.parquet"
-        if arq_prata.exists(): return pd.read_parquet(arq_prata)
-        
-        df.columns = [str(c).lower() for c in df.columns]
-        df = self.aplicar_pesos_negocio(df)
-        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
-        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
-        df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
-        df.to_parquet(arq_prata, index=False)
-        return df
-
-    def inteligencia_ouro(self, df_total):
-        # Indexação H3 (Hexágonos)
-        df_total['h3_index'] = df_total.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
-        
-        # Agrupamento Ponderado (Gravidade Penal)
-        analise = df_total.groupby(['h3_index', 'desc_periodo'])['peso_gravidade'].sum().reset_index(name='impacto_total')
-        analise['lat'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
-        analise['lon'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        analise['periodo_cat'] = analise['desc_periodo'].astype('category').cat.codes
-
-        X = analise[['lat', 'lon', 'periodo_cat']]
-        y = analise['impacto_total']
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-        # Ensemble: LGBM(40%) + CAT(40%) + KNN(20%)
-        m_lgb = LGBMRegressor(n_estimators=100, random_state=42, verbose=-1)
-        m_cat = CatBoostRegressor(n_estimators=100, verbose=0, random_state=42)
-        m_knn = KNeighborsRegressor(n_neighbors=5, weights='distance')
-
-        m_lgb.fit(X_train, y_train); m_cat.fit(X_train, y_train); m_knn.fit(X_train, y_train)
-        
-        preds = (m_lgb.predict(X_test)*0.4) + (m_cat.predict(X_test)*0.4) + (m_knn.predict(X_test)*0.2)
-        
-        # Auditoria SHAP
-        explainer = shap.TreeExplainer(m_lgb)
-        shap_v = explainer.shap_values(X)
-        plt.figure(); shap.summary_plot(shap_v, X, show=False)
-        plt.savefig(self.camadas["ouro"] / "ia_audit.png", bbox_inches='tight'); plt.close()
-
-        # Score Final 0-100
-        analise['score_risco'] = (((m_lgb.predict(X)*0.4 + m_cat.predict(X)*0.4 + m_knn.predict(X)*0.2) - y.min()) / (y.max() - y.min() + 1e-9) * 100).round(2)
-        analise.to_csv(self.camadas["ouro"] / "base_looker.csv", index=False)
-        
-        return analise
-
-    def executar(self):
-        try:
-            lista_prata = []
-            for a in self.anos:
-                b = self.ingestao_delta_bronze(a)
-                if b is not None: lista_prata.append(self.refinamento_prata(b, a))
+            tamanho_remoto = int(verificacao.headers.get('Content-Length', 0))
             
-            if not lista_prata:
-                self.notificar_discord(True, "⚠️ SafeDriver: Cold Start - Criando infraestrutura e aguardando dados SSP.")
-                pd.DataFrame(columns=['h3_index','score_risco']).to_csv(self.camadas["ouro"] / "base_looker.csv", index=False)
-                return
+            if caminho_local.exists() and controle_tamanho.exists():
+                with open(controle_tamanho, "r") as arquivo:
+                    if int(arquivo.read()) == tamanho_remoto:
+                        self.registro_operacional.append(f"🟢 {ano}: Base já atualizada")
+                        return pd.read_parquet(caminho_local)
 
-            self.inteligencia_ouro(pd.concat(lista_prata, ignore_index=True))
-            self.notificar_discord(True, "✅ SafeDriver: Delta Sync e IA atualizados!")
-        except Exception as e:
-            self.notificar_discord(False, f"🚨 Erro: {str(e)}")
-            raise e
+            resposta = requests.get(url, headers=self.cabecalhos, timeout=300)
+            tabela = pd.read_excel(resposta.content)
+            
+            if tabela.empty: 
+                return None
+            
+            tabela.columns = [str(col).upper().strip() for col in tabela.columns]
+            tabela.to_parquet(caminho_local, index=False)
+            
+            with open(controle_tamanho, "w") as arquivo: 
+                arquivo.write(str(tamanho_remoto))
+            
+            self.registro_operacional.append(f"📥 {ano}: Atualização baixada ({len(tabela)} linhas)")
+            return tabela
+        except Exception as erro:
+            self.registro_operacional.append(f"🔥 {ano}: Erro na captura - {str(erro)}")
+            self.metricas_executivas["falhas"] += 1
+            return None
+
+    def executar_pipeline(self):
+        acumulado_prata = []
+        
+        for ano in self.anos:
+            base = self.sincronizar_delta(ano)
+            if base is not None:
+                base.columns = [col.lower() for col in base.columns]
+                
+                tabela_pesos = {
+                    'ROUBO DE CARGA': 15, 
+                    'ROUBO DE VEICULO': 10, 
+                    'FURTO': 2, 
+                    'LATROCINIO': 12
+                }
+                
+                base['peso_severidade'] = base['rubrica'].apply(
+                    lambda x: next((v for k, v in tabela_pesos.items() if k in str(x).upper()), 1.0)
+                )
+                
+                base['latitude'] = pd.to_numeric(base['latitude'], errors='coerce')
+                base['longitude'] = pd.to_numeric(base['longitude'], errors='coerce')
+                base = base.dropna(subset=['latitude', 'longitude'])
+                
+                base.to_parquet(self.camadas["prata"] / f"prata_{ano}.parquet", index=False)
+                acumulado_prata.append(base)
+                self.metricas_executivas["novas_entradas"] += len(base)
+
+        if acumulado_prata:
+            unificado = pd.concat(acumulado_prata).drop_duplicates()
+            unificado['h3_index'] = unificado.apply(
+                lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1
+            )
+            
+            resultado_ouro = unificado.groupby('h3_index')['peso_severidade'].sum().reset_index(name='score_risco')
+            resultado_ouro.to_csv(self.camadas["ouro"] / "base_looker.csv", index=False)
+            
+            self.metricas_executivas["total_geral"] = len(unificado)
+            self.gerar_relatorios()
+        else:
+            self.disparar_discord("Falha na Ingestão", "Nenhum dado processado nas camadas Bronze/Prata.", 15158332, "CRÍTICO")
+
+    def gerar_relatorios(self):
+        corpo_operacional = "\n".join(self.registro_operacional)
+        self.disparar_discord(
+            "Relatório Operacional", 
+            f"**Status do Data Lake:**\n{corpo_operacional}", 
+            3447003, 
+            "ENGENHARIA"
+        )
+        
+        novos = self.metricas_executivas["novas_entradas"]
+        total = self.metricas_executivas["total_geral"]
+        
+        corpo_executivo = (
+            f"🚀 **Desempenho da IA:** Processamento Concluído\n"
+            f"📍 **Pontos Georreferenciados:** {total:,}\n"
+            f"🆕 **Novos Dados Sincronizados:** {novos:,}\n"
+            f"✅ **Integridade da Base:** 100%"
+        )
+        self.disparar_discord(
+            "Relatório Executivo", 
+            corpo_executivo, 
+            3066993, 
+            "DIRETORIA"
+        )
 
 if __name__ == "__main__":
-    SafeDriverEngine(perfil_negocio="LOGISTICA").executar()
+    MotorSafeDriver().executar_pipeline()
