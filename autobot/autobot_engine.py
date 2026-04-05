@@ -39,7 +39,7 @@ class SafeDriverEngine:
             "ouro": self.raiz / "datalake" / "ouro"
         }
         for p in self.camadas.values(): p.mkdir(parents=True, exist_ok=True)
-        self.geolocator = Nominatim(user_agent="safedriver_pro_v13")
+        self.geolocator = Nominatim(user_agent="safedriver_pro_v14")
 
     def ingestao_bronze(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
@@ -82,19 +82,14 @@ class SafeDriverEngine:
         m_knn = KNeighborsRegressor(n_neighbors=5, weights='distance')
 
         m_lgb.fit(X_train, y_train); m_cat.fit(X_train, y_train); m_knn.fit(X_train, y_train)
-        
         preds = (m_lgb.predict(X_test)*0.4) + (m_cat.predict(X_test)*0.4) + (m_knn.predict(X_test)*0.2)
         
-        # Auditoria e Métricas
-        metricas = {"MAE": round(mean_absolute_error(y_test, preds), 2), "R2": round(r2_score(y_test, preds), 4)}
+        metricas = {"MAE": round(mean_absolute_error(y_test, preds), 2), "R2": round(r2_score(y_test, preds), 4), "Atualizacao": datetime.now().isoformat()}
         with open(self.camadas["ouro"] / "metricas.json", "w") as f: json.dump(metricas, f)
 
         analise['score_risco'] = (((m_lgb.predict(X)*0.4 + m_cat.predict(X)*0.4 + m_knn.predict(X)*0.2) - y.min()) / (y.max() - y.min()) * 100).round(2)
-        
-        # Export para Looker Studio (CSV com Lat/Lon separadas)
         analise.to_csv(self.camadas["ouro"] / "base_looker.csv", index=False)
         
-        # SHAP
         explainer = shap.TreeExplainer(m_lgb)
         shap_v = explainer.shap_values(X)
         plt.figure(); shap.summary_plot(shap_v, X, show=False)
@@ -111,9 +106,9 @@ class SafeDriverEngine:
             if lista:
                 df_ouro = self.inteligencia_ouro(pd.concat(lista, ignore_index=True))
                 df_ouro.to_parquet(self.camadas["ouro"] / "ouro_final.parquet")
-                notificar_discord(True, f"✅ SafeDriver: Dados de {self.ano_atual} processados e auditados.")
+                notificar_discord(True, f"✅ SafeDriver: Ciclo {self.ano_atual} finalizado com sucesso.")
         except Exception as e:
-            notificar_discord(False, f"🚨 Falha no SafeDriver: {str(e)}")
+            notificar_discord(False, f"🚨 Erro no SafeDriver: {str(e)}")
 
 if __name__ == "__main__":
     SafeDriverEngine().rodar()
