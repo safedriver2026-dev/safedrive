@@ -6,14 +6,24 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
+  build-and-run:
     runs-on: ubuntu-latest
+    
+
+    permissions:
+      contents: write
+    
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.10', cache: 'pip' }
-      - run: pip install -r requirements.txt
-      - name: Executa Pipeline
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Instalando Dependências
+        run: pip install -r requirements.txt
+
+      - name: Execute SafeDriver Engine
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -21,10 +31,11 @@ jobs:
           python autobot/autobot_engine.py
           python gerador_diagramas.py
           python -m pytest tests/test_contracts.py
-      - name: Atualiza Delta
+
+      - name: Realizando DeltaSync
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
           git add datalake/ouro/* documentacao/*.png
-          git commit -m "update: delta results [skip ci]" || echo "No changes"
+          git commit -m "update: delta results and diagrams [skip ci]" || echo "No changes"
           git push
