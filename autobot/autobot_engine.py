@@ -10,123 +10,132 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 from geopy.geocoders import Nominatim
-from sklearn.model_selection import train_test_split
 from lightgbm import LGBMRegressor
 
 class MotorSafeDriver:
     def __init__(self):
         self.raiz = Path(".")
-        self.camadas = {
+        self.pastas = {
             "bronze": self.raiz / "datalake" / "bronze",
             "prata": self.raiz / "datalake" / "prata",
             "ouro": self.raiz / "datalake" / "ouro",
             "docs": self.raiz / "documentacao"
         }
-        for pasta in self.camadas.values():
-            pasta.mkdir(parents=True, exist_ok=True)
-            
+        for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
+        
+        # ESCALABILIDADE: Range dinâmico de anos
         ano_inicial = 2022
         self.anos = list(range(ano_inicial, datetime.now().year + 1))
-        self.agente = {'User-Agent': 'SafeDriver-Industrial-V10-SHAP'}
-        self.geolocalizador = Nominatim(user_agent="safedriver_final_engine")
-        self.logs = []
+        self.agente = {'User-Agent': 'SafeDriver-Industrial-V12'}
+        self.geolocalizador = Nominatim(user_agent="safedriver_fatec_v12")
+        self.webhook = os.environ.get("DISCORD_WEBHOOK")
 
-    def disparar_discord(self, titulo, mensagem, cor):
-        webhook = os.environ.get("DISCORD_SUCESSO")
-        if not webhook: return
-        payload = {"embeds": [{"title": titulo, "description": mensagem, "color": cor}]}
-        requests.post(webhook, json=payload, timeout=15)
+    def enviar_relatorio_discord(self, titulo, mensagem, cor):
+        if not self.webhook: return
+        payload = {
+            "embeds": [{
+                "title": titulo,
+                "description": mensagem,
+                "color": cor,
+                "timestamp": datetime.now().isoformat(),
+                "footer": {"text": "SafeDriver Operational Monitor"}
+            }]
+        }
+        requests.post(self.webhook, json=payload, timeout=10)
 
-    def localizar_folha_dados(self, conteudo):
-        excel = pd.ExcelFile(io.BytesIO(conteudo))
-        for nome_aba in excel.sheet_names:
-            df_teste = excel.parse(nome_aba, nrows=10)
-            df_teste.columns = [str(c).upper().strip() for c in df_teste.columns]
-            if any(col in df_teste.columns for col in ['LATITUDE', 'RUBRICA', 'NATUREZA_APURADA']):
-                return excel.parse(nome_aba)
+    def descobrir_aba_de_dados(self, conteudo_excel):
+        excel = pd.ExcelFile(io.BytesIO(conteudo_excel))
+        for aba in excel.sheet_names:
+            df_temp = excel.parse(aba, nrows=10)
+            df_temp.columns = [str(c).upper().strip() for c in df_temp.columns]
+            if any(k in df_temp.columns for k in ['LATITUDE', 'NATUREZA_APURADA', 'RUBRICA']):
+                return excel.parse(aba)
         return None
 
-    def classificar_perfis(self, df):
-        df.columns = [str(c).lower().strip() for c in df.columns]
-        col_nat = next((c for c in ['natureza_apurada', 'rubrica', 'natureza'] if c in df.columns), None)
+    def processar_ia_e_explicabilidade(self, df):
+        df.columns = [c.lower().strip() for c in df.columns]
+        
+        # 1. Classificação de Perfis (Vetor de Exposição)
         df['perfil'] = 'Geral'
-        if col_nat:
-            df['nat_clean'] = df[col_nat].fillna('').astype(str).upper()
-            df.loc[df['nat_clean'].str.contains('VEÍCULO|CARGA|AUTO|MOTO'), 'perfil'] = 'Motorista'
-            df.loc[df['nat_clean'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
-            col_loc = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), None)
-            if col_loc:
-                loc_clean = df[col_loc].fillna('').astype(str).upper()
-                ped_mask = (loc_clean.str.contains('VIA PÚBLICA|RUA')) & (df['nat_clean'].str.contains('CELULAR|PESSOA'))
-                df.loc[ped_mask, 'perfil'] = 'Pedestre'
-            df['peso'] = df['nat_clean'].apply(lambda x: 15 if 'ROUBO' in x else 2)
-        return df
+        col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
+        df['crime_texto'] = df[col_crime].fillna('').astype(str).upper()
+        
+        df.loc[df['crime_texto'].str.contains('VEÍCULO|MOTO|CARGA|AUTO'), 'perfil'] = 'Motorista'
+        df.loc[df['crime_texto'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
+        
+        col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
+        if col_local in df.columns:
+            local_texto = df[col_local].fillna('').astype(str).upper()
+            df.loc[(local_texto.str.contains('VIA PÚBLICA')) & (df['crime_texto'].str.contains('CELULAR|PESSOA')), 'perfil'] = 'Pedestre'
+        
+        df['peso_severidade'] = df['crime_texto'].apply(lambda x: 15 if 'ROUBO' in x else 2)
 
-    def sincronizar_delta(self, ano):
-        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-        bruto, meta = self.camadas["bronze"] / f"bruto_{ano}.parquet", self.camadas["bronze"] / f"size_{ano}.txt"
-        try:
-            head = requests.head(url, headers=self.agente, timeout=30)
-            tam_remoto = str(head.headers.get('Content-Length', '0'))
-            if bruto.exists() and meta.exists():
-                with open(meta, "r") as f:
-                    if f.read() == tam_remoto: return pd.read_parquet(bruto)
-            res = requests.get(url, headers=self.agente, timeout=300)
-            df = self.localizar_folha_dados(res.content)
-            if df is not None:
-                df.columns = [str(c).upper().strip() for c in df.columns]
-                df.to_parquet(bruto, index=False)
-                with open(meta, "w") as f: f.write(tam_remoto)
-                return df
-        except: return pd.read_parquet(bruto) if bruto.exists() else None
-
-    def gerar_ouro_com_explicabilidade(self, df):
+        # 2. Tratamento Geospacial
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
-        df = df[(df['latitude'] != 0) & (df['longitude'] != 0)]
-        if df.empty: return 0
+        df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
         
-        df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
-        resumo = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['peso'].sum().reset_index()
-        resumo['lat'] = resumo['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
-        resumo['lon'] = resumo['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        resumo['perfil_idx'] = resumo['perfil'].astype('category').cat.codes
-        resumo['periodo_idx'] = resumo['desc_periodo'].astype('category').cat.codes
-        
-        X = resumo[['lat', 'lon', 'perfil_idx', 'periodo_idx']]
-        y = resumo['peso']
-        lgb = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
-        
-      
-        explainer = shap.TreeExplainer(lgb)
-        shap_values = explainer.shap_values(X)
-        shap_df = pd.DataFrame(shap_values, columns=[f'shap_{c}' for c in X.columns])
-        
-       
-        resumo = pd.concat([resumo.reset_index(drop=True), shap_df], axis=1)
-        resumo['score_risco'] = lgb.predict(X)
-        
-        
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(shap_values, X, show=False, plot_type="bar")
-        plt.savefig(self.camadas["docs"] / "explicabilidade_ia.png", bbox_inches='tight')
-        plt.close()
+        if df.empty: raise ValueError("Nenhum dado geolocalizado válido após filtragem.")
 
-        ouro_path = self.camadas["ouro"] / "base_looker.csv"
-        resumo.to_csv(ouro_path, index=False)
-        hash_val = hashlib.sha256(open(ouro_path, "rb").read()).hexdigest()
-        with open(self.camadas["ouro"] / "base_looker.sha256", "w") as f: f.write(hash_val)
-        return len(resumo)
+        # 3. Agregação por Hexágonos H3 (Resolução 9)
+        df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
+        fato_risco = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['peso_severidade'].sum().reset_index()
+        
+        fato_risco['lat'] = fato_risco['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
+        fato_risco['lon'] = fato_risco['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
+        fato_risco['perfil_idx'] = fato_risco['perfil'].astype('category').cat.codes
+        fato_risco['periodo_idx'] = fato_risco['desc_periodo'].astype('category').cat.codes
+
+        # 4. Machine Learning: Treino e Extração SHAP
+        X = fato_risco[['lat', 'lon', 'perfil_idx', 'periodo_idx']]
+        y = fato_risco['peso_severidade']
+        modelo = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
+
+        explainer = shap.TreeExplainer(modelo)
+        shap_values = explainer.shap_values(X)
+        
+        # Adiciona influências das variáveis como colunas para o Looker
+        for i, col in enumerate(X.columns):
+            fato_risco[f'influencia_{col}'] = shap_values[:, i]
+            
+        fato_risco['score_predito'] = modelo.predict(X)
+
+        # 5. Exportação e Assinatura Digital
+        caminho_final = self.pastas["ouro"] / "base_final_looker.csv"
+        fato_risco.to_csv(caminho_final, index=False)
+        hash_val = hashlib.sha256(open(caminho_final, "rb").read()).hexdigest()
+        with open(self.pastas["ouro"] / "assinatura.sha256", "w") as f: f.write(hash_val)
+        
+        return len(fato_risco)
 
     def iniciar(self):
-        pool = []
-        for ano in self.anos:
-            dados = self.sincronizar_delta(ano)
-            if dados is not None:
-                pool.append(self.classificar_perfis(dados))
-        if pool:
-            total = self.gerar_ouro_com_explicabilidade(pd.concat(pool))
-            self.disparar_discord("SafeDriver: IA Explicável Ativa", f"📍 {total} Células prontas para o Looker.", 3066993)
+        try:
+            pool_dados = []
+            logs_operacionais = []
+            
+            for ano in self.anos:
+                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+                try:
+                    res = requests.get(url, headers=self.agente, timeout=300)
+                    if res.status_code == 200:
+                        df = self.descobrir_aba_de_dados(res.content)
+                        if df is not None: 
+                            pool_dados.append(df)
+                            logs_operacionais.append(f"✅ {ano}: {len(df)} linhas importadas.")
+                except Exception as e:
+                    logs_operacionais.append(f"⚠️ {ano}: Falha na conexão.")
+
+            if not pool_dados: raise Exception("Falha crítica: Nenhuma base de dados pôde ser carregada.")
+
+            total_celulas = self.processar_ia_e_explicabilidade(pd.concat(pool_dados))
+            
+            # Relatórios Discord
+            self.enviar_relatorio_discord("📊 Relatório Operacional", "\n".join(logs_operacionais), 3447003)
+            self.enviar_relatorio_discord("🚀 Relatório Executivo", f"Inteligência SafeDriver atualizada.\n📍 Células de Risco: {total_celulas}\n🛡️ Integridade: SHA256 Gerado.", 3066993)
+
+        except Exception as e:
+            self.enviar_relatorio_discord("🚨 Erro Crítico no Pipeline", f"Ocorreu uma falha na etapa de processamento:\n`{str(e)}`", 15158332)
+            raise e
 
 if __name__ == "__main__":
     MotorSafeDriver().iniciar()
