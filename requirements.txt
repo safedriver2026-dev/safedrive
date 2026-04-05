@@ -11,7 +11,6 @@ catboost
 lightgbm
 shap
 geopy
-matplotlib
+holidays
 fastapi
 uvicorn
-holidays
