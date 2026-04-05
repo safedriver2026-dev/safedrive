@@ -14,6 +14,8 @@ from datetime import datetime
 from sklearn.neighbors import KNeighborsRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
 
 class MotorSafeDriver:
     def __init__(self):
@@ -37,9 +39,8 @@ class MotorSafeDriver:
         self.auditoria = self.carregar_manifesto()
 
         self.colunas_taticas = [
-            'NUM_BO', 'ANO_BO', 'NOME_MUNICIPIO', 'DATA_REGISTRO', 
-            'DATA_OCORRENCIA_BO', 'RUBRICA', 'NATUREZA_APURADA', 
-            'DESCR_TIPOLOCAL', 'DESCR_LOCAL', 'LATITUDE', 'LONGITUDE', 'DESC_PERIODO'
+            'NUM_BO', 'DATA_OCORRENCIA_BO', 'RUBRICA', 'NATUREZA_APURADA', 
+            'DESCR_TIPOLOCAL', 'LATITUDE', 'LONGITUDE', 'DESC_PERIODO'
         ]
 
     def carregar_manifesto(self):
@@ -47,10 +48,18 @@ class MotorSafeDriver:
             with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def despachar_alerta(self, titulo, msg, cor, sucesso=True):
+    def despachar_alerta_operacional(self, msg, cor=3447003):
+        if not self.webhook_sucesso: return
+        payload = {"embeds": [{"title": "⚙️ Log Operacional", "description": msg, "color": cor}]}
+        try: requests.post(self.webhook_sucesso, json=payload, timeout=5)
+        except: pass
+
+    def despachar_alerta_executivo(self, titulo, kpis, cor=3066993, sucesso=True):
         webhook = self.webhook_sucesso if sucesso else self.webhook_erro
         if not webhook: return
-        payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
+        
+        descricao = "\n".join([f"**{k}:** {v}" for k, v in kpis.items()]) if isinstance(kpis, dict) else kpis
+        payload = {"embeds": [{"title": titulo, "description": descricao, "color": cor, "timestamp": datetime.now().isoformat()}]}
         try: requests.post(webhook, json=payload, timeout=10)
         except: pass
 
@@ -58,76 +67,60 @@ class MotorSafeDriver:
         retries = 5
         backoff_factor = 0.5
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         }
 
-        print(f"\n[NETWORK] Iniciando conexao com: {url}")
-
         for attempt in range(retries):
             try:
-                print(f"  -> Tentativa {attempt + 1}/{retries}...")
                 res = self.sessao.get(url, stream=True, headers=headers, timeout=(60, 1800))
                 res.raise_for_status()
                 
                 tamanho_atual = str(res.headers.get('Content-Length', '0'))
-                print(f"  -> Conexao estavel. Tamanho do arquivo reportado: {tamanho_atual} bytes")
-                
                 sha256 = hashlib.sha256()
+                
                 with open(caminho_destino, 'wb') as f:
                     for chunk in res.iter_content(chunk_size=1048576):
                         if chunk:
                             f.write(chunk)
                             sha256.update(chunk)
                             
-                print(f"  -> [SUCESSO] Download concluido. Arquivo salvo.")
                 return sha256.hexdigest(), tamanho_atual
                 
-            except requests.exceptions.RequestException as req_err:
-                print(f"  -> [ERRO DE REDE] Tentativa {attempt + 1} falhou: {req_err}")
-                if attempt < retries - 1:
-                    sleep_time = backoff_factor * (2 ** attempt)
-                    print(f"  -> Aguardando {sleep_time} segundos para retentar...")
-                    time.sleep(sleep_time)
-                else:
-                    print("  -> [FALHA CRITICA] Todas as tentativas de rede foram esgotadas.")
-                    raise
+            except requests.exceptions.RequestException:
+                if attempt < retries - 1: time.sleep(backoff_factor * (2 ** attempt))
+                else: raise
 
     def processar_planilha_bruta(self, caminho_xlsx):
-        print(f"[PROCESSAMENTO] Iniciando leitura do Excel: {caminho_xlsx}")
         try:
             excel = pd.ExcelFile(caminho_xlsx)
             abas_compiladas = []
             
             for aba in excel.sheet_names:
-                print(f"  -> Analisando aba: {aba}")
-                df_amostra = excel.parse(aba, nrows=40)
-                df_amostra.columns = [str(c).upper().strip() for c in df_amostra.columns]
+                df_amostra = excel.parse(aba, nrows=0)
+                colunas_reais = [str(c).upper().strip() for c in df_amostra.columns]
                 
-                if all(k in df_amostra.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'DATA_OCORRENCIA_BO']):
-                    print(f"  -> Aba valida encontrada: {aba}. Extraindo apenas colunas alvo...")
-                    df_completo = excel.parse(aba)
-                    df_completo.columns = [str(c).upper().strip() for c in df_completo.columns]
+                if 'NUM_BO' in colunas_reais and 'LATITUDE' in colunas_reais:
+                    colunas_leitura = [c for c in colunas_reais if c in self.colunas_taticas]
                     
-                    colunas_presentes = [c for c in self.colunas_taticas if c in df_completo.columns]
-                    df_reduzido = df_completo[colunas_presentes].astype(str).copy()
+                    df_reduzido = excel.parse(aba, usecols=lambda x: str(x).upper().strip() in colunas_leitura)
+                    df_reduzido.columns = [str(c).upper().strip() for c in df_reduzido.columns]
+                    
+                    df_reduzido = df_reduzido.dropna(subset=['NUM_BO'])
+                    df_reduzido['NUM_BO'] = df_reduzido['NUM_BO'].astype(str).str.strip()
+                    df_reduzido = df_reduzido.drop_duplicates(subset=['NUM_BO'])
                     
                     abas_compiladas.append(df_reduzido)
-                    
-                    del df_completo
                     gc.collect()
             
             if abas_compiladas:
-                print(f"  -> [SUCESSO] Consolidando {len(abas_compiladas)} aba(s) otimizadas.")
                 df_final = pd.concat(abas_compiladas, ignore_index=True)
+                df_final = df_final.drop_duplicates(subset=['NUM_BO'])
                 del abas_compiladas
                 gc.collect()
                 return df_final
-            else:
-                print(f"  -> [ERRO] Nenhuma aba possui a estrutura tabular exigida.")
-                return None
-        except Exception as e:
-            print(f"  -> [ERRO FATAL NO PANDAS] Nao foi possivel ler o arquivo Excel: {e}")
+            return None
+        except Exception:
             return None
 
     def limpar_pasta_raw(self):
@@ -136,9 +129,9 @@ class MotorSafeDriver:
             except: pass
 
     def compilar_inteligencia(self, df):
-        print("\n[IA ENSEMBLE] Iniciando compilacao e feature engineering...")
         df.columns = [str(c).lower().strip() for c in df.columns]
-        df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro']).copy()
+        df = df.drop_duplicates(subset=['num_bo']).copy()
+        linhas_iniciais = len(df)
         
         df['data_ocorrencia'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
         df = df.dropna(subset=['data_ocorrencia']).copy()
@@ -146,9 +139,9 @@ class MotorSafeDriver:
         df['dia_semana'] = df['data_ocorrencia'].dt.dayofweek
         df['dia_mes'] = df['data_ocorrencia'].dt.day
         
-        df['is_feriado'] = df['data_ocorrencia'].apply(lambda x: 1 if x in self.feriados_sp else 0)
-        df['is_pagamento'] = df['dia_mes'].apply(lambda x: 1 if x in [5, 6, 7, 20, 21] else 0)
-        df['is_fim_semana'] = df['dia_semana'].apply(lambda x: 1 if x >= 5 else 0)
+        df['is_feriado'] = df['data_ocorrencia'].apply(lambda x: 1 if x in self.feriados_sp else 0).astype(np.int8)
+        df['is_pagamento'] = df['dia_mes'].apply(lambda x: 1 if x in [5, 6, 7, 20, 21] else 0).astype(np.int8)
+        df['is_fim_semana'] = df['dia_semana'].apply(lambda x: 1 if x >= 5 else 0).astype(np.int8)
         
         df['perfil'] = 'Geral'
         col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
@@ -162,55 +155,65 @@ class MotorSafeDriver:
             loc_alvo = df[col_local].fillna('').astype(str).str.upper()
             df.loc[(loc_alvo.str.contains('VIA PÚBLICA')) & (df['crime_alvo'].str.contains('CELULAR|PESSOA')), 'perfil'] = 'Pedestre'
         
-        df['severidade'] = df['crime_alvo'].apply(lambda x: 15 if 'ROUBO' in x else 2)
+        df['severidade'] = df['crime_alvo'].apply(lambda x: 15 if 'ROUBO' in x else 2).astype(np.int8)
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
 
-        print("[IA ENSEMBLE] Gerando indices espaciais H3...")
         df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
         
+        caminho_detalhes = self.pastas["ouro"] / "base_crimes_detalhados.csv"
+        cols_exportacao = ['num_bo', 'data_ocorrencia', 'perfil', 'crime_alvo', 'latitude', 'longitude', 'h3_index']
+        cols_presentes = [c for c in cols_exportacao if c in df.columns]
+        df[cols_presentes].to_csv(caminho_detalhes, index=False)
+        
         fato = df.groupby(['h3_index', 'desc_periodo', 'perfil', 'is_feriado', 'is_pagamento', 'is_fim_semana'])['severidade'].sum().reset_index()
-        fato['lat'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
-        fato['lon'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
-        fato['perfil_idx'] = fato['perfil'].astype('category').cat.codes
-        fato['periodo_idx'] = fato['desc_periodo'].astype('category').cat.codes
+        fato['lat'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0]).astype(np.float32)
+        fato['lon'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1]).astype(np.float32)
+        fato['perfil_idx'] = fato['perfil'].astype('category').cat.codes.astype(np.int8)
+        fato['periodo_idx'] = fato['desc_periodo'].astype('category').cat.codes.astype(np.int8)
 
         X = fato[['lat', 'lon', 'perfil_idx', 'periodo_idx', 'is_feriado', 'is_pagamento', 'is_fim_semana']]
         y = fato['severidade']
         
-        print("[IA ENSEMBLE] Treinando modelos (LGBM, CatBoost, KNN)...")
-        lgbm = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
-        catb = CatBoostRegressor(iterations=100, silent=True).fit(X, y)
-        knnr = KNeighborsRegressor(n_neighbors=5).fit(X, y)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
+        
+        lgbm = LGBMRegressor(n_estimators=100, verbose=-1).fit(X_train, y_train)
+        catb = CatBoostRegressor(iterations=100, silent=True).fit(X_train, y_train)
+        knnr = KNeighborsRegressor(n_neighbors=5).fit(X_train, y_train)
 
-        print("[IA ENSEMBLE] Calculando Explicabilidade SHAP...")
+        pred_test = (lgbm.predict(X_test) * 0.4 + catb.predict(X_test) * 0.4 + knnr.predict(X_test) * 0.2)
+        score_r2 = r2_score(y_test, pred_test)
+        margem_erro = mean_absolute_error(y_test, pred_test)
+
+        lgbm.fit(X, y)
+        catb.fit(X, y)
+        knnr.fit(X, y)
+
         explicador = shap.TreeExplainer(lgbm)
         shap_v = explicador.shap_values(X)
-        for i, col in enumerate(X.columns): fato[f'influencia_{col}'] = shap_v[:, i]
+        for i, col in enumerate(X.columns): fato[f'influencia_{col}'] = np.round(shap_v[:, i], 3)
             
-        fato['score_risco'] = (lgbm.predict(X) * 0.4 + catb.predict(X) * 0.4 + knnr.predict(X) * 0.2)
+        fato['score_risco'] = np.round((lgbm.predict(X) * 0.4 + catb.predict(X) * 0.4 + knnr.predict(X) * 0.2), 2)
         
         ouro_path = self.pastas["ouro"] / "base_final_looker.csv"
         fato.to_csv(ouro_path, index=False)
-        print(f"[SUCESSO] Base final exportada para {ouro_path}")
         
-        sha256 = hashlib.sha256()
+        sha256_ia = hashlib.sha256()
         with open(ouro_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b""): sha256.update(chunk)
-        self.auditoria["hash_ouro"] = sha256.hexdigest()
-        
-        return len(fato)
+            for chunk in iter(lambda: f.read(4096), b""): sha256_ia.update(chunk)
+        self.auditoria["hash_ouro_ia"] = sha256_ia.hexdigest()
+
+        return linhas_iniciais, len(fato), score_r2, margem_erro
 
     def executar(self):
+        inicio_op = time.time()
         try:
             pool = []
             log_op = []
             mudanca = False
             
-            print("==================================================")
-            print(" INICIANDO PIPELINE SAFEDRIVER - MODO DIAGNOSTICO ")
-            print("==================================================")
+            self.despachar_alerta_operacional("Iniciando ingestão de dados e validação de chaves primárias.")
             
             for ano in self.anos:
                 self.limpar_pasta_raw()
@@ -222,9 +225,8 @@ class MotorSafeDriver:
                     hash_arquivo, tamanho_atual = self.baixar_dados_resiliente(url_direta, caminho_xlsx)
                     
                     if caminho_parquet.exists() and self.auditoria.get(f"hash_{ano}") == hash_arquivo:
-                        print(f"[CACHE] Arquivo de {ano} inalterado. Carregando Parquet local.")
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"📦 {ano}: Sincronizacao Ignorada (Hash Identico)")
+                        log_op.append(f"✅ {ano}: Sincronização Ignorada (Hash Idêntico)")
                         self.limpar_pasta_raw()
                         continue
                     
@@ -235,37 +237,46 @@ class MotorSafeDriver:
                         self.auditoria[f"hash_{ano}"] = hash_arquivo
                         self.auditoria[f"size_{ano}"] = tamanho_atual
                         pool.append(df_novo)
-                        log_op.append(f"📥 {ano}: Processamento Nativo Concluido")
+                        log_op.append(f"📥 {ano}: Processado e Otimizado em Memória")
                         mudanca = True
                     else:
-                        raise Exception(f"Estrutura tabular invalida retornada no processamento de {ano}")
+                        raise Exception("Estrutura tabular inválida")
                         
                     self.limpar_pasta_raw()
                     gc.collect()
                         
                 except Exception as e:
-                    print(f"\n[ERRO CRITICO EM LOTE] Falha total ao obter/processar dados de {ano}: {e}")
                     self.limpar_pasta_raw()
                     if caminho_parquet.exists():
-                        print(f"  -> Sobrevivendo com arquivo Parquet em cache para {ano}.")
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"⚠️ {ano}: Erro de Extracao ({str(e)}). Base de Cache Aplicada")
-                    else:
-                        print(f"  -> [FALTA DE CACHE] Nenhum arquivo local disponivel para {ano}!")
+                        log_op.append(f"⚠️ {ano}: Erro de Extração. Utilizando Cache Local.")
 
-            if not pool: 
-                print("\n🚨 DIAGNOSTICO FINAL: Nenhum dado de nenhum ano conseguiu ser carregado no pool.")
-                raise Exception("Falha Critica: Fontes de dados indisponiveis para o ciclo atual.")
+            if not pool: raise Exception("Falha Crítica: Fontes de dados indisponíveis.")
 
-            total = self.compilar_inteligencia(pd.concat(pool, ignore_index=True))
+            self.despachar_alerta_operacional("\n".join(log_op))
+            self.despachar_alerta_operacional("Ingestão concluída. Iniciando divisão Treino/Teste e cálculo SHAP.")
+
+            df_consolidado = pd.concat(pool, ignore_index=True)
+            df_consolidado = df_consolidado.drop_duplicates(subset=['NUM_BO'])
+            
+            linhas_puras, total_hex, score_r2, margem_erro = self.compilar_inteligencia(df_consolidado)
+            
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
-            self.despachar_alerta("SafeDriver: Status Operacional", "\n".join(log_op), 3447003, sucesso=True)
+            tempo_total = round((time.time() - inicio_op) / 60, 2)
+
             if mudanca:
-                self.despachar_alerta("SafeDriver: Relatorio Analitico", f"Pipeline Atualizado.\nAreas Mapeadas: {total}\nFatores Comportamentais: Ativos", 3066993, sucesso=True)
+                kpis = {
+                    "B.O.s Únicos Processados": f"{linhas_puras:,}".replace(',', '.'),
+                    "Zonas de Risco (H3) Mapeadas": f"{total_hex:,}".replace(',', '.'),
+                    "Acurácia do Modelo (R²)": f"{score_r2:.2%}",
+                    "Margem de Erro Média": f"± {margem_erro:.2f} pontos de severidade",
+                    "Tempo de Execução": f"{tempo_total} minutos"
+                }
+                self.despachar_alerta_executivo("📊 SafeDriver: Relatório Executivo de IA", kpis, 3066993)
 
         except Exception as e:
-            self.despachar_alerta("SafeDriver: Incidente Critico", str(e), 15158332, sucesso=False)
+            self.despachar_alerta_executivo("🚨 SafeDriver: Incidente Crítico", str(e), 15158332, False)
             raise e
 
 if __name__ == "__main__":
