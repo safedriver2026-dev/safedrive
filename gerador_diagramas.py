@@ -1,50 +1,46 @@
 import base64, zlib, requests
 from pathlib import Path
 
-def salvar_png(mermaid, nome):
-    cod = base64.urlsafe_b64encode(zlib.compress(mermaid.encode('utf-8'), 9)).decode('ascii')
-    res = requests.get(f"https://kroki.io/mermaid/png/{cod}")
-    if res.status_code == 200:
-        Path("documentacao").mkdir(exist_ok=True)
-        with open(f"documentacao/diag_{nome}.png", "wb") as f: f.write(res.content)
+def criar_diagrama(codigo_mermaid, nome_arquivo):
+    """Gera uma imagem PNG a partir do código de diagrama"""
+    try:
+        conteudo = base64.urlsafe_b64encode(zlib.compress(codigo_mermaid.encode('utf-8'), 9)).decode('ascii')
+        url = f"https://kroki.io/mermaid/png/{conteudo}"
+        res = requests.get(url)
+        if res.status_code == 200:
+            Path("documentacao").mkdir(exist_ok=True)
+            with open(f"documentacao/{nome_arquivo}.png", "wb") as f:
+                f.write(res.content)
+            print(f"Diagrama {nome_arquivo} gerado com sucesso.")
+    except:
+        print(f"Falha ao gerar diagrama {nome_arquivo}.")
 
-salvar_png("""
+# Diagrama de Fluxo de Dados (TCC)
+criar_diagrama("""
 graph TD
-    A[Início do Fluxo] --> B[Download Chunked Resiliente 1MB]
-    B --> C{Verificação Criptográfica SHA256}
-    C -- Hash Inalterado --> D[Abortar Processamento + Cache Parquet]
-    C -- Hash Alterado --> E[Extração Otimizada - Descarte Vertical]
-    E --> F[Deduplicação por NUM_BO]
-    D --> F
-    F --> G[Agrupamento H3 Geoespacial]
-    G --> H[Train/Test Split 80/20]
-    H --> I[Ensemble IA e Cálculo SHAP]
-    I --> J[Alertas Discord: Operacional e Executivo]
-    I --> K[Exportar base_final_looker.csv]
-    F --> L[Exportar base_crimes_detalhados.csv]
-""", "arquitetura_safedriver")
+    A[Base Oficial SSP-SP] -->|Download Seguro| B(Motor de Dados)
+    B --> C{Validação NUM_BO}
+    C -->|Dados Limpos| D[Camada de Cache Parquet]
+    D --> E[Inteligência Artificial Ensemble]
+    E --> F[Base Predição - Looker]
+    C --> G[Base Detalhes - Drilldown]
+    F & G --> H[Selo Digital de Auditoria]
+    H --> I[Acesso via API e BI]
+""", "fluxo_projeto_safedriver")
 
-salvar_png("""
+# Diagrama do Esquema Estrela (Storytelling)
+criar_diagrama("""
 erDiagram
-    BASE_FINAL_LOOKER {
+    PREDICAO_RISCO {
         string h3_index
         float score_risco
-        float influencia_is_pagamento
+        float influencia_pagamento
     }
-    BASE_CRIMES_DETALHADOS {
+    CRIMES_DETALHADOS {
         string num_bo
         string h3_index
-        string crime_alvo
-        date data_ocorrencia
+        string tipo_crime
+        date data_real
     }
-    BASE_FINAL_LOOKER ||--o{ BASE_CRIMES_DETALHADOS : "h3_index (Looker Join)"
-""", "modelo_dados_safedriver")
-
-salvar_png("""
-graph TD
-    API[FastAPI Gateway] -->|Validacao X-API-KEY| S{Integridade SHA256}
-    S -->|Audita hash_ouro_ia| M[manifesto.json]
-    S -- Sucesso --> D[Consulta base_final_looker.csv]
-    D --> J[JSON Payload: Fatores de Risco]
-    J --> L[Aplicações Externas]
-""", "fluxo_api_safedriver")
+    PREDICAO_RISCO ||--o{ CRIMES_DETALHADOS : "União por Hexágono H3"
+""", "esquema_estrela_dados")
