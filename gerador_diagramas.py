@@ -1,39 +1,41 @@
 import base64, zlib, requests
 from pathlib import Path
 
-def extrair_diagrama(mermaid, nome):
-    codificado = base64.urlsafe_b64encode(zlib.compress(mermaid.encode('utf-8'), 9)).decode('ascii')
-    res = requests.get(f"https://kroki.io/mermaid/png/{codificado}")
-    if res.status_code == 200:
+def produzir_diagrama(mermaid_texto, nome_imagem):
+    url_kroki = base64.urlsafe_b64encode(zlib.compress(mermaid_texto.encode('utf-8'), 9)).decode('ascii')
+    res_kroki = requests.get(f"https://kroki.io/mermaid/png/{url_kroki}")
+    if res_kroki.status_code == 200:
         Path("documentacao").mkdir(exist_ok=True)
-        with open(f"documentacao/arquitetura_{nome}.png", "wb") as f: f.write(res.content)
+        with open(f"documentacao/arquitetura_{nome_imagem}.png", "wb") as f_img:
+            f_img.write(res_kroki.content)
 
-extrair_diagrama("""
+produzir_diagrama("""
 graph TD
-    A[GitHub Actions] --> B[Motor DeltaSync]
-    B --> C{Auditoria Hash}
-    C --> D[Ensemble: LGBM + CatBoost]
-    D --> E[Export SHAP Data]
-    E --> F[Manifesto JSON]
-    F --> G[Notificacao Discord]
-""", "automacao_auditavel")
+    subgraph Infraestrutura_ColdStart
+        A[GitHub Runner] --> B[Criar Pastas Datalake]
+        B --> C[Loop de Download SSP-SP]
+    end
+    subgraph Core_Processamento
+        C --> D[Auto-Sheet Scan]
+        D --> E[Auditoria Hash SHA256]
+        E --> F[Ensemble: LGBM + CatBoost + KNN]
+        F --> G[Exportacao SHAP Data]
+    end
+    subgraph Monitoramento
+        G --> H[Manifesto JSON]
+        H --> I[Relatorios Discord]
+    end
+""", "automacao_industrial")
 
-extrair_diagrama("""
+produzir_diagrama("""
 erDiagram
-    FATO_RISCO {
+    TABELA_FATO_RISCO {
         string h3_index
-        float score_risco
+        float score_final
         float influencia_perfil
-        float influencia_horario
+        float influencia_periodo
     }
-    DIM_GEOGRAFIA ||--o{ FATO_RISCO : "lat_lon"
-    DIM_PERFIL ||--o{ FATO_RISCO : "idx"
-    DIM_TEMPO ||--o{ FATO_RISCO : "idx"
+    DIM_LOCALIZACAO ||--o{ TABELA_FATO_RISCO : "h3"
+    DIM_PERFIL ||--o{ TABELA_FATO_RISCO : "cod"
+    DIM_TEMPO ||--o{ TABELA_FATO_RISCO : "cod"
 """, "modelo_estrela")
-
-extrair_diagrama("""
-graph LR
-    API[FastAPI] -->|Auth| GAS[Google Apps Script]
-    GAS -->|Fetch| Sheet[Google Sheets]
-    Sheet -->|Conector| Looker[Looker Studio]
-""", "integracao_looker")
