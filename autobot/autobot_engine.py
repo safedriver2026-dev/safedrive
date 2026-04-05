@@ -9,6 +9,7 @@ import folium
 import uvicorn
 import shap
 import matplotlib.pyplot as plt
+import io
 from fastapi import FastAPI, HTTPException
 from pathlib import Path
 from geopy.geocoders import Nominatim
@@ -20,13 +21,6 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from datetime import datetime
 
 app = FastAPI(title="SafeDriver API")
-CACHE_OURO_CONSOLIDADO = None
-
-def notificar_discord(sucesso: bool, mensagem: str):
-    webhook = os.environ.get("DISCORD_SUCESSO") if sucesso else os.environ.get("DISCORD_ERRO")
-    if webhook:
-        try: requests.post(webhook, json={"content": mensagem}, timeout=5)
-        except: pass
 
 class SafeDriverEngine:
     def __init__(self):
@@ -38,36 +32,57 @@ class SafeDriverEngine:
             "prata": self.raiz / "datalake" / "prata",
             "ouro": self.raiz / "datalake" / "ouro"
         }
+   
         for p in self.camadas.values(): p.mkdir(parents=True, exist_ok=True)
-        self.geolocator = Nominatim(user_agent="safedriver_pro_v14")
+
+    def notificar_discord(self, sucesso: bool, mensagem: str):
+        webhook = os.environ.get("DISCORD_SUCESSO") if sucesso else os.environ.get("DISCORD_ERRO")
+        if webhook:
+            try: requests.post(webhook, json={"content": mensagem}, timeout=5)
+            except: pass
 
     def ingestao_bronze(self, ano):
-        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+        """Implementação de Delta Sync: só baixa se não existir no Data Lake"""
         arq_pq = self.camadas["bronze"] / f"bruto_{ano}.parquet"
-        if arq_pq.exists(): return pd.read_parquet(arq_pq)
+        if arq_pq.exists(): 
+            print(f"📦 [Delta Sync] Ano {ano} já existe na Bronze. Pulando download.")
+            return pd.read_parquet(arq_pq)
+        
+        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         try:
             r = requests.get(url, timeout=120)
             r.raise_for_status()
-            xls = pd.ExcelFile(r.content)
+            xls = pd.ExcelFile(io.BytesIO(r.content))
+            df_final = pd.DataFrame()
             for sheet in xls.sheet_names:
                 df = pd.read_excel(xls, sheet_name=sheet)
                 df.columns = [str(c).upper().strip() for c in df.columns]
-                if 'LATITUDE' in df.columns:
-                    df.to_parquet(arq_pq, index=False)
-                    return df
+                if 'LATITUDE' in df.columns and 'LONGITUDE' in df.columns:
+                    df_final = df.copy()
+                    break
+            if not df_final.empty:
+                df_final.to_parquet(arq_pq, index=False)
+                return df_final
             return None
-        except: return None
+        except Exception as e:
+            print(f"⚠️ Falha ao baixar {ano}: {e}")
+            return None
 
     def refinamento_prata(self, df, ano):
+        arq_prata = self.camadas["prata"] / f"prata_{ano}.parquet"
+        if arq_prata.exists(): return pd.read_parquet(arq_prata)
+        
         df.columns = [str(c).lower() for c in df.columns]
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
-        df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
-        df.to_parquet(self.camadas["prata"] / f"prata_{ano}.parquet", index=False)
-        return df
+        df_limpo = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
+        df_limpo.to_parquet(arq_prata, index=False)
+        return df_limpo
 
     def inteligencia_ouro(self, df_total):
         df_total['h3_index'] = df_total.apply(lambda x: h3.latlng_to_cell(float(x['latitude']), float(x['longitude']), 9), axis=1)
+        if 'desc_periodo' not in df_total.columns: df_total['desc_periodo'] = 'DESCONHECIDO'
+        
         analise = df_total.groupby(['h3_index', 'desc_periodo']).size().reset_index(name='crimes')
         analise['lat'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
         analise['lon'] = analise['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
@@ -82,12 +97,18 @@ class SafeDriverEngine:
         m_knn = KNeighborsRegressor(n_neighbors=5, weights='distance')
 
         m_lgb.fit(X_train, y_train); m_cat.fit(X_train, y_train); m_knn.fit(X_train, y_train)
-        preds = (m_lgb.predict(X_test)*0.4) + (m_cat.predict(X_test)*0.4) + (m_knn.predict(X_test)*0.2)
         
-        metricas = {"MAE": round(mean_absolute_error(y_test, preds), 2), "R2": round(r2_score(y_test, preds), 4), "Atualizacao": datetime.now().isoformat()}
+   
+        p_final = (m_lgb.predict(X_test)*0.4) + (m_cat.predict(X_test)*0.4) + (m_knn.predict(X_test)*0.2)
+        
+        metricas = {
+            "MAE": round(mean_absolute_error(y_test, p_final), 2),
+            "R2": round(r2_score(y_test, p_final), 4),
+            "Data_Processamento": datetime.now().isoformat()
+        }
         with open(self.camadas["ouro"] / "metricas.json", "w") as f: json.dump(metricas, f)
 
-        analise['score_risco'] = (((m_lgb.predict(X)*0.4 + m_cat.predict(X)*0.4 + m_knn.predict(X)*0.2) - y.min()) / (y.max() - y.min()) * 100).round(2)
+        analise['score_risco'] = (((m_lgb.predict(X)*0.4 + m_cat.predict(X)*0.4 + m_knn.predict(X)*0.2) - y.min()) / (y.max() - y.min() + 1e-9) * 100).round(2)
         analise.to_csv(self.camadas["ouro"] / "base_looker.csv", index=False)
         
         explainer = shap.TreeExplainer(m_lgb)
@@ -103,12 +124,21 @@ class SafeDriverEngine:
             for a in self.anos:
                 b = self.ingestao_bronze(a)
                 if b is not None: lista.append(self.refinamento_prata(b, a))
-            if lista:
-                df_ouro = self.inteligencia_ouro(pd.concat(lista, ignore_index=True))
-                df_ouro.to_parquet(self.camadas["ouro"] / "ouro_final.parquet")
-                notificar_discord(True, f"✅ SafeDriver: Ciclo {self.ano_atual} finalizado com sucesso.")
+            
+            if not lista:
+              
+                self.notificar_discord(True, "⚠️ SafeDriver: Infraestrutura pronta, aguardando dados da SSP-SP.")
+                with open(self.camadas["ouro"] / "metricas.json", "w") as f: 
+                    json.dump({"MAE": 0, "R2": 0, "Status": "Primeira_Execucao_Vazia"}, f)
+                pd.DataFrame(columns=['lat','lon','score_risco']).to_csv(self.camadas["ouro"] / "base_looker.csv", index=False)
+                return
+
+            df_ouro = self.inteligencia_ouro(pd.concat(lista, ignore_index=True))
+            df_ouro.to_parquet(self.camadas["ouro"] / "ouro_final.parquet")
+            self.notificar_discord(True, f"✅ SafeDriver: Delta Sync concluído com sucesso!")
         except Exception as e:
-            notificar_discord(False, f"🚨 Erro no SafeDriver: {str(e)}")
+            self.notificar_discord(False, f"🚨 Erro crítico no Pipeline: {str(e)}")
+            raise e
 
 if __name__ == "__main__":
     SafeDriverEngine().rodar()
