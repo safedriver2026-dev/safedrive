@@ -26,8 +26,7 @@ class MotorSafeDriver:
             "bronze": self.raiz / "datalake" / "bronze",
             "prata": self.raiz / "datalake" / "prata",
             "ouro": self.raiz / "datalake" / "ouro",
-            "auditoria": self.raiz / "datalake" / "auditoria",
-            "docs": self.raiz / "documentacao"
+            "auditoria": self.raiz / "datalake" / "auditoria"
         }
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         
@@ -45,7 +44,7 @@ class MotorSafeDriver:
             with open(self.manifesto_path, "r") as f: return json.load(f)
         return {}
 
-    def inicializar_auth_hibrida(self):
+    def forjar_credenciais_acesso(self):
         opcoes = Options()
         opcoes.add_argument('--headless=new')
         opcoes.add_argument('--no-sandbox')
@@ -55,8 +54,8 @@ class MotorSafeDriver:
         driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opcoes)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
-        driver.get("https://www.ssp.sp.gov.br/estatistica/consultas")
-        time.sleep(8)
+        driver.get("https://www.ssp.sp.gov.br/")
+        time.sleep(5)
         
         agente = driver.execute_script("return navigator.userAgent;")
         cookies = driver.get_cookies()
@@ -69,18 +68,7 @@ class MotorSafeDriver:
         })
         for c in cookies: self.sessao.cookies.set(c['name'], c['value'])
 
-    def baixar_arquivo_gigante(self, url, caminho_destino):
-        res = self.sessao.get(url, stream=True, timeout=600)
-        res.raise_for_status()
-        sha256 = hashlib.sha256()
-        with open(caminho_destino, 'wb') as f:
-            for chunk in res.iter_content(chunk_size=1048576):
-                if chunk:
-                    f.write(chunk)
-                    sha256.update(chunk)
-        return sha256.hexdigest()
-
-    def extrair_converter_dados(self, caminho_xlsx):
+    def processar_planilha_bruta(self, caminho_xlsx):
         try:
             excel = pd.ExcelFile(caminho_xlsx)
             for aba in excel.sheet_names:
@@ -91,14 +79,14 @@ class MotorSafeDriver:
             return None
         except: return None
 
-    def enviar_alerta(self, titulo, msg, cor, sucesso=True):
+    def despachar_alerta(self, titulo, msg, cor, sucesso=True):
         webhook = self.webhook_sucesso if sucesso else self.webhook_erro
         if not webhook: return
         payload = {"embeds": [{"title": titulo, "description": msg, "color": cor, "timestamp": datetime.now().isoformat()}]}
         try: requests.post(webhook, json=payload, timeout=10)
         except: pass
 
-    def processar_ia_comportamental(self, df):
+    def compilar_inteligencia(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
         df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
         
@@ -121,7 +109,7 @@ class MotorSafeDriver:
         
         col_local = next((c for c in ['descr_tipolocal', 'descr_local'] if c in df.columns), 'descr_tipolocal')
         if col_local in df.columns:
-            loc_alvo = df[col_local].fillna('').astype(str).upper()
+            loc_alvo = col_local.fillna('').astype(str).upper()
             df.loc[(loc_alvo.str.contains('VIA PÚBLICA')) & (df['crime_alvo'].str.contains('CELULAR|PESSOA')), 'perfil'] = 'Pedestre'
         
         df['severidade'] = df['crime_alvo'].apply(lambda x: 15 if 'ROUBO' in x else 2)
@@ -158,37 +146,46 @@ class MotorSafeDriver:
 
     def executar(self):
         try:
-            self.inicializar_auth_hibrida()
+            self.forjar_credenciais_acesso()
             pool = []
             log_op = []
             mudanca = False
             
             for ano in self.anos:
-                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+                url_direta = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
                 caminho_xlsx = self.pastas["raw"] / f"bruto_{ano}.xlsx"
                 caminho_parquet = self.pastas["bronze"] / f"limpo_{ano}.parquet"
                 
                 try:
-                    head = self.sessao.head(url, timeout=30)
-                    tamanho_atual = str(head.headers.get('Content-Length', '0'))
+                    res = self.sessao.get(url_direta, stream=True, timeout=120)
+                    res.raise_for_status()
+                    
+                    tamanho_atual = str(res.headers.get('Content-Length', '0'))
                     
                     if caminho_parquet.exists() and self.auditoria.get(f"size_{ano}") == tamanho_atual:
+                        res.close()
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"📦 {ano}: DeltaSync OK")
+                        log_op.append(f"📦 {ano}: DeltaSync OK (S/ Alterações)")
                         continue
 
-                    hash_arquivo = self.baixar_arquivo_gigante(url, caminho_xlsx)
-                    df_novo = self.extrair_converter_dados(caminho_xlsx)
+                    sha256 = hashlib.sha256()
+                    with open(caminho_xlsx, 'wb') as f:
+                        for chunk in res.iter_content(chunk_size=1048576):
+                            if chunk:
+                                f.write(chunk)
+                                sha256.update(chunk)
+                    
+                    df_novo = self.processar_planilha_bruta(caminho_xlsx)
                     
                     if df_novo is not None:
                         df_novo.to_parquet(caminho_parquet)
                         self.auditoria[f"size_{ano}"] = tamanho_atual
-                        self.auditoria[f"hash_{ano}"] = hash_arquivo
+                        self.auditoria[f"hash_{ano}"] = sha256.hexdigest()
                         pool.append(df_novo)
-                        log_op.append(f"📥 {ano}: Streaming Concluído")
+                        log_op.append(f"📥 {ano}: Streaming Concluído via Link Direto")
                         mudanca = True
                     else:
-                        raise Exception(f"Estrutura tabular invalida {ano}")
+                        raise Exception(f"Layout do Excel inválido {ano}")
                         
                     if caminho_xlsx.exists(): os.remove(caminho_xlsx)
                         
@@ -196,19 +193,19 @@ class MotorSafeDriver:
                     if caminho_xlsx.exists(): os.remove(caminho_xlsx)
                     if caminho_parquet.exists():
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"⚠️ {ano}: Usando Cache")
+                        log_op.append(f"⚠️ {ano}: Falha de Conexão. Usando Cache Parquet")
 
-            if not pool: raise Exception("Falha Catastrófica: Dados Indisponíveis")
+            if not pool: raise Exception("Falha Catastrófica: Nenhuma base acessível através dos links fornecidos.")
 
-            total = self.processar_ia_comportamental(pd.concat(pool))
+            total = self.compilar_inteligencia(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
-            self.enviar_alerta("Log Operacional SafeDriver", "\n".join(log_op), 3447003, sucesso=True)
+            self.despachar_alerta("Log Operacional SafeDriver V28", "\n".join(log_op), 3447003, sucesso=True)
             if mudanca:
-                self.enviar_alerta("Relatório IA SafeDriver", f"Feature Engineering Ativo.\nÁreas: {total}\nFatores: Pagamento/Feriado auditados", 3066993, sucesso=True)
+                self.despachar_alerta("Relatório IA SafeDriver", f"Pipeline Direto Finalizado.\nÁreas: {total}\nSHAP Auditado", 3066993, sucesso=True)
 
         except Exception as e:
-            self.enviar_alerta("Incidente Crítico", str(e), 15158332, sucesso=False)
+            self.despachar_alerta("Incidente Crítico V28", str(e), 15158332, sucesso=False)
             raise e
 
 if __name__ == "__main__":
