@@ -2,27 +2,24 @@ import hashlib
 import json
 from pathlib import Path
 
-def test_integridade_dos_dados():
-    pasta_seguranca = Path("datalake/auditoria/controle_integridade.json")
-    base_ia = Path("datalake/ouro/predicao_risco_mapa.csv")
-    base_detalhes = Path("datalake/ouro/crimes_detalhados.csv")
+def test_verificar_selos_digitais():
+    controle_path = Path("datalake/auditoria/controle_integridade.json")
+    ia_path = Path("datalake/ouro/predicao_risco_mapa.csv")
+    detalhes_path = Path("datalake/ouro/crimes_detalhados.csv")
     
-    assert pasta_seguranca.exists(), "Arquivo de controle sumiu!"
+    assert controle_path.exists()
+    with open(controle_path, "r") as f: controle = json.load(f)
     
-    with open(pasta_seguranca, "r") as f: controle = json.load(f)
-    
-    def conferir_selo(caminho):
+    def calcular(p):
         h = hashlib.sha256()
-        with open(caminho, "rb") as f:
-            for bloco in iter(lambda: f.read(4096), b""): h.update(bloco)
+        with open(p, "rb") as f:
+            for b in iter(lambda: f.read(4096), b""): h.update(b)
         return h.hexdigest()
     
-    # O teste falha se alguém mudar um único B.O. no arquivo final
-    assert conferir_selo(base_ia) == controle.get("selo_ia"), "Base de IA foi violada!"
-    assert conferir_selo(base_detalhes) == controle.get("selo_detalhes"), "Base de Detalhes foi violada!"
+    assert calcular(ia_path) == controle.get("selo_ia")
+    assert calcular(detalhes_path) == controle.get("selo_detalhes")
 
-def test_unicidade_bo():
+def test_validar_chaves_unicas():
     import pandas as pd
     df = pd.read_csv("datalake/ouro/crimes_detalhados.csv")
-    # Garante que o motor não deixou passar B.O.s repetidos
-    assert df['num_bo'].is_unique, "Existem B.O.s duplicados na base final!"
+    assert df['num_bo'].is_unique
