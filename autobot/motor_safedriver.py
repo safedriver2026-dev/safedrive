@@ -7,6 +7,7 @@ import numpy as np
 import h3
 import shap
 import hashlib
+import holidays
 from pathlib import Path
 from datetime import datetime
 from sklearn.neighbors import KNeighborsRegressor
@@ -32,10 +33,10 @@ class MotorSafeDriver:
         
         self.anos = list(range(2022, datetime.now().year + 1))
         self.sessao = requests.Session()
+        self.feriados_sp = holidays.Brazil(state='SP')
         
         self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
         self.webhook_erro = os.environ.get("DISCORD_ERRO")
-        
         self.manifesto_path = self.pastas["auditoria"] / "manifesto.json"
         self.auditoria = self.carregar_manifesto()
 
@@ -66,14 +67,11 @@ class MotorSafeDriver:
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Referer': 'https://www.ssp.sp.gov.br/'
         })
-        
-        for c in cookies:
-            self.sessao.cookies.set(c['name'], c['value'])
+        for c in cookies: self.sessao.cookies.set(c['name'], c['value'])
 
     def baixar_arquivo_gigante(self, url, caminho_destino):
         res = self.sessao.get(url, stream=True, timeout=600)
         res.raise_for_status()
-        
         sha256 = hashlib.sha256()
         with open(caminho_destino, 'wb') as f:
             for chunk in res.iter_content(chunk_size=1048576):
@@ -88,7 +86,7 @@ class MotorSafeDriver:
             for aba in excel.sheet_names:
                 df = excel.parse(aba, nrows=40)
                 df.columns = [str(c).upper().strip() for c in df.columns]
-                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE']):
+                if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'DATA_OCORRENCIA_BO']):
                     return excel.parse(aba)
             return None
         except: return None
@@ -100,10 +98,19 @@ class MotorSafeDriver:
         try: requests.post(webhook, json=payload, timeout=10)
         except: pass
 
-    def processar_ia_core(self, df):
+    def processar_ia_comportamental(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
-        
         df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
+        
+        df['data_ocorrencia'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
+        df = df.dropna(subset=['data_ocorrencia']).copy()
+        
+        df['dia_semana'] = df['data_ocorrencia'].dt.dayofweek
+        df['dia_mes'] = df['data_ocorrencia'].dt.day
+        
+        df['is_feriado'] = df['data_ocorrencia'].apply(lambda x: 1 if x in self.feriados_sp else 0)
+        df['is_pagamento'] = df['dia_mes'].apply(lambda x: 1 if x in [5, 6, 7, 20, 21] else 0)
+        df['is_fim_semana'] = df['dia_semana'].apply(lambda x: 1 if x >= 5 else 0)
         
         df['perfil'] = 'Geral'
         col_crime = next((c for c in ['natureza_apurada', 'rubrica'] if c in df.columns), 'rubrica')
@@ -121,17 +128,16 @@ class MotorSafeDriver:
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce').fillna(0)
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
-        
-        if df.empty: return None
 
         df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
-        fato = df.groupby(['h3_index', 'desc_periodo', 'perfil'])['severidade'].sum().reset_index()
+        
+        fato = df.groupby(['h3_index', 'desc_periodo', 'perfil', 'is_feriado', 'is_pagamento', 'is_fim_semana'])['severidade'].sum().reset_index()
         fato['lat'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[0])
         fato['lon'] = fato['h3_index'].apply(lambda x: h3.cell_to_latlng(x)[1])
         fato['perfil_idx'] = fato['perfil'].astype('category').cat.codes
         fato['periodo_idx'] = fato['desc_periodo'].astype('category').cat.codes
 
-        X = fato[['lat', 'lon', 'perfil_idx', 'periodo_idx']]
+        X = fato[['lat', 'lon', 'perfil_idx', 'periodo_idx', 'is_feriado', 'is_pagamento', 'is_fim_semana']]
         y = fato['severidade']
         
         lgbm = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
@@ -153,7 +159,6 @@ class MotorSafeDriver:
     def executar(self):
         try:
             self.inicializar_auth_hibrida()
-            
             pool = []
             log_op = []
             mudanca = False
@@ -169,11 +174,10 @@ class MotorSafeDriver:
                     
                     if caminho_parquet.exists() and self.auditoria.get(f"size_{ano}") == tamanho_atual:
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"📦 {ano}: DeltaSync OK (Cache Parquet)")
+                        log_op.append(f"📦 {ano}: DeltaSync OK")
                         continue
 
                     hash_arquivo = self.baixar_arquivo_gigante(url, caminho_xlsx)
-                    
                     df_novo = self.extrair_converter_dados(caminho_xlsx)
                     
                     if df_novo is not None:
@@ -181,28 +185,27 @@ class MotorSafeDriver:
                         self.auditoria[f"size_{ano}"] = tamanho_atual
                         self.auditoria[f"hash_{ano}"] = hash_arquivo
                         pool.append(df_novo)
-                        log_op.append(f"📥 {ano}: Streaming 300MB+ Concluído")
+                        log_op.append(f"📥 {ano}: Streaming Concluído")
                         mudanca = True
                     else:
                         raise Exception(f"Estrutura tabular invalida {ano}")
                         
-                    if caminho_xlsx.exists():
-                        os.remove(caminho_xlsx)
+                    if caminho_xlsx.exists(): os.remove(caminho_xlsx)
                         
                 except Exception as e:
                     if caminho_xlsx.exists(): os.remove(caminho_xlsx)
                     if caminho_parquet.exists():
                         pool.append(pd.read_parquet(caminho_parquet))
-                        log_op.append(f"⚠️ {ano}: Falha de Download (Forçando Cache)")
+                        log_op.append(f"⚠️ {ano}: Usando Cache")
 
             if not pool: raise Exception("Falha Catastrófica: Dados Indisponíveis")
 
-            total = self.processar_ia_core(pd.concat(pool))
+            total = self.processar_ia_comportamental(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
 
             self.enviar_alerta("Log Operacional SafeDriver", "\n".join(log_op), 3447003, sucesso=True)
             if mudanca:
-                self.enviar_alerta("Relatório IA SafeDriver", f"Atualização Big Data concluída.\nÁreas: {total}\nSHAP Auditado", 3066993, sucesso=True)
+                self.enviar_alerta("Relatório IA SafeDriver", f"Feature Engineering Ativo.\nÁreas: {total}\nFatores: Pagamento/Feriado auditados", 3066993, sucesso=True)
 
         except Exception as e:
             self.enviar_alerta("Incidente Crítico", str(e), 15158332, sucesso=False)
