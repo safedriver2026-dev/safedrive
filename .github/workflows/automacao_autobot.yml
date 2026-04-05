@@ -1,12 +1,12 @@
-name: Autobot Execução Diaria
+name: Autobot Fluxo Diario 
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 9 * * *'
   workflow_dispatch:
 
 jobs:
-  pipeline:
+  build-and-run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,15 +14,20 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-      - run: pip install -r requirements.txt
-      - env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest tests/ -v
-      - run: ANO_PROCESSAMENTO=$(date +'%Y') python autobot/autobot_engine.py
-      - run: python gerador_diagramas.py
-      - run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add datalake/ouro/* geo_cache.json *.png
-          git commit -m "update: dados e diagramas" || echo "no changes"
+      - name: Install Libs
+        run: pip install -r requirements.txt
+      - name: Execute Engine and Docs
+        env:
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+        run: |
+          python autobot/autobot_engine.py
+          python gerador_diagramas.py
+          python -m pytest tests/test_contracts.py
+      - name: Commit Results
+        run: |
+          git config --local user.email "bot@safedriver.com"
+          git config --local user.name "SafeDriver Bot"
+          git add datalake/ouro/* documentacao/*.png
+          git commit -m "Update: Pipeline Results and Documentation [skip ci]" || echo "No changes"
           git push
