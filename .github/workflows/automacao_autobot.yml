@@ -1,25 +1,22 @@
-name: Autobot Execução Diaria
+name: SafeDriver Atualização Diária
 on:
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
 jobs:
-  pipeline_extracao:
+  pipeline:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-          
-      - name: Configurar Pacotes Python
+      - name: Instalar Dependencias
         run: pip install -r requirements.txt
-        
-      - name: Executar Motor de Extracao e ML
+      - name: Rodar Motor de Dados
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -27,14 +24,12 @@ jobs:
         run: |
           python autobot/motor_safedriver.py
           python gerador_diagramas.py
-          
-      - name: Validar Camada de Seguranca e Auditoria
+      - name: Auditoria de Segurança
         run: python -m pytest tests/test_seguranca.py
-        
-      - name: Persistir Artefatos e Datalake
+      - name: Salvar Mudanças no Repositório
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver AutoBot"
-          git add datalake/auditoria/manifesto.json datalake/ouro/base_final_looker.csv datalake/ouro/base_crimes_detalhados.csv documentacao/*.png
-          git commit -m "auto: otimizacao de memoria e split de treino [skip ci]" || echo "Sem mudanças"
+          git add datalake/auditoria/*.json datalake/ouro/*.csv documentacao/*.png
+          git commit -m "sincronização automática: dados auditados e limpos [skip ci]" || echo "Sem mudanças"
           git push
