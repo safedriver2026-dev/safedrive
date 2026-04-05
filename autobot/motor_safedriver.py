@@ -55,10 +55,16 @@ class MotorSafeDriver:
             'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         }
 
+        print(f"\n[NETWORK] Iniciando conexao com: {url}")
+
         for attempt in range(retries):
             try:
+                print(f"  -> Tentativa {attempt + 1}/{retries}...")
                 res = self.sessao.get(url, stream=True, headers=headers, timeout=(60, 1800))
                 res.raise_for_status()
+                
+                tamanho_atual = str(res.headers.get('Content-Length', '0'))
+                print(f"  -> Conexao estavel. Tamanho do arquivo reportado: {tamanho_atual} bytes")
                 
                 sha256 = hashlib.sha256()
                 with open(caminho_destino, 'wb') as f:
@@ -66,24 +72,36 @@ class MotorSafeDriver:
                         if chunk:
                             f.write(chunk)
                             sha256.update(chunk)
-                return sha256.hexdigest(), str(res.headers.get('Content-Length', '0'))
+                            
+                print(f"  -> [SUCESSO] Download concluido. Arquivo salvo.")
+                return sha256.hexdigest(), tamanho_atual
                 
-            except requests.exceptions.RequestException:
+            except requests.exceptions.RequestException as req_err:
+                print(f"  -> [ERRO DE REDE] Tentativa {attempt + 1} falhou: {req_err}")
                 if attempt < retries - 1:
-                    time.sleep(backoff_factor * (2 ** attempt))
+                    sleep_time = backoff_factor * (2 ** attempt)
+                    print(f"  -> Aguardando {sleep_time} segundos para retentar...")
+                    time.sleep(sleep_time)
                 else:
+                    print("  -> [FALHA CRITICA] Todas as tentativas de rede foram esgotadas.")
                     raise
 
     def processar_planilha_bruta(self, caminho_xlsx):
+        print(f"[PROCESSAMENTO] Iniciando leitura do Excel: {caminho_xlsx}")
         try:
             excel = pd.ExcelFile(caminho_xlsx)
             for aba in excel.sheet_names:
+                print(f"  -> Analisando aba: {aba}")
                 df = excel.parse(aba, nrows=40)
                 df.columns = [str(c).upper().strip() for c in df.columns]
                 if all(k in df.columns for k in ['NUM_BO', 'ANO_BO', 'LATITUDE', 'DATA_OCORRENCIA_BO']):
+                    print(f"  -> Aba valida encontrada: {aba}. Carregando base completa...")
                     return excel.parse(aba)
+            print(f"  -> [ERRO] Nenhuma aba possui a estrutura tabular exigida.")
             return None
-        except: return None
+        except Exception as e:
+            print(f"  -> [ERRO FATAL NO PANDAS] Nao foi possivel ler o arquivo Excel: {e}")
+            return None
 
     def limpar_pasta_raw(self):
         for f in self.pastas["raw"].glob("*"):
@@ -91,6 +109,7 @@ class MotorSafeDriver:
             except: pass
 
     def compilar_inteligencia(self, df):
+        print("\n[IA ENSEMBLE] Iniciando compilacao e feature engineering...")
         df.columns = [str(c).lower().strip() for c in df.columns]
         df = df.drop_duplicates(subset=['num_bo', 'ano_bo', 'nome_municipio', 'data_registro'])
         
@@ -121,6 +140,7 @@ class MotorSafeDriver:
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce').fillna(0)
         df = df[(df['latitude'] != 0) & (df['longitude'] != 0)].copy()
 
+        print("[IA ENSEMBLE] Gerando indices espaciais H3...")
         df['h3_index'] = df.apply(lambda x: h3.latlng_to_cell(x['latitude'], x['longitude'], 9), axis=1)
         
         fato = df.groupby(['h3_index', 'desc_periodo', 'perfil', 'is_feriado', 'is_pagamento', 'is_fim_semana'])['severidade'].sum().reset_index()
@@ -132,10 +152,12 @@ class MotorSafeDriver:
         X = fato[['lat', 'lon', 'perfil_idx', 'periodo_idx', 'is_feriado', 'is_pagamento', 'is_fim_semana']]
         y = fato['severidade']
         
+        print("[IA ENSEMBLE] Treinando modelos (LGBM, CatBoost, KNN)...")
         lgbm = LGBMRegressor(n_estimators=100, verbose=-1).fit(X, y)
         catb = CatBoostRegressor(iterations=100, silent=True).fit(X, y)
         knnr = KNeighborsRegressor(n_neighbors=5).fit(X, y)
 
+        print("[IA ENSEMBLE] Calculando Explicabilidade SHAP...")
         explicador = shap.TreeExplainer(lgbm)
         shap_v = explicador.shap_values(X)
         for i, col in enumerate(X.columns): fato[f'influencia_{col}'] = shap_v[:, i]
@@ -144,6 +166,7 @@ class MotorSafeDriver:
         
         ouro_path = self.pastas["ouro"] / "base_final_looker.csv"
         fato.to_csv(ouro_path, index=False)
+        print(f"[SUCESSO] Base final exportada para {ouro_path}")
         
         sha256 = hashlib.sha256()
         with open(ouro_path, 'rb') as f:
@@ -158,6 +181,10 @@ class MotorSafeDriver:
             log_op = []
             mudanca = False
             
+            print("==================================================")
+            print(" INICIANDO PIPELINE SAFEDRIVER - MODO DIAGNOSTICO ")
+            print("==================================================")
+            
             for ano in self.anos:
                 self.limpar_pasta_raw()
                 url_direta = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
@@ -168,6 +195,7 @@ class MotorSafeDriver:
                     hash_arquivo, tamanho_atual = self.baixar_dados_resiliente(url_direta, caminho_xlsx)
                     
                     if caminho_parquet.exists() and self.auditoria.get(f"hash_{ano}") == hash_arquivo:
+                        print(f"[CACHE] Arquivo de {ano} inalterado. Carregando Parquet local.")
                         pool.append(pd.read_parquet(caminho_parquet))
                         log_op.append(f"📦 {ano}: Sincronizacao Ignorada (Hash Identico)")
                         self.limpar_pasta_raw()
@@ -183,17 +211,23 @@ class MotorSafeDriver:
                         log_op.append(f"📥 {ano}: Processamento Nativo Concluido")
                         mudanca = True
                     else:
-                        raise Exception(f"Layout estrutural invalido em {ano}")
+                        raise Exception(f"Estrutura tabular invalida retornada no processamento de {ano}")
                         
                     self.limpar_pasta_raw()
                         
                 except Exception as e:
+                    print(f"\n[ERRO CRITICO EM LOTE] Falha total ao obter/processar dados de {ano}: {e}")
                     self.limpar_pasta_raw()
                     if caminho_parquet.exists():
+                        print(f"  -> Sobrevivendo com arquivo Parquet em cache para {ano}.")
                         pool.append(pd.read_parquet(caminho_parquet))
                         log_op.append(f"⚠️ {ano}: Erro de Extracao ({str(e)}). Base de Cache Aplicada")
+                    else:
+                        print(f"  -> [FALTA DE CACHE] Nenhum arquivo local disponivel para {ano}!")
 
-            if not pool: raise Exception("Falha Critica: Fontes de dados indisponiveis para o ciclo atual.")
+            if not pool: 
+                print("\n🚨 DIAGNOSTICO FINAL: Nenhum dado de nenhum ano conseguiu ser carregado no pool.")
+                raise Exception("Falha Critica: Fontes de dados indisponiveis para o ciclo atual.")
 
             total = self.compilar_inteligencia(pd.concat(pool))
             with open(self.manifesto_path, "w") as f: json.dump(self.auditoria, f, indent=4)
