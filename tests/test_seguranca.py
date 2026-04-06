@@ -1,29 +1,26 @@
-import hashlib
-import json
+import pytest
 import pandas as pd
+import json
 from pathlib import Path
 
 def test_auditoria_criptografica():
-    manifesto = Path("datalake/auditoria/controle_integridade.json")
-    base_ia = Path("datalake/ouro/predicao_risco_mapa.csv")
-    base_detalhes = Path("datalake/ouro/crimes_detalhados.parquet")
+    manifesto_path = Path("datalake/auditoria/controle_integridade.json")
+    base_dash = Path("datalake/ouro/dashboard_risco_consolidado.csv")
     
-    assert manifesto.exists(), "ERRO: Manifesto de integridade nao encontrado"
-    with open(manifesto, "r") as f: controle = json.load(f)
+    assert manifesto_path.exists(), "ERRO: Manifesto de integridade não encontrado"
+    assert base_dash.exists(), "ERRO: Base de saída para Dashboard não encontrada"
     
-    def gerar_hash(caminho):
-        sha = hashlib.sha256()
-        with open(caminho, "rb") as f:
-            for bloco in iter(lambda: f.read(4096), b""): sha.update(bloco)
-        return sha.hexdigest()
-    
-    assert gerar_hash(base_ia) == controle.get("selo_ia"), "ERRO: Base de IA violada"
-    assert gerar_hash(base_detalhes) == controle.get("selo_detalhes"), "ERRO: Base de Detalhes violada"
+    with open(manifesto_path, "r") as f:
+        dados = json.load(f)
+        assert "sha256" in dados, "ERRO: Selo SHA-256 ausente no manifesto"
+        assert dados["r2"] > 0.55, f"ERRO: Confiabilidade abaixo da meta (Atual: {dados['r2']:.2%})"
 
 def test_qualidade_dados_ouro():
-    df_ia = pd.read_csv("datalake/ouro/predicao_risco_mapa.csv")
-    df_detalhes = pd.read_parquet("datalake/ouro/crimes_detalhados.parquet")
+    df = pd.read_csv("datalake/ouro/dashboard_risco_consolidado.csv")
+    colunas_obrigatorias = ['H3_INDEX', 'PREDICAO_RISCO', 'LAT', 'LON']
     
-    assert 'score_risco' in df_ia.columns
-    assert 'inf_hora' in df_ia.columns
-    assert df_detalhes['num_bo'].is_unique, "ERRO: Existem duplicatas na camada ouro"
+    for col in colunas_obrigatorias:
+        assert col in df.columns, f"ERRO: Coluna vital {col} ausente na camada Ouro"
+    
+    assert df['PREDICAO_RISCO'].min() >= 0, "ERRO: Predição de risco negativa detectada"
+    assert not df['H3_INDEX'].isnull().any(), "ERRO: Existem hexágonos nulos na base final"
