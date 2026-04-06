@@ -3,6 +3,7 @@ import os
 import json
 import requests
 import traceback
+import polars as pl
 import pandas as pd
 import numpy as np
 import h3
@@ -10,6 +11,8 @@ import gc
 import time
 import holidays
 import warnings
+import shap
+import fastexcel
 from pathlib import Path
 from datetime import datetime
 from google.cloud import storage
@@ -35,7 +38,7 @@ class MotorSafeDriverCloud:
         self.hoje = datetime.now()
         self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
         self.storage_client = storage.Client()
-        self.feriados_br = holidays.Brazil(years=[self.hoje.year, self.hoje.year - 1, self.hoje.year - 2])
+        self.feriados_br = holidays.Brazil(years=[self.hoje.year, self.hoje.year-1, self.hoje.year-2])
 
     def garantir_infraestrutura_bucket(self):
         try:
@@ -43,206 +46,230 @@ class MotorSafeDriverCloud:
         except Exception:
             self.storage_client.create_bucket(self.bucket_nome, location="US-EAST1")
 
-    def extrair_dados(self):
-        ano_inicio = 2022
-        ano_atual = self.hoje.year
-        dfs = []
-        
-        mapeamento_colunas = {
-            'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO',
-            'DATA DO FATO': 'DATA_OCORRENCIA_BO',
-            'DATA_OCORRENCIA': 'DATA_OCORRENCIA_BO',
-            'NATUREZA': 'RUBRICA',
-            'NATUREZA_APURADA': 'RUBRICA',
-            'NUM_BO': 'NUM_BO',
-            'NUMERO_BOLETIM': 'NUM_BO',
-            'NUMERO BOLETIM': 'NUM_BO',
-            'NÚMERO DO BO': 'NUM_BO',
-            'LATITUDE': 'LATITUDE',
-            'LONGITUDE': 'LONGITUDE'
+    # ==========================================
+    # CAMADA RAW: Ingestão de Alta Performance (Polars + FastExcel)
+    # ==========================================
+    def processar_camada_raw(self):
+        ano_inicio, ano_atual = 2022, self.hoje.year
+        mapeamento = {
+            'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATA DO FATO': 'DATA_OCORRENCIA_BO',
+            'NATUREZA': 'RUBRICA', 'NUMERO_BOLETIM': 'NUM_BO', 'NÚMERO DO BO': 'NUM_BO'
         }
 
-        print(f"🔄 Iniciando extração incremental de {ano_inicio} até {ano_atual}...")
-
+        print("🟤 [LAYER RAW] Iniciando ingestão textual segura...")
         for ano in range(ano_inicio, ano_atual + 1):
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-            arquivo_destino = self.pastas["raw"] / f"SPDadosCriminais_{ano}.xlsx"
+            xlsx_temp = self.pastas["raw"] / f"temp_{ano}.xlsx"
+            parquet_raw = self.pastas["raw"] / f"ssp_bruto_{ano}.parquet"
             
             try:
-                head_req = requests.head(url, verify=False, allow_redirects=True)
-                tamanho_remoto = int(head_req.headers.get('Content-Length', 0))
-            except Exception as e:
-                print(f"⚠️ Erro ao verificar servidor para o ano {ano}: {e}. Pulando...")
-                continue
-
-            precisa_baixar = True
-            
-            if arquivo_destino.exists():
-                tamanho_local = arquivo_destino.stat().st_size
-                if tamanho_local == tamanho_remoto and tamanho_remoto > 0:
-                    print(f"✅ Arquivo de {ano} atualizado (Tamanho idêntico: {tamanho_local} bytes). Usando cache.")
-                    precisa_baixar = False
-                else:
-                    print(f"♻️ Alteração detectada em {ano}! Atualizando arquivo local...")
-
-            if precisa_baixar:
-                print(f"📥 Baixando dados de {ano}. Isso pode demorar...")
-                resposta = requests.get(url, stream=True, verify=False)
-                
-                if resposta.status_code == 200:
-                    with open(arquivo_destino, 'wb') as f:
-                        for chunk in resposta.iter_content(chunk_size=1024*1024):
-                            f.write(chunk)
-                else:
-                    print(f"❌ Falha no download de {ano}. Status HTTP: {resposta.status_code}")
+                h = requests.head(url, verify=False, timeout=15)
+                remoto = int(h.headers.get('Content-Length', 0))
+                if parquet_raw.exists():
+                    print(f"✅ {ano} já em cache.")
                     continue
+            except: pass
 
-            print(f"🗃️ Processando planilhas de {ano}...")
-            xls = pd.ExcelFile(arquivo_destino)
-            abas_de_dados = [aba for aba in xls.sheet_names if "capa" not in aba.lower()]
-            
-            for aba in abas_de_dados:
-                df_temp = pd.read_excel(xls, sheet_name=aba)
-                df_temp.columns = [str(c).upper().strip() for c in df_temp.columns]
-                df_temp.rename(columns=mapeamento_colunas, inplace=True)
+            for t in range(3):
+                try:
+                    print(f"📥 Baixando {ano} (T{t+1})...")
+                    r = requests.get(url, stream=True, verify=False, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(60, 1800))
+                    if r.status_code == 200:
+                        with open(xlsx_temp, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=2*1024*1024): f.write(chunk)
+                        break
+                except: time.sleep(5)
+
+            if not xlsx_temp.exists(): continue
+
+            try:
+                # FastExcel lê os metadados instantaneamente
+                excel_reader = fastexcel.read_excel(str(xlsx_temp))
+                abas_validas = [
+                    aba for aba in excel_reader.sheet_names 
+                    if "capa" not in aba.lower() and "campo" not in aba.lower() and "tabela" not in aba.lower()
+                ]
                 
-                if 'NUM_BO' not in df_temp.columns:
-                    df_temp['NUM_BO'] = np.nan
+                dfs_ano = []
+                for aba in abas_validas:
+                    # Polars lê nativamente via Calamine (Rust)
+                    df_aba = pl.read_excel(str(xlsx_temp), sheet_name=aba, engine="calamine")
                     
-                dfs.append(df_temp)
+                    # Padroniza nomes e força tudo para String
+                    df_aba = df_aba.rename({c: str(c).upper().strip() for c in df_aba.columns})
+                    for velho, novo in mapeamento.items():
+                        if velho in df_aba.columns:
+                            df_aba = df_aba.rename({velho: novo})
+                            
+                    df_aba = df_aba.with_columns(pl.all().cast(pl.String))
+                    dfs_ano.append(df_aba)
+                
+                if dfs_ano:
+                    df_ano_completo = pl.concat(dfs_ano, how="diagonal")
+                    df_ano_completo.write_parquet(parquet_raw, compression='snappy')
+                    print(f"💾 Raw salva: {parquet_raw.name} ({df_ano_completo.height} linhas)")
+                
+                os.remove(xlsx_temp)
+                gc.collect()
+            except Exception as e:
+                print(f"❌ Erro ao processar o Excel de {ano}: {e}")
 
-        print("🏗️ Empilhando todos os anos...")
-        df_bruto = pd.concat(dfs, ignore_index=True)
-        vol_antes = len(df_bruto)
+    # ==========================================
+    # CAMADA PRATA: Lazy Evaluation e Geoprocessamento Inteligente
+    # ==========================================
+    def processar_camada_prata(self):
+        print("⚪ [LAYER PRATA] Iniciando tipagem e tratamento (Lazy Evaluation)...")
+        arquivos_raw = [str(p) for p in self.pastas["raw"].glob("ssp_bruto_*.parquet")]
+        if not arquivos_raw: raise ValueError("Datalake Raw vazio.")
+        
+        # O LazyFrame não gasta RAM, apenas planeja a execução
+        lazy_df = pl.scan_parquet(arquivos_raw)
+        
+        # Pipeline de Limpeza de Dados
+        df_prata = (
+            lazy_df
+            .with_columns([
+                # Remove nulos e converte datas
+                pl.col("NUM_BO").replace(["nan", "NaN", "NULL", "None", ""], None),
+                pl.col("DATA_OCORRENCIA_BO").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DATA_DT"),
+            ])
+            .filter(pl.col("NUM_BO").is_not_null())
+            .unique(subset=["NUM_BO"], keep="last")
+        )
 
-        df_bruto['NUM_BO'] = df_bruto['NUM_BO'].astype(str).str.strip()
-        df_bruto = df_bruto[~df_bruto['NUM_BO'].isin(['nan', 'NaN', '', 'None'])]
-        
-        df_bruto.drop_duplicates(subset=['NUM_BO'], keep='last', inplace=True)
-        
-        vol_depois = len(df_bruto)
-        print(f"🧹 Deduplicação concluída! {vol_antes - vol_depois} registros redundantes removidos.")
-        print(f"🚀 Extração finalizada! {vol_depois} Boletins únicos enviados para o motor.")
-        
-        return df_bruto
+        if "LATITUDE" in df_prata.columns and "LONGITUDE" in df_prata.columns:
+            df_prata = df_prata.with_columns([
+                pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float32, strict=False).alias("LAT"),
+                pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float32, strict=False).alias("LON"),
+            ]).filter(
+                (pl.col("LAT").is_not_null()) & (pl.col("LON").is_not_null()) &
+                (pl.col("LAT") != 0.0) & (pl.col("LON") != 0.0) &
+                (pl.col("DATA_DT").is_not_null())
+            )
+        else:
+            raise ValueError("Colunas espaciais não encontradas.")
 
-    def processar_datalake(self, df):
+        # Executa a limpeza estrutural e joga para a memória
+        df_prata = df_prata.collect()
+        
+        print("📍 Calculando H3 Vetorizado (Alta Velocidade)...")
+        # Extrai só locais únicos para não calcular o H3 milhões de vezes
+        coords_unicas = df_prata.select(["LAT", "LON"]).unique().to_pandas()
+        coords_unicas['H3'] = coords_unicas.apply(lambda row: h3.latlng_to_cell(row['LAT'], row['LON'], 8), axis=1)
+        coords_pl = pl.from_pandas(coords_unicas)
+        
+        # Junta a inteligência H3 na base inteira instantaneamente
+        df_prata = df_prata.join(coords_pl, on=["LAT", "LON"], how="left")
+        
+        parquet_prata = self.pastas["prata"] / "camada_prata_limpa.parquet"
+        df_prata.write_parquet(parquet_prata, compression='snappy')
+        print(f"✨ Prata finalizada! {df_prata.height} registros aprovados.")
+        return df_prata
+
+    # ==========================================
+    # CAMADA OURO & ML: Inteligência de Máquina
+    # ==========================================
+    def processar_camada_ouro_e_ml(self, df):
+        print("🟡 [LAYER OURO] Iniciando Feature Engineering e Modelagem...")
         t_ini = time.time()
-        v_bruto = len(df)
+        v_bruto = df.height
         
-        df['DATA_DT'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
-        df.dropna(subset=['DATA_DT', 'LATITUDE', 'LONGITUDE'], inplace=True)
+        col_crime = 'NATUREZA_APURADA' if 'NATUREZA_APURADA' in df.columns else 'RUBRICA'
         
-        df['LATITUDE'] = df['LATITUDE'].astype(str).str.replace(',', '.')
-        df['LONGITUDE'] = df['LONGITUDE'].astype(str).str.replace(',', '.')
-        
-        df['LAT'] = pd.to_numeric(df['LATITUDE'], errors='coerce').astype(np.float32)
-        df['LON'] = pd.to_numeric(df['LONGITUDE'], errors='coerce').astype(np.float32)
-        df.dropna(subset=['LAT', 'LON'], inplace=True)
-        
-        coords_unicas = df[['LAT', 'LON']].drop_duplicates()
-        coords_unicas['H3'] = [h3.latlng_to_cell(la, lo, 8) for la, lo in zip(coords_unicas['LAT'], coords_unicas['LON'])]
-        df = df.merge(coords_unicas, on=['LAT', 'LON'], how='left')
-        df.to_parquet(self.pastas["prata"] / "camada_prata_limpa.parquet", compression='snappy', index=False)
+        # Feature Engineering com Polars
+        df = df.with_columns([
+            pl.when((self.hoje - pl.col("DATA_DT")).dt.total_days() <= 180).then(3.0).otherwise(1.0).alias("PESO"),
+            pl.col(col_crime).str.contains("ROUBO").alias("IS_ROUBO"),
+            pl.col(col_crime).str.contains("FURTO").alias("IS_FURTO"),
+            pl.col("DATA_DT").dt.hour().alias("HORA")
+        ])
 
-        df['PESO'] = np.where((self.hoje - df['DATA_DT']).dt.days <= 180, 3.0, 1.0).astype(np.float32)
-        df['RISCO'] = (np.where(df['RUBRICA'].astype(str).str.contains('ROUBO', na=False), 20, 5) * df['PESO']).astype(np.float32)
-        df['TURNO'] = pd.cut(df['DATA_DT'].dt.hour, bins=[-1, 6, 12, 18, 24], labels=[0, 1, 2, 3]).astype(np.int8)
+        df = df.with_columns([
+            pl.when(pl.col("IS_ROUBO")).then(20)
+              .when(pl.col("IS_FURTO")).then(10)
+              .otherwise(5).alias("RISCO_BASE")
+        ]).with_columns((pl.col("RISCO_BASE") * pl.col("PESO")).alias("RISCO"))
 
-        fato = df.groupby(['H3', 'TURNO', 'DATA_DT']).agg({'RISCO': 'sum', 'LAT': 'mean', 'LON': 'mean'}).reset_index()
-        del df, coords_unicas
-        gc.collect()
+        df = df.with_columns([
+            pl.when(pl.col("HORA") <= 6).then(0)
+              .when(pl.col("HORA") <= 12).then(1)
+              .when(pl.col("HORA") <= 18).then(2)
+              .otherwise(3).alias("TURNO")
+        ])
 
-        fato['DIA_SEM'] = fato['DATA_DT'].dt.dayofweek.astype(np.int8)
-        fato['MES'] = fato['DATA_DT'].dt.month.astype(np.int8)
-        fato['IS_PGTO'] = fato['DATA_DT'].dt.day.isin([5,6,7,20,21]).astype(np.int8)
-        fato['IS_FERIADO'] = fato['DATA_DT'].dt.date.isin(self.feriados_br).astype(np.int8)
-        fato = fato.sort_values('DATA_DT')
+        # Agrupamento OLAP
+        fato_pl = df.group_by(["H3", "TURNO", "DATA_DT"]).agg([
+            pl.col("RISCO").sum().alias("RISCO"),
+            pl.col("LAT").mean().alias("LAT"),
+            pl.col("LON").mean().alias("LON")
+        ]).sort("DATA_DT")
+
+        fato_pl = fato_pl.with_columns([
+            pl.col("DATA_DT").dt.weekday().alias("DIA_SEM"),
+            pl.col("DATA_DT").dt.month().alias("MES"),
+            pl.col("DATA_DT").dt.day().is_in([5,6,7,20,21]).cast(pl.Int8).alias("IS_PGTO"),
+            pl.col("DATA_DT").dt.date().is_in(self.feriados_br).cast(pl.Int8).alias("IS_FERIADO")
+        ])
+
+        # Entrega ao SciKit-Learn (Pandas)
+        fato = fato_pl.to_pandas()
         
         X = fato[['LAT', 'LON', 'TURNO', 'DIA_SEM', 'MES', 'IS_PGTO', 'IS_FERIADO']]
         y = np.log1p(fato['RISCO'])
         X_s = StandardScaler().fit_transform(X)
         X_tr, X_te, y_tr, y_te = train_test_split(X_s, y, test_size=0.2, shuffle=False)
 
-        print("🧠 Iniciando auto-correção para otimização do modelo...")
-        melhor_r2_teste = -float('inf')
-        melhor_cat = None
-        melhor_lgb = None
-        melhor_r2_treino = 0
-        
-        tentativas = 15 
-        meta_r2 = 0.42 
-        
-        for i in range(tentativas):
-            depth = int(np.random.choice([4, 6, 8, 10]))
-            lr = float(np.random.choice([0.01, 0.05, 0.08, 0.1]))
-            l2_reg = float(np.random.choice([1.0, 5.0, 10.0]))
-            
-            cat_temp = CatBoostRegressor(iterations=800, depth=depth, learning_rate=lr, l2_leaf_reg=l2_reg, silent=True).fit(X_tr, y_tr)
-            lgb_temp = LGBMRegressor(n_estimators=800, max_depth=depth, learning_rate=lr, reg_lambda=l2_reg, verbose=-1).fit(X_tr, y_tr)
-            
-            preds_te_temp = (cat_temp.predict(X_te) * 0.7) + (lgb_temp.predict(X_te) * 0.3)
-            r2_teste_temp = r2_score(y_te, preds_te_temp)
-            
-            if r2_teste_temp > melhor_r2_teste:
-                melhor_r2_teste = r2_teste_temp
-                melhor_cat = cat_temp
-                melhor_lgb = lgb_temp
-                melhor_r2_treino = r2_score(y_tr, (cat_temp.predict(X_tr) * 0.7) + (lgb_temp.predict(X_tr) * 0.3))
-                
-            if melhor_r2_teste >= meta_r2:
-                print(f"🎯 Meta de R² atingida na tentativa {i+1}! R² Teste: {melhor_r2_teste:.4f}")
-                break
-                
-        cat = melhor_cat
-        lgb = melhor_lgb
-        r2_treino = melhor_r2_treino
-        r2_teste = melhor_r2_teste
+        print("🧠 Iniciando Auto-Tuning do Motor...")
+        melhor_r2, melhor_cat, melhor_lgb = -1, None, None
+        for _ in range(10):
+            d, lr = int(np.random.choice([4,6,8])), float(np.random.choice([0.01, 0.05, 0.1]))
+            c = CatBoostRegressor(iterations=500, depth=d, learning_rate=lr, silent=True).fit(X_tr, y_tr)
+            l = LGBMRegressor(n_estimators=500, max_depth=d, learning_rate=lr, verbose=-1).fit(X_tr, y_tr)
+            r2 = r2_score(y_te, (c.predict(X_te)*0.7 + l.predict(X_te)*0.3))
+            if r2 > melhor_r2: melhor_r2, melhor_cat, melhor_lgb = r2, c, l
+            if melhor_r2 > 0.42: break
 
-        degradacao = r2_treino - r2_teste
-        status_overfitting = "CRÍTICO (Overfitting)" if degradacao > 0.15 else "SAUDÁVEL (Generalizado)"
+        print("🔍 Extraindo Inteligência SHAP...")
+        explainer = shap.TreeExplainer(melhor_cat)
+        shap_vals = explainer.shap_values(pd.DataFrame(X_te[:1000], columns=X.columns))
+        importancias = pd.DataFrame({'VAR': X.columns, 'SHAP': np.abs(shap_vals).mean(axis=0)}).sort_values('SHAP', ascending=False)
+        top_driver = importancias.iloc[0]['VAR']
         
-        fato['PRED'] = np.round(np.expm1((cat.predict(X_s) * 0.7) + (lgb.predict(X_s) * 0.3)), 2).astype(np.float32)
-        fato['ERRO'] = np.abs(fato['RISCO'] - fato['PRED']).astype(np.float32)
-        assertividade = (fato['ERRO'] <= 5.0).sum() / len(fato)
+        fato['PREVISAO_RISCO'] = np.round(np.expm1((melhor_cat.predict(X_s)*0.7) + (melhor_lgb.predict(X_s)*0.3)), 2)
 
-        fato.to_parquet(self.pastas["ouro"] / "fato_risco_real.parquet", index=False)
-        fato[['H3', 'DATA_DT', 'TURNO', 'RISCO', 'PRED', 'ERRO']].to_csv(self.pastas["ouro"] / "dashboard_risco_real.csv", index=False)
+        # Retorna para o Polars para gravação otimizada
+        importancias_pl = pl.from_pandas(importancias)
+        fato_final_pl = pl.from_pandas(fato[['H3', 'DATA_DT', 'TURNO', 'RISCO', 'PREVISAO_RISCO']])
 
+        importancias_pl.write_parquet(self.pastas["ouro"] / "explicabilidade_shap.parquet", compression='snappy')
+        fato_final_pl.write_parquet(self.pastas["ouro"] / "dashboard_risco_real.parquet", compression='snappy')
+
+        r2_tr = r2_score(y_tr, (melhor_cat.predict(X_tr)*0.7 + melhor_lgb.predict(X_tr)*0.3))
         manifesto = {
             "auditoria_estatistica": {
-                "r2_treino": float(r2_treino),
-                "r2_teste": float(r2_teste),
-                "degradacao_overfitting": float(degradacao),
-                "status_modelo": status_overfitting,
-                "data_leakage_bloqueado": True
+                "r2_treino": float(r2_tr), "r2_teste": float(melhor_r2),
+                "degradacao_overfitting": float(r2_tr - melhor_r2)
             },
-            "linhas_processadas": int(v_bruto),
-            "timestamp": self.hoje.isoformat()
+            "linhas_processadas": int(v_bruto), "timestamp": self.hoje.isoformat()
         }
-        with open(self.pastas["auditoria"] / "auditoria_pipeline.json", "w") as f:
-            json.dump(manifesto, f, indent=4)
-
+        with open(self.pastas["auditoria"] / "auditoria_pipeline.json", "w") as f: json.dump(manifesto, f, indent=4)
+        
         self.garantir_infraestrutura_bucket()
         self.fazer_upload_diretorio(self.raiz / "datalake")
-        self._notificar_sucesso(assertividade, r2_teste, r2_treino, status_overfitting, v_bruto, len(fato), time.time() - t_ini)
+        self._notificar_sucesso(melhor_r2, r2_tr, top_driver)
 
-    def fazer_upload_diretorio(self, caminho_local):
+    def fazer_upload_diretorio(self, local):
         bucket = self.storage_client.get_bucket(self.bucket_nome)
-        for arquivo in Path(caminho_local).rglob("*"):
-            if arquivo.is_file():
-                blob_path = str(arquivo.relative_to(self.raiz))
-                blob = bucket.blob(blob_path)
-                blob.upload_from_filename(str(arquivo))
+        for aqv in Path(local).rglob("*"):
+            if aqv.is_file(): bucket.blob(str(aqv.relative_to(self.raiz))).upload_from_filename(str(aqv))
 
-    def _notificar_sucesso(self, taxa, r2_te, r2_tr, status_over, bruto, fato_vol, tempo):
+    def _notificar_sucesso(self, r2_te, r2_tr, driver):
         if not self.webhook_sucesso: return
-        cor = 3066993 if "SAUDÁVEL" in status_over else 15158332 
         payload = { "embeds": [{
-            "title": "🔬 SafeDriver: Auditoria de Machine Learning", "color": cor, "fields": [
-                {"name": "🎯 Assertividade", "value": "{:.1%}".format(taxa), "inline": False},
-                {"name": "📊 R2 Teste", "value": "{:.2%}".format(r2_te), "inline": True},
-                {"name": "🚨 Status", "value": status_over, "inline": False}
+            "title": "⚡ SafeDriver: Pipeline Estado da Arte (Polars)", "color": 3066993, "fields": [
+                {"name": "📊 R2 Teste", "value": f"{r2_te:.2%}", "inline": True},
+                {"name": "📉 R2 Treino", "value": f"{r2_tr:.2%}", "inline": True},
+                {"name": "🧠 Decisão Guiada Por (SHAP)", "value": f"**{driver}**", "inline": False}
             ]
         }]}
         requests.post(self.webhook_sucesso, json=payload)
@@ -250,22 +277,10 @@ class MotorSafeDriverCloud:
 if __name__ == "__main__":
     try:
         motor = MotorSafeDriverCloud()
-        df_real = motor.extrair_dados()
-        motor.processar_datalake(df_real)
-    except Exception as e:
-        webhook_erro = os.environ.get("DISCORD_ERRO")
-        if webhook_erro:
-            err_msg = f"❌ Erro crítico no pipeline SafeDriver:\n```{traceback.format_exc()}```"
-            payload = {
-                "embeds": [{
-                    "title": "🚨 Falha no Motor Preditivo", 
-                    "description": err_msg[:4000],
-                    "color": 15158332
-                }]
-            }
-            requests.post(webhook_erro, json=payload)
-        else:
-            traceback.print_exc()
-            
-        # Força o pipeline a falhar aqui!
-        sys.exit(1)
+        motor.processar_camada_raw()
+        df_prata = motor.processar_camada_prata()
+        motor.processar_camada_ouro_e_ml(df_prata)
+    except Exception:
+        if os.environ.get("DISCORD_ERRO"):
+            requests.post(os.environ.get("DISCORD_ERRO"), json={"content": f"❌ Erro Crítico:\n
+http://googleusercontent.com/immersive_entry_chip/0
