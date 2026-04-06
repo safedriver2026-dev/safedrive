@@ -1,35 +1,32 @@
-name: SafeDriver Atualização Diaria
-on:
-  schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+name: Pipeline SafeDriver
+on: [push]
+
 jobs:
-  pipeline:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-          cache: 'pip'
-      - name: Instalar Dependencias
-        run: pip install -r requirements.txt
-      - name: Rodar Motor
+          
+      - name: Install Dependencies
+        run: pip install pandas numpy h3 shap lightgbm catboost scikit-learn holidays requests pyarrow calamine pytest
+        
+      - name: Execute Motor de Inteligência
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-          API_KEY: ${{ secrets.API_KEY }}
-        run: |
-          python autobot/motor_safedriver.py
-          python gerador_diagramas.py
-      - name: Auditoria Pytest
+        run: python motor_analise_preditiva.py
+        
+      - name: Run Security Tests
         run: python -m pytest tests/test_seguranca.py
-      - name: Git Push
+        
+      - name: Git Sync (Skip Large Files)
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
-          git add datalake/auditoria/*.json datalake/ouro/*.csv datalake/ouro/*.parquet documentacao/*.png
-          git commit -m "auto: sync auditado [skip ci]" || echo "nada para subir"
+          git add datalake/auditoria/ datalake/ouro/dashboard_risco_consolidado.csv
+          git commit -m "auto: inteligência auditada [skip ci]" || echo "Nada para commitar"
           git push
