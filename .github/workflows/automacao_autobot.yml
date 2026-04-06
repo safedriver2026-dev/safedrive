@@ -1,10 +1,8 @@
-name: Pipeline SafeDriver Auto-Provisioning
+name: Pipeline SafeDriver
 on: [push]
-permissions:
-  contents: write
 
 jobs:
-  build:
+  data-pipeline:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -14,17 +12,22 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install
-        run: pip install pandas numpy h3 google-cloud-storage catboost scikit-learn pyarrow requests
+      - name: Instalar Dependencias Cloud e ML
+        run: pip install -r requirements.txt
 
-      - name: Auth to Google Cloud
+      - name: Autenticacao Google Cloud API (IAM)
+        id: auth
         uses: 'google-github-actions/auth@v1'
         with:
           credentials_json: '${{ secrets.GCP_SA_KEY }}'
 
-      - name: Run Motor (IA + Cloud Storage)
+      - name: Executar Motor (Criacao do Datalake e API Discord)
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           GCP_BUCKET_NAME: ${{ secrets.GCP_BUCKET_NAME }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
         run: python autobot/motor_analise_preditiva.py
+
+      - name: Inspecao de Qualidade (Pytest Antivicio)
+        run: python -m pytest tests/test_seguranca.py
