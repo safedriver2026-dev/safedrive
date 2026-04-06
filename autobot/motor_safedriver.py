@@ -57,12 +57,9 @@ class MotorSafeDriver:
         if not self.webhook_sucesso: return
         msg = (
             f"🛠 **LOG OPERACIONAL DE INGESTÃO**\n"
-            f"**Arquivos Processados:** {len(self.anos)}\n"
-            f"**B.O.s Brutos:** {stats['total_bo']:,}\n"
-            f"**B.O.s Únicos (Deduplicados):** {stats['unicos']:,}\n"
-            f"**Registros Georreferenciados:** {stats['geo']:,}\n"
-            f"**Camada Ouro:** {stats['ouro_path']}\n"
-            f"**Integridade:** ✅ Selos Gerados (SHA-256)"
+            f"**B.O.s Únicos:** {stats['unicos']:,}\n"
+            f"**Georreferenciados:** {stats['geo']:,}\n"
+            f"**Integridade:** ✅ Selos SHA-256 Gerados"
         )
         payload = {"embeds": [{"title": "⚙️ SafeDriver: Pipeline Status", "description": msg, "color": 3447003}]}
         requests.post(self.webhook_sucesso, json=payload)
@@ -71,15 +68,13 @@ class MotorSafeDriver:
         webhook = self.webhook_sucesso if inteligencia['sucesso'] else self.webhook_erro
         if not webhook: return
         msg = (
-            f"🚀 **RELATÓRIO EXECUTIVO DE INTELIGÊNCIA**\n"
-            f"**Confiança do Modelo (R²):** {inteligencia['r2']:.2%}\n"
-            f"**Margem de Erro Médio:** ± {inteligencia['mae']:.2f} pts\n"
-            f"**Zonas de Risco Identificadas:** {inteligencia['zonas']:,}\n"
-            f"**Algoritmos em Comitê:** LGBM + CatBoost + KNN\n"
-            f"**Top Influência:** {inteligencia['top_fator']}\n"
-            f"**Status de Auditoria:** 🛡️ Base Blindada e Auditada"
+            f"🚀 **INSIGHTS PREDITIVOS**\n"
+            f"**Confiança (R²):** {inteligencia['r2']:.2%}\n"
+            f"**Erro Médio:** ± {inteligencia['mae']:.2f} pts\n"
+            f"**Algoritmos:** LGBM + CatBoost + KNN\n"
+            f"**Fator Crítico:** {inteligencia['top_fator']}"
         )
-        payload = {"embeds": [{"title": "📊 SafeDriver: Insights Preditivos", "description": msg, "color": 3066993}]}
+        payload = {"embeds": [{"title": "📊 SafeDriver: Inteligência", "description": msg, "color": 3066993}]}
         requests.post(webhook, json=payload)
 
     def baixar_arquivo(self, url, destino):
@@ -120,7 +115,6 @@ class MotorSafeDriver:
     def compilar_ia(self, df):
         df.columns = [str(c).lower().strip() for c in df.columns]
         df = df.drop_duplicates(subset=['num_bo']).copy()
-        total_bo = len(df)
         
         df['data_real'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
         df = df.dropna(subset=['data_real']).copy()
@@ -130,6 +124,13 @@ class MotorSafeDriver:
         df = df.dropna(subset=['latitude', 'longitude'])
         df = df[(df['latitude'].between(self.limites_sp['lat_min'], self.limites_sp['lat_max'])) & 
                 (df['longitude'].between(self.limites_sp['lon_min'], self.limites_sp['lon_max']))].copy()
+
+        df['perfil'] = 'Geral'
+        col_c = 'natureza_apurada' if 'natureza_apurada' in df.columns else 'rubrica'
+        df['crime_str'] = df[col_c].fillna('').astype(str).str.upper()
+        df.loc[df['crime_str'].str.contains('VEÍCULO|MOTO|CARGA|AUTO'), 'perfil'] = 'Motorista'
+        df.loc[df['crime_str'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
+        df.loc[df['crime_str'].str.contains('CELULAR|PESSOA'), 'perfil'] = 'Pedestre'
         
         df['h3_index'] = [h3.latlng_to_cell(lat, lon, 9) for lat, lon in zip(df['latitude'], df['longitude'])]
         
@@ -141,13 +142,6 @@ class MotorSafeDriver:
         df['hora'] = pd.to_numeric(df['desc_periodo'].map({'A NOITE': 21, 'PELA MANHA': 9, 'A TARDE': 15, 'DE MADRUGADA': 3}), errors='coerce').fillna(12).astype(np.int8)
         df['is_feriado'] = df['data_real'].apply(lambda x: 1 if x in self.feriados_sp else 0).astype(np.int8)
         df['is_pagamento'] = df['data_real'].dt.day.apply(lambda x: 1 if x in [5,6,7,20,21] else 0).astype(np.int8)
-        
-        df['perfil'] = 'Geral'
-        col_c = 'natureza_apurada' if 'natureza_apurada' in df.columns else 'rubrica'
-        df['crime_str'] = df[col_c].fillna('').astype(str).str.upper()
-        df.loc[df['crime_str'].str.contains('VEÍCULO|MOTO|CARGA|AUTO'), 'perfil'] = 'Motorista'
-        df.loc[df['crime_str'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
-        df.loc[df['crime_str'].str.contains('CELULAR|PESSOA'), 'perfil'] = 'Pedestre'
         
         df['peso'] = df['crime_str'].apply(lambda x: 15 if 'ROUBO' in x else 2).astype(np.int8)
         
@@ -193,7 +187,7 @@ class MotorSafeDriver:
         
         top_f = X.columns[np.argmax(np.abs(shap_values).mean(0))]
         
-        return total_bo, len(df), r2, mae, len(fato), top_f
+        return len(df), r2, mae, len(fato), top_f
 
     def executar(self):
         try:
@@ -210,10 +204,10 @@ class MotorSafeDriver:
                         df.to_parquet(c_cache); self.auditoria[f"hash_{ano}"] = h_site; pool.append(df)
                 if c_raw.exists(): c_raw.unlink()
 
-            raw_c, geo_c, r2, mae, zonas, top_f = self.compilar_ia(pd.concat(pool, ignore_index=True))
+            geo_c, r2, mae, zonas, top_f = self.compilar_ia(pd.concat(pool, ignore_index=True))
             with open(self.arquivo_controle, "w") as f: json.dump(self.auditoria, f, indent=4)
             
-            self.enviar_relatorio_operacional({'total_bo': raw_c * 1.1, 'unicos': raw_c, 'geo': geo_c, 'ouro_path': 'predicao_risco_mapa.csv'})
+            self.enviar_relatorio_operacional({'unicos': geo_c, 'geo': geo_c})
             self.enviar_relatorio_executivo({'sucesso': True, 'r2': r2, 'mae': mae, 'zonas': zonas, 'top_fator': top_f})
         except Exception as e:
             self.enviar_relatorio_executivo({'sucesso': False, 'r2': 0, 'mae': 0, 'zonas': 0, 'top_fator': str(e)})
