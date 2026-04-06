@@ -42,16 +42,37 @@ class MotorAnaliseSafeDriver:
         
         if not arquivos:
             np.random.seed(42)
-            n_samples = 3000
+            n_samples = 5000
             datas = pd.date_range(end=self.hoje, periods=n_samples, freq='h')
-            lats = np.random.uniform(-23.70, -23.40, n_samples)
-            lons = np.random.uniform(-46.80, -46.40, n_samples)
             
-            horas = datas.hour
-            regra_risco = (lats > -23.55) & ((horas >= 18) | (horas <= 4))
-            rubricas = np.where(regra_risco, "ROUBO", "FURTO")
+            regioes = ['capital', 'campinas', 'ribeirao', 'santos', 'sjc']
+            probs = [0.5, 0.2, 0.1, 0.1, 0.1]
+            locais = np.random.choice(regioes, n_samples, p=probs)
             
-            ruido = np.random.choice(n_samples, int(n_samples * 0.15), replace=False)
+            lats = np.zeros(n_samples)
+            lons = np.zeros(n_samples)
+            
+            base_coords = {
+                'capital': (-23.5505, -46.6333),
+                'campinas': (-22.9099, -47.0626),
+                'ribeirao': (-21.1704, -47.8103),
+                'santos': (-23.9618, -46.3322),
+                'sjc': (-23.2237, -45.9009)
+            }
+            
+            for regiao, (lat_base, lon_base) in base_coords.items():
+                mask = locais == regiao
+                lats[mask] = np.random.normal(lat_base, 0.05, mask.sum())
+                lons[mask] = np.random.normal(lon_base, 0.05, mask.sum())
+            
+            is_pagto = np.isin(datas.day, [5, 6, 7, 20, 21])
+            is_noite = (datas.hour < 6) | (datas.hour > 18)
+            is_polo_alto_risco = np.isin(locais, ['capital', 'campinas', 'santos'])
+            
+            score = is_pagto.astype(int) + is_noite.astype(int) + is_polo_alto_risco.astype(int)
+            rubricas = np.where(score >= 2, "ROUBO", "FURTO")
+            
+            ruido = np.random.choice(n_samples, int(n_samples * 0.05), replace=False)
             for idx in ruido:
                 rubricas[idx] = "FURTO" if rubricas[idx] == "ROUBO" else "ROUBO"
                 
