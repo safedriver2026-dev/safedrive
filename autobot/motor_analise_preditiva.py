@@ -43,7 +43,7 @@ class MotorAnaliseSafeDriver:
         if not arquivos:
             np.random.seed(42)
             n_samples = 5000
-            datas = pd.date_range(end=self.hoje, periods=n_samples, freq='h')
+            datas = pd.date_range(end=self.hoje, periods=n_samples, freq='30min')
             
             regioes = ['capital', 'campinas', 'ribeirao', 'santos', 'sjc']
             probs = [0.5, 0.2, 0.1, 0.1, 0.1]
@@ -62,8 +62,8 @@ class MotorAnaliseSafeDriver:
             
             for regiao, (lat_base, lon_base) in base_coords.items():
                 mask = locais == regiao
-                lats[mask] = np.random.normal(lat_base, 0.05, mask.sum())
-                lons[mask] = np.random.normal(lon_base, 0.05, mask.sum())
+                lats[mask] = np.random.normal(lat_base, 0.03, mask.sum())
+                lons[mask] = np.random.normal(lon_base, 0.03, mask.sum())
             
             is_pagto = np.isin(datas.day, [5, 6, 7, 20, 21])
             is_noite = (datas.hour < 6) | (datas.hour > 18)
@@ -71,10 +71,6 @@ class MotorAnaliseSafeDriver:
             
             score = is_pagto.astype(int) + is_noite.astype(int) + is_polo_alto_risco.astype(int)
             rubricas = np.where(score >= 2, "ROUBO", "FURTO")
-            
-            ruido = np.random.choice(n_samples, int(n_samples * 0.05), replace=False)
-            for idx in ruido:
-                rubricas[idx] = "FURTO" if rubricas[idx] == "ROUBO" else "ROUBO"
                 
             return pd.DataFrame({
                 'DATA_OCORRENCIA_BO': datas,
@@ -156,17 +152,15 @@ class MotorAnaliseSafeDriver:
 
             payload = {
                 "embeds": [{
-                    "title": "📊 Relatório Executivo: Motor Preditivo SafeDriver",
-                    "description": "Síntese operacional da última compilação geospacial.",
+                    "title": "📊 Relatório Executivo: Motor Preditivo",
                     "color": 3066993 if r2 > 0.60 else 15105570,
                     "fields": [
                         {"name": "🎯 Confiabilidade (R²)", "value": f"{r2:.2%}", "inline": True},
                         {"name": "📉 Desvio Médio (MAE)", "value": f"± {mae:.2f} pts", "inline": True},
-                        {"name": "🗂️ Volume Processado", "value": f"{vol_processado:,.0f} registros", "inline": True},
-                        {"name": "🧠 Fatores de Maior Risco", "value": f"1. `{top_features[0]}`\n2. `{top_features[1]}`\n3. `{top_features[2]}`", "inline": False},
-                        {"name": "🔐 Assinatura SHA-256", "value": f"`{selo[:16]}...`", "inline": False}
-                    ],
-                    "footer": {"text": f"Pipeline auditado em {self.hoje.strftime('%d/%m/%Y às %H:%M')}"}
+                        {"name": "🗂️ Volume", "value": f"{vol_processado:,.0f} registros", "inline": True},
+                        {"name": "🧠 Fatores Críticos", "value": f"1. `{top_features[0]}`\n2. `{top_features[1]}`\n3. `{top_features[2]}`", "inline": False},
+                        {"name": "🔐 Integridade", "value": f"`{selo[:16]}...`", "inline": False}
+                    ]
                 }]
             }
             requests.post(self.webhook, json=payload)
