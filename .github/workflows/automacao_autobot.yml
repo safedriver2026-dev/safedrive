@@ -23,6 +23,6 @@ jobs:
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
-          git add datalake/auditoria/ datalake/ouro/dashboard_risco_consolidado.csv
+          git add datalake/auditoria/ datalake/ouro/
           git commit -m "auto: sync [skip ci]" || echo "Nada para commitar"
           git push
