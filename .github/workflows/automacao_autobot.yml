@@ -1,34 +1,28 @@
 name: Pipeline SafeDriver
 on: [push]
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
       - name: Setup Python 3.12
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
-          
-      - name: Install Correct Dependencies
+      - name: Install Dependencies
         run: |
           pip install pandas numpy h3 shap lightgbm catboost scikit-learn \
           holidays requests pyarrow python-calamine pytest fastapi uvicorn
-        
-      - name: Execute Motor de Inteligência
+      - name: Execute Motor
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
         run: python motor_analise_preditiva.py
-        
-      - name: Run Quality and Security Tests
+      - name: Run Tests
         run: python -m pytest tests/test_seguranca.py
-        
-      - name: Git Sync (Safe Files Only)
+      - name: Git Sync
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
           git add datalake/auditoria/ datalake/ouro/dashboard_risco_consolidado.csv
-          git commit -m "auto: inteligencia auditada e sincronizada [skip ci]" || echo "Nada para commitar"
+          git commit -m "auto: sync [skip ci]" || echo "Nada para commitar"
           git push
