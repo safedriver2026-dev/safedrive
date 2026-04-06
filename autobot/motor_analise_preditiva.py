@@ -151,6 +151,15 @@ if __name__ == "__main__":
     except Exception as e:
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-            err_msg = "
-http://googleusercontent.com/immersive_entry_chip/0
-http://googleusercontent.com/immersive_entry_chip/1
+        
+            err_msg = f"❌ Erro crítico no pipeline SafeDriver:\n```{traceback.format_exc()}```"
+            payload = {
+                "embeds": [{
+                    "title": "🚨 Falha no Motor Preditivo", 
+                    "description": err_msg[:4000], #
+                    "color": 15158332
+                }]
+            }
+            requests.post(webhook_erro, json=payload)
+        else:
+            traceback.print_exc()
