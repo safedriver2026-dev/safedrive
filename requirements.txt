@@ -9,6 +9,5 @@ holidays
 google-cloud-storage
 requests
 pytest
-shap
 matplotlib
 pyarrow
