@@ -1,4 +1,5 @@
-pandas
+polars
+fastexcel
 numpy
 h3
 catboost
@@ -7,7 +8,6 @@ scikit-learn
 holidays
 google-cloud-storage
 requests
-openpyxl
 pytest
 shap
 matplotlib
