@@ -4,6 +4,8 @@ from pathlib import Path
 
 def test_cloud_pipeline_metrics():
     manifesto = Path("datalake/auditoria/auditoria_pipeline.json")
+    
+    # Se o arquivo não existir, o teste falha imediatamente
     assert manifesto.exists(), "Pipeline falhou: Manifesto de auditoria não foi gerado!"
     
     with open(manifesto, "r") as f:
