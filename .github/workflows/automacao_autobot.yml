@@ -1,5 +1,9 @@
 name: Pipeline SafeDriver
 on: [push]
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,7 +22,6 @@ jobs:
       - name: Execute Motor
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-        # A CORREÇÃO ESTÁ AQUI: Apontando para a pasta autobot/
         run: python autobot/motor_analise_preditiva.py
         
       - name: Run Tests
@@ -29,5 +32,5 @@ jobs:
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
           git add datalake/auditoria/ datalake/ouro/
-          git commit -m "auto: sync [skip ci]" || echo "Nada para commitar"
+          git commit -m "auto: sync inteligência de dados [skip ci]" || echo "Nada para commitar"
           git push
