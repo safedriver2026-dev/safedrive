@@ -134,6 +134,11 @@ class MotorAnaliseSafeDriver:
         fato['RISCO_PREDITO'] = np.round(np.expm1((cat.predict(X_s) * 0.6) + (lgbm.predict(X_s) * 0.4)), 2).astype(np.float32)
         fato['DESVIO_ABS'] = np.abs(fato['RISCO_REAL'] - fato['RISCO_PREDITO']).astype(np.float32)
         
+        # CÁLCULO DA TAXA DE ASSERTIVIDADE TÁTICA (Margem de tolerância: 5 pontos)
+        margem_tolerancia = 5.0
+        qtd_acertos = (fato['DESVIO_ABS'] <= margem_tolerancia).sum()
+        taxa_assertividade = qtd_acertos / len(fato)
+
         fato.to_parquet(self.pastas["ouro"] / "fato_risco_comparativo.parquet", index=False)
         
         cols_comparativo = ['H3_INDEX', 'DATA_DT', 'TURNO', 'RISCO_REAL', 'RISCO_PREDITO', 'DESVIO_ABS']
@@ -152,15 +157,17 @@ class MotorAnaliseSafeDriver:
 
             payload = {
                 "embeds": [{
-                    "title": "📊 Relatório Executivo: Motor Preditivo",
-                    "color": 3066993 if r2 > 0.60 else 15105570,
+                    "title": "📊 Relatório Executivo: Motor Preditivo SafeDriver",
+                    "description": "Síntese operacional da compilação geospacial.",
+                    "color": 3066993 if taxa_assertividade > 0.70 else 15105570,
                     "fields": [
-                        {"name": "🎯 Confiabilidade (R²)", "value": f"{r2:.2%}", "inline": True},
-                        {"name": "📉 Desvio Médio (MAE)", "value": f"± {mae:.2f} pts", "inline": True},
+                        {"name": "🎯 Taxa de Assertividade", "value": f"**{taxa_assertividade:.1%}**", "inline": True},
+                        {"name": "📉 Erro Médio (MAE)", "value": f"± {mae:.2f} pts", "inline": True},
                         {"name": "🗂️ Volume", "value": f"{vol_processado:,.0f} registros", "inline": True},
-                        {"name": "🧠 Fatores Críticos", "value": f"1. `{top_features[0]}`\n2. `{top_features[1]}`\n3. `{top_features[2]}`", "inline": False},
-                        {"name": "🔐 Integridade", "value": f"`{selo[:16]}...`", "inline": False}
-                    ]
+                        {"name": "🔬 R² (Sinal Estatístico)", "value": f"{r2:.2%}", "inline": False},
+                        {"name": "🧠 Variáveis Críticas (Top 3)", "value": f"1. `{top_features[0]}`\n2. `{top_features[1]}`\n3. `{top_features[2]}`", "inline": False},
+                    ],
+                    "footer": {"text": f"Selo de Integridade: {selo[:10]} | {self.hoje.strftime('%d/%m/%Y %H:%M')}"}
                 }]
             }
             requests.post(self.webhook, json=payload)
