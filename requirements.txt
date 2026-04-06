@@ -1,14 +1,12 @@
-pandas<2.2.0
+pandas
 numpy
 h3
 shap
 lightgbm
 catboost
 scikit-learn
-holidays
 requests
 pyarrow
-python-calamine
+google-cloud-storage
 pytest
-fastapi
-uvicorn
+python-calamine
