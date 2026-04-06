@@ -7,26 +7,28 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Setup Python
+      - name: Setup Python 3.12
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.12'
           
-      - name: Install Dependencies
-        run: pip install pandas numpy h3 shap lightgbm catboost scikit-learn holidays requests pyarrow calamine pytest
+      - name: Install Correct Dependencies
+        run: |
+          pip install pandas numpy h3 shap lightgbm catboost scikit-learn \
+          holidays requests pyarrow python-calamine pytest fastapi uvicorn
         
       - name: Execute Motor de Inteligência
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
         run: python motor_analise_preditiva.py
         
-      - name: Run Security Tests
+      - name: Run Quality and Security Tests
         run: python -m pytest tests/test_seguranca.py
         
-      - name: Git Sync (Skip Large Files)
+      - name: Git Sync (Safe Files Only)
         run: |
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
           git add datalake/auditoria/ datalake/ouro/dashboard_risco_consolidado.csv
-          git commit -m "auto: inteligência auditada [skip ci]" || echo "Nada para commitar"
+          git commit -m "auto: inteligencia auditada e sincronizada [skip ci]" || echo "Nada para commitar"
           git push
