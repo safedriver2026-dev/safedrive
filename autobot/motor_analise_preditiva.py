@@ -7,6 +7,7 @@ import h3
 import shap
 import hashlib
 import gc
+import time
 import warnings
 from pathlib import Path
 from datetime import datetime
@@ -90,7 +91,9 @@ class MotorAnaliseSafeDriver:
         return pd.concat(pool, ignore_index=True)
 
     def processar_pipeline_comparativo(self, df_raw):
-        vol_processado = len(df_raw)
+        tempo_inicio = time.time()
+        
+        vol_bruto = len(df_raw)
         df = df_raw.copy()
         del df_raw
         gc.collect()
@@ -98,6 +101,10 @@ class MotorAnaliseSafeDriver:
         df.columns = [str(c).upper().strip() for c in df.columns]
         df['DATA_DT'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
         df.dropna(subset=['DATA_DT', 'LATITUDE', 'LONGITUDE'], inplace=True)
+        
+        vol_limpo = len(df)
+        linhas_sujas = vol_bruto - vol_limpo
+        taxa_perda = (linhas_sujas / vol_bruto) if vol_bruto > 0 else 0
 
         df['LAT'] = pd.to_numeric(df['LATITUDE']).astype(np.float32)
         df['LON'] = pd.to_numeric(df['LONGITUDE']).astype(np.float32)
@@ -111,6 +118,9 @@ class MotorAnaliseSafeDriver:
         fato = df.groupby(['H3_INDEX', 'TURNO', 'DATA_DT']).agg({
             'RISCO_REAL': 'sum', 'LAT': 'mean', 'LON': 'mean'
         }).reset_index()
+        
+        vol_fato = len(fato)
+        taxa_compressao = (1 - (vol_fato / vol_limpo)) if vol_limpo > 0 else 0
         
         del df
         gc.collect()
@@ -134,7 +144,6 @@ class MotorAnaliseSafeDriver:
         fato['RISCO_PREDITO'] = np.round(np.expm1((cat.predict(X_s) * 0.6) + (lgbm.predict(X_s) * 0.4)), 2).astype(np.float32)
         fato['DESVIO_ABS'] = np.abs(fato['RISCO_REAL'] - fato['RISCO_PREDITO']).astype(np.float32)
         
-        # CÁLCULO DA TAXA DE ASSERTIVIDADE TÁTICA (Margem de tolerância: 5 pontos)
         margem_tolerancia = 5.0
         qtd_acertos = (fato['DESVIO_ABS'] <= margem_tolerancia).sum()
         taxa_assertividade = qtd_acertos / len(fato)
@@ -150,25 +159,39 @@ class MotorAnaliseSafeDriver:
         with open(self.pastas["auditoria"] / "controle_integridade.json", "w") as f:
             json.dump({"r2": float(r2), "sha256": selo, "timestamp": self.hoje.isoformat()}, f, indent=4)
 
+        tempo_total = time.time() - tempo_inicio
+
         if self.webhook:
             importancias = cat.get_feature_importance()
             top_idx = np.argsort(importancias)[-3:][::-1]
             top_features = [X.columns[i] for i in top_idx]
 
             payload = {
-                "embeds": [{
-                    "title": "📊 Relatório Executivo: Motor Preditivo SafeDriver",
-                    "description": "Síntese operacional da compilação geospacial.",
-                    "color": 3066993 if taxa_assertividade > 0.70 else 15105570,
-                    "fields": [
-                        {"name": "🎯 Taxa de Assertividade", "value": f"**{taxa_assertividade:.1%}**", "inline": True},
-                        {"name": "📉 Erro Médio (MAE)", "value": f"± {mae:.2f} pts", "inline": True},
-                        {"name": "🗂️ Volume", "value": f"{vol_processado:,.0f} registros", "inline": True},
-                        {"name": "🔬 R² (Sinal Estatístico)", "value": f"{r2:.2%}", "inline": False},
-                        {"name": "🧠 Variáveis Críticas (Top 3)", "value": f"1. `{top_features[0]}`\n2. `{top_features[1]}`\n3. `{top_features[2]}`", "inline": False},
-                    ],
-                    "footer": {"text": f"Selo de Integridade: {selo[:10]} | {self.hoje.strftime('%d/%m/%Y %H:%M')}"}
-                }]
+                "embeds": [
+                    {
+                        "title": "📊 Relatório Executivo: IA Preditiva",
+                        "color": 3066993 if taxa_assertividade > 0.70 else 15105570,
+                        "fields": [
+                            {"name": "🎯 Assertividade", "value": f"**{taxa_assertividade:.1%}**", "inline": True},
+                            {"name": "📉 Erro (MAE)", "value": f"± {mae:.2f} pts", "inline": True},
+                            {"name": "🔬 Sinal (R²)", "value": f"{r2:.2%}", "inline": True},
+                            {"name": "🧠 Variáveis Críticas (Top 3)", "value": f"1. `{top_features[0]}`\n2. `{top_features[1]}`\n3. `{top_features[2]}`", "inline": False}
+                        ]
+                    },
+                    {
+                        "title": "⚙️ Relatório Operacional: Engenharia de Dados",
+                        "color": 8359053,
+                        "fields": [
+                            {"name": "📥 Ingestão Bruta", "value": f"{vol_bruto:,.0f} linhas", "inline": True},
+                            {"name": "🗑️ Descartes (Erros)", "value": f"{linhas_sujas:,.0f} ({taxa_perda:.1%})", "inline": True},
+                            {"name": "✨ Base Útil", "value": f"{vol_limpo:,.0f} linhas", "inline": True},
+                            {"name": "📦 Compressão Ouro", "value": f"Redução de {taxa_compressao:.1%} (Restam {vol_fato:,.0f})", "inline": False},
+                            {"name": "⏱️ Tempo Total", "value": f"{tempo_total:.2f} segundos", "inline": True},
+                            {"name": "🔐 SHA-256", "value": f"`{selo[:10]}...`", "inline": True}
+                        ],
+                        "footer": {"text": f"Pipeline auditado em {self.hoje.strftime('%d/%m/%Y %H:%M')}"}
+                    }
+                ]
             }
             requests.post(self.webhook, json=payload)
 
