@@ -12,16 +12,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Instalar Dependencias Cloud e ML
+      - name: Instalar Dependencias
         run: pip install -r requirements.txt
 
-      - name: Autenticacao Google Cloud API (IAM)
+      - name: Autenticacao Google Cloud API
         id: auth
         uses: 'google-github-actions/auth@v1'
         with:
           credentials_json: '${{ secrets.GCP_SA_KEY }}'
 
-      - name: Executar Motor (Criacao do Datalake e API Discord)
+      - name: Executar Motor Medallion (Raw -> Prata -> Ouro)
         env:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
@@ -29,5 +29,5 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
         run: python autobot/motor_analise_preditiva.py
 
-      - name: Inspecao de Qualidade (Pytest Antivicio)
+      - name: Inspecao de Qualidade
         run: python -m pytest tests/test_seguranca.py
