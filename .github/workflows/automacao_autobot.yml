@@ -32,5 +32,6 @@ jobs:
           git config --local user.email "bot@safedriver.com"
           git config --local user.name "SafeDriver Bot"
           git add datalake/auditoria/ datalake/ouro/
-          git commit -m "auto: sync inteligência de dados [skip ci]" || echo "Nada para commitar"
+          git commit -m "auto: sync inteligencia de dados [skip ci]" || echo "Nada para commitar"
+          git pull --rebase origin main
           git push
