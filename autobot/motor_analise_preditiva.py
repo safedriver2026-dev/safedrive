@@ -184,8 +184,6 @@ if __name__ == "__main__":
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
             trace_log = traceback.format_exc()
-            
-         
-            texto_erro = f"
+            texto_erro = "
 http://googleusercontent.com/immersive_entry_chip/0
 http://googleusercontent.com/immersive_entry_chip/1
