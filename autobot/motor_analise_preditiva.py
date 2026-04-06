@@ -39,7 +39,7 @@ class MotorSafeDriverCloud:
         self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
         self.storage_client = storage.Client()
         self.feriados_br = holidays.Brazil(years=[self.hoje.year, self.hoje.year-1, self.hoje.year-2])
-        self.linhas_descartadas = 0 # Inicialização da variável para a Visão Operacional
+        self.linhas_descartadas = 0
 
     def garantir_infraestrutura_bucket(self):
         try:
@@ -48,7 +48,7 @@ class MotorSafeDriverCloud:
             self.storage_client.create_bucket(self.bucket_nome, location="US-EAST1")
 
     # ==========================================
-    # CAMADA RAW: Ingestão de Alta Performance (Polars + FastExcel)
+    # CAMADA RAW: Extração de Dados Brutos
     # ==========================================
     def processar_camada_raw(self):
         ano_inicio, ano_atual = 2022, self.hoje.year
@@ -57,7 +57,7 @@ class MotorSafeDriverCloud:
             'NATUREZA': 'RUBRICA', 'NUMERO_BOLETIM': 'NUM_BO', 'NÚMERO DO BO': 'NUM_BO'
         }
 
-        print("🟤 [LAYER RAW] Iniciando ingestão textual segura...")
+        print("🟤 [Camada Raw] A iniciar a extração de dados brutos...")
         for ano in range(ano_inicio, ano_atual + 1):
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             xlsx_temp = self.pastas["raw"] / f"temp_{ano}.xlsx"
@@ -67,13 +67,13 @@ class MotorSafeDriverCloud:
                 h = requests.head(url, verify=False, timeout=15)
                 remoto = int(h.headers.get('Content-Length', 0))
                 if parquet_raw.exists():
-                    print(f"✅ {ano} já em cache.")
+                    print(f"✅ Ano {ano} já existe localmente. A ignorar o download.")
                     continue
             except: pass
 
             for t in range(3):
                 try:
-                    print(f"📥 Baixando {ano} (T{t+1})...")
+                    print(f"📥 A descarregar ano {ano} (Tentativa {t+1})...")
                     r = requests.get(url, stream=True, verify=False, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(60, 1800))
                     if r.status_code == 200:
                         with open(xlsx_temp, 'wb') as f:
@@ -84,7 +84,6 @@ class MotorSafeDriverCloud:
             if not xlsx_temp.exists(): continue
 
             try:
-                # FastExcel lê os metadados instantaneamente
                 excel_reader = fastexcel.read_excel(str(xlsx_temp))
                 abas_validas = [
                     aba for aba in excel_reader.sheet_names 
@@ -93,9 +92,7 @@ class MotorSafeDriverCloud:
                 
                 dfs_ano = []
                 for aba in abas_validas:
-                    # Polars lê nativamente via Calamine (Rust)
                     df_aba = pl.read_excel(str(xlsx_temp), sheet_name=aba, engine="calamine")
-                    
                     df_aba = df_aba.rename({c: str(c).upper().strip() for c in df_aba.columns})
                     for velho, novo in mapeamento.items():
                         if velho in df_aba.columns:
@@ -107,26 +104,26 @@ class MotorSafeDriverCloud:
                 if dfs_ano:
                     df_ano_completo = pl.concat(dfs_ano, how="diagonal")
                     df_ano_completo.write_parquet(parquet_raw, compression='snappy')
-                    print(f"💾 Raw salva: {parquet_raw.name} ({df_ano_completo.height} linhas)")
+                    print(f"💾 Ficheiro guardado: {parquet_raw.name} ({df_ano_completo.height} linhas)")
                 
                 os.remove(xlsx_temp)
                 gc.collect()
             except Exception as e:
-                print(f"❌ Erro ao processar o Excel de {ano}: {e}")
+                print(f"❌ Erro ao ler o Excel do ano {ano}: {e}")
 
     # ==========================================
-    # CAMADA PRATA: Tipagem, Limpeza e Deduplicação
+    # CAMADA PRATA: Limpeza e Conversão de Tipos
     # ==========================================
     def processar_camada_prata(self):
-        print("⚪ [LAYER PRATA] Iniciando tipagem e tratamento...")
+        print("⚪ [Camada Prata] A iniciar a limpeza e formatação de dados...")
         arquivos_raw = [str(p) for p in self.pastas["raw"].glob("ssp_bruto_*.parquet")]
-        if not arquivos_raw: raise ValueError("Datalake Raw vazio.")
+        if not arquivos_raw: raise ValueError("Nenhum dado encontrado na pasta Raw.")
         
-        # Carrega os dados brutos para sabermos o tamanho original
-        df_bruto = pl.scan_parquet(arquivos_raw).collect()
+        lazy_dfs = [pl.scan_parquet(f) for f in arquivos_raw]
+        df_bruto = pl.concat(lazy_dfs, how="diagonal").collect()
+        
         vol_inicial = df_bruto.height
         
-        # Pipeline de Limpeza de Dados com Polars
         df_prata = (
             df_bruto.lazy()
             .with_columns([
@@ -147,30 +144,29 @@ class MotorSafeDriverCloud:
                 (pl.col("DATA_DT").is_not_null())
             )
         else:
-            raise ValueError("Colunas espaciais não encontradas.")
+            raise ValueError("Colunas de latitude ou longitude não encontradas.")
 
         df_prata = df_prata.collect()
         
-        print("📍 Calculando H3 Vetorizado (Alta Velocidade)...")
+        print("📍 A mapear coordenadas para zonas geográficas (H3)...")
         coords_unicas = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords_unicas['H3'] = coords_unicas.apply(lambda row: h3.latlng_to_cell(row['LAT'], row['LON'], 8), axis=1)
         coords_pl = pl.from_pandas(coords_unicas)
         
         df_prata = df_prata.join(coords_pl, on=["LAT", "LON"], how="left")
         
-        # Guardar a métrica de linhas descartadas para o relatório operacional
         self.linhas_descartadas = vol_inicial - df_prata.height
         
         parquet_prata = self.pastas["prata"] / "camada_prata_limpa.parquet"
         df_prata.write_parquet(parquet_prata, compression='snappy')
-        print(f"✨ Prata finalizada! {self.linhas_descartadas} registos sujos descartados.")
+        print(f"✨ Limpeza concluída. {self.linhas_descartadas} registos inválidos foram descartados.")
         return df_prata
 
     # ==========================================
-    # CAMADA OURO & ML: Inteligência de Máquina
+    # CAMADA OURO & ML: Preparação e Previsões
     # ==========================================
     def processar_camada_ouro_e_ml(self, df):
-        print("🟡 [LAYER OURO] Iniciando Feature Engineering e Modelagem...")
+        print("🟡 [Camada Ouro] A preparar os dados para o modelo...")
         t_ini = time.time()
         v_bruto = df.height
         
@@ -183,7 +179,6 @@ class MotorSafeDriverCloud:
             pl.col("DATA_DT").dt.hour().alias("HORA")
         ])
 
-        # Métricas para a Visão Executiva no Discord
         qtd_roubo = df.filter(pl.col("IS_ROUBO")).height
         qtd_furto = df.filter(pl.col("IS_FURTO")).height
 
@@ -220,7 +215,7 @@ class MotorSafeDriverCloud:
         X_s = StandardScaler().fit_transform(X)
         X_tr, X_te, y_tr, y_te = train_test_split(X_s, y, test_size=0.2, shuffle=False)
 
-        print("🧠 Iniciando Auto-Tuning do Motor...")
+        print("🧠 A testar as melhores configurações do modelo...")
         melhor_r2, melhor_cat, melhor_lgb = -1, None, None
         for _ in range(10):
             d, lr = int(np.random.choice([4,6,8])), float(np.random.choice([0.01, 0.05, 0.1]))
@@ -230,7 +225,7 @@ class MotorSafeDriverCloud:
             if r2 > melhor_r2: melhor_r2, melhor_cat, melhor_lgb = r2, c, l
             if melhor_r2 > 0.42: break
 
-        print("🔍 Extraindo Inteligência SHAP...")
+        print("🔍 A calcular as variáveis com maior peso nas previsões...")
         explainer = shap.TreeExplainer(melhor_cat)
         shap_vals = explainer.shap_values(pd.DataFrame(X_te[:1000], columns=X.columns))
         importancias = pd.DataFrame({'VAR': X.columns, 'SHAP': np.abs(shap_vals).mean(axis=0)}).sort_values('SHAP', ascending=False)
@@ -257,7 +252,6 @@ class MotorSafeDriverCloud:
         self.garantir_infraestrutura_bucket()
         self.fazer_upload_diretorio(self.raiz / "datalake")
         
-        # Chama o novo alerta do Discord passando todas as contagens
         self._notificar_sucesso(melhor_r2, top_driver, v_bruto, self.linhas_descartadas, qtd_roubo, qtd_furto)
 
     def fazer_upload_diretorio(self, local):
@@ -268,7 +262,6 @@ class MotorSafeDriverCloud:
     def _notificar_sucesso(self, r2_te, driver, vol_dados, vol_sujo, roubos, furtos):
         if not self.webhook_sucesso: return
         
-        # Formatação de números para leitura amigável
         vol_dados_fmt = f"{vol_dados:,}".replace(",", ".")
         vol_sujo_fmt = f"{vol_sujo:,}".replace(",", ".")
         roubos_fmt = f"{roubos:,}".replace(",", ".")
@@ -276,17 +269,17 @@ class MotorSafeDriverCloud:
 
         payload = {
             "embeds": [{
-                "title": "📊 Relatório Diário - Pipeline SafeDriver", 
+                "title": "📊 Resumo Diário - Processamento SafeDriver", 
                 "color": 3066993,
                 "fields": [
                     {
-                        "name": "👔 Visão Executiva (Negócio & Modelo)", 
-                        "value": f"**Precisão (R²):** {r2_te:.2%}\n**Variável de Maior Peso:** {driver}\n**Perfil Identificado:** {roubos_fmt} Roubos | {furtos_fmt} Furtos", 
+                        "name": "👔 Indicadores do Modelo", 
+                        "value": f"**Precisão do Modelo (R²):** {r2_te:.2%}\n**Variável Principal:** {driver}\n**Ocorrências Classificadas:** {roubos_fmt} Roubos | {furtos_fmt} Furtos", 
                         "inline": False
                     },
                     {
-                        "name": "⚙️ Visão Operacional (Manutenção de Dados)", 
-                        "value": f"**Dados Válidos Ingeridos:** {vol_dados_fmt} linhas\n**Dados Sujos Limpos:** {vol_sujo_fmt} linhas (nulos, lat/lon zero)\n**Camadas:** Raw ➔ Prata ➔ Ouro atualizadas.", 
+                        "name": "⚙️ Engenharia e Qualidade dos Dados", 
+                        "value": f"**Registos Válidos Processados:** {vol_dados_fmt} linhas\n**Registos Inválidos Descartados:** {vol_sujo_fmt} linhas (nulos, coordenadas incorretas)\n**Estado do Storage:** Ficheiros Parquet (Raw, Prata, Ouro) enviados para a Cloud.", 
                         "inline": False
                     }
                 ]
@@ -295,7 +288,7 @@ class MotorSafeDriverCloud:
         try:
             requests.post(self.webhook_sucesso, json=payload)
         except Exception as e:
-            print(f"Erro ao enviar webhook de sucesso: {e}")
+            print(f"Erro ao enviar notificação para o Discord: {e}")
 
 if __name__ == "__main__":
     try:
@@ -306,12 +299,10 @@ if __name__ == "__main__":
     except Exception:
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-            # Pega o erro detalhado e limita o tamanho de forma segura
             detalhe_erro = traceback.format_exc()[:1900]
             
-            # Monta o JSON separadamente para evitar o SyntaxError (unterminated f-string)
             payload = {
-                "content": f"❌ **Erro Crítico no SafeDriver:**\n```{detalhe_erro}```"
+                "content": f"❌ **Falha no processamento do SafeDriver:**\n```{detalhe_erro}```"
             }
             try:
                 requests.post(webhook_erro, json=payload)
