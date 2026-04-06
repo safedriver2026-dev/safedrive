@@ -1,3 +1,4 @@
+import sys
 import os
 import json
 import requests
@@ -16,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.metrics import r2_score
 
 warnings.filterwarnings("ignore")
 
@@ -47,7 +48,6 @@ class MotorSafeDriverCloud:
         ano_atual = self.hoje.year
         dfs = []
         
-        # Mapeamento expandido para lidar com inconsistências da SSP-SP ao longo dos anos
         mapeamento_colunas = {
             'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO',
             'DATA DO FATO': 'DATA_OCORRENCIA_BO',
@@ -68,7 +68,6 @@ class MotorSafeDriverCloud:
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             arquivo_destino = self.pastas["raw"] / f"SPDadosCriminais_{ano}.xlsx"
             
-            # 1. CHECAGEM DE TAMANHO (Sem baixar o arquivo)
             try:
                 head_req = requests.head(url, verify=False, allow_redirects=True)
                 tamanho_remoto = int(head_req.headers.get('Content-Length', 0))
@@ -86,7 +85,6 @@ class MotorSafeDriverCloud:
                 else:
                     print(f"♻️ Alteração detectada em {ano}! Atualizando arquivo local...")
 
-            # 2. DOWNLOAD
             if precisa_baixar:
                 print(f"📥 Baixando dados de {ano}. Isso pode demorar...")
                 resposta = requests.get(url, stream=True, verify=False)
@@ -99,7 +97,6 @@ class MotorSafeDriverCloud:
                     print(f"❌ Falha no download de {ano}. Status HTTP: {resposta.status_code}")
                     continue
 
-            # 3. LEITURA E PADRONIZAÇÃO DAS ABAS
             print(f"🗃️ Processando planilhas de {ano}...")
             xls = pd.ExcelFile(arquivo_destino)
             abas_de_dados = [aba for aba in xls.sheet_names if "capa" not in aba.lower()]
@@ -114,7 +111,6 @@ class MotorSafeDriverCloud:
                     
                 dfs.append(df_temp)
 
-        # 4. CONSOLIDAÇÃO FINAL E DEDUPLICAÇÃO
         print("🏗️ Empilhando todos os anos...")
         df_bruto = pd.concat(dfs, ignore_index=True)
         vol_antes = len(df_bruto)
@@ -122,7 +118,6 @@ class MotorSafeDriverCloud:
         df_bruto['NUM_BO'] = df_bruto['NUM_BO'].astype(str).str.strip()
         df_bruto = df_bruto[~df_bruto['NUM_BO'].isin(['nan', 'NaN', '', 'None'])]
         
-        # Deduplicação priorizando o dado mais recente
         df_bruto.drop_duplicates(subset=['NUM_BO'], keep='last', inplace=True)
         
         vol_depois = len(df_bruto)
@@ -135,11 +130,9 @@ class MotorSafeDriverCloud:
         t_ini = time.time()
         v_bruto = len(df)
         
-        # Pré-processamento
         df['DATA_DT'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
         df.dropna(subset=['DATA_DT', 'LATITUDE', 'LONGITUDE'], inplace=True)
         
-        # Tratamento seguro para conversão de coordenadas com vírgula para ponto (se necessário)
         df['LATITUDE'] = df['LATITUDE'].astype(str).str.replace(',', '.')
         df['LONGITUDE'] = df['LONGITUDE'].astype(str).str.replace(',', '.')
         
@@ -152,7 +145,6 @@ class MotorSafeDriverCloud:
         df = df.merge(coords_unicas, on=['LAT', 'LON'], how='left')
         df.to_parquet(self.pastas["prata"] / "camada_prata_limpa.parquet", compression='snappy', index=False)
 
-        # Regras de Negócio e Engenharia de Features
         df['PESO'] = np.where((self.hoje - df['DATA_DT']).dt.days <= 180, 3.0, 1.0).astype(np.float32)
         df['RISCO'] = (np.where(df['RUBRICA'].astype(str).str.contains('ROUBO', na=False), 20, 5) * df['PESO']).astype(np.float32)
         df['TURNO'] = pd.cut(df['DATA_DT'].dt.hour, bins=[-1, 6, 12, 18, 24], labels=[0, 1, 2, 3]).astype(np.int8)
@@ -172,7 +164,6 @@ class MotorSafeDriverCloud:
         X_s = StandardScaler().fit_transform(X)
         X_tr, X_te, y_tr, y_te = train_test_split(X_s, y, test_size=0.2, shuffle=False)
 
-        # --- INÍCIO DO MECANISMO DE AUTO-CORREÇÃO (AUTO-TUNING) ---
         print("🧠 Iniciando auto-correção para otimização do modelo...")
         melhor_r2_teste = -float('inf')
         melhor_cat = None
@@ -207,7 +198,6 @@ class MotorSafeDriverCloud:
         lgb = melhor_lgb
         r2_treino = melhor_r2_treino
         r2_teste = melhor_r2_teste
-        # --- FIM DO MECANISMO DE AUTO-CORREÇÃO ---
 
         degradacao = r2_treino - r2_teste
         status_overfitting = "CRÍTICO (Overfitting)" if degradacao > 0.15 else "SAUDÁVEL (Generalizado)"
@@ -276,3 +266,6 @@ if __name__ == "__main__":
             requests.post(webhook_erro, json=payload)
         else:
             traceback.print_exc()
+            
+        # Força o pipeline a falhar aqui!
+        sys.exit(1)
