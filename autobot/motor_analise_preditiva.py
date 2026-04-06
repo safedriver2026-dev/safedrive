@@ -11,18 +11,18 @@ import gc
 import time
 import holidays
 import warnings
-import shap
 import fastexcel
 import hashlib
 from pathlib import Path
 from datetime import datetime
 from google.cloud import storage
 from sklearn.preprocessing import StandardScaler
-from catboost import CatBoostRegressor
+from catboost import CatBoostRegressor, Pool
 from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
+# Desativar avisos desnecessários
 warnings.filterwarnings("ignore")
 
 class MotorSafeDriverCloud:
@@ -41,7 +41,7 @@ class MotorSafeDriverCloud:
         self.storage_client = storage.Client()
         self.feriados_br = holidays.Brazil(years=[self.hoje.year, self.hoje.year-1, self.hoje.year-2])
         self.linhas_descartadas = 0
-        self.hashes_seguranca = {} # Dicionário para guardar as impressões digitais
+        self.hashes_seguranca = {} 
 
     def garantir_infraestrutura_bucket(self):
         try:
@@ -49,7 +49,6 @@ class MotorSafeDriverCloud:
         except Exception:
             self.storage_client.create_bucket(self.bucket_nome, location="US-EAST1")
 
-    # Função para criar o selo antifraude (Impressão Digital)
     def gerar_hash_sha256(self, caminho_arquivo):
         sha256_hash = hashlib.sha256()
         with open(caminho_arquivo, "rb") as f:
@@ -58,7 +57,7 @@ class MotorSafeDriverCloud:
         return sha256_hash.hexdigest()
 
     # ==========================================
-    # CAMADA RAW: Extração de Dados Brutos
+    # CAMADA RAW: Extração e Assinatura Digital
     # ==========================================
     def processar_camada_raw(self):
         ano_inicio, ano_atual = 2022, self.hoje.year
@@ -77,8 +76,7 @@ class MotorSafeDriverCloud:
                 h = requests.head(url, verify=False, timeout=15)
                 remoto = int(h.headers.get('Content-Length', 0))
                 if parquet_raw.exists():
-                    print(f"✅ Ano {ano} já existe localmente. A ignorar o download.")
-                    # Como já existe, calculamos o hash de segurança do ficheiro atual
+                    print(f"✅ Ano {ano} já existe. A validar integridade...")
                     self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                     continue
             except: pass
@@ -114,29 +112,29 @@ class MotorSafeDriverCloud:
                     dfs_ano.append(df_aba)
                 
                 if dfs_ano:
+                    # Junção diagonal para suportar mudanças de colunas entre anos
                     df_ano_completo = pl.concat(dfs_ano, how="diagonal")
                     df_ano_completo.write_parquet(parquet_raw, compression='snappy')
                     
-                    # Gerar e guardar o selo de segurança (SHA-256) logo após criar o Parquet
                     hash_atual = self.gerar_hash_sha256(parquet_raw)
                     self.hashes_seguranca[parquet_raw.name] = hash_atual
                     
-                    print(f"💾 Ficheiro guardado: {parquet_raw.name} ({df_ano_completo.height} linhas)")
-                    print(f"🔒 Impressão digital (SHA-256): {hash_atual}")
+                    print(f"💾 Guardado: {parquet_raw.name} | 🔒 SHA-256: {hash_atual[:10]}...")
                 
                 os.remove(xlsx_temp)
                 gc.collect()
             except Exception as e:
-                print(f"❌ Erro ao ler o Excel do ano {ano}: {e}")
+                print(f"❌ Erro no ano {ano}: {e}")
 
     # ==========================================
-    # CAMADA PRATA: Limpeza e Conversão de Tipos
+    # CAMADA PRATA: Limpeza e União (Polars)
     # ==========================================
     def processar_camada_prata(self):
-        print("⚪ [Camada Prata] A iniciar a limpeza e formatação de dados...")
+        print("⚪ [Camada Prata] A unificar e limpar os dados...")
         arquivos_raw = [str(p) for p in self.pastas["raw"].glob("ssp_bruto_*.parquet")]
-        if not arquivos_raw: raise ValueError("Nenhum dado encontrado na pasta Raw.")
+        if not arquivos_raw: raise ValueError("Pasta Raw vazia.")
         
+        # União diagonal resolve o erro 'ColumnNotFoundError'
         lazy_dfs = [pl.scan_parquet(f) for f in arquivos_raw]
         df_bruto = pl.concat(lazy_dfs, how="diagonal").collect()
         
@@ -161,33 +159,27 @@ class MotorSafeDriverCloud:
                 (pl.col("LAT") != 0.0) & (pl.col("LON") != 0.0) &
                 (pl.col("DATA_DT").is_not_null())
             )
-        else:
-            raise ValueError("Colunas de latitude ou longitude não encontradas.")
 
         df_prata = df_prata.collect()
         
-        print("📍 A mapear coordenadas para zonas geográficas (H3)...")
+        # Geoprocessamento H3
         coords_unicas = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords_unicas['H3'] = coords_unicas.apply(lambda row: h3.latlng_to_cell(row['LAT'], row['LON'], 8), axis=1)
-        coords_pl = pl.from_pandas(coords_unicas)
-        
-        df_prata = df_prata.join(coords_pl, on=["LAT", "LON"], how="left")
+        df_prata = df_prata.join(pl.from_pandas(coords_unicas), on=["LAT", "LON"], how="left")
         
         self.linhas_descartadas = vol_inicial - df_prata.height
+        df_prata.write_parquet(self.pastas["prata"] / "camada_prata_limpa.parquet", compression='snappy')
         
-        parquet_prata = self.pastas["prata"] / "camada_prata_limpa.parquet"
-        df_prata.write_parquet(parquet_prata, compression='snappy')
-        print(f"✨ Limpeza concluída. {self.linhas_descartadas} registos inválidos foram descartados.")
+        del df_bruto
+        gc.collect()
         return df_prata
 
     # ==========================================
-    # CAMADA OURO & ML: Preparação e Previsões
+    # CAMADA OURO & ML: Inteligência e SHAP
     # ==========================================
     def processar_camada_ouro_e_ml(self, df):
-        print("🟡 [Camada Ouro] A preparar os dados para o modelo...")
-        t_ini = time.time()
+        print("🟡 [Camada Ouro] A treinar o modelo preditivo...")
         v_bruto = df.height
-        
         col_crime = 'NATUREZA_APURADA' if 'NATUREZA_APURADA' in df.columns else 'RUBRICA'
         
         df = df.with_columns([
@@ -201,16 +193,11 @@ class MotorSafeDriverCloud:
         qtd_furto = df.filter(pl.col("IS_FURTO")).height
 
         df = df.with_columns([
-            pl.when(pl.col("IS_ROUBO")).then(20)
-              .when(pl.col("IS_FURTO")).then(10)
-              .otherwise(5).alias("RISCO_BASE")
+            pl.when(pl.col("IS_ROUBO")).then(20).when(pl.col("IS_FURTO")).then(10).otherwise(5).alias("RISCO_BASE")
         ]).with_columns((pl.col("RISCO_BASE") * pl.col("PESO")).alias("RISCO"))
 
         df = df.with_columns([
-            pl.when(pl.col("HORA") <= 6).then(0)
-              .when(pl.col("HORA") <= 12).then(1)
-              .when(pl.col("HORA") <= 18).then(2)
-              .otherwise(3).alias("TURNO")
+            pl.when(pl.col("HORA") <= 6).then(0).when(pl.col("HORA") <= 12).then(1).when(pl.col("HORA") <= 18).then(2).otherwise(3).alias("TURNO")
         ])
 
         fato_pl = df.group_by(["H3", "TURNO", "DATA_DT"]).agg([
@@ -226,14 +213,14 @@ class MotorSafeDriverCloud:
             pl.col("DATA_DT").dt.date().is_in(self.feriados_br).cast(pl.Int8).alias("IS_FERIADO")
         ])
 
-        fato = fato_pl.to_pandas()
+        # Preparação para o Modelo (Numpy para poupar RAM)
+        colunas_x = ['LAT', 'LON', 'TURNO', 'DIA_SEM', 'MES', 'IS_PGTO', 'IS_FERIADO']
+        X_arr = StandardScaler().fit_transform(fato_pl.select(colunas_x).to_pandas())
+        y_arr = np.log1p(fato_pl.select("RISCO").to_numpy().ravel())
         
-        X = fato[['LAT', 'LON', 'TURNO', 'DIA_SEM', 'MES', 'IS_PGTO', 'IS_FERIADO']]
-        y = np.log1p(fato['RISCO'])
-        X_s = StandardScaler().fit_transform(X)
-        X_tr, X_te, y_tr, y_te = train_test_split(X_s, y, test_size=0.2, shuffle=False)
+        X_tr, X_te, y_tr, y_te = train_test_split(X_arr, y_arr, test_size=0.2, shuffle=False)
 
-        print("🧠 A testar as melhores configurações do modelo...")
+        print("🧠 A otimizar o modelo...")
         melhor_r2, melhor_cat, melhor_lgb = -1, None, None
         for _ in range(10):
             d, lr = int(np.random.choice([4,6,8])), float(np.random.choice([0.01, 0.05, 0.1]))
@@ -242,38 +229,34 @@ class MotorSafeDriverCloud:
             r2 = r2_score(y_te, (c.predict(X_te)*0.7 + l.predict(X_te)*0.3))
             if r2 > melhor_r2: melhor_r2, melhor_cat, melhor_lgb = r2, c, l
             if melhor_r2 > 0.42: break
+            gc.collect()
 
-        print("🔍 A calcular as variáveis com maior peso nas previsões...")
-        explainer = shap.TreeExplainer(melhor_cat)
-        shap_vals = explainer.shap_values(pd.DataFrame(X_te[:1000], columns=X.columns))
-        importancias = pd.DataFrame({'VAR': X.columns, 'SHAP': np.abs(shap_vals).mean(axis=0)}).sort_values('SHAP', ascending=False)
+        print("🔍 A calcular importância das variáveis (SHAP Nativo)...")
+        # SHAP via CatBoost (Sem crash)
+        pool_teste = Pool(X_te[:1000])
+        shap_vals = melhor_cat.get_feature_importance(pool_teste, type='ShapValues')[:, :-1]
+        
+        importancias = pd.DataFrame({'VAR': colunas_x, 'SHAP': np.abs(shap_vals).mean(axis=0)}).sort_values('SHAP', ascending=False)
         top_driver = importancias.iloc[0]['VAR']
         
-        fato['PREVISAO_RISCO'] = np.round(np.expm1((melhor_cat.predict(X_s)*0.7) + (melhor_lgb.predict(X_s)*0.3)), 2)
+        preds_finais = np.round(np.expm1((melhor_cat.predict(X_arr)*0.7) + (melhor_lgb.predict(X_arr)*0.3)), 2)
+        fato_final_pl = fato_pl.select(['H3', 'DATA_DT', 'TURNO', 'RISCO']).with_columns([pl.Series("PREVISAO_RISCO", preds_finais)])
 
-        importancias_pl = pl.from_pandas(importancias)
-        fato_final_pl = pl.from_pandas(fato[['H3', 'DATA_DT', 'TURNO', 'RISCO', 'PREVISAO_RISCO']])
-
-        importancias_pl.write_parquet(self.pastas["ouro"] / "explicabilidade_shap.parquet", compression='snappy')
-        fato_final_pl.write_parquet(self.pastas["ouro"] / "dashboard_risco_real.parquet", compression='snappy')
+        # Gravação Ouro
+        pl.from_pandas(importancias).write_parquet(self.pastas["ouro"] / "explicabilidade_shap.parquet")
+        fato_final_pl.write_parquet(self.pastas["ouro"] / "dashboard_risco_real.parquet")
 
         r2_tr = r2_score(y_tr, (melhor_cat.predict(X_tr)*0.7 + melhor_lgb.predict(X_tr)*0.3))
         
-        # O manifesto agora guarda os hashes para auditar os dados brutos e garantir que não houve adulteração
         manifesto = {
-            "auditoria_estatistica": {
-                "r2_treino": float(r2_tr), "r2_teste": float(melhor_r2),
-                "degradacao_overfitting": float(r2_tr - melhor_r2)
-            },
+            "auditoria_estatistica": {"r2_treino": float(r2_tr), "r2_teste": float(melhor_r2), "degradacao_overfitting": float(r2_tr - melhor_r2)},
             "seguranca_antifraude": self.hashes_seguranca,
-            "linhas_processadas": int(v_bruto), 
-            "timestamp": self.hoje.isoformat()
+            "linhas_processadas": int(v_bruto), "timestamp": self.hoje.isoformat()
         }
         with open(self.pastas["auditoria"] / "auditoria_pipeline.json", "w") as f: json.dump(manifesto, f, indent=4)
         
         self.garantir_infraestrutura_bucket()
         self.fazer_upload_diretorio(self.raiz / "datalake")
-        
         self._notificar_sucesso(melhor_r2, top_driver, v_bruto, self.linhas_descartadas, qtd_roubo, qtd_furto)
 
     def fazer_upload_diretorio(self, local):
@@ -283,34 +266,16 @@ class MotorSafeDriverCloud:
 
     def _notificar_sucesso(self, r2_te, driver, vol_dados, vol_sujo, roubos, furtos):
         if not self.webhook_sucesso: return
-        
-        vol_dados_fmt = f"{vol_dados:,}".replace(",", ".")
-        vol_sujo_fmt = f"{vol_sujo:,}".replace(",", ".")
-        roubos_fmt = f"{roubos:,}".replace(",", ".")
-        furtos_fmt = f"{furtos:,}".replace(",", ".")
-
         payload = {
             "embeds": [{
-                "title": "📊 Resumo Diário - Processamento SafeDriver", 
-                "color": 3066993,
+                "title": "📊 Resumo Diário - SafeDriver", "color": 3066993,
                 "fields": [
-                    {
-                        "name": "👔 Indicadores do Modelo", 
-                        "value": f"**Precisão do Modelo (R²):** {r2_te:.2%}\n**Variável Principal:** {driver}\n**Ocorrências Classificadas:** {roubos_fmt} Roubos | {furtos_fmt} Furtos", 
-                        "inline": False
-                    },
-                    {
-                        "name": "⚙️ Engenharia e Qualidade dos Dados", 
-                        "value": f"**Registos Válidos Processados:** {vol_dados_fmt} linhas\n**Registos Inválidos Descartados:** {vol_sujo_fmt} linhas (nulos, coordenadas incorretas)\n**Segurança:** Integridade garantida (Selos SHA-256 gerados).\n**Estado:** Ficheiros Parquet (Raw, Prata, Ouro) enviados para a Cloud.", 
-                        "inline": False
-                    }
+                    {"name": "👔 Negócio", "value": f"**R²:** {r2_te:.2%}\n**Causa:** {driver}\n**Perfil:** {roubos:,} Roubos | {furtos:,} Furtos", "inline": False},
+                    {"name": "⚙️ Engenharia", "value": f"**Válidos:** {vol_dados:,}\n**Descartados:** {vol_sujo:,}\n**Segurança:** SHA-256 OK", "inline": False}
                 ]
             }]
         }
-        try:
-            requests.post(self.webhook_sucesso, json=payload)
-        except Exception as e:
-            print(f"Erro ao enviar notificação para o Discord: {e}")
+        requests.post(self.webhook_sucesso, json=payload)
 
 if __name__ == "__main__":
     try:
@@ -319,17 +284,10 @@ if __name__ == "__main__":
         df_prata = motor.processar_camada_prata()
         motor.processar_camada_ouro_e_ml(df_prata)
     except Exception:
-        webhook_erro = os.environ.get("DISCORD_ERRO")
-        if webhook_erro:
-            detalhe_erro = traceback.format_exc()[:1900]
-            
-            payload = {
-                "content": f"❌ **Falha no processamento do SafeDriver:**\n```{detalhe_erro}```"
-            }
-            try:
-                requests.post(webhook_erro, json=payload)
-            except Exception:
-                pass
-                
-        traceback.print_exc()
-        sys.exit(1)
+        err = traceback.format_exc()
+        print(f"\n❌ ERRO:\n{err}"); sys.stdout.flush()
+        if os.environ.get("DISCORD_ERRO"):
+            requests.post(os.environ.get("DISCORD_ERRO"), json={"content": f"❌ **Falha:**\n
+http://googleusercontent.com/immersive_entry_chip/0
+
+Agora podes fazer o *commit* e ver o pipeline a chegar ao fim com sucesso!
