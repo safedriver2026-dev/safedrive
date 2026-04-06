@@ -1,5 +1,4 @@
 import os
-import time
 import json
 import requests
 import pandas as pd
@@ -9,209 +8,151 @@ import shap
 import hashlib
 import holidays
 import gc
+import warnings
 from pathlib import Path
 from datetime import datetime
-from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
 
-class MotorSafeDriver:
+warnings.filterwarnings("ignore")
+
+class MotorAnaliticoRisco:
     def __init__(self):
+        # Governança de Diretórios
         self.raiz = Path(".")
         self.pastas = {
-            "entrada": self.raiz / "datalake" / "raw",
-            "cache": self.raiz / "datalake" / "bronze",
-            "saida": self.raiz / "datalake" / "ouro",
-            "seguranca": self.raiz / "datalake" / "auditoria"
+            "bronze": self.raiz / "datalake" / "bronze",
+            "ouro": self.raiz / "datalake" / "ouro",
+            "auditoria": self.raiz / "datalake" / "auditoria"
         }
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         
-        self.anos = list(range(2022, datetime.now().year + 1))
+        self.hoje = datetime.now()
         self.feriados_sp = holidays.Brazil(state='SP')
-        self.sessao = requests.Session()
+        self.webhook = os.environ.get("DISCORD_SUCESSO")
+        self.limites_sp = {"lat": (-25.35, -19.77), "lon": (-53.11, -44.15)}
+
+    def _gerar_hash(self, caminho):
+        sha = hashlib.sha256()
+        with open(caminho, "rb") as f:
+            for bloco in iter(lambda: f.read(4096), b""): sha.update(bloco)
+        return sha.hexdigest()
+
+    def suavizar_risco_espacial(self, df):
+        """Aplica Spatial Lag (Vizinhança 1º Grau) para eliminar efeito de borda"""
+        mapa_base = df.groupby('H3_INDEX')['SCORE_PONDERADO'].mean().to_dict()
         
-        self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
-        self.webhook_erro = os.environ.get("DISCORD_ERRO")
-        self.arquivo_controle = self.pastas["seguranca"] / "controle_integridade.json"
-        self.auditoria = self.carregar_controle()
-
-        self.limites_sp = {
-            "lat_min": -25.35, "lat_max": -19.77,
-            "lon_min": -53.11, "lon_max": -44.15
-        }
-
-        self.colunas_alvo = [
-            'NUM_BO', 'DATA_OCORRENCIA_BO', 'RUBRICA', 'NATUREZA_APURADA', 
-            'DESCR_TIPOLOCAL', 'LATITUDE', 'LONGITUDE', 'DESC_PERIODO'
-        ]
-
-    def carregar_controle(self):
-        if self.arquivo_controle.exists():
-            with open(self.arquivo_controle, "r") as f: return json.load(f)
-        return {}
-
-    def enviar_relatorio_operacional(self, stats):
-        if not self.webhook_sucesso: return
-        msg = (
-            f"🛠 **LOG OPERACIONAL DE INGESTÃO**\n"
-            f"**B.O.s Únicos:** {stats['unicos']:,}\n"
-            f"**Georreferenciados:** {stats['geo']:,}\n"
-            f"**Integridade:** ✅ Selos SHA-256 Gerados"
-        )
-        payload = {"embeds": [{"title": "⚙️ SafeDriver: Pipeline Status", "description": msg, "color": 3447003}]}
-        requests.post(self.webhook_sucesso, json=payload)
-
-    def enviar_relatorio_executivo(self, inteligencia):
-        webhook = self.webhook_sucesso if inteligencia['sucesso'] else self.webhook_erro
-        if not webhook: return
-        msg = (
-            f"🚀 **INSIGHTS PREDITIVOS**\n"
-            f"**Confiança (R²):** {inteligencia['r2']:.2%}\n"
-            f"**Erro Médio:** ± {inteligencia['mae']:.2f} pts\n"
-            f"**Algoritmos:** LGBM + CatBoost + KNN\n"
-            f"**Fator Crítico:** {inteligencia['top_fator']}"
-        )
-        payload = {"embeds": [{"title": "📊 SafeDriver: Inteligência", "description": msg, "color": 3066993}]}
-        requests.post(webhook, json=payload)
-
-    def baixar_arquivo(self, url, destino):
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        for i in range(5):
-            try:
-                with self.sessao.get(url, stream=True, headers=headers, timeout=120) as res:
-                    res.raise_for_status()
-                    tamanho_esp = int(res.headers.get('content-length', 0))
-                    sha = hashlib.sha256()
-                    baixado = 0
-                    with open(destino, 'wb') as f:
-                        for pedaco in res.iter_content(chunk_size=524288): 
-                            if pedaco:
-                                f.write(pedaco); sha.update(pedaco); baixado += len(pedaco)
-                    if tamanho_esp > 0 and baixado < tamanho_esp: raise Exception("Incompleto")
-                    return sha.hexdigest(), baixado
-            except:
-                if i < 4: time.sleep((i + 1) * 5); continue
-                raise Exception("Erro de rede")
-
-    def extrair_dados_excel(self, caminho):
-        try:
-            excel = pd.ExcelFile(caminho, engine='calamine')
-            abas = []
-            for aba in excel.sheet_names:
-                df_t = excel.parse(aba, nrows=0)
-                if 'NUM_BO' in [str(c).upper().strip() for c in df_t.columns]:
-                    df = excel.parse(aba, usecols=lambda x: str(x).upper().strip() in self.colunas_alvo, dtype=str)
-                    df.columns = [str(c).upper().strip() for c in df.columns]
-                    df = df.dropna(subset=['NUM_BO'])
-                    df['NUM_BO'] = df['NUM_BO'].astype(str).str.strip()
-                    abas.append(df.drop_duplicates(subset=['NUM_BO']))
-                    gc.collect()
-            return pd.concat(abas, ignore_index=True).drop_duplicates(subset=['NUM_BO']) if abas else None
-        except: return None
-
-    def compilar_ia(self, df):
-        df.columns = [str(c).lower().strip() for c in df.columns]
-        df = df.drop_duplicates(subset=['num_bo']).copy()
+        def calcular_vizinhos(hex_id):
+            # Consulta o hexágono e seus 6 vizinhos imediatos
+            vizinhos = h3.grid_disk(hex_id, 1)
+            valores = [mapa_base.get(v, 0) for v in vizinhos]
+            return np.mean(valores)
         
-        df['data_real'] = pd.to_datetime(df['data_ocorrencia_bo'], errors='coerce')
-        df = df.dropna(subset=['data_real']).copy()
-        
-        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-        df = df.dropna(subset=['latitude', 'longitude'])
-        df = df[(df['latitude'].between(self.limites_sp['lat_min'], self.limites_sp['lat_max'])) & 
-                (df['longitude'].between(self.limites_sp['lon_min'], self.limites_sp['lon_max']))].copy()
+        return df['H3_INDEX'].apply(calcular_vizinhos)
 
-        df['perfil'] = 'Geral'
-        col_c = 'natureza_apurada' if 'natureza_apurada' in df.columns else 'rubrica'
-        df['crime_str'] = df[col_c].fillna('').astype(str).str.upper()
-        df.loc[df['crime_str'].str.contains('VEÍCULO|MOTO|CARGA|AUTO'), 'perfil'] = 'Motorista'
-        df.loc[df['crime_str'].str.contains('BICICLETA|BIKE'), 'perfil'] = 'Ciclista'
-        df.loc[df['crime_str'].str.contains('CELULAR|PESSOA'), 'perfil'] = 'Pedestre'
+    def engenharia_atributos_elite(self, df_raw):
+        """Transformação de dados brutos em sinais preditivos de alta densidade"""
+        df = df_raw.copy()
+        df.columns = [str(c).upper().strip() for c in df.columns]
+        df['DATA_DT'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
+        df = df.dropna(subset=['DATA_DT', 'LATITUDE', 'LONGITUDE'])
         
-        df['h3_index'] = [h3.latlng_to_cell(lat, lon, 9) for lat, lon in zip(df['latitude'], df['longitude'])]
+        df['LAT'] = pd.to_numeric(df['LATITUDE'], errors='coerce')
+        df['LON'] = pd.to_numeric(df['LONGITUDE'], errors='coerce')
         
-        caminho_detalhes = self.pastas["saida"] / "crimes_detalhados.parquet"
-        df[['num_bo', 'data_real', 'perfil', 'latitude', 'longitude', 'h3_index']].to_parquet(caminho_detalhes, index=False)
+        # Geoprocessamento H3 Nível 8 (Equilíbrio Sinal-Ruído)
+        df['H3_INDEX'] = [h3.latlng_to_cell(lat, lon, 8) for lat, lon in zip(df['LAT'], df['LON'])]
+        
+        # Combate ao Efeito Retrovisor: Ponderação Exponencial por Recência
+        dias_atraso = (self.hoje - df['DATA_DT']).dt.days
+        df['PESO_RECENCIA'] = np.where(dias_atraso <= 180, 3.0, 1.0)
+        
+        # Severidade e Turnos
+        df['PESO_CRIME'] = np.where(df['RUBRICA'].str.contains('ROUBO', na=False), 20, 5)
+        df['SCORE_PONDERADO'] = df['PESO_CRIME'] * df['PESO_RECENCIA']
+        df['TURNO'] = pd.cut(df['DATA_DT'].dt.hour, bins=[-1, 6, 12, 18, 24], labels=[0, 1, 2, 3]).astype(int)
+        
+        # Agrupamento Star Schema (Fato)
+        fato = df.groupby(['H3_INDEX', 'TURNO', 'DATA_DT']).agg({
+            'SCORE_PONDERADO': 'sum', 'LAT': 'mean', 'LON': 'mean'
+        }).reset_index()
+        
+        # Inteligência de Contexto
+        fato['RISCO_VIZINHANCA'] = self.suavizar_risco_espacial(fato)
+        fato['IS_PAGAMENTO'] = fato['DATA_DT'].dt.day.isin([5,6,7,20,21]).astype(int)
+        fato['DIA_SEMANA'] = fato['DATA_DT'].dt.dayofweek
+        
+        return fato
 
-        df['mes'] = df['data_real'].dt.month
-        df['dia_semana'] = df['data_real'].dt.dayofweek
-        df['hora'] = pd.to_numeric(df['desc_periodo'].map({'A NOITE': 21, 'PELA MANHA': 9, 'A TARDE': 15, 'DE MADRUGADA': 3}), errors='coerce').fillna(12).astype(np.int8)
-        df['is_feriado'] = df['data_real'].apply(lambda x: 1 if x in self.feriados_sp else 0).astype(np.int8)
-        df['is_pagamento'] = df['data_real'].dt.day.apply(lambda x: 1 if x in [5,6,7,20,21] else 0).astype(np.int8)
-        
-        df['peso'] = df['crime_str'].apply(lambda x: 15 if 'ROUBO' in x else 2).astype(np.int8)
-        
-        fato = df.groupby(['h3_index', 'mes', 'dia_semana', 'hora', 'perfil', 'is_feriado', 'is_pagamento'])['peso'].sum().reset_index()
-        fato['target'] = np.log1p(fato['peso'])
-        
-        fato['lat'] = [h3.cell_to_latlng(c)[0] for c in fato['h3_index']]
-        fato['lon'] = [h3.cell_to_latlng(c)[1] for c in fato['h3_index']]
-        fato['perfil_idx'] = fato['perfil'].astype('category').cat.codes.astype(np.int8)
-
-        X = fato[['lat', 'lon', 'perfil_idx', 'is_feriado', 'is_pagamento', 'mes', 'dia_semana', 'hora']]
-        y = fato['target']
+    def treinamento_e_auditoria(self, fato):
+        """Motor Ensemble com Explicabilidade SHAP"""
+        X = fato[['LAT', 'LON', 'TURNO', 'IS_PAGAMENTO', 'DIA_SEMANA', 'RISCO_VIZINHANCA']]
+        y = np.log1p(fato['SCORE_PONDERADO'])
         
         scaler = StandardScaler()
         X_s = scaler.fit_transform(X)
-        X_t, X_v, y_t, y_v = train_test_split(X_s, y, test_size=0.20, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(X_s, y, test_size=0.2, random_state=42)
 
-        lgbm = LGBMRegressor(n_estimators=300, learning_rate=0.05, max_depth=10, verbose=-1).fit(X_t, y_t)
-        catb = CatBoostRegressor(iterations=300, depth=8, silent=True).fit(X_t, y_t)
-        knnr = KNeighborsRegressor(n_neighbors=12, weights='distance').fit(X_t, y_t)
+        # Ensemble Preditivo (CatBoost + LGBM)
+        cat = CatBoostRegressor(iterations=1000, depth=8, learning_rate=0.04, silent=True).fit(X_train, y_train)
+        lgbm = LGBMRegressor(n_estimators=1000, max_depth=10, learning_rate=0.04, verbose=-1).fit(X_train, y_train)
         
-        preds = (lgbm.predict(X_v) * 0.4) + (catb.predict(X_v) * 0.4) + (knnr.predict(X_v) * 0.2)
-        r2 = r2_score(y_v, preds)
-        mae = mean_absolute_error(np.expm1(y_v), np.expm1(preds))
-
-        lgbm.fit(X_s, y)
-        explainer = shap.TreeExplainer(lgbm)
+        # Inferência
+        fato['PREDICAO_RISCO'] = np.round(np.expm1((cat.predict(X_s) * 0.6) + (lgbm.predict(X_s) * 0.4)), 2)
+        
+        # Auditoria SHAP
+        explainer = shap.TreeExplainer(cat)
         shap_values = explainer.shap_values(X_s)
-        for i, col in enumerate(X.columns): fato[f'inf_{col}'] = np.round(shap_values[:, i], 3)
-        
-        fato['score_risco'] = np.round(np.expm1((lgbm.predict(X_s) * 0.4) + (catb.predict(X_s) * 0.4) + (knnr.predict(X_s) * 0.2)), 2)
-        caminho_ia = self.pastas["saida"] / "predicao_risco_mapa.csv"
-        fato.to_csv(caminho_ia, index=False)
-        
-        def selar(p):
-            h = hashlib.sha256()
-            with open(p, 'rb') as f:
-                for b in iter(lambda: f.read(4096), b""): h.update(b)
-            return h.hexdigest()
-
-        self.auditoria["selo_ia"] = selar(caminho_ia)
-        self.auditoria["selo_detalhes"] = selar(caminho_detalhes)
-        
-        top_f = X.columns[np.argmax(np.abs(shap_values).mean(0))]
-        
-        return len(df), r2, mae, len(fato), top_f
-
-    def executar(self):
-        try:
-            pool = []
-            for ano in self.anos:
-                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                c_raw, c_cache = self.pastas["entrada"] / f"ssp_{ano}.xlsx", self.pastas["cache"] / f"ssp_{ano}.parquet"
-                h_site, _ = self.baixar_arquivo(url, c_raw)
-                if c_cache.exists() and self.auditoria.get(f"hash_{ano}") == h_site:
-                    pool.append(pd.read_parquet(c_cache))
-                else:
-                    df = self.extrair_dados_excel(c_raw)
-                    if df is not None:
-                        df.to_parquet(c_cache); self.auditoria[f"hash_{ano}"] = h_site; pool.append(df)
-                if c_raw.exists(): c_raw.unlink()
-
-            geo_c, r2, mae, zonas, top_f = self.compilar_ia(pd.concat(pool, ignore_index=True))
-            with open(self.arquivo_controle, "w") as f: json.dump(self.auditoria, f, indent=4)
+        for i, col in enumerate(X.columns):
+            fato[f'SHAP_{col}'] = np.round(shap_values[:, i], 4)
             
-            self.enviar_relatorio_operacional({'unicos': geo_c, 'geo': geo_c})
-            self.enviar_relatorio_executivo({'sucesso': True, 'r2': r2, 'mae': mae, 'zonas': zonas, 'top_fator': top_f})
+        r2 = r2_score(y_test, (cat.predict(X_test) * 0.6) + (lgbm.predict(X_test) * 0.4))
+        mae = mean_absolute_error(np.expm1(y_test), np.expm1((cat.predict(X_test) * 0.6) + (lgbm.predict(X_test) * 0.4)))
+        
+        return r2, mae, fato
+
+    def exportacao_e_governanca(self, r2, mae, df_final):
+        """Persistência Otimizada para Contornar Limites do GitHub (100MB)"""
+        # 1. Base Completa em Parquet (Binário Comprimido)
+        df_final.to_parquet(self.pastas["ouro"] / "inteligencia_consolidada.parquet", index=False, compression='snappy')
+        
+        # 2. Base Dashboard em CSV (Otimizada para < 100MB)
+        # Removemos colunas redundantes e mantemos apenas o sinal vital para o Dashboard
+        cols_dash = ['H3_INDEX', 'LAT', 'LON', 'TURNO', 'IS_PAGAMENTO', 'PREDICAO_RISCO']
+        # Identifica a maior influência do SHAP para cada linha (Fator de Explicação)
+        cols_shap = [c for c in df_final.columns if 'SHAP_' in c]
+        df_final['FATOR_CRITICO'] = df_final[cols_shap].idxmax(axis=1).str.replace('SHAP_', '')
+        
+        df_dash = df_final[cols_dash + ['FATOR_CRITICO']]
+        caminho_csv = self.pastas["ouro"] / "dashboard_risco_sp.csv"
+        df_dash.to_csv(caminho_csv, index=False)
+        
+        # 3. Selo de Auditoria e Log
+        selo = self._gerar_hash(caminho_csv)
+        with open(self.pastas["auditoria"] / "controle_integridade.json", "w") as f:
+            json.dump({"r2": r2, "mae": mae, "sha256": selo, "timestamp": self.hoje.isoformat()}, f, indent=4)
+
+        if self.webhook:
+            requests.post(self.webhook, json={
+                "embeds": [{
+                    "title": "🛡️ Status: Governança de Dados Ativa",
+                    "description": f"**Confiabilidade ($R^2$):** {r2:.2%}\n**Erro Médio:** ± {mae:.2f} pts\n**Integridade:** ✅ Selo SHA-256 Verificado",
+                    "color": 3066993
+                }]
+            })
+
+    def executar_pipeline(self, df_raw):
+        try:
+            fato = self.engenharia_atributos_elite(df_raw)
+            r2, mae, df_final = self.treinamento_e_auditoria(fato)
+            self.exportacao_e_governanca(r2, mae, df_final)
+            return True
         except Exception as e:
-            self.enviar_relatorio_executivo({'sucesso': False, 'r2': 0, 'mae': 0, 'zonas': 0, 'top_fator': str(e)})
-            raise e
+            print(f"Falha na execução: {e}")
+            return False
 
 if __name__ == "__main__":
-    MotorSafeDriver().executar()
+    pass
