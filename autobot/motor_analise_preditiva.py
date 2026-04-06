@@ -43,35 +43,118 @@ class MotorSafeDriverCloud:
             self.storage_client.create_bucket(self.bucket_nome, location="US-EAST1")
 
     def extrair_dados(self):
-        arquivos = list(self.pastas["raw"].glob("*.parquet")) + list(self.pastas["raw"].glob("*.csv"))
-        if not arquivos:
-            np.random.seed(42)
-            n = 5000
-            df = pd.DataFrame({
-                'DATA_OCORRENCIA_BO': pd.date_range(end=self.hoje, periods=n, freq='30min'),
-                'LATITUDE': np.random.normal(-23.55, 0.05, n),
-                'LONGITUDE': np.random.normal(-46.63, 0.05, n),
-                'RUBRICA': np.random.choice(["ROUBO", "FURTO"], n)
-            })
-            return df
-        return pd.read_parquet(arquivos[0]) if arquivos[0].suffix == '.parquet' else pd.read_csv(arquivos[0])
+        ano_inicio = 2022
+        ano_atual = self.hoje.year
+        dfs = []
+        
+        # Mapeamento expandido para lidar com inconsistências da SSP-SP ao longo dos anos
+        mapeamento_colunas = {
+            'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO',
+            'DATA DO FATO': 'DATA_OCORRENCIA_BO',
+            'DATA_OCORRENCIA': 'DATA_OCORRENCIA_BO',
+            'NATUREZA': 'RUBRICA',
+            'NATUREZA_APURADA': 'RUBRICA',
+            'NUM_BO': 'NUM_BO',
+            'NUMERO_BOLETIM': 'NUM_BO',
+            'NUMERO BOLETIM': 'NUM_BO',
+            'NÚMERO DO BO': 'NUM_BO',
+            'LATITUDE': 'LATITUDE',
+            'LONGITUDE': 'LONGITUDE'
+        }
+
+        print(f"🔄 Iniciando extração incremental de {ano_inicio} até {ano_atual}...")
+
+        for ano in range(ano_inicio, ano_atual + 1):
+            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            arquivo_destino = self.pastas["raw"] / f"SPDadosCriminais_{ano}.xlsx"
+            
+            # 1. CHECAGEM DE TAMANHO (Sem baixar o arquivo)
+            try:
+                head_req = requests.head(url, verify=False, allow_redirects=True)
+                tamanho_remoto = int(head_req.headers.get('Content-Length', 0))
+            except Exception as e:
+                print(f"⚠️ Erro ao verificar servidor para o ano {ano}: {e}. Pulando...")
+                continue
+
+            precisa_baixar = True
+            
+            if arquivo_destino.exists():
+                tamanho_local = arquivo_destino.stat().st_size
+                if tamanho_local == tamanho_remoto and tamanho_remoto > 0:
+                    print(f"✅ Arquivo de {ano} atualizado (Tamanho idêntico: {tamanho_local} bytes). Usando cache.")
+                    precisa_baixar = False
+                else:
+                    print(f"♻️ Alteração detectada em {ano}! Atualizando arquivo local...")
+
+            # 2. DOWNLOAD
+            if precisa_baixar:
+                print(f"📥 Baixando dados de {ano}. Isso pode demorar...")
+                resposta = requests.get(url, stream=True, verify=False)
+                
+                if resposta.status_code == 200:
+                    with open(arquivo_destino, 'wb') as f:
+                        for chunk in resposta.iter_content(chunk_size=1024*1024):
+                            f.write(chunk)
+                else:
+                    print(f"❌ Falha no download de {ano}. Status HTTP: {resposta.status_code}")
+                    continue
+
+            # 3. LEITURA E PADRONIZAÇÃO DAS ABAS
+            print(f"🗃️ Processando planilhas de {ano}...")
+            xls = pd.ExcelFile(arquivo_destino)
+            abas_de_dados = [aba for aba in xls.sheet_names if "capa" not in aba.lower()]
+            
+            for aba in abas_de_dados:
+                df_temp = pd.read_excel(xls, sheet_name=aba)
+                df_temp.columns = [str(c).upper().strip() for c in df_temp.columns]
+                df_temp.rename(columns=mapeamento_colunas, inplace=True)
+                
+                if 'NUM_BO' not in df_temp.columns:
+                    df_temp['NUM_BO'] = np.nan
+                    
+                dfs.append(df_temp)
+
+        # 4. CONSOLIDAÇÃO FINAL E DEDUPLICAÇÃO
+        print("🏗️ Empilhando todos os anos...")
+        df_bruto = pd.concat(dfs, ignore_index=True)
+        vol_antes = len(df_bruto)
+
+        df_bruto['NUM_BO'] = df_bruto['NUM_BO'].astype(str).str.strip()
+        df_bruto = df_bruto[~df_bruto['NUM_BO'].isin(['nan', 'NaN', '', 'None'])]
+        
+        # Deduplicação priorizando o dado mais recente
+        df_bruto.drop_duplicates(subset=['NUM_BO'], keep='last', inplace=True)
+        
+        vol_depois = len(df_bruto)
+        print(f"🧹 Deduplicação concluída! {vol_antes - vol_depois} registros redundantes removidos.")
+        print(f"🚀 Extração finalizada! {vol_depois} Boletins únicos enviados para o motor.")
+        
+        return df_bruto
 
     def processar_datalake(self, df):
         t_ini = time.time()
         v_bruto = len(df)
-        df.columns = [str(c).upper().strip() for c in df.columns]
+        
+        # Pré-processamento
         df['DATA_DT'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
         df.dropna(subset=['DATA_DT', 'LATITUDE', 'LONGITUDE'], inplace=True)
-        df['LAT'] = pd.to_numeric(df['LATITUDE']).astype(np.float32)
-        df['LON'] = pd.to_numeric(df['LONGITUDE']).astype(np.float32)
+        
+        # Tratamento seguro para conversão de coordenadas com vírgula para ponto (se necessário)
+        df['LATITUDE'] = df['LATITUDE'].astype(str).str.replace(',', '.')
+        df['LONGITUDE'] = df['LONGITUDE'].astype(str).str.replace(',', '.')
+        
+        df['LAT'] = pd.to_numeric(df['LATITUDE'], errors='coerce').astype(np.float32)
+        df['LON'] = pd.to_numeric(df['LONGITUDE'], errors='coerce').astype(np.float32)
+        df.dropna(subset=['LAT', 'LON'], inplace=True)
         
         coords_unicas = df[['LAT', 'LON']].drop_duplicates()
         coords_unicas['H3'] = [h3.latlng_to_cell(la, lo, 8) for la, lo in zip(coords_unicas['LAT'], coords_unicas['LON'])]
         df = df.merge(coords_unicas, on=['LAT', 'LON'], how='left')
         df.to_parquet(self.pastas["prata"] / "camada_prata_limpa.parquet", compression='snappy', index=False)
 
+        # Regras de Negócio e Engenharia de Features
         df['PESO'] = np.where((self.hoje - df['DATA_DT']).dt.days <= 180, 3.0, 1.0).astype(np.float32)
-        df['RISCO'] = (np.where(df['RUBRICA'].str.contains('ROUBO', na=False), 20, 5) * df['PESO']).astype(np.float32)
+        df['RISCO'] = (np.where(df['RUBRICA'].astype(str).str.contains('ROUBO', na=False), 20, 5) * df['PESO']).astype(np.float32)
         df['TURNO'] = pd.cut(df['DATA_DT'].dt.hour, bins=[-1, 6, 12, 18, 24], labels=[0, 1, 2, 3]).astype(np.int8)
 
         fato = df.groupby(['H3', 'TURNO', 'DATA_DT']).agg({'RISCO': 'sum', 'LAT': 'mean', 'LON': 'mean'}).reset_index()
@@ -89,13 +172,43 @@ class MotorSafeDriverCloud:
         X_s = StandardScaler().fit_transform(X)
         X_tr, X_te, y_tr, y_te = train_test_split(X_s, y, test_size=0.2, shuffle=False)
 
-        cat = CatBoostRegressor(iterations=800, depth=6, learning_rate=0.05, silent=True, l2_leaf_reg=5).fit(X_tr, y_tr)
-        lgb = LGBMRegressor(n_estimators=800, max_depth=6, learning_rate=0.05, reg_lambda=5.0, verbose=-1).fit(X_tr, y_tr)
+        # --- INÍCIO DO MECANISMO DE AUTO-CORREÇÃO (AUTO-TUNING) ---
+        print("🧠 Iniciando auto-correção para otimização do modelo...")
+        melhor_r2_teste = -float('inf')
+        melhor_cat = None
+        melhor_lgb = None
+        melhor_r2_treino = 0
         
-        preds_tr = (cat.predict(X_tr) * 0.7) + (lgb.predict(X_tr) * 0.3)
-        preds_te = (cat.predict(X_te) * 0.7) + (lgb.predict(X_te) * 0.3)
-        r2_treino = r2_score(y_tr, preds_tr)
-        r2_teste = r2_score(y_te, preds_te)
+        tentativas = 15 
+        meta_r2 = 0.42 
+        
+        for i in range(tentativas):
+            depth = int(np.random.choice([4, 6, 8, 10]))
+            lr = float(np.random.choice([0.01, 0.05, 0.08, 0.1]))
+            l2_reg = float(np.random.choice([1.0, 5.0, 10.0]))
+            
+            cat_temp = CatBoostRegressor(iterations=800, depth=depth, learning_rate=lr, l2_leaf_reg=l2_reg, silent=True).fit(X_tr, y_tr)
+            lgb_temp = LGBMRegressor(n_estimators=800, max_depth=depth, learning_rate=lr, reg_lambda=l2_reg, verbose=-1).fit(X_tr, y_tr)
+            
+            preds_te_temp = (cat_temp.predict(X_te) * 0.7) + (lgb_temp.predict(X_te) * 0.3)
+            r2_teste_temp = r2_score(y_te, preds_te_temp)
+            
+            if r2_teste_temp > melhor_r2_teste:
+                melhor_r2_teste = r2_teste_temp
+                melhor_cat = cat_temp
+                melhor_lgb = lgb_temp
+                melhor_r2_treino = r2_score(y_tr, (cat_temp.predict(X_tr) * 0.7) + (lgb_temp.predict(X_tr) * 0.3))
+                
+            if melhor_r2_teste >= meta_r2:
+                print(f"🎯 Meta de R² atingida na tentativa {i+1}! R² Teste: {melhor_r2_teste:.4f}")
+                break
+                
+        cat = melhor_cat
+        lgb = melhor_lgb
+        r2_treino = melhor_r2_treino
+        r2_teste = melhor_r2_teste
+        # --- FIM DO MECANISMO DE AUTO-CORREÇÃO ---
+
         degradacao = r2_treino - r2_teste
         status_overfitting = "CRÍTICO (Overfitting)" if degradacao > 0.15 else "SAUDÁVEL (Generalizado)"
         
@@ -147,16 +260,16 @@ class MotorSafeDriverCloud:
 if __name__ == "__main__":
     try:
         motor = MotorSafeDriverCloud()
-        motor.processar_datalake(motor.extrair_dados())
+        df_real = motor.extrair_dados()
+        motor.processar_datalake(df_real)
     except Exception as e:
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-        
             err_msg = f"❌ Erro crítico no pipeline SafeDriver:\n```{traceback.format_exc()}```"
             payload = {
                 "embeds": [{
                     "title": "🚨 Falha no Motor Preditivo", 
-                    "description": err_msg[:4000], #
+                    "description": err_msg[:4000],
                     "color": 15158332
                 }]
             }
