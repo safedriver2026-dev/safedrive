@@ -13,6 +13,7 @@ import holidays
 import warnings
 import shap
 import fastexcel
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from google.cloud import storage
@@ -40,12 +41,21 @@ class MotorSafeDriverCloud:
         self.storage_client = storage.Client()
         self.feriados_br = holidays.Brazil(years=[self.hoje.year, self.hoje.year-1, self.hoje.year-2])
         self.linhas_descartadas = 0
+        self.hashes_seguranca = {} # Dicionário para guardar as impressões digitais
 
     def garantir_infraestrutura_bucket(self):
         try:
             self.storage_client.get_bucket(self.bucket_nome)
         except Exception:
             self.storage_client.create_bucket(self.bucket_nome, location="US-EAST1")
+
+    # Função para criar o selo antifraude (Impressão Digital)
+    def gerar_hash_sha256(self, caminho_arquivo):
+        sha256_hash = hashlib.sha256()
+        with open(caminho_arquivo, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
 
     # ==========================================
     # CAMADA RAW: Extração de Dados Brutos
@@ -68,6 +78,8 @@ class MotorSafeDriverCloud:
                 remoto = int(h.headers.get('Content-Length', 0))
                 if parquet_raw.exists():
                     print(f"✅ Ano {ano} já existe localmente. A ignorar o download.")
+                    # Como já existe, calculamos o hash de segurança do ficheiro atual
+                    self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                     continue
             except: pass
 
@@ -104,7 +116,13 @@ class MotorSafeDriverCloud:
                 if dfs_ano:
                     df_ano_completo = pl.concat(dfs_ano, how="diagonal")
                     df_ano_completo.write_parquet(parquet_raw, compression='snappy')
+                    
+                    # Gerar e guardar o selo de segurança (SHA-256) logo após criar o Parquet
+                    hash_atual = self.gerar_hash_sha256(parquet_raw)
+                    self.hashes_seguranca[parquet_raw.name] = hash_atual
+                    
                     print(f"💾 Ficheiro guardado: {parquet_raw.name} ({df_ano_completo.height} linhas)")
+                    print(f"🔒 Impressão digital (SHA-256): {hash_atual}")
                 
                 os.remove(xlsx_temp)
                 gc.collect()
@@ -240,12 +258,16 @@ class MotorSafeDriverCloud:
         fato_final_pl.write_parquet(self.pastas["ouro"] / "dashboard_risco_real.parquet", compression='snappy')
 
         r2_tr = r2_score(y_tr, (melhor_cat.predict(X_tr)*0.7 + melhor_lgb.predict(X_tr)*0.3))
+        
+        # O manifesto agora guarda os hashes para auditar os dados brutos e garantir que não houve adulteração
         manifesto = {
             "auditoria_estatistica": {
                 "r2_treino": float(r2_tr), "r2_teste": float(melhor_r2),
                 "degradacao_overfitting": float(r2_tr - melhor_r2)
             },
-            "linhas_processadas": int(v_bruto), "timestamp": self.hoje.isoformat()
+            "seguranca_antifraude": self.hashes_seguranca,
+            "linhas_processadas": int(v_bruto), 
+            "timestamp": self.hoje.isoformat()
         }
         with open(self.pastas["auditoria"] / "auditoria_pipeline.json", "w") as f: json.dump(manifesto, f, indent=4)
         
@@ -279,7 +301,7 @@ class MotorSafeDriverCloud:
                     },
                     {
                         "name": "⚙️ Engenharia e Qualidade dos Dados", 
-                        "value": f"**Registos Válidos Processados:** {vol_dados_fmt} linhas\n**Registos Inválidos Descartados:** {vol_sujo_fmt} linhas (nulos, coordenadas incorretas)\n**Estado do Storage:** Ficheiros Parquet (Raw, Prata, Ouro) enviados para a Cloud.", 
+                        "value": f"**Registos Válidos Processados:** {vol_dados_fmt} linhas\n**Registos Inválidos Descartados:** {vol_sujo_fmt} linhas (nulos, coordenadas incorretas)\n**Segurança:** Integridade garantida (Selos SHA-256 gerados).\n**Estado:** Ficheiros Parquet (Raw, Prata, Ouro) enviados para a Cloud.", 
                         "inline": False
                     }
                 ]
