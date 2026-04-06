@@ -4,7 +4,6 @@ import requests
 import pandas as pd
 import numpy as np
 import h3
-import shap
 import hashlib
 import gc
 import time
@@ -24,7 +23,6 @@ class MotorAnaliseSafeDriver:
         self.raiz = Path(".")
         self.pastas = {
             "raw": self.raiz / "datalake" / "raw",
-            "bronze": self.raiz / "datalake" / "bronze",
             "ouro": self.raiz / "datalake" / "ouro",
             "auditoria": self.raiz / "datalake" / "auditoria"
         }
@@ -39,167 +37,89 @@ class MotorAnaliseSafeDriver:
         return sha.hexdigest()
 
     def extrair_dados(self):
-        arquivos = list(self.pastas["raw"].glob("*.xlsx")) + list(self.pastas["raw"].glob("*.parquet")) + list(self.pastas["raw"].glob("*.csv"))
-        
+        arquivos = list(self.pastas["raw"].glob("*.parquet")) + list(self.pastas["raw"].glob("*.csv"))
         if not arquivos:
+            # Mock Data Estadual para Testes de CI/CD
             np.random.seed(42)
-            n_samples = 5000
-            datas = pd.date_range(end=self.hoje, periods=n_samples, freq='30min')
-            
-            regioes = ['capital', 'campinas', 'ribeirao', 'santos', 'sjc']
-            probs = [0.5, 0.2, 0.1, 0.1, 0.1]
-            locais = np.random.choice(regioes, n_samples, p=probs)
-            
-            lats = np.zeros(n_samples)
-            lons = np.zeros(n_samples)
-            
-            base_coords = {
-                'capital': (-23.5505, -46.6333),
-                'campinas': (-22.9099, -47.0626),
-                'ribeirao': (-21.1704, -47.8103),
-                'santos': (-23.9618, -46.3322),
-                'sjc': (-23.2237, -45.9009)
-            }
-            
-            for regiao, (lat_base, lon_base) in base_coords.items():
-                mask = locais == regiao
-                lats[mask] = np.random.normal(lat_base, 0.03, mask.sum())
-                lons[mask] = np.random.normal(lon_base, 0.03, mask.sum())
-            
-            is_pagto = np.isin(datas.day, [5, 6, 7, 20, 21])
-            is_noite = (datas.hour < 6) | (datas.hour > 18)
-            is_polo_alto_risco = np.isin(locais, ['capital', 'campinas', 'santos'])
-            
-            score = is_pagto.astype(int) + is_noite.astype(int) + is_polo_alto_risco.astype(int)
-            rubricas = np.where(score >= 2, "ROUBO", "FURTO")
-                
-            return pd.DataFrame({
-                'DATA_OCORRENCIA_BO': datas,
-                'LATITUDE': lats,
-                'LONGITUDE': lons,
-                'RUBRICA': rubricas
-            })
+            n = 5000
+            datas = pd.date_range(end=self.hoje, periods=n, freq='30min')
+            locais = np.random.choice(['capital', 'interior'], n, p=[0.6, 0.4])
+            lats = np.where(locais == 'capital', np.random.normal(-23.55, 0.02, n), np.random.normal(-22.90, 0.05, n))
+            lons = np.where(locais == 'capital', np.random.normal(-46.63, 0.02, n), np.random.normal(-47.06, 0.05, n))
+            is_risco = ((datas.hour > 18) | (datas.hour < 6)) & (np.isin(datas.day, [5,6,7,20,21]))
+            rubricas = np.where(is_risco, "ROUBO", "FURTO")
+            return pd.DataFrame({'DATA_OCORRENCIA_BO': datas, 'LATITUDE': lats, 'LONGITUDE': lons, 'RUBRICA': rubricas})
         
-        pool = []
-        for arq in arquivos:
-            if arq.suffix == '.xlsx':
-                pool.append(pd.read_excel(arq, engine='calamine'))
-            elif arq.suffix == '.parquet':
-                pool.append(pd.read_parquet(arq))
-            elif arq.suffix == '.csv':
-                pool.append(pd.read_csv(arq))
-        return pd.concat(pool, ignore_index=True)
+        return pd.read_parquet(arquivos[0]) if arquivos[0].suffix == '.parquet' else pd.read_csv(arquivos[0])
 
-    def processar_pipeline_comparativo(self, df_raw):
-        tempo_inicio = time.time()
+    def processar(self, df_raw):
+        t_ini = time.time()
+        v_bruto = len(df_raw)
         
-        vol_bruto = len(df_raw)
+        # Limpeza e Tipagem
         df = df_raw.copy()
-        del df_raw
-        gc.collect()
-
         df.columns = [str(c).upper().strip() for c in df.columns]
         df['DATA_DT'] = pd.to_datetime(df['DATA_OCORRENCIA_BO'], errors='coerce')
         df.dropna(subset=['DATA_DT', 'LATITUDE', 'LONGITUDE'], inplace=True)
-        
-        vol_limpo = len(df)
-        linhas_sujas = vol_bruto - vol_limpo
-        taxa_perda = (linhas_sujas / vol_bruto) if vol_bruto > 0 else 0
+        v_limpo = len(df)
 
+        # Feature Engineering (Otimizada para RAM)
         df['LAT'] = pd.to_numeric(df['LATITUDE']).astype(np.float32)
         df['LON'] = pd.to_numeric(df['LONGITUDE']).astype(np.float32)
-        df['H3_INDEX'] = [h3.latlng_to_cell(lat, lon, 8) for lat, lon in zip(df['LAT'], df['LON'])]
-        
-        dias_atraso = (self.hoje - df['DATA_DT']).dt.days
-        df['PESO_RECENCIA'] = np.where(dias_atraso <= 180, 3.0, 1.0).astype(np.float32)
-        df['RISCO_REAL'] = (np.where(df['RUBRICA'].str.contains('ROUBO', na=False), 20, 5) * df['PESO_RECENCIA']).astype(np.float32)
+        df['H3'] = [h3.latlng_to_cell(la, lo, 8) for la, lo in zip(df['LAT'], df['LON'])]
+        df['PESO'] = np.where((self.hoje - df['DATA_DT']).dt.days <= 180, 3.0, 1.0).astype(np.float32)
+        df['RISCO'] = (np.where(df['RUBRICA'].str.contains('ROUBO', na=False), 20, 5) * df['PESO']).astype(np.float32)
         df['TURNO'] = pd.cut(df['DATA_DT'].dt.hour, bins=[-1, 6, 12, 18, 24], labels=[0, 1, 2, 3]).astype(np.int8)
 
-        fato = df.groupby(['H3_INDEX', 'TURNO', 'DATA_DT']).agg({
-            'RISCO_REAL': 'sum', 'LAT': 'mean', 'LON': 'mean'
-        }).reset_index()
+        # Agregação Star Schema
+        fato = df.groupby(['H3', 'TURNO', 'DATA_DT']).agg({'RISCO': 'sum', 'LAT': 'mean', 'LON': 'mean'}).reset_index()
+        fato['IS_PGTO'] = fato['DATA_DT'].dt.day.isin([5,6,7,20,21]).astype(np.int8)
+        fato['DIA_SEM'] = fato['DATA_DT'].dt.dayofweek.astype(np.int8)
         
-        vol_fato = len(fato)
-        taxa_compressao = (1 - (vol_fato / vol_limpo)) if vol_limpo > 0 else 0
-        
-        del df
-        gc.collect()
-
-        fato['IS_PAGAMENTO'] = fato['DATA_DT'].dt.day.isin([5,6,7,20,21]).astype(np.int8)
-        fato['DIA_SEMANA'] = fato['DATA_DT'].dt.dayofweek.astype(np.int8)
-        
-        X = fato[['LAT', 'LON', 'TURNO', 'IS_PAGAMENTO', 'DIA_SEMANA']]
-        y = np.log1p(fato['RISCO_REAL'])
-        
+        # ML Engine
+        X = fato[['LAT', 'LON', 'TURNO', 'IS_PGTO', 'DIA_SEM']]
+        y = np.log1p(fato['RISCO'])
         X_s = StandardScaler().fit_transform(X)
-        X_train, X_test, y_train, y_test = train_test_split(X_s, y, test_size=0.2, random_state=42)
+        X_tr, X_te, y_tr, y_te = train_test_split(X_s, y, test_size=0.2, random_state=42)
 
-        cat = CatBoostRegressor(iterations=800, depth=8, learning_rate=0.05, silent=True).fit(X_train, y_train)
-        lgbm = LGBMRegressor(n_estimators=800, max_depth=10, learning_rate=0.05, verbose=-1).fit(X_train, y_train)
-
-        preds_teste = (cat.predict(X_test) * 0.6) + (lgbm.predict(X_test) * 0.4)
-        r2 = r2_score(y_test, preds_teste)
-        mae = mean_absolute_error(np.expm1(y_test), np.expm1(preds_teste))
-
-        fato['RISCO_PREDITO'] = np.round(np.expm1((cat.predict(X_s) * 0.6) + (lgbm.predict(X_s) * 0.4)), 2).astype(np.float32)
-        fato['DESVIO_ABS'] = np.abs(fato['RISCO_REAL'] - fato['RISCO_PREDITO']).astype(np.float32)
+        model = CatBoostRegressor(iterations=600, depth=8, learning_rate=0.05, silent=True).fit(X_tr, y_tr)
+        preds = model.predict(X_te)
         
-        margem_tolerancia = 5.0
-        qtd_acertos = (fato['DESVIO_ABS'] <= margem_tolerancia).sum()
-        taxa_assertividade = qtd_acertos / len(fato)
-
-        fato.to_parquet(self.pastas["ouro"] / "fato_risco_comparativo.parquet", index=False)
+        r2 = r2_score(y_te, preds)
+        mae = mean_absolute_error(np.expm1(y_te), np.expm1(preds))
         
-        cols_comparativo = ['H3_INDEX', 'DATA_DT', 'TURNO', 'RISCO_REAL', 'RISCO_PREDITO', 'DESVIO_ABS']
-        caminho_csv = self.pastas["ouro"] / "dashboard_comparativo_real_ia.csv"
-        fato[cols_comparativo].to_csv(caminho_csv, index=False)
+        fato['PRED'] = np.round(np.expm1(model.predict(X_s)), 2).astype(np.float32)
+        fato['ERRO'] = np.abs(fato['RISCO'] - fato['PRED']).astype(np.float32)
+        assertividade = (fato['ERRO'] <= 5.0).sum() / len(fato)
 
+        # Exportação e Auditoria
+        caminho_csv = self.pastas["ouro"] / "dashboard_risco_real.csv"
+        fato.to_parquet(self.pastas["ouro"] / "fato_risco_real.parquet", index=False)
+        fato[['H3', 'DATA_DT', 'TURNO', 'RISCO', 'PRED', 'ERRO']].to_csv(caminho_csv, index=False)
+        
         selo = self._gerar_assinatura(caminho_csv)
-        
         with open(self.pastas["auditoria"] / "controle_integridade.json", "w") as f:
-            json.dump({"r2": float(r2), "sha256": selo, "timestamp": self.hoje.isoformat()}, f, indent=4)
+            json.dump({"r2": float(r2), "sha256": selo, "ts": self.hoje.isoformat()}, f)
 
-        tempo_total = time.time() - tempo_inicio
+        self._enviar_discord(taxa=assertividade, r2=r2, mae=mae, bruto=v_bruto, limpo=v_limpo, fato=len(fato), tempo=time.time()-t_ini, selo=selo)
 
-        if self.webhook:
-            importancias = cat.get_feature_importance()
-            top_idx = np.argsort(importancias)[-3:][::-1]
-            top_features = [X.columns[i] for i in top_idx]
-
-            payload = {
-                "embeds": [
-                    {
-                        "title": "📊 Relatório Executivo: IA Preditiva",
-                        "color": 3066993 if taxa_assertividade > 0.70 else 15105570,
-                        "fields": [
-                            {"name": "🎯 Assertividade", "value": f"**{taxa_assertividade:.1%}**", "inline": True},
-                            {"name": "📉 Erro (MAE)", "value": f"± {mae:.2f} pts", "inline": True},
-                            {"name": "🔬 Sinal (R²)", "value": f"{r2:.2%}", "inline": True},
-                            {"name": "🧠 Variáveis Críticas (Top 3)", "value": f"1. `{top_features[0]}`\n2. `{top_features[1]}`\n3. `{top_features[2]}`", "inline": False}
-                        ]
-                    },
-                    {
-                        "title": "⚙️ Relatório Operacional: Engenharia de Dados",
-                        "color": 8359053,
-                        "fields": [
-                            {"name": "📥 Ingestão Bruta", "value": f"{vol_bruto:,.0f} linhas", "inline": True},
-                            {"name": "🗑️ Descartes (Erros)", "value": f"{linhas_sujas:,.0f} ({taxa_perda:.1%})", "inline": True},
-                            {"name": "✨ Base Útil", "value": f"{vol_limpo:,.0f} linhas", "inline": True},
-                            {"name": "📦 Compressão Ouro", "value": f"Redução de {taxa_compressao:.1%} (Restam {vol_fato:,.0f})", "inline": False},
-                            {"name": "⏱️ Tempo Total", "value": f"{tempo_total:.2f} segundos", "inline": True},
-                            {"name": "🔐 SHA-256", "value": f"`{selo[:10]}...`", "inline": True}
-                        ],
-                        "footer": {"text": f"Pipeline auditado em {self.hoje.strftime('%d/%m/%Y %H:%M')}"}
-                    }
-                ]
-            }
-            requests.post(self.webhook, json=payload)
-
-        return r2
-
-    def executar(self):
-        df_raw = self.extrair_dados()
-        self.processar_pipeline_comparativo(df_raw)
+    def _enviar_discord(self, **k):
+        if not self.webhook: return
+        p = { "embeds": [
+            { "title": "🎯 SafeDriver: Relatório Executivo (IA)", "color": 3066993, "fields": [
+                {"name": "Assertividade", "value": f"**{k['taxa']:.1%}**", "inline": True},
+                {"name": "Confiança (R²)", "value": f"{k['r2']:.2%}", "inline": True},
+                {"name": "Erro Médio", "value": f"± {k['mae']:.2f} pts", "inline": True}
+            ]},
+            { "title": "⚙️ SafeDriver: Relatório Operacional (Engenharia)", "color": 8359053, "fields": [
+                {"name": "Ingestão", "value": f"{k['bruto']:,} linhas", "inline": True},
+                {"name": "Processamento", "value": f"{k['fato']:,} registros", "inline": True},
+                {"name": "Tempo", "value": f"{k['tempo']:.2f}s", "inline": True},
+                {"name": "Selo SHA-256", "value": f"`{k['selo'][:12]}`", "inline": False}
+            ]}
+        ]}
+        requests.post(self.webhook, json=p)
 
 if __name__ == "__main__":
-    MotorAnaliseSafeDriver().executar()
+    motor = MotorAnaliseSafeDriver()
+    motor.processar(motor.extrair_dados())
