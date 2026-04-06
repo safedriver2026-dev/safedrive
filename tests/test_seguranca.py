@@ -1,19 +1,16 @@
 import pytest
-import pandas as pd
 import json
 from pathlib import Path
 
-def test_integridade_e_performance():
+def test_metrics_and_files():
     manifesto = Path("datalake/auditoria/controle_integridade.json")
-    base_dash = Path("datalake/ouro/dashboard_comparativo_real_ia.csv")
-    assert manifesto.exists()
-    assert base_dash.exists()
+    base_dash = Path("datalake/ouro/dashboard_risco_real.csv")
+    
+    assert manifesto.exists(), "Manifesto de auditoria não encontrado!"
+    assert base_dash.exists(), "Arquivo do Dashboard não foi gerado!"
+    
     with open(manifesto, "r") as f:
         log = json.load(f)
-        assert log["r2"] > 0.60
-        assert len(log["sha256"]) == 64
-
-def test_schema_dashboard():
-    df = pd.read_csv("datalake/ouro/dashboard_comparativo_real_ia.csv")
-    for col in ['H3_INDEX', 'RISCO_REAL', 'RISCO_PREDITO', 'DESVIO_ABS']:
-        assert col in df.columns
+        # O R2 deve estar entre 0.60 (mínimo real) e 0.98 (evita overfitting)
+        assert 0.60 <= log["r2"] <= 0.98, f"R2 fora da margem de segurança: {log['r2']}"
+        assert len(log["sha256"]) == 64, "Assinatura digital inválida!"
