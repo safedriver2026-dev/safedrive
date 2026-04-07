@@ -13,6 +13,8 @@ import h3
 import gc
 import holidays
 import warnings
+import re
+import unicodedata
 from pathlib import Path
 from datetime import datetime
 from google.cloud import storage
@@ -21,7 +23,7 @@ from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.metrics import r2_score
 
-print("[INICIALIZACAO] Motor Autônomo SafeDriver ativado. Carregando módulos de análise espacial e temporal...", flush=True)
+print("[INICIALIZACAO] Motor Autônomo SafeDriver ativado. Carregando módulos semânticos e preditivos...", flush=True)
 warnings.filterwarnings("ignore")
 
 class MotorSafeDriverCloud:
@@ -63,9 +65,7 @@ class MotorSafeDriverCloud:
         )
 
     def criar_sessao_cacada(self):
-        """Cria uma sessão agressiva que força o download se o servidor recusar."""
         sessao = requests.Session()
-        # Se falhar, espera 2s, depois 4s, depois 8s, até 5 vezes.
         estrategia_retry = Retry(
             total=5,
             backoff_factor=2,
@@ -76,7 +76,6 @@ class MotorSafeDriverCloud:
         sessao.mount("https://", adaptador)
         sessao.mount("http://", adaptador)
         
-        # Disfarce absoluto de navegador baixando Excel
         sessao.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel, text/html, */*',
@@ -85,20 +84,53 @@ class MotorSafeDriverCloud:
         })
         return sessao
 
+    def normalizador_semantico(self, df, ano):
+        df = df.rename({c: str(c).upper().strip() for c in df.columns})
+        
+        def achatar_texto(texto):
+            t_sem_acento = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+            return re.sub(r'[^A-Z0-9]', '', t_sem_acento)
+
+        dicionario_sinonimos = {
+            'NUMEROBOLETIM': 'NUM_BO', 'NUMERODOBOLETIM': 'NUM_BO', 'NUMEROBO': 'NUM_BO', 
+            'NUMERODOBO': 'NUM_BO', 'BOLETIM': 'NUM_BO', 'BO': 'NUM_BO', 'NBO': 'NUM_BO', 'NBOLETIM': 'NUM_BO',
+            'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATADOFATO': 'DATA_OCORRENCIA_BO', 
+            'DATADAOCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATADEOCORRENCIA': 'DATA_OCORRENCIA_BO', 
+            'DATAREGCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATA': 'DATA_OCORRENCIA_BO',
+            'NATUREZA': 'RUBRICA', 'NATUREZAJURIDICA': 'RUBRICA', 'CRIME': 'RUBRICA', 'DELITO': 'RUBRICA',
+            'DESCRICAOLOCAL': 'DESCR_TIPOLOCAL', 'TIPOLOCAL': 'DESCR_TIPOLOCAL', 
+            'LOCALFATO': 'DESCR_TIPOLOCAL', 'AMBIENTE': 'DESCR_TIPOLOCAL',
+            'LAT': 'LATITUDE', 'LONG': 'LONGITUDE', 'LON': 'LONGITUDE', 
+            'LONGITUD': 'LONGITUDE', 'COORDX': 'LONGITUDE', 'COORDY': 'LATITUDE'
+        }
+
+        mapa_renomeacao = {}
+        colunas_atuais = df.columns
+        
+        for col_original in colunas_atuais:
+            col_achatada = achatar_texto(col_original)
+            if col_achatada in dicionario_sinonimos:
+                alvo = dicionario_sinonimos[col_achatada]
+                if alvo not in colunas_atuais and alvo not in mapa_renomeacao.values():
+                    mapa_renomeacao[col_original] = alvo
+
+        if mapa_renomeacao:
+            df = df.rename(mapa_renomeacao)
+
+        if "NUM_BO" not in df.columns:
+            print(f"[AVISO_ESQUEMA] Identificador NUM_BO não localizado para o ano {ano}. Gerando chaves primárias sintéticas.", flush=True)
+            df = df.with_columns([
+                pl.format("VIRTUAL_BO_{}_{}", pl.lit(ano), pl.int_range(0, pl.len())).alias("NUM_BO")
+            ])
+            
+        return df
+
     def executar_extracao_dados(self):
         print("[COLETOR_DADOS] Iniciando protocolo de Caçada Contínua (Sincronização Resiliente).", flush=True)
         ano_atual = self.hoje.year
         anos_foco = [ano_atual - 2, ano_atual - 1, ano_atual]
         
         sessao = self.criar_sessao_cacada()
-        
-        mapeamento = {
-            'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO', 
-            'DATA DO FATO': 'DATA_OCORRENCIA_BO', 
-            'NATUREZA': 'RUBRICA',
-            'DESCRICAO LOCAL': 'DESCR_TIPOLOCAL'
-        }
-
         arquivos_baixados_com_sucesso = 0
 
         for ano in anos_foco:
@@ -123,9 +155,8 @@ class MotorSafeDriverCloud:
                     import fastexcel
                     excel = fastexcel.read_excel(str(temp_xlsx))
                     df_novo = pl.read_excel(str(temp_xlsx), sheet_name=excel.sheet_names[0], engine="calamine")
-                    df_novo = df_novo.rename({c: str(c).upper().strip() for c in df_novo.columns})
-                    for v, n in mapeamento.items():
-                        if v in df_novo.columns: df_novo = df_novo.rename({v: n})
+                    
+                    df_novo = self.normalizador_semantico(df_novo, ano)
                     
                     df_novo = df_novo.with_columns(pl.all().cast(pl.String))
                     if arquivo_bruto.exists():
@@ -139,14 +170,14 @@ class MotorSafeDriverCloud:
                     os.remove(temp_xlsx)
                     gc.collect()
                     arquivos_baixados_com_sucesso += 1
-                    print(f"[COLETOR_DADOS] Ingestão do ano {ano} concluída e blindada.", flush=True)
+                    print(f"[COLETOR_DADOS] Ingestão do ano {ano} concluída e mapeada com sucesso.", flush=True)
                 else:
                     print(f"[ALERTA_REDE] O servidor SSP recusou todas as tentativas para o ano {ano} (HTTP {r.status_code}).", flush=True)
             except Exception as e:
                 print(f"[ALERTA_REDE] Esgotamento de tentativas para o ano {ano}: {str(e)}", flush=True)
 
         if arquivos_baixados_com_sucesso == 0 and not list(self.pastas["bruto"].glob("*.parquet")):
-            raise RuntimeError("[ERRO_FATAL] O Protocolo de Caçada esgotou todas as tentativas e o repositório permanece vazio. O servidor governamental está inacessível. Sistema abortando para prevenir anomalias preditivas.")
+            raise RuntimeError("[ERRO_FATAL] O Protocolo de Caçada esgotou todas as tentativas e o repositório permanece vazio. O servidor governamental está inacessível. Sistema abortando.")
 
     def executar_limpeza_dados(self):
         print("[REFINADOR_DADOS] Executando rotinas de higienização, isolamento geoespacial e rastreio volumétrico.", flush=True)
@@ -175,6 +206,12 @@ class MotorSafeDriverCloud:
 
         self.registros_validados = df_processado.height
         self.registros_descartados = self.registros_brutos - self.registros_validados
+
+        # PROTOCOLO DE PRIVACIDADE E ANOMINIZAÇÃO DE DADOS (LGPD)
+        print("[PROTOCOLO_PRIVACIDADE] Anonimizando identificadores públicos. Destruindo NUM_BO e gerando chaves sintéticas.", flush=True)
+        df_processado = df_processado.with_columns(
+            pl.format("SEC_KEY_{}", pl.col("NUM_BO").hash(42)).alias("ID_ANONIMO")
+        ).drop("NUM_BO")
 
         coords = df_processado.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
@@ -237,11 +274,11 @@ class MotorSafeDriverCloud:
 
 ## 3. Relatório Operacional Algorítmico
 * **Tempo Total de Execução:** {tempo_decorrido} segundos
+* **Conformidade de Privacidade (LGPD):** ATIVA (Identificadores BO permanentemente destruídos e mascarados).
 * **Variáveis Temporais Injetadas:** Mês Sazonal, Fim de Semana (Flag), Feriados Nacionais/Estaduais (SP).
 * **Ciclo Econômico:** Mapeamento de janela de liquidez (Dias de Pagamento).
-* **Variável Espacial de Contexto:** Volume de Ocorrências em Via Pública.
+* **Mecanismo de Reconhecimento:** Analisador Semântico de Esquema Ativo.
 * **Mecanismo de Fusão Preditiva:** Ativo (CatBoost Regressor 70% + LightGBM Regressor 30%)
-* **Suavização Espacial de Vizinhança:** Algoritmo H3 `grid_disk` ativado.
 
 ---
 
@@ -307,7 +344,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "6.0.2-autonomo-cacador"
+            "versao_sistema": "6.2.0-privacidade-lgpd"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
