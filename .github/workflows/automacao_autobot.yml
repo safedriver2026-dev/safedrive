@@ -1,5 +1,4 @@
 name: SafeDriver Execução Diaria
-
 on:
   schedule:
     - cron: '0 3 * * *'
@@ -21,7 +20,7 @@ jobs:
       - name: Instalar Dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install polars pandas numpy h3 fastexcel python-calamine openpyxl requests holidays scikit-learn catboost lightgbm google-cloud-storage pytest
+          pip install polars pandas numpy h3 fastexcel python-calamine openpyxl requests holidays scikit-learn catboost lightgbm google-cloud-storage pytest pyarrow
 
       - name: Autenticar no Google Cloud
         uses: google-github-actions/auth@v2
