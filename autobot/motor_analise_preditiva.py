@@ -2,6 +2,8 @@ import sys
 import os
 import json
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import traceback
 import hashlib
 import polars as pl
@@ -9,6 +11,7 @@ import pandas as pd
 import numpy as np
 import h3
 import gc
+import holidays
 import warnings
 from pathlib import Path
 from datetime import datetime
@@ -18,7 +21,7 @@ from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.metrics import r2_score
 
-print("[INICIALIZACAO] Motor Autônomo SafeDriver ativado. Carregando módulos de análise...", flush=True)
+print("[INICIALIZACAO] Motor Autônomo SafeDriver ativado. Carregando módulos de análise espacial e temporal...", flush=True)
 warnings.filterwarnings("ignore")
 
 class MotorSafeDriverCloud:
@@ -36,12 +39,15 @@ class MotorSafeDriverCloud:
         self.hoje = datetime.now()
         self.storage_client = storage.Client(project="sandbox-suprimentos")
         
-        # Variáveis de Estado e Telemetria
         self.assinaturas_seguranca = {}
         self.anomalias_detectadas = 0
         self.registros_brutos = 0
         self.registros_validados = 0
         self.registros_descartados = 0
+
+        ano_atual = self.hoje.year
+        calendario_feriados = holidays.Brazil(subdiv='SP', years=[ano_atual - 2, ano_atual - 1, ano_atual])
+        self.datas_feriados = list(calendario_feriados.keys())
 
     def gerar_assinatura_criptografica(self, caminho):
         sha256_hash = hashlib.sha256()
@@ -56,12 +62,44 @@ class MotorSafeDriverCloud:
             (pl.col("LON").between(-53.5, -44.0))
         )
 
+    def criar_sessao_cacada(self):
+        """Cria uma sessão agressiva que força o download se o servidor recusar."""
+        sessao = requests.Session()
+        # Se falhar, espera 2s, depois 4s, depois 8s, até 5 vezes.
+        estrategia_retry = Retry(
+            total=5,
+            backoff_factor=2,
+            status_forcelist=[403, 404, 429, 500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        adaptador = HTTPAdapter(max_retries=estrategia_retry)
+        sessao.mount("https://", adaptador)
+        sessao.mount("http://", adaptador)
+        
+        # Disfarce absoluto de navegador baixando Excel
+        sessao.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel, text/html, */*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive'
+        })
+        return sessao
+
     def executar_extracao_dados(self):
-        print("[COLETOR_DADOS] Iniciando protocolo de sincronização incremental e verificação criptográfica.", flush=True)
+        print("[COLETOR_DADOS] Iniciando protocolo de Caçada Contínua (Sincronização Resiliente).", flush=True)
         ano_atual = self.hoje.year
         anos_foco = [ano_atual - 2, ano_atual - 1, ano_atual]
-        cabecalho = {'User-Agent': 'Mozilla/5.0'}
-        mapeamento = {'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATA DO FATO': 'DATA_OCORRENCIA_BO', 'NATUREZA': 'RUBRICA'}
+        
+        sessao = self.criar_sessao_cacada()
+        
+        mapeamento = {
+            'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO', 
+            'DATA DO FATO': 'DATA_OCORRENCIA_BO', 
+            'NATUREZA': 'RUBRICA',
+            'DESCRICAO LOCAL': 'DESCR_TIPOLOCAL'
+        }
+
+        arquivos_baixados_com_sucesso = 0
 
         for ano in anos_foco:
             arquivo_bruto = self.pastas["bruto"] / f"ssp_{ano}.parquet"
@@ -69,10 +107,14 @@ class MotorSafeDriverCloud:
             
             if arquivo_bruto.exists() and ano < ano_atual:
                 self.assinaturas_seguranca[f"ssp_{ano}"] = self.gerar_assinatura_criptografica(arquivo_bruto)
+                print(f"[COLETOR_DADOS] Arquivo do ano {ano} validado em cache local.", flush=True)
+                arquivos_baixados_com_sucesso += 1
                 continue
 
             try:
-                r = requests.get(url, stream=True, verify=False, timeout=60, headers=cabecalho)
+                print(f"[COLETOR_DADOS] Forçando extração do servidor SSP para o ano {ano}...", flush=True)
+                r = sessao.get(url, stream=True, verify=False, timeout=120)
+                
                 if r.status_code == 200:
                     temp_xlsx = self.pastas["bruto"] / "temp.xlsx"
                     with open(temp_xlsx, 'wb') as f:
@@ -96,21 +138,33 @@ class MotorSafeDriverCloud:
                     self.assinaturas_seguranca[f"ssp_{ano}"] = self.gerar_assinatura_criptografica(arquivo_bruto)
                     os.remove(temp_xlsx)
                     gc.collect()
-            except: pass
+                    arquivos_baixados_com_sucesso += 1
+                    print(f"[COLETOR_DADOS] Ingestão do ano {ano} concluída e blindada.", flush=True)
+                else:
+                    print(f"[ALERTA_REDE] O servidor SSP recusou todas as tentativas para o ano {ano} (HTTP {r.status_code}).", flush=True)
+            except Exception as e:
+                print(f"[ALERTA_REDE] Esgotamento de tentativas para o ano {ano}: {str(e)}", flush=True)
+
+        if arquivos_baixados_com_sucesso == 0 and not list(self.pastas["bruto"].glob("*.parquet")):
+            raise RuntimeError("[ERRO_FATAL] O Protocolo de Caçada esgotou todas as tentativas e o repositório permanece vazio. O servidor governamental está inacessível. Sistema abortando para prevenir anomalias preditivas.")
 
     def executar_limpeza_dados(self):
         print("[REFINADOR_DADOS] Executando rotinas de higienização, isolamento geoespacial e rastreio volumétrico.", flush=True)
         arquivos = list(self.pastas["bruto"].glob("*.parquet"))
+        
         lf = pl.scan_parquet([str(f) for f in arquivos])
         
-        # Rastreio volumétrico da Camada Bruta (Lazy evaluation para não consumir RAM)
         self.registros_brutos = lf.select(pl.len()).collect().item()
         
+        if "DESCR_TIPOLOCAL" not in lf.columns:
+            lf = lf.with_columns(pl.lit("NAO_INFORMADO").alias("DESCR_TIPOLOCAL"))
+
         df_processado = (
             lf.with_columns([
                 pl.col("DATA_OCORRENCIA_BO").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DATA_DT"),
                 pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float32, strict=False).alias("LAT"),
                 pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float32, strict=False).alias("LON"),
+                pl.col("DESCR_TIPOLOCAL").fill_null("OUTROS")
             ])
             .filter(pl.col("LAT").is_not_null() & pl.col("DATA_DT").is_not_null())
             .unique(subset=["NUM_BO"]) 
@@ -119,7 +173,6 @@ class MotorSafeDriverCloud:
 
         df_processado = self.validar_perimetro_geografico(df_processado)
 
-        # Computa a perda no funil de dados
         self.registros_validados = df_processado.height
         self.registros_descartados = self.registros_brutos - self.registros_validados
 
@@ -130,7 +183,18 @@ class MotorSafeDriverCloud:
         df_final.write_parquet(self.pastas["processado"] / "camada_prata.parquet")
         return df_final
 
-    def aplicar_suavizacao_vizinhança(self, df_fato):
+    def identificar_ciclo_pagamento(self, df):
+        return df.with_columns(
+            pl.when(
+                (pl.col("DATA_DT").dt.day().between(28, 31)) | 
+                (pl.col("DATA_DT").dt.day().between(1, 7))
+            )
+            .then(1)
+            .otherwise(0)
+            .alias("FLG_DIA_PAGAMENTO")
+        )
+
+    def aplicar_suavizacao_vizinhanca(self, df_fato):
         mapa_inc = dict(zip(df_fato['H3'], df_fato['INCIDENTES']))
         suavizado = []
         for h, inc in zip(df_fato['H3'], df_fato['INCIDENTES']):
@@ -171,11 +235,13 @@ class MotorSafeDriverCloud:
 
 ---
 
-## 3. Relatório Operacional
+## 3. Relatório Operacional Algorítmico
 * **Tempo Total de Execução:** {tempo_decorrido} segundos
-* **Validação de Perímetro Geoespacial:** Coordenadas restritas ao Estado de São Paulo confirmadas.
+* **Variáveis Temporais Injetadas:** Mês Sazonal, Fim de Semana (Flag), Feriados Nacionais/Estaduais (SP).
+* **Ciclo Econômico:** Mapeamento de janela de liquidez (Dias de Pagamento).
+* **Variável Espacial de Contexto:** Volume de Ocorrências em Via Pública.
 * **Mecanismo de Fusão Preditiva:** Ativo (CatBoost Regressor 70% + LightGBM Regressor 30%)
-* **Suavização Espacial de Vizinhança:** Algoritmo H3 `grid_disk` ativado (Raio K=1, Decaimento=0.4).
+* **Suavização Espacial de Vizinhança:** Algoritmo H3 `grid_disk` ativado.
 
 ---
 
@@ -192,23 +258,38 @@ class MotorSafeDriverCloud:
         return relatorio
 
     def executar_predicao_inteligente(self, df):
-        print("[NUCLEO_PREDITIVO] Calibrando rede preditiva e gerando métricas de auditoria.", flush=True)
+        print("[NUCLEO_PREDITIVO] Extraindo tensores temporais, ciclo de pagamento e calibrando rede preditiva...", flush=True)
         col_crime = 'NATUREZA_APURADA' if 'NATUREZA_APURADA' in df.columns else 'RUBRICA'
         
+        df_engenharia = df.with_columns([
+            pl.col(col_crime).str.contains("ROUBO").alias("IS_ROUBO"),
+            pl.col("DATA_DT").dt.month().alias("MES"),
+            pl.col("DATA_DT").dt.weekday().alias("DIA_SEMANA"),
+            pl.col("DATA_DT").dt.hour().alias("HORA"),
+            pl.col("DATA_DT").dt.date().alias("DATA_CURTA"),
+            pl.col("DESCR_TIPOLOCAL").str.to_uppercase().str.contains("VIA PÚBLICA").cast(pl.Int8).alias("IS_VIA_PUBLICA")
+        ]).with_columns([
+            pl.col("DIA_SEMANA").is_in([6, 7]).cast(pl.Int8).alias("IS_FIM_SEMANA"),
+            pl.col("DATA_CURTA").is_in(self.datas_feriados).cast(pl.Int8).alias("IS_FERIADO")
+        ])
+
+        df_engenharia = self.identificar_ciclo_pagamento(df_engenharia)
+
         fato = (
-            df.with_columns([
-                pl.col(col_crime).str.contains("ROUBO").alias("IS_ROUBO"),
-                pl.col("DATA_DT").dt.hour().alias("HORA"),
-                pl.col("DATA_DT").dt.weekday().alias("DIA_SEMANA")
+            df_engenharia.group_by(["H3", "MES", "DIA_SEMANA", "HORA", "IS_FIM_SEMANA", "IS_FERIADO", "FLG_DIA_PAGAMENTO"])
+            .agg([
+                pl.col("LAT").mean().alias("LAT"), 
+                pl.col("LON").mean().alias("LON"), 
+                pl.len().alias("INCIDENTES"),
+                pl.col("IS_VIA_PUBLICA").sum().alias("QTD_VIA_PUBLICA")
             ])
-            .group_by(["H3", "HORA", "DIA_SEMANA"])
-            .agg([pl.col("LAT").mean().alias("LAT"), pl.col("LON").mean().alias("LON"), pl.len().alias("INCIDENTES")])
         )
 
         self.detectar_anomalias_estatisticas(fato)
-        fato = self.aplicar_suavizacao_vizinhança(fato)
+        fato = self.aplicar_suavizacao_vizinhanca(fato)
 
-        X_df = fato.select(['LAT', 'LON', 'HORA', 'DIA_SEMANA', 'RISCO_GEO']).to_pandas()
+        colunas_modelo = ['LAT', 'LON', 'MES', 'HORA', 'IS_FIM_SEMANA', 'IS_FERIADO', 'FLG_DIA_PAGAMENTO', 'QTD_VIA_PUBLICA', 'RISCO_GEO']
+        X_df = fato.select(colunas_modelo).to_pandas()
         X = StandardScaler().fit_transform(X_df)
         y = np.log1p(fato.select("INCIDENTES").to_numpy().ravel())
         
@@ -226,7 +307,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "5.0.1-autonomo-funil"
+            "versao_sistema": "6.0.2-autonomo-cacador"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
@@ -237,7 +318,7 @@ class MotorSafeDriverCloud:
         fato = fato.with_columns([pl.Series("PREVISAO_FINAL", resultados)])
         fato.write_parquet(self.pastas["refinado"] / "dashboard_final.parquet")
         
-        print("[SINCRONIZACAO_REMOTA] Transmitindo pacotes processados e relatórios para o repositório de armazenamento.", flush=True)
+        print("[SINCRONIZACAO_REMOTA] Transmitindo pacotes processados e relatórios para armazenamento.", flush=True)
         balde_nuvem = self.storage_client.bucket(self.bucket_nome)
         for f in self.raiz.rglob("datalake/*/*"):
             if f.is_file():
