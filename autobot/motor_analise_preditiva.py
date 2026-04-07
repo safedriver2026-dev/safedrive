@@ -41,7 +41,7 @@ class MotorSafeDriverCloud:
         self.storage_client = storage.Client()
         self.feriados_br = holidays.Brazil(years=[self.hoje.year, self.hoje.year-1, self.hoje.year-2])
         self.linhas_descartadas = 0
-        self.hashes_seguranca = {} 
+        self.hashes_seguranca = dict() 
 
     def garantir_infraestrutura_bucket(self):
         try:
@@ -68,22 +68,21 @@ class MotorSafeDriverCloud:
 
         print("🟤 [Camada Raw] Iniciando extração dos dados...")
         for ano in range(ano_inicio, ano_atual + 1):
-            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-            xlsx_temp = self.pastas["raw"] / f"temp_{ano}.xlsx"
-            parquet_raw = self.pastas["raw"] / f"ssp_bruto_{ano}.parquet"
+            url = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_" + str(ano) + ".xlsx"
+            xlsx_temp = self.pastas["raw"] / ("temp_" + str(ano) + ".xlsx")
+            parquet_raw = self.pastas["raw"] / ("ssp_bruto_" + str(ano) + ".parquet")
             
             try:
                 h = requests.head(url, verify=False, timeout=15)
-                remoto = int(h.headers.get('Content-Length', 0))
                 if parquet_raw.exists():
-                    print(f"✅ Ano {ano} já está no cache.")
+                    print("✅ Ano " + str(ano) + " já está no cache.")
                     self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                     continue
             except: pass
 
             for t in range(3):
                 try:
-                    print(f"📥 Baixando {ano} (Tentativa {t+1})...")
+                    print("📥 Baixando " + str(ano) + " (Tentativa " + str(t+1) + ")...")
                     r = requests.get(url, stream=True, verify=False, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(60, 1800))
                     if r.status_code == 200:
                         with open(xlsx_temp, 'wb') as f:
@@ -103,7 +102,12 @@ class MotorSafeDriverCloud:
                 dfs_ano = []
                 for aba in abas_validas:
                     df_aba = pl.read_excel(str(xlsx_temp), sheet_name=aba, engine="calamine")
-                    df_aba = df_aba.rename({c: str(c).upper().strip() for c in df_aba.columns})
+                    
+                    novas_colunas = dict()
+                    for c in df_aba.columns:
+                        novas_colunas[c] = str(c).upper().strip()
+                    df_aba = df_aba.rename(novas_colunas)
+                    
                     for velho, novo in mapeamento.items():
                         if velho in df_aba.columns:
                             df_aba = df_aba.rename({velho: novo})
@@ -118,12 +122,12 @@ class MotorSafeDriverCloud:
                     hash_atual = self.gerar_hash_sha256(parquet_raw)
                     self.hashes_seguranca[parquet_raw.name] = hash_atual
                     
-                    print(f"💾 Salvo: {parquet_raw.name} | 🔒 SHA-256: {hash_atual[:10]}...")
+                    print("💾 Salvo: " + parquet_raw.name + " | 🔒 SHA-256: " + hash_atual[:10] + "...")
                 
                 os.remove(xlsx_temp)
                 gc.collect()
             except Exception as e:
-                print(f"❌ Erro no ano {ano}: {e}")
+                print("❌ Erro no ano " + str(ano) + ": " + str(e))
 
     # ==========================================
     # CAMADA PRATA: Limpeza e União dos Anos
@@ -242,11 +246,12 @@ class MotorSafeDriverCloud:
 
         r2_tr = r2_score(y_tr, (melhor_cat.predict(X_tr)*0.7 + melhor_lgb.predict(X_tr)*0.3))
         
-        manifesto = {
-            "auditoria_estatistica": {"r2_treino": float(r2_tr), "r2_teste": float(melhor_r2), "degradacao_overfitting": float(r2_tr - melhor_r2)},
-            "seguranca_antifraude": self.hashes_seguranca,
-            "linhas_processadas": int(v_bruto), "timestamp": self.hoje.isoformat()
-        }
+        manifesto = dict(
+            auditoria_estatistica=dict(r2_treino=float(r2_tr), r2_teste=float(melhor_r2), degradacao_overfitting=float(r2_tr - melhor_r2)),
+            seguranca_antifraude=self.hashes_seguranca,
+            linhas_processadas=int(v_bruto),
+            timestamp=self.hoje.isoformat()
+        )
         with open(self.pastas["auditoria"] / "auditoria_pipeline.json", "w") as f: json.dump(manifesto, f, indent=4)
         
         self.garantir_infraestrutura_bucket()
@@ -260,15 +265,13 @@ class MotorSafeDriverCloud:
 
     def _notificar_sucesso(self, r2_te, driver, vol_dados, vol_sujo, roubos, furtos):
         if not self.webhook_sucesso: return
-        payload = {
-            "embeds": [{
-                "title": "📊 Relatório Diário - SafeDriver", "color": 3066993,
-                "fields": [
-                    {"name": "👔 Indicadores", "value": f"**R²:** {r2_te:.2%}\n**Peso:** {driver}\n**Perfil:** {roubos:,} Roubos | {furtos:,} Furtos", "inline": False},
-                    {"name": "⚙️ Manutenção", "value": f"**Válidos:** {vol_dados:,}\n**Limpados:** {vol_sujo:,}\n**SHA-256:** OK", "inline": False}
-                ]
-            }]
-        }
+        
+        campo_negocio = dict(name="👔 Indicadores", value="**R²:** " + str(round(r2_te * 100, 2)) + "%\n**Peso:** " + driver + "\n**Perfil:** " + str(roubos) + " Roubos | " + str(furtos) + " Furtos", inline=False)
+        campo_engenharia = dict(name="⚙️ Manutenção", value="**Válidos:** " + str(vol_dados) + "\n**Limpados:** " + str(vol_sujo) + "\n**SHA-256:** OK", inline=False)
+        
+        embed = dict(title="📊 Relatório Diário - SafeDriver", color=3066993, fields=[campo_negocio, campo_engenharia])
+        payload = dict(embeds=[embed])
+        
         requests.post(self.webhook_sucesso, json=payload)
 
 if __name__ == "__main__":
@@ -279,10 +282,10 @@ if __name__ == "__main__":
         motor.processar_camada_ouro_e_ml(df_prata)
     except Exception:
         err = traceback.format_exc()
-        print(f"\n❌ ERRO:\n{err}")
+        print("\n❌ ERRO:\n" + err)
         sys.stdout.flush()
         
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-            msg = {"content": f"❌ **Falha no motor:**\n
+            texto_erro = "❌ **Falha no motor:**\n
 http://googleusercontent.com/immersive_entry_chip/0
