@@ -44,23 +44,26 @@ class MotorSafeDriverCloud:
         self.feriados_br = holidays.Brazil(years=[self.hoje.year, self.hoje.year-1, self.hoje.year-2])
         self.hashes_seguranca = dict() 
 
-    def gerar_hash_sha256(self, caminho_ficheiro):
+    def gerar_hash_sha256(self, caminho_arquivo):
         sha256_hash = hashlib.sha256()
-        with open(caminho_ficheiro, "rb") as f:
+        with open(caminho_arquivo, "rb") as f:
             for byte_block in iter(lambda: f.read(4096), b""):
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
 
     def processar_camada_raw(self):
-        print("--- [Camada Raw] A extrair dados da SSP ---", flush=True)
+        print("--- [Camada Raw] Extraindo dados da SSP ---", flush=True)
         ano_inicio, ano_atual = 2022, self.hoje.year
         mapeamento = {
             'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATA DO FATO': 'DATA_OCORRENCIA_BO',
             'NATUREZA': 'RUBRICA', 'NUMERO_BOLETIM': 'NUM_BO', 'NÚMERO DO BO': 'NUM_BO'
         }
+        
+        # Disfarce para o site do governo nao bloquear o robô
+        cabecalho = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
         for ano in range(ano_inicio, ano_atual + 1):
-            url = "[https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais](https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais)_" + str(ano) + ".xlsx"
+            url = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_" + str(ano) + ".xlsx"
             parquet_raw = self.pastas["raw"] / ("ssp_bruto_" + str(ano) + ".parquet")
             xlsx_temp = self.pastas["raw"] / ("temp_" + str(ano) + ".xlsx")
             
@@ -71,15 +74,17 @@ class MotorSafeDriverCloud:
 
             for t in range(3):
                 try:
-                    print("A descarregar ano " + str(ano) + "...", flush=True)
-                    r = requests.get(url, stream=True, verify=False, timeout=60)
+                    print("Baixando ano " + str(ano) + "...", flush=True)
+                    r = requests.get(url, stream=True, verify=False, timeout=60, headers=cabecalho)
                     if r.status_code == 200:
                         with open(xlsx_temp, 'wb') as f:
                             for chunk in r.iter_content(chunk_size=1024*1024): f.write(chunk)
                         break
                 except: time.sleep(5)
 
-            if not xlsx_temp.exists(): continue
+            if not xlsx_temp.exists(): 
+                print("Falha ao baixar o ano " + str(ano) + ".", flush=True)
+                continue
 
             try:
                 excel = fastexcel.read_excel(str(xlsx_temp))
@@ -106,8 +111,12 @@ class MotorSafeDriverCloud:
                 print("Erro no ano " + str(ano) + ": " + str(e), flush=True)
 
     def processar_camada_prata(self):
-        print("--- [Camada Prata] A limpar dados ---", flush=True)
+        print("--- [Camada Prata] Limpando dados ---", flush=True)
         arquivos = [str(p) for p in self.pastas["raw"].glob("*.parquet")]
+        
+        if len(arquivos) == 0:
+            raise ValueError("A pasta RAW ta vazia. O robô nao conseguiu baixar nada da SSP.")
+
         df = pl.concat([pl.scan_parquet(f) for f in arquivos], how="diagonal").collect()
         
         df_prata = (
@@ -131,7 +140,7 @@ class MotorSafeDriverCloud:
         return df_final
 
     def processar_camada_ouro_e_ml(self, df):
-        print("--- [Camada Ouro] A gerar inteligencia ---", flush=True)
+        print("--- [Camada Ouro] Gerando inteligencia ---", flush=True)
         col_crime = 'NATUREZA_APURADA' if 'NATUREZA_APURADA' in df.columns else 'RUBRICA'
         
         df = df.with_columns([
@@ -154,7 +163,7 @@ class MotorSafeDriverCloud:
         fato_final = fato.with_columns([pl.Series("PREVISAO", preds)])
         fato_final.write_parquet(self.pastas["ouro"] / "dashboard_risco.parquet")
         
-        print("--- A enviar para o Google Cloud Storage ---", flush=True)
+        print("--- Enviando pro Google Cloud Storage ---", flush=True)
         bucket = self.storage_client.bucket(self.bucket_nome)
         for f in self.raiz.rglob("datalake/*/*.parquet"):
             blob = bucket.blob(str(f.relative_to(self.raiz)))
