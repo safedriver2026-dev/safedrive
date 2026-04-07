@@ -84,16 +84,17 @@ class MotorSafeDriverCloud:
         })
         return sessao
 
+    @staticmethod
+    def achatar_texto(texto):
+        t_sem_acento = ''.join(c for c in unicodedata.normalize('NFD', str(texto)) if unicodedata.category(c) != 'Mn')
+        return re.sub(r'[^A-Z0-9]', '', t_sem_acento.upper())
+
     def normalizador_semantico(self, df, ano):
         df = df.rename({c: str(c).upper().strip() for c in df.columns})
         
-        def achatar_texto(texto):
-            t_sem_acento = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
-            return re.sub(r'[^A-Z0-9]', '', t_sem_acento)
-
         dicionario_sinonimos = {
             'NUMEROBOLETIM': 'NUM_BO', 'NUMERODOBOLETIM': 'NUM_BO', 'NUMEROBO': 'NUM_BO', 
-            'NUMERODOBO': 'NUM_BO', 'BOLETIM': 'NUM_BO', 'BO': 'NUM_BO', 'NBO': 'NUM_BO', 'NBOLETIM': 'NUM_BO',
+            'NUMERODOBO': 'NUM_BO', 'BOLETIM': 'NUM_BO', 'BO': 'NUM_BO', 'NBO': 'NUM_BO', 'NBOLETIM': 'NUM_BO', 'NUMBO': 'NUM_BO',
             'DATAOCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATADOFATO': 'DATA_OCORRENCIA_BO', 
             'DATADAOCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATADEOCORRENCIA': 'DATA_OCORRENCIA_BO', 
             'DATAREGCORRENCIA': 'DATA_OCORRENCIA_BO', 'DATA': 'DATA_OCORRENCIA_BO',
@@ -108,7 +109,7 @@ class MotorSafeDriverCloud:
         colunas_atuais = df.columns
         
         for col_original in colunas_atuais:
-            col_achatada = achatar_texto(col_original)
+            col_achatada = self.achatar_texto(col_original)
             if col_achatada in dicionario_sinonimos:
                 alvo = dicionario_sinonimos[col_achatada]
                 if alvo not in colunas_atuais and alvo not in mapa_renomeacao.values():
@@ -118,7 +119,7 @@ class MotorSafeDriverCloud:
             df = df.rename(mapa_renomeacao)
 
         if "NUM_BO" not in df.columns:
-            print(f"[AVISO_ESQUEMA] Identificador NUM_BO não localizado para o ano {ano}. Gerando chaves primárias sintéticas.", flush=True)
+            print(f"[AVISO_ESQUEMA] Identificador NUM_BO não localizado de forma colunar no ano {ano}. Gerando chaves primárias sintéticas.", flush=True)
             df = df.with_columns([
                 pl.format("VIRTUAL_BO_{}_{}", pl.lit(ano), pl.int_range(0, pl.len())).alias("NUM_BO")
             ])
@@ -154,11 +155,30 @@ class MotorSafeDriverCloud:
                     
                     import fastexcel
                     excel = fastexcel.read_excel(str(temp_xlsx))
-                    df_novo = pl.read_excel(str(temp_xlsx), sheet_name=excel.sheet_names[0], engine="calamine")
+                    
+                    # SCANNER COLUNAR: Detecta a aba correta ignorando a Capa
+                    df_novo = None
+                    indicadores_matriz = ['NUMBO', 'NUMEROBO', 'BOLETIM', 'LATITUDE', 'DATAOCORRENCIA']
+                    
+                    for aba in excel.sheet_names:
+                        df_temp = pl.read_excel(str(temp_xlsx), sheet_name=aba, engine="calamine")
+                        colunas_achatadas = [self.achatar_texto(c) for c in df_temp.columns]
+                        
+                        # Verifica se possui colunas amplas (>5) e algum identificador chave em modo Colunar
+                        if any(ind in colunas_achatadas for ind in indicadores_matriz) and len(df_temp.columns) > 5:
+                            df_novo = df_temp
+                            print(f"[COLETOR_DADOS] Matriz validada de forma colunar na aba: '{aba}'. Capa ignorada.", flush=True)
+                            break
+                            
+                    if df_novo is None:
+                        # Fallback: Seleciona a aba com o maior número de colunas (A capa geralmente tem apenas 2 colunas)
+                        aba_mais_colunas = max(excel.sheet_names, key=lambda x: len(pl.read_excel(str(temp_xlsx), sheet_name=x, engine="calamine").columns))
+                        print(f"[ALERTA_ESQUEMA] Identificadores ausentes. Selecionando por densidade colunar na aba: '{aba_mais_colunas}'.", flush=True)
+                        df_novo = pl.read_excel(str(temp_xlsx), sheet_name=aba_mais_colunas, engine="calamine")
                     
                     df_novo = self.normalizador_semantico(df_novo, ano)
-                    
                     df_novo = df_novo.with_columns(pl.all().cast(pl.String))
+                    
                     if arquivo_bruto.exists():
                         df_final = pl.concat([pl.read_parquet(arquivo_bruto), df_novo], how="diagonal")
                         df_final = df_final.unique(subset=["NUM_BO"], keep="last")
@@ -207,7 +227,6 @@ class MotorSafeDriverCloud:
         self.registros_validados = df_processado.height
         self.registros_descartados = self.registros_brutos - self.registros_validados
 
-        # PROTOCOLO DE PRIVACIDADE E ANOMINIZAÇÃO DE DADOS (LGPD)
         print("[PROTOCOLO_PRIVACIDADE] Anonimizando identificadores públicos. Destruindo NUM_BO e gerando chaves sintéticas.", flush=True)
         df_processado = df_processado.with_columns(
             pl.format("SEC_KEY_{}", pl.col("NUM_BO").hash(42)).alias("ID_ANONIMO")
@@ -277,7 +296,7 @@ class MotorSafeDriverCloud:
 * **Conformidade de Privacidade (LGPD):** ATIVA (Identificadores BO permanentemente destruídos e mascarados).
 * **Variáveis Temporais Injetadas:** Mês Sazonal, Fim de Semana (Flag), Feriados Nacionais/Estaduais (SP).
 * **Ciclo Econômico:** Mapeamento de janela de liquidez (Dias de Pagamento).
-* **Mecanismo de Reconhecimento:** Analisador Semântico de Esquema Ativo.
+* **Mecanismo de Reconhecimento:** Scanner Colunar e Analisador Semântico de Esquema.
 * **Mecanismo de Fusão Preditiva:** Ativo (CatBoost Regressor 70% + LightGBM Regressor 30%)
 
 ---
@@ -344,7 +363,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "6.2.0-privacidade-lgpd"
+            "versao_sistema": "6.3.0-varredura-colunar"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
