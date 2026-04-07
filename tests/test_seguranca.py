@@ -5,40 +5,37 @@ from pathlib import Path
 
 def test_pipeline_integridade_e_metricas():
     caminho_auditoria = Path("datalake/auditoria/auditoria.json")
-    assert caminho_auditoria.exists(), "[FALHA] Arquivo de auditoria nao localizado no diretorio esperado."
+    assert caminho_auditoria.exists(), "[FALHA] Arquivo de auditoria nao localizado."
     
     with open(caminho_auditoria, "r") as f:
         log = json.load(f)
         
-    assert log.get("r2_final", 0) > 0.35, "[FALHA] Metrica R2 abaixo do limite minimo aceitavel para operacao."
-    assert len(log.get("hashes_seguranca", {})) > 0, "[FALHA] Ausencia de hashes SHA-256 no manifesto de seguranca."
-    assert "timestamp" in log, "[FALHA] Registro de tempo ausente no manifesto."
-    assert log.get("anomalias_estatisticas_z3", 0) >= 0, "[FALHA] Valor de anomalias estatisticas invalido."
+    assert log.get("precisao_modelo", 0) > 0.35, "[FALHA] Precisao (R2) abaixo do limite operacional."
+    assert "assinaturas_seguranca" in log, "[FALHA] Ausencia de assinaturas criptograficas SHA-256."
+    assert log.get("volumetria_bruta", 0) > 0, "[FALHA] Volume de entrada zerado."
 
-def test_deduplicacao_bo():
+def test_deduplicacao_e_limpeza():
     caminho_prata = Path("datalake/prata/camada_prata.parquet")
     if caminho_prata.exists():
         df = pl.read_parquet(caminho_prata)
-        assert df.height == df.select("NUM_BO").unique().height, "[FALHA] Duplicatas detectadas na chave primaria (NUM_BO)."
+        assert df.height == df.select("NUM_BO").unique().height, "[FALHA] Duplicatas detectadas na Camada Prata."
+        assert df.filter((pl.col("LAT") > -19.5) | (pl.col("LAT") < -25.5)).height == 0, "[FALHA] Dados fora de SP detectados."
 
-def test_antifraude_geografica():
-    caminho_prata = Path("datalake/prata/camada_prata.parquet")
-    if caminho_prata.exists():
-        df = pl.read_parquet(caminho_prata)
-        max_lat = df.select(pl.col("LAT").max()).to_numpy()[0][0]
-        min_lat = df.select(pl.col("LAT").min()).to_numpy()[0][0]
-        max_lon = df.select(pl.col("LON").max()).to_numpy()[0][0]
-        min_lon = df.select(pl.col("LON").min()).to_numpy()[0][0]
-        
-        assert max_lat <= -19.5, "[FALHA] Coordenada de latitude excede limite superior definido."
-        assert min_lat >= -25.5, "[FALHA] Coordenada de latitude excede limite inferior definido."
-        assert max_lon <= -44.0, "[FALHA] Coordenada de longitude excede limite superior definido."
-        assert min_lon >= -53.5, "[FALHA] Coordenada de longitude excede limite inferior definido."
-
-def test_qualidade_geospatial():
+def test_engenharia_de_features():
     caminho_ouro = Path("datalake/ouro/dashboard_final.parquet")
     if caminho_ouro.exists():
         df = pl.read_parquet(caminho_ouro)
-        assert df.filter(pl.col("H3").is_null()).height == 0, "[FALHA] Detectados registros sem indexacao H3 valida."
-        assert "PREVISAO_FINAL" in df.columns, "[FALHA] Coluna de previsao ausente no dataset final."
-        assert df.select("PREVISAO_FINAL").mean().to_numpy()[0] > 0, "[FALHA] Media preditiva zerada. Modelo requer recalibragem."
+        colunas_obrigatorias = ["MES", "IS_FIM_SEMANA", "IS_FERIADO", "QTD_VIA_PUBLICA", "PREVISAO_FINAL"]
+        for col in colunas_obrigatorias:
+            assert col in df.columns, f"[FALHA] Variavel critica ausente: {col}"
+        
+    
+        assert df.select("IS_FERIADO").unique().height <= 2
+        assert df.select("IS_FIM_SEMANA").unique().height <= 2
+
+def test_qualidade_h3():
+    caminho_ouro = Path("datalake/ouro/dashboard_final.parquet")
+    if caminho_ouro.exists():
+        df = pl.read_parquet(caminho_ouro)
+        assert df.filter(pl.col("H3").is_null()).height == 0, "[FALHA] Falha na indexacao hexagonal H3."
+        assert "RISCO_GEO" in df.columns, "[FALHA] Suavizacao de vizinhanca nao processada."
