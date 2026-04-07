@@ -22,7 +22,7 @@ from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
-print("🚀 [SISTEMA] Motor SafeDriver iniciado...", flush=True)
+print("[SISTEMA] Motor SafeDriver iniciado...", flush=True)
 warnings.filterwarnings("ignore")
 
 class MotorSafeDriverCloud:
@@ -60,18 +60,18 @@ class MotorSafeDriverCloud:
         }
 
         for ano in range(ano_inicio, ano_atual + 1):
-            url = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_" + str(ano) + ".xlsx"
+            url = "[https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais](https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais)_" + str(ano) + ".xlsx"
             parquet_raw = self.pastas["raw"] / ("ssp_bruto_" + str(ano) + ".parquet")
             xlsx_temp = self.pastas["raw"] / ("temp_" + str(ano) + ".xlsx")
             
             if parquet_raw.exists():
-                print("✅ Ano " + str(ano) + " já processado.", flush=True)
+                print("Ano " + str(ano) + " ja processado.", flush=True)
                 self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                 continue
 
             for t in range(3):
                 try:
-                    print("📥 A descarregar ano " + str(ano) + "...", flush=True)
+                    print("A descarregar ano " + str(ano) + "...", flush=True)
                     r = requests.get(url, stream=True, verify=False, timeout=60)
                     if r.status_code == 200:
                         with open(xlsx_temp, 'wb') as f:
@@ -103,7 +103,7 @@ class MotorSafeDriverCloud:
                     self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                 os.remove(xlsx_temp)
             except Exception as e:
-                print("⚠️ Erro no ano " + str(ano) + ": " + str(e), flush=True)
+                print("Erro no ano " + str(ano) + ": " + str(e), flush=True)
 
     def processar_camada_prata(self):
         print("--- [Camada Prata] A limpar dados ---", flush=True)
@@ -131,7 +131,7 @@ class MotorSafeDriverCloud:
         return df_final
 
     def processar_camada_ouro_e_ml(self, df):
-        print("--- [Camada Ouro] A gerar inteligência ---", flush=True)
+        print("--- [Camada Ouro] A gerar inteligencia ---", flush=True)
         col_crime = 'NATUREZA_APURADA' if 'NATUREZA_APURADA' in df.columns else 'RUBRICA'
         
         df = df.with_columns([
@@ -159,10 +159,10 @@ class MotorSafeDriverCloud:
         for f in self.raiz.rglob("datalake/*/*.parquet"):
             blob = bucket.blob(str(f.relative_to(self.raiz)))
             blob.upload_from_filename(str(f))
-            print("✅ Upload: " + f.name, flush=True)
+            print("Upload: " + f.name, flush=True)
 
         if self.webhook_sucesso:
-            msg_sucesso = dict(content="✅ SafeDriver: Dados atualizados no Storage com sucesso.")
+            msg_sucesso = dict(content="SafeDriver: Dados atualizados no Storage com sucesso.")
             requests.post(self.webhook_sucesso, json=msg_sucesso)
 
 if __name__ == "__main__":
@@ -173,9 +173,14 @@ if __name__ == "__main__":
         motor.processar_camada_ouro_e_ml(df_prata)
     except Exception:
         err = traceback.format_exc()
-        quebra = chr(10)
-        print("❌ ERRO:" + quebra + str(err), flush=True)
+        print("ERRO CRITICO NO SISTEMA:", flush=True)
+        print(err, flush=True)
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-            texto_erro = "❌ Falha no SafeDriver:" + quebra + "
-http://googleusercontent.com/immersive_entry_chip/0
+            texto_erro = "SafeDriver Error: " + str(err)[:1500]
+            msg_erro = dict(content=texto_erro)
+            try:
+                requests.post(webhook_erro, json=msg_erro)
+            except:
+                pass
+        sys.exit(1)
