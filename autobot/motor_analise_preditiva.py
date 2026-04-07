@@ -60,18 +60,18 @@ class MotorSafeDriverCloud:
         }
 
         for ano in range(ano_inicio, ano_atual + 1):
-            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-            parquet_raw = self.pastas["raw"] / f"ssp_bruto_{ano}.parquet"
-            xlsx_temp = self.pastas["raw"] / f"temp_{ano}.xlsx"
+            url = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_" + str(ano) + ".xlsx"
+            parquet_raw = self.pastas["raw"] / ("ssp_bruto_" + str(ano) + ".parquet")
+            xlsx_temp = self.pastas["raw"] / ("temp_" + str(ano) + ".xlsx")
             
             if parquet_raw.exists():
-                print(f"✅ Ano {ano} já processado.", flush=True)
+                print("✅ Ano " + str(ano) + " já processado.", flush=True)
                 self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                 continue
 
             for t in range(3):
                 try:
-                    print(f"📥 A descarregar ano {ano}...", flush=True)
+                    print("📥 A descarregar ano " + str(ano) + "...", flush=True)
                     r = requests.get(url, stream=True, verify=False, timeout=60)
                     if r.status_code == 200:
                         with open(xlsx_temp, 'wb') as f:
@@ -87,7 +87,12 @@ class MotorSafeDriverCloud:
                 dfs = []
                 for aba in abas:
                     df_aba = pl.read_excel(str(xlsx_temp), sheet_name=aba, engine="calamine")
-                    df_aba = df_aba.rename({c: str(c).upper().strip() for c in df_aba.columns})
+                    
+                    novas_cols = dict()
+                    for c in df_aba.columns:
+                        novas_cols[c] = str(c).upper().strip()
+                    df_aba = df_aba.rename(novas_cols)
+                    
                     for v, n in mapeamento.items():
                         if v in df_aba.columns: df_aba = df_aba.rename({v: n})
                     dfs.append(df_aba.with_columns(pl.all().cast(pl.String)))
@@ -98,7 +103,7 @@ class MotorSafeDriverCloud:
                     self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                 os.remove(xlsx_temp)
             except Exception as e:
-                print(f"⚠️ Erro no ano {ano}: {e}", flush=True)
+                print("⚠️ Erro no ano " + str(ano) + ": " + str(e), flush=True)
 
     def processar_camada_prata(self):
         print("--- [Camada Prata] A limpar dados ---", flush=True)
@@ -154,7 +159,7 @@ class MotorSafeDriverCloud:
         for f in self.raiz.rglob("datalake/*/*.parquet"):
             blob = bucket.blob(str(f.relative_to(self.raiz)))
             blob.upload_from_filename(str(f))
-            print(f"✅ Upload: {f.name}", flush=True)
+            print("✅ Upload: " + f.name, flush=True)
 
         if self.webhook_sucesso:
             msg_sucesso = dict(content="✅ SafeDriver: Dados atualizados no Storage com sucesso.")
@@ -168,8 +173,9 @@ if __name__ == "__main__":
         motor.processar_camada_ouro_e_ml(df_prata)
     except Exception:
         err = traceback.format_exc()
-        print(f"❌ ERRO:\n{err}", flush=True)
+        quebra = chr(10)
+        print("❌ ERRO:" + quebra + str(err), flush=True)
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-            texto_erro = "❌ Falha no SafeDriver:\n
+            texto_erro = "❌ Falha no SafeDriver:" + quebra + "
 http://googleusercontent.com/immersive_entry_chip/0
