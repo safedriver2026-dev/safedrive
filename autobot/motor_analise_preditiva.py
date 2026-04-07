@@ -22,7 +22,6 @@ from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
-# Desativa avisos de sistema para manter o log limpo
 warnings.filterwarnings("ignore")
 
 class MotorSafeDriverCloud:
@@ -43,12 +42,6 @@ class MotorSafeDriverCloud:
         self.linhas_descartadas = 0
         self.hashes_seguranca = dict() 
 
-    def garantir_infraestrutura_bucket(self):
-        try:
-            self.storage_client.get_bucket(self.bucket_nome)
-        except Exception:
-            self.storage_client.create_bucket(self.bucket_nome, location="US-EAST1")
-
     def gerar_hash_sha256(self, caminho_arquivo):
         sha256_hash = hashlib.sha256()
         with open(caminho_arquivo, "rb") as f:
@@ -57,7 +50,7 @@ class MotorSafeDriverCloud:
         return sha256_hash.hexdigest()
 
     # ==========================================
-    # CAMADA RAW: Baixa e gera a impressão digital
+    # CAMADA BRUTA: Download e Assinatura (SHA)
     # ==========================================
     def processar_camada_raw(self):
         ano_inicio, ano_atual = 2022, self.hoje.year
@@ -66,24 +59,20 @@ class MotorSafeDriverCloud:
             'NATUREZA': 'RUBRICA', 'NUMERO_BOLETIM': 'NUM_BO', 'NÚMERO DO BO': 'NUM_BO'
         }
 
-        print("🟤 [Camada Raw] Iniciando extração dos dados...")
+        print("--- [Camada Bruta] Iniciando ingestão ---")
         for ano in range(ano_inicio, ano_atual + 1):
             url = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_" + str(ano) + ".xlsx"
             xlsx_temp = self.pastas["raw"] / ("temp_" + str(ano) + ".xlsx")
             parquet_raw = self.pastas["raw"] / ("ssp_bruto_" + str(ano) + ".parquet")
             
-            try:
-                h = requests.head(url, verify=False, timeout=15)
-                if parquet_raw.exists():
-                    print("✅ Ano " + str(ano) + " já está no cache.")
-                    self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
-                    continue
-            except: pass
+            if parquet_raw.exists():
+                print("Ano " + str(ano) + " em cache. Gerando hash...")
+                self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
+                continue
 
             for t in range(3):
                 try:
-                    print("📥 Baixando " + str(ano) + " (Tentativa " + str(t+1) + ")...")
-                    r = requests.get(url, stream=True, verify=False, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(60, 1800))
+                    r = requests.get(url, stream=True, verify=False, timeout=(60, 1800))
                     if r.status_code == 200:
                         with open(xlsx_temp, 'wb') as f:
                             for chunk in r.iter_content(chunk_size=2*1024*1024): f.write(chunk)
@@ -94,185 +83,118 @@ class MotorSafeDriverCloud:
 
             try:
                 excel_reader = fastexcel.read_excel(str(xlsx_temp))
-                abas_validas = [
-                    aba for aba in excel_reader.sheet_names 
-                    if "capa" not in aba.lower() and "campo" not in aba.lower() and "tabela" not in aba.lower()
-                ]
+                abas = [a for a in excel_reader.sheet_names if "capa" not in a.lower()]
                 
                 dfs_ano = []
-                for aba in abas_validas:
+                for aba in abas:
                     df_aba = pl.read_excel(str(xlsx_temp), sheet_name=aba, engine="calamine")
-                    
-                    novas_colunas = dict()
-                    for c in df_aba.columns:
-                        novas_colunas[c] = str(c).upper().strip()
-                    df_aba = df_aba.rename(novas_colunas)
-                    
+                    df_aba = df_aba.rename({c: str(c).upper().strip() for c in df_aba.columns})
                     for velho, novo in mapeamento.items():
-                        if velho in df_aba.columns:
-                            df_aba = df_aba.rename({velho: novo})
-                            
+                        if velho in df_aba.columns: df_aba = df_aba.rename({velho: novo})
                     df_aba = df_aba.with_columns(pl.all().cast(pl.String))
                     dfs_ano.append(df_aba)
                 
                 if dfs_ano:
+                    # Concatena na diagonal para aceitar colunas novas (como CMD)
                     df_ano_completo = pl.concat(dfs_ano, how="diagonal")
                     df_ano_completo.write_parquet(parquet_raw, compression='snappy')
-                    
-                    hash_atual = self.gerar_hash_sha256(parquet_raw)
-                    self.hashes_seguranca[parquet_raw.name] = hash_atual
-                    
-                    print("💾 Salvo: " + parquet_raw.name + " | 🔒 SHA-256: " + hash_atual[:10] + "...")
+                    self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
+                    print("Salvo: " + parquet_raw.name)
                 
                 os.remove(xlsx_temp)
                 gc.collect()
             except Exception as e:
-                print("❌ Erro no ano " + str(ano) + ": " + str(e))
+                print("Erro no processamento de " + str(ano) + ": " + str(e))
 
     # ==========================================
-    # CAMADA PRATA: Limpeza e União dos Anos
+    # CAMADA PRATA: Limpeza e H3
     # ==========================================
     def processar_camada_prata(self):
-        print("⚪ [Camada Prata] Unificando e limpando os dados...")
-        arquivos_raw = [str(p) for p in self.pastas["raw"].glob("ssp_bruto_*.parquet")]
-        if not arquivos_raw: raise ValueError("Pasta Raw vazia.")
+        print("--- [Camada Prata] Limpeza e Normalização ---")
+        arquivos = [str(p) for p in self.pastas["raw"].glob("*.parquet")]
+        df = pl.concat([pl.scan_parquet(f) for f in arquivos], how="diagonal").collect()
         
-        lazy_dfs = [pl.scan_parquet(f) for f in arquivos_raw]
-        df_bruto = pl.concat(lazy_dfs, how="diagonal").collect()
-        
-        vol_inicial = df_bruto.height
-        
-        df_prata = (
-            df_bruto.lazy()
+        vol_ini = df.height
+        df_limpo = (
+            df.lazy()
             .with_columns([
-                pl.col("NUM_BO").replace(["nan", "NaN", "NULL", "None", ""], None),
+                pl.col("NUM_BO").replace(["nan", ""], None),
                 pl.col("DATA_OCORRENCIA_BO").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DATA_DT"),
             ])
             .filter(pl.col("NUM_BO").is_not_null())
-            .unique(subset=["NUM_BO"], keep="last")
-        )
-
-        if "LATITUDE" in df_prata.columns and "LONGITUDE" in df_prata.columns:
-            df_prata = df_prata.with_columns([
+            .unique(subset=["NUM_BO"])
+            .with_columns([
                 pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float32, strict=False).alias("LAT"),
                 pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float32, strict=False).alias("LON"),
-            ]).filter(
-                (pl.col("LAT").is_not_null()) & (pl.col("LON").is_not_null()) &
-                (pl.col("LAT") != 0.0) & (pl.col("LON") != 0.0) &
-                (pl.col("DATA_DT").is_not_null())
-            )
+            ])
+            .filter((pl.col("LAT").is_not_null()) & (pl.col("DATA_DT").is_not_null()))
+            .collect()
+        )
 
-        df_prata = df_prata.collect()
+        coords = df_limpo.select(["LAT", "LON"]).unique().to_pandas()
+        coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
+        df_prata = df_limpo.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
         
-        coords_unicas = df_prata.select(["LAT", "LON"]).unique().to_pandas()
-        coords_unicas['H3'] = coords_unicas.apply(lambda row: h3.latlng_to_cell(row['LAT'], row['LON'], 8), axis=1)
-        df_prata = df_prata.join(pl.from_pandas(coords_unicas), on=["LAT", "LON"], how="left")
-        
-        self.linhas_descartadas = vol_inicial - df_prata.height
-        df_prata.write_parquet(self.pastas["prata"] / "camada_prata_limpa.parquet", compression='snappy')
-        
-        del df_bruto
-        gc.collect()
+        self.linhas_descartadas = vol_ini - df_prata.height
+        df_prata.write_parquet(self.pastas["prata"] / "camada_prata_limpa.parquet")
         return df_prata
 
     # ==========================================
-    # CAMADA OURO: Modelo e Importância das Variáveis
+    # CAMADA OURO: Inteligência e Upload
     # ==========================================
     def processar_camada_ouro_e_ml(self, df):
-        print("🟡 [Camada Ouro] Treinando o modelo...")
-        v_bruto = df.height
+        print("--- [Camada Ouro] Treino e Predição ---")
         col_crime = 'NATUREZA_APURADA' if 'NATUREZA_APURADA' in df.columns else 'RUBRICA'
         
         df = df.with_columns([
-            pl.when((self.hoje - pl.col("DATA_DT")).dt.total_days() <= 180).then(3.0).otherwise(1.0).alias("PESO"),
             pl.col(col_crime).str.contains("ROUBO").alias("IS_ROUBO"),
             pl.col(col_crime).str.contains("FURTO").alias("IS_FURTO"),
             pl.col("DATA_DT").dt.hour().alias("HORA")
+        ]).with_columns([
+            pl.when(pl.col("IS_ROUBO")).then(20).when(pl.col("IS_FURTO")).then(10).otherwise(5).alias("RISCO_BASE"),
+            pl.when(pl.col("HORA") <= 12).then(1).when(pl.col("HORA") <= 18).then(2).otherwise(3).alias("TURNO")
         ])
 
-        qtd_roubo = df.filter(pl.col("IS_ROUBO")).height
-        qtd_furto = df.filter(pl.col("IS_FURTO")).height
-
-        df = df.with_columns([
-            pl.when(pl.col("IS_ROUBO")).then(20).when(pl.col("IS_FURTO")).then(10).otherwise(5).alias("RISCO_BASE")
-        ]).with_columns((pl.col("RISCO_BASE") * pl.col("PESO")).alias("RISCO"))
-
-        df = df.with_columns([
-            pl.when(pl.col("HORA") <= 6).then(0).when(pl.col("HORA") <= 12).then(1).when(pl.col("HORA") <= 18).then(2).otherwise(3).alias("TURNO")
-        ])
-
-        fato_pl = df.group_by(["H3", "TURNO", "DATA_DT"]).agg([
-            pl.col("RISCO").sum().alias("RISCO"),
+        fato = df.group_by(["H3", "TURNO", "DATA_DT"]).agg([
+            pl.col("RISCO_BASE").sum().alias("RISCO"),
             pl.col("LAT").mean().alias("LAT"),
             pl.col("LON").mean().alias("LON")
-        ]).sort("DATA_DT")
-
-        fato_pl = fato_pl.with_columns([
+        ]).with_columns([
             pl.col("DATA_DT").dt.weekday().alias("DIA_SEM"),
-            pl.col("DATA_DT").dt.month().alias("MES"),
-            pl.col("DATA_DT").dt.day().is_in([5,6,7,20,21]).cast(pl.Int8).alias("IS_PGTO"),
-            pl.col("DATA_DT").dt.date().is_in(self.feriados_br).cast(pl.Int8).alias("IS_FERIADO")
+            pl.col("DATA_DT").dt.month().alias("MES")
         ])
 
-        colunas_x = ['LAT', 'LON', 'TURNO', 'DIA_SEM', 'MES', 'IS_PGTO', 'IS_FERIADO']
-        X_arr = StandardScaler().fit_transform(fato_pl.select(colunas_x).to_pandas())
-        y_arr = np.log1p(fato_pl.select("RISCO").to_numpy().ravel())
+        X_cols = ['LAT', 'LON', 'TURNO', 'DIA_SEM', 'MES']
+        X = StandardScaler().fit_transform(fato.select(X_cols).to_pandas())
+        y = np.log1p(fato.select("RISCO").to_numpy().ravel())
         
-        X_tr, X_te, y_tr, y_te = train_test_split(X_arr, y_arr, test_size=0.2, shuffle=False)
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = CatBoostRegressor(iterations=500, silent=True).fit(X_tr, y_tr)
+        
+        # SHAP nativo (sem crashes)
+        pool = Pool(X_te[:1000])
+        importancia = model.get_feature_importance(pool, type='ShapValues')[:, :-1]
+        top_driver = X_cols[np.argmax(np.abs(importancia).mean(axis=0))]
 
-        print("🧠 Ajustando o modelo...")
-        melhor_r2, melhor_cat, melhor_lgb = -1, None, None
-        for _ in range(10):
-            d, lr = int(np.random.choice([4,6,8])), float(np.random.choice([0.01, 0.05, 0.1]))
-            c = CatBoostRegressor(iterations=500, depth=d, learning_rate=lr, silent=True).fit(X_tr, y_tr)
-            l = LGBMRegressor(n_estimators=500, max_depth=d, learning_rate=lr, verbose=-1).fit(X_tr, y_tr)
-            r2 = r2_score(y_te, (c.predict(X_te)*0.7 + l.predict(X_te)*0.3))
-            if r2 > melhor_r2: melhor_r2, melhor_cat, melhor_lgb = r2, c, l
-            if melhor_r2 > 0.42: break
-            gc.collect()
+        preds = np.round(np.expm1(model.predict(X)), 2)
+        fato_final = fato.select(['H3', 'DATA_DT', 'TURNO', 'RISCO']).with_columns([pl.Series("PREVISAO", preds)])
 
-        print("🔍 Analisando peso das variáveis...")
-        pool_teste = Pool(X_te[:1000])
-        shap_vals = melhor_cat.get_feature_importance(pool_teste, type='ShapValues')[:, :-1]
+        fato_final.write_parquet(self.pastas["ouro"] / "dashboard_risco.parquet")
         
-        importancias = pd.DataFrame({'VAR': colunas_x, 'SHAP': np.abs(shap_vals).mean(axis=0)}).sort_values('SHAP', ascending=False)
-        top_driver = importancias.iloc[0]['VAR']
+        # Auditoria
+        manifesto = dict(hashes=self.hashes_seguranca, r2=float(r2_score(y_te, model.predict(X_te))), timestamp=self.hoje.isoformat())
+        with open(self.pastas["auditoria"] / "auditoria.json", "w") as f: json.dump(manifesto, f)
         
-        preds_finais = np.round(np.expm1((melhor_cat.predict(X_arr)*0.7) + (melhor_lgb.predict(X_arr)*0.3)), 2)
-        fato_final_pl = fato_pl.select(['H3', 'DATA_DT', 'TURNO', 'RISCO']).with_columns([pl.Series("PREVISAO_RISCO", preds_finais)])
-
-        pl.from_pandas(importancias).write_parquet(self.pastas["ouro"] / "explicabilidade_shap.parquet")
-        fato_final_pl.write_parquet(self.pastas["ouro"] / "dashboard_risco_real.parquet")
-
-        r2_tr = r2_score(y_tr, (melhor_cat.predict(X_tr)*0.7 + melhor_lgb.predict(X_tr)*0.3))
+        # Upload para o Bucket (Foca em alimentar, sem tentar criar)
+        print("--- Alimentando o Bucket ---")
+        bucket = self.storage_client.bucket(self.bucket_nome)
+        for aqv in self.raiz.rglob("datalake/*/*.parquet"):
+            blob = bucket.blob(str(aqv.relative_to(self.raiz)))
+            blob.upload_from_filename(str(aqv))
+            print("Upload: " + aqv.name)
         
-        manifesto = dict(
-            auditoria_estatistica=dict(r2_treino=float(r2_tr), r2_teste=float(melhor_r2), degradacao_overfitting=float(r2_tr - melhor_r2)),
-            seguranca_antifraude=self.hashes_seguranca,
-            linhas_processadas=int(v_bruto),
-            timestamp=self.hoje.isoformat()
-        )
-        with open(self.pastas["auditoria"] / "auditoria_pipeline.json", "w") as f: json.dump(manifesto, f, indent=4)
-        
-        self.garantir_infraestrutura_bucket()
-        self.fazer_upload_diretorio(self.raiz / "datalake")
-        self._notificar_sucesso(melhor_r2, top_driver, v_bruto, self.linhas_descartadas, qtd_roubo, qtd_furto)
-
-    def fazer_upload_diretorio(self, local):
-        bucket = self.storage_client.get_bucket(self.bucket_nome)
-        for aqv in Path(local).rglob("*"):
-            if aqv.is_file(): bucket.blob(str(aqv.relative_to(self.raiz))).upload_from_filename(str(aqv))
-
-    def _notificar_sucesso(self, r2_te, driver, vol_dados, vol_sujo, roubos, furtos):
-        if not self.webhook_sucesso: return
-        
-        campo_negocio = dict(name="Indicadores", value="R2: " + str(round(r2_te * 100, 2)) + "% | Peso: " + driver + " | Roubos: " + str(roubos) + " | Furtos: " + str(furtos), inline=False)
-        campo_engenharia = dict(name="Manutencao", value="Validos: " + str(vol_dados) + " | Limpados: " + str(vol_sujo) + " | SHA-256: OK", inline=False)
-        
-        embed = dict(title="Relatorio Diario - SafeDriver", color=3066993, fields=[campo_negocio, campo_engenharia])
-        payload = dict(embeds=[embed])
-        
-        requests.post(self.webhook_sucesso, json=payload)
+        if self.webhook_sucesso:
+            requests.post(self.webhook_sucesso, json={"content": "✅ SafeDriver: Dados enviados ao Bucket. Driver: " + top_driver})
 
 if __name__ == "__main__":
     try:
@@ -280,19 +202,9 @@ if __name__ == "__main__":
         motor.processar_camada_raw()
         df_prata = motor.processar_camada_prata()
         motor.processar_camada_ouro_e_ml(df_prata)
-    except Exception as e:
+    except Exception:
         err = traceback.format_exc()
-        print("ERRO DETETADO:")
         print(err)
-        sys.stdout.flush()
-        
-        webhook_erro = os.environ.get("DISCORD_ERRO")
-        if webhook_erro:
-            # Texto limpo, 100% seguro contra quebras de linha acidentais
-            texto_erro = "Falha no motor SafeDriver: " + str(err)[:1800]
-            msg = dict(content=texto_erro)
-            try:
-                requests.post(webhook_erro, json=msg)
-            except:
-                pass
+        if os.environ.get("DISCORD_ERRO"):
+            requests.post(os.environ.get("DISCORD_ERRO"), json={"content": "❌ Falha: " + err[:1800]})
         sys.exit(1)
