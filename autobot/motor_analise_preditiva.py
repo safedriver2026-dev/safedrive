@@ -59,9 +59,10 @@ class MotorSafeDriverCloud:
         return sha256_hash.hexdigest()
 
     def validar_perimetro_geografico(self, df):
+        # PATCH APLICADO: between -> is_between
         return df.filter(
-            (pl.col("LAT").between(-25.5, -19.5)) & 
-            (pl.col("LON").between(-53.5, -44.0))
+            (pl.col("LAT").is_between(-25.5, -19.5)) & 
+            (pl.col("LON").is_between(-53.5, -44.0))
         )
 
     def criar_sessao_cacada(self):
@@ -156,7 +157,6 @@ class MotorSafeDriverCloud:
                     import fastexcel
                     excel = fastexcel.read_excel(str(temp_xlsx))
                     
-                    # SCANNER COLUNAR: Detecta a aba correta ignorando a Capa
                     df_novo = None
                     indicadores_matriz = ['NUMBO', 'NUMEROBO', 'BOLETIM', 'LATITUDE', 'DATAOCORRENCIA']
                     
@@ -164,14 +164,12 @@ class MotorSafeDriverCloud:
                         df_temp = pl.read_excel(str(temp_xlsx), sheet_name=aba, engine="calamine")
                         colunas_achatadas = [self.achatar_texto(c) for c in df_temp.columns]
                         
-                        # Verifica se possui colunas amplas (>5) e algum identificador chave em modo Colunar
                         if any(ind in colunas_achatadas for ind in indicadores_matriz) and len(df_temp.columns) > 5:
                             df_novo = df_temp
                             print(f"[COLETOR_DADOS] Matriz validada de forma colunar na aba: '{aba}'. Capa ignorada.", flush=True)
                             break
                             
                     if df_novo is None:
-                        # Fallback: Seleciona a aba com o maior número de colunas (A capa geralmente tem apenas 2 colunas)
                         aba_mais_colunas = max(excel.sheet_names, key=lambda x: len(pl.read_excel(str(temp_xlsx), sheet_name=x, engine="calamine").columns))
                         print(f"[ALERTA_ESQUEMA] Identificadores ausentes. Selecionando por densidade colunar na aba: '{aba_mais_colunas}'.", flush=True)
                         df_novo = pl.read_excel(str(temp_xlsx), sheet_name=aba_mais_colunas, engine="calamine")
@@ -240,10 +238,11 @@ class MotorSafeDriverCloud:
         return df_final
 
     def identificar_ciclo_pagamento(self, df):
+        # PATCH APLICADO: between -> is_between
         return df.with_columns(
             pl.when(
-                (pl.col("DATA_DT").dt.day().between(28, 31)) | 
-                (pl.col("DATA_DT").dt.day().between(1, 7))
+                (pl.col("DATA_DT").dt.day().is_between(28, 31)) | 
+                (pl.col("DATA_DT").dt.day().is_between(1, 7))
             )
             .then(1)
             .otherwise(0)
@@ -363,7 +362,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "6.3.0-varredura-colunar"
+            "versao_sistema": "6.3.1-patch-polars"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
