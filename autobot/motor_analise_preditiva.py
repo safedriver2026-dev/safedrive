@@ -22,7 +22,7 @@ from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
-# Desativar avisos desnecessários
+# Desativa avisos de sistema para manter o log limpo
 warnings.filterwarnings("ignore")
 
 class MotorSafeDriverCloud:
@@ -57,7 +57,7 @@ class MotorSafeDriverCloud:
         return sha256_hash.hexdigest()
 
     # ==========================================
-    # CAMADA RAW: Extração e Assinatura Digital
+    # CAMADA RAW: Baixa e gera a impressão digital
     # ==========================================
     def processar_camada_raw(self):
         ano_inicio, ano_atual = 2022, self.hoje.year
@@ -66,7 +66,7 @@ class MotorSafeDriverCloud:
             'NATUREZA': 'RUBRICA', 'NUMERO_BOLETIM': 'NUM_BO', 'NÚMERO DO BO': 'NUM_BO'
         }
 
-        print("🟤 [Camada Raw] A iniciar a extração de dados brutos...")
+        print("🟤 [Camada Raw] Iniciando extração dos dados...")
         for ano in range(ano_inicio, ano_atual + 1):
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             xlsx_temp = self.pastas["raw"] / f"temp_{ano}.xlsx"
@@ -76,14 +76,14 @@ class MotorSafeDriverCloud:
                 h = requests.head(url, verify=False, timeout=15)
                 remoto = int(h.headers.get('Content-Length', 0))
                 if parquet_raw.exists():
-                    print(f"✅ Ano {ano} já existe. A validar integridade...")
+                    print(f"✅ Ano {ano} já está no cache.")
                     self.hashes_seguranca[parquet_raw.name] = self.gerar_hash_sha256(parquet_raw)
                     continue
             except: pass
 
             for t in range(3):
                 try:
-                    print(f"📥 A descarregar ano {ano} (Tentativa {t+1})...")
+                    print(f"📥 Baixando {ano} (Tentativa {t+1})...")
                     r = requests.get(url, stream=True, verify=False, headers={'User-Agent': 'Mozilla/5.0'}, timeout=(60, 1800))
                     if r.status_code == 200:
                         with open(xlsx_temp, 'wb') as f:
@@ -112,14 +112,13 @@ class MotorSafeDriverCloud:
                     dfs_ano.append(df_aba)
                 
                 if dfs_ano:
-                    # Junção diagonal para suportar mudanças de colunas entre anos
                     df_ano_completo = pl.concat(dfs_ano, how="diagonal")
                     df_ano_completo.write_parquet(parquet_raw, compression='snappy')
                     
                     hash_atual = self.gerar_hash_sha256(parquet_raw)
                     self.hashes_seguranca[parquet_raw.name] = hash_atual
                     
-                    print(f"💾 Guardado: {parquet_raw.name} | 🔒 SHA-256: {hash_atual[:10]}...")
+                    print(f"💾 Salvo: {parquet_raw.name} | 🔒 SHA-256: {hash_atual[:10]}...")
                 
                 os.remove(xlsx_temp)
                 gc.collect()
@@ -127,14 +126,13 @@ class MotorSafeDriverCloud:
                 print(f"❌ Erro no ano {ano}: {e}")
 
     # ==========================================
-    # CAMADA PRATA: Limpeza e União (Polars)
+    # CAMADA PRATA: Limpeza e União dos Anos
     # ==========================================
     def processar_camada_prata(self):
-        print("⚪ [Camada Prata] A unificar e limpar os dados...")
+        print("⚪ [Camada Prata] Unificando e limpando os dados...")
         arquivos_raw = [str(p) for p in self.pastas["raw"].glob("ssp_bruto_*.parquet")]
         if not arquivos_raw: raise ValueError("Pasta Raw vazia.")
         
-        # União diagonal resolve o erro 'ColumnNotFoundError'
         lazy_dfs = [pl.scan_parquet(f) for f in arquivos_raw]
         df_bruto = pl.concat(lazy_dfs, how="diagonal").collect()
         
@@ -162,7 +160,6 @@ class MotorSafeDriverCloud:
 
         df_prata = df_prata.collect()
         
-        # Geoprocessamento H3
         coords_unicas = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords_unicas['H3'] = coords_unicas.apply(lambda row: h3.latlng_to_cell(row['LAT'], row['LON'], 8), axis=1)
         df_prata = df_prata.join(pl.from_pandas(coords_unicas), on=["LAT", "LON"], how="left")
@@ -175,10 +172,10 @@ class MotorSafeDriverCloud:
         return df_prata
 
     # ==========================================
-    # CAMADA OURO & ML: Inteligência e SHAP
+    # CAMADA OURO: Modelo e Importância das Variáveis
     # ==========================================
     def processar_camada_ouro_e_ml(self, df):
-        print("🟡 [Camada Ouro] A treinar o modelo preditivo...")
+        print("🟡 [Camada Ouro] Treinando o modelo...")
         v_bruto = df.height
         col_crime = 'NATUREZA_APURADA' if 'NATUREZA_APURADA' in df.columns else 'RUBRICA'
         
@@ -213,14 +210,13 @@ class MotorSafeDriverCloud:
             pl.col("DATA_DT").dt.date().is_in(self.feriados_br).cast(pl.Int8).alias("IS_FERIADO")
         ])
 
-        # Preparação para o Modelo (Numpy para poupar RAM)
         colunas_x = ['LAT', 'LON', 'TURNO', 'DIA_SEM', 'MES', 'IS_PGTO', 'IS_FERIADO']
         X_arr = StandardScaler().fit_transform(fato_pl.select(colunas_x).to_pandas())
         y_arr = np.log1p(fato_pl.select("RISCO").to_numpy().ravel())
         
         X_tr, X_te, y_tr, y_te = train_test_split(X_arr, y_arr, test_size=0.2, shuffle=False)
 
-        print("🧠 A otimizar o modelo...")
+        print("🧠 Ajustando o modelo...")
         melhor_r2, melhor_cat, melhor_lgb = -1, None, None
         for _ in range(10):
             d, lr = int(np.random.choice([4,6,8])), float(np.random.choice([0.01, 0.05, 0.1]))
@@ -231,8 +227,7 @@ class MotorSafeDriverCloud:
             if melhor_r2 > 0.42: break
             gc.collect()
 
-        print("🔍 A calcular importância das variáveis (SHAP Nativo)...")
-        # SHAP via CatBoost (Sem crash)
+        print("🔍 Analisando peso das variáveis...")
         pool_teste = Pool(X_te[:1000])
         shap_vals = melhor_cat.get_feature_importance(pool_teste, type='ShapValues')[:, :-1]
         
@@ -242,7 +237,6 @@ class MotorSafeDriverCloud:
         preds_finais = np.round(np.expm1((melhor_cat.predict(X_arr)*0.7) + (melhor_lgb.predict(X_arr)*0.3)), 2)
         fato_final_pl = fato_pl.select(['H3', 'DATA_DT', 'TURNO', 'RISCO']).with_columns([pl.Series("PREVISAO_RISCO", preds_finais)])
 
-        # Gravação Ouro
         pl.from_pandas(importancias).write_parquet(self.pastas["ouro"] / "explicabilidade_shap.parquet")
         fato_final_pl.write_parquet(self.pastas["ouro"] / "dashboard_risco_real.parquet")
 
@@ -268,10 +262,10 @@ class MotorSafeDriverCloud:
         if not self.webhook_sucesso: return
         payload = {
             "embeds": [{
-                "title": "📊 Resumo Diário - SafeDriver", "color": 3066993,
+                "title": "📊 Relatório Diário - SafeDriver", "color": 3066993,
                 "fields": [
-                    {"name": "👔 Negócio", "value": f"**R²:** {r2_te:.2%}\n**Causa:** {driver}\n**Perfil:** {roubos:,} Roubos | {furtos:,} Furtos", "inline": False},
-                    {"name": "⚙️ Engenharia", "value": f"**Válidos:** {vol_dados:,}\n**Descartados:** {vol_sujo:,}\n**Segurança:** SHA-256 OK", "inline": False}
+                    {"name": "👔 Indicadores", "value": f"**R²:** {r2_te:.2%}\n**Peso:** {driver}\n**Perfil:** {roubos:,} Roubos | {furtos:,} Furtos", "inline": False},
+                    {"name": "⚙️ Manutenção", "value": f"**Válidos:** {vol_dados:,}\n**Limpados:** {vol_sujo:,}\n**SHA-256:** OK", "inline": False}
                 ]
             }]
         }
@@ -285,9 +279,10 @@ if __name__ == "__main__":
         motor.processar_camada_ouro_e_ml(df_prata)
     except Exception:
         err = traceback.format_exc()
-        print(f"\n❌ ERRO:\n{err}"); sys.stdout.flush()
-        if os.environ.get("DISCORD_ERRO"):
-            requests.post(os.environ.get("DISCORD_ERRO"), json={"content": f"❌ **Falha:**\n
+        print(f"\n❌ ERRO:\n{err}")
+        sys.stdout.flush()
+        
+        webhook_erro = os.environ.get("DISCORD_ERRO")
+        if webhook_erro:
+            msg = {"content": f"❌ **Falha no motor:**\n
 http://googleusercontent.com/immersive_entry_chip/0
-
-Agora podes fazer o *commit* e ver o pipeline a chegar ao fim com sucesso!
