@@ -29,12 +29,12 @@ class MotorSafeDriverCloud:
     def __init__(self):
         self.raiz = Path(".")
         self.bucket_nome = os.environ.get("GCP_BUCKET_NAME")
-        self.pastas = {
-            "raw": self.raiz / "datalake" / "raw",
-            "prata": self.raiz / "datalake" / "prata",
-            "ouro": self.raiz / "datalake" / "ouro",
-            "auditoria": self.raiz / "datalake" / "auditoria"
-        }
+        self.pastas = dict(
+            raw=self.raiz / "datalake" / "raw",
+            prata=self.raiz / "datalake" / "prata",
+            ouro=self.raiz / "datalake" / "ouro",
+            auditoria=self.raiz / "datalake" / "auditoria"
+        )
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         self.hoje = datetime.now()
         self.webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
@@ -157,7 +157,8 @@ class MotorSafeDriverCloud:
             print(f"✅ Upload: {f.name}", flush=True)
 
         if self.webhook_sucesso:
-            requests.post(self.webhook_sucesso, json={"content": "✅ SafeDriver: Dados atualizados no Storage com sucesso."})
+            msg_sucesso = dict(content="✅ SafeDriver: Dados atualizados no Storage com sucesso.")
+            requests.post(self.webhook_sucesso, json=msg_sucesso)
 
 if __name__ == "__main__":
     try:
@@ -170,5 +171,5 @@ if __name__ == "__main__":
         print(f"❌ ERRO:\n{err}", flush=True)
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-            requests.post(webhook_erro, json={"content": f"❌ Falha no SafeDriver:\n
+            texto_erro = "❌ Falha no SafeDriver:\n
 http://googleusercontent.com/immersive_entry_chip/0
