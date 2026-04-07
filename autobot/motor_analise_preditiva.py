@@ -266,10 +266,10 @@ class MotorSafeDriverCloud:
     def _notificar_sucesso(self, r2_te, driver, vol_dados, vol_sujo, roubos, furtos):
         if not self.webhook_sucesso: return
         
-        campo_negocio = dict(name="👔 Indicadores", value="**R²:** " + str(round(r2_te * 100, 2)) + "%\n**Peso:** " + driver + "\n**Perfil:** " + str(roubos) + " Roubos | " + str(furtos) + " Furtos", inline=False)
-        campo_engenharia = dict(name="⚙️ Manutenção", value="**Válidos:** " + str(vol_dados) + "\n**Limpados:** " + str(vol_sujo) + "\n**SHA-256:** OK", inline=False)
+        campo_negocio = dict(name="Indicadores", value="R2: " + str(round(r2_te * 100, 2)) + "% | Peso: " + driver + " | Roubos: " + str(roubos) + " | Furtos: " + str(furtos), inline=False)
+        campo_engenharia = dict(name="Manutencao", value="Validos: " + str(vol_dados) + " | Limpados: " + str(vol_sujo) + " | SHA-256: OK", inline=False)
         
-        embed = dict(title="📊 Relatório Diário - SafeDriver", color=3066993, fields=[campo_negocio, campo_engenharia])
+        embed = dict(title="Relatorio Diario - SafeDriver", color=3066993, fields=[campo_negocio, campo_engenharia])
         payload = dict(embeds=[embed])
         
         requests.post(self.webhook_sucesso, json=payload)
@@ -280,12 +280,19 @@ if __name__ == "__main__":
         motor.processar_camada_raw()
         df_prata = motor.processar_camada_prata()
         motor.processar_camada_ouro_e_ml(df_prata)
-    except Exception:
+    except Exception as e:
         err = traceback.format_exc()
-        print("\n❌ ERRO:\n" + err)
+        print("ERRO DETETADO:")
+        print(err)
         sys.stdout.flush()
         
         webhook_erro = os.environ.get("DISCORD_ERRO")
         if webhook_erro:
-            texto_erro = "❌ **Falha no motor:**\n
-http://googleusercontent.com/immersive_entry_chip/0
+            # Texto limpo, 100% seguro contra quebras de linha acidentais
+            texto_erro = "Falha no motor SafeDriver: " + str(err)[:1800]
+            msg = dict(content=texto_erro)
+            try:
+                requests.post(webhook_erro, json=msg)
+            except:
+                pass
+        sys.exit(1)
