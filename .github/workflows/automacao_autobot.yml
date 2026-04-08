@@ -2,33 +2,34 @@ name: SafeDriver Pipeline
 
 on:
   schedule:
-    - cron: '0 1 * * *'
-  workflow_dispatch:
+    - cron: '0 1 * * *' 
+  workflow_dispatch: # Permite rodar manualmente pelo botao do GitHub
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout do Codigo
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Configurar Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Instalar Bibliotecas
         run: |
-          pip install polars pandas numpy h3 fastexcel python-calamine openpyxl requests holidays scikit-learn catboost lightgbm pyarrow boto3 pytest
+          pip install polars pandas numpy h3 fastexcel python-calamine openpyxl requests holidays scikit-learn catboost pyarrow boto3 pytest
 
-      - name: Run Motor
+      - name: Executar Motor de Dados
         env:
+          # Credenciais do Cloudflare R2 (Devem estar no Settings > Secrets do GitHub)
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: python -u autobot/motor_analise_preditiva.py
 
-      - name: Run Validation Tests
+      - name: Validar Integridade (Testes)
         run: pytest tests/test_seguranca.py -v
