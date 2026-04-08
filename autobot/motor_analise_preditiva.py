@@ -32,55 +32,46 @@ class SafeDriverMotor:
                                aws_access_key_id=self.r2_cfg["key"], 
                                aws_secret_access_key=self.r2_cfg["secret"], region_name="auto")
         
-        self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, self.hoje.year + 1)).keys())
+        self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
 
     def normalizar_colunas(self, df):
+        # Remove duplicados físicos e padroniza nomes
+        cols_vistas = set()
+        cols_para_manter = []
+        for c in df.columns:
+            c_norm = c.upper().strip()
+            if c_norm not in cols_vistas:
+                cols_para_manter.append(c)
+                cols_vistas.add(c_norm)
+        
+        df = df.select(cols_para_manter)
         df = df.rename({c: re.sub(r'[^A-Z0-9]', '_', c.upper().strip()) for c in df.columns})
+
         mapeamento = {
             'LATITUDE': 'LAT', 'LAT': 'LAT', 'LONGITUDE': 'LON', 'LON': 'LON',
             'DATAOCORRENCIA': 'DATA_REF', 'DATA_OCORRENCIA_BO': 'DATA_REF',
             'HORAOCORRENCIA': 'HORA_REF', 'HORA_OCORRENCIA_BO': 'HORA_REF',
             'RUBRICA': 'NATUREZA_RAW', 'NATUREZA_APURADA': 'NATUREZA_RAW'
         }
+        
         colunas_atuais = df.columns
-        renomear = {}
-        ocupados = set()
-        for orig, alvo in mapeamento.items():
-            if orig in colunas_atuais and alvo not in ocupados:
-                renomear[orig] = alvo
-                ocupados.add(alvo)
-        return df.select(pl.all().unique()).rename(renomear)
-
-    def classificar_dados(self, rubrica):
-        r = str(rubrica).upper()
-        # Natureza
-        natureza = "OUTROS"
-        if any(x in r for x in ["HOMICIDIO", "LESAO", "AMEACA", "ESTUPRO", "LATROCINIO"]): natureza = "CONTRA_A_PESSOA"
-        elif any(x in r for x in ["ROUBO", "FURTO", "ESTELIONATO", "DANO"]): natureza = "AO_PATRIMONIO"
-        # Perfil
-        perfil = "PEDESTRE"
-        if any(x in r for x in ["VEICULO", "CARGA", "AUTO", "MOTO", "ONIBUS"]): perfil = "MOTORISTA"
-        elif any(x in r for x in ["BICICLETA", "BIKE"]): perfil = "CICLISTA"
-        return natureza, perfil
-
-    def get_session(self):
-        s = requests.Session()
-        retries = Retry(total=5, backoff_factor=3, status_forcelist=[500, 502, 503, 504])
-        s.mount('https://', HTTPAdapter(max_retries=retries))
-        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-        return s
+        renomear = {orig: alvo for orig, alvo in mapeamento.items() if orig in colunas_atuais and alvo not in df.columns}
+        return df.rename(renomear)
 
     def executar(self):
-        session = self.get_session()
-        print("Sincronizando arquivos SSP (2022-2026)...", flush=True)
+        # 1. Download Resiliente
+        s = requests.Session()
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=3)))
+        s.headers.update({'User-Agent': 'Mozilla/5.0'})
 
+        print("Sincronizando arquivos (2022-2026)...", flush=True)
         for ano in range(2022, self.hoje.year + 1):
             arq_raw = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if arq_raw.exists() and ano < self.hoje.year: continue
 
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             try:
-                r = session.get(url, timeout=300, verify=False)
+                r = s.get(url, timeout=300, verify=False)
                 if r.status_code == 200:
                     temp = self.pastas["raw"] / "temp.xlsx"
                     with open(temp, "wb") as f: f.write(r.content)
@@ -94,22 +85,21 @@ class SafeDriverMotor:
                             df_tmp = self.normalizar_colunas(df_tmp)
                             if "LAT" in df_tmp.columns and "DATA_REF" in df_tmp.columns:
                                 abas.append(df_tmp.with_columns(pl.all().cast(pl.String)))
-                    
                     if abas:
                         pl.concat(abas, how="diagonal").write_parquet(arq_raw)
                         print(f" -> Ano {ano} OK.", flush=True)
                     os.remove(temp)
-                else: print(f" -> Erro no ano {ano}: Status {r.status_code}")
-            except Exception as e: print(f" -> Falha técnica no ano {ano}: {str(e)}")
+            except: print(f" -> Falha no download do ano {ano}.")
 
-        # Processamento e Filtro Geográfico SP
-        arquivos = list(self.pastas["raw"].glob("*.parquet"))
+        # 2. Processamento de Alta Performance (Lazy)
+        arquivos = [str(f) for f in self.pastas["raw"].glob("*.parquet")]
         if not arquivos: return
 
-        print("Limpando e filtrando coordenadas de SP...", flush=True)
-        df = pl.concat([pl.read_parquet(str(f)) for f in arquivos], how="diagonal")
+        print("Processando inteligência de dados...", flush=True)
+        # Usamos scan_parquet para economizar RAM
+        lf = pl.scan_parquet(arquivos)
         
-        df_prata = df.with_columns([
+        df_prata = lf.with_columns([
             pl.col("DATA_REF").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DT"),
             pl.col("LAT").str.replace(",", ".").cast(pl.Float32, strict=False),
             pl.col("LON").str.replace(",", ".").cast(pl.Float32, strict=False),
@@ -118,25 +108,34 @@ class SafeDriverMotor:
             (pl.col("LAT").is_between(-25.5, -19.5)) & 
             (pl.col("LON").is_between(-53.5, -44.0)) &
             (pl.col("DT").is_not_null())
-        )
+        ).with_columns([
+            # Classificação Nativa Polars (Muito mais rápido que map_rows)
+            pl.when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("HOMICIDIO|LESAO|AMEACA|ESTUPRO|LATROCINIO"))
+              .then(pl.lit("CONTRA_A_PESSOA"))
+              .when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("ROUBO|FURTO|ESTELIONATO|DANO"))
+              .then(pl.lit("AO_PATRIMONIO"))
+              .otherwise(pl.lit("OUTROS")).alias("NATUREZA_CRIME"),
+              
+            pl.when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("VEICULO|CARGA|AUTO|MOTO|ONIBUS"))
+              .then(pl.lit("MOTORISTA"))
+              .when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("BICICLETA|BIKE"))
+              .then(pl.lit("CICLISTA"))
+              .otherwise(pl.lit("PEDESTRE")).alias("PERFIL"),
 
-        # Classificação de Perfil, Natureza e Turno
-        df_prata = df_prata.with_columns([
-            pl.col("NATUREZA_RAW").map_elements(lambda x: self.classificar_dados(x)[0], return_dtype=pl.String).alias("NATUREZA_CRIME"),
-            pl.col("NATUREZA_RAW").map_elements(lambda x: self.classificar_dados(x)[1], return_dtype=pl.String).alias("PERFIL"),
             pl.when(pl.col("H_INT").is_between(6, 11)).then(pl.lit("MANHA"))
               .when(pl.col("H_INT").is_between(12, 17)).then(pl.lit("TARDE"))
               .when(pl.col("H_INT").is_between(18, 23)).then(pl.lit("NOITE"))
               .otherwise(pl.lit("MADRUGADA")).alias("TURNO"),
+
             pl.col("DT").dt.date().is_in(self.feriados).cast(pl.Int8).alias("IS_FERIADO"),
             ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
-        ])
+        ]).collect() # Aqui o Polars executa tudo otimizado
 
-        # Anonimização e IA
         df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")).drop(["DATA_REF", "HORA_REF", "H_INT"])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        print("Calculando risco geoespacial...", flush=True)
+        # 3. IA e Sincronização
+        print("Finalizando mapa de risco e Cloudflare...", flush=True)
         coords = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         df_final = df_prata.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
@@ -151,7 +150,6 @@ class SafeDriverMotor:
         fato = fato.with_columns(pl.Series("RISCO_SCORE", np.round(np.expm1(modelo.predict(X)), 2)))
 
         fato.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
-        print("Sincronizando Cloudflare...", flush=True)
         for f in self.raiz.rglob("datalake/*/*"):
             if f.is_file():
                 self.s3.upload_file(str(f), self.r2_cfg["bucket"], f.relative_to(self.raiz).as_posix())
