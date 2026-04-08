@@ -10,7 +10,6 @@ import numpy as np
 import h3, holidays, boto3
 from catboost import CatBoostRegressor
 
-# Desativa alertas de SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 print("[SISTEMA] Processamento iniciado.", flush=True)
@@ -38,28 +37,34 @@ class SafeDriverMotor:
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
 
     def limpar_esquema(self, df):
-        df.columns = [c.upper().strip() for c in df.columns]
-        cols_unicas = []
-        vistas = set()
-        for c in df.columns:
-            if c not in vistas:
-                cols_unicas.append(c)
-                vistas.add(c)
-        df = df.select(cols_unicas)
-
+        # 1. Padroniza nomes das colunas originais
+        cols_originais = [c.upper().strip() for c in df.columns]
+        df.columns = cols_originais
+        
+        # 2. Mapeamento de PRIORIDADE (Se houver mais de uma, ele pega a primeira da lista)
         mapeamento = {
-            'LATITUDE': 'LAT', 'LAT': 'LAT',
-            'LONGITUDE': 'LON', 'LON': 'LON',
-            'DATAOCORRENCIA': 'DATA_REF', 'DATA_OCORRENCIA_BO': 'DATA_REF',
-            'HORAOCORRENCIA': 'HORA_REF', 'HORA_OCORRENCIA_BO': 'HORA_REF',
-            'RUBRICA': 'NATUREZA_RAW', 'NATUREZA_APURADA': 'NATUREZA_RAW'
+            'LAT': ['LATITUDE', 'LAT'],
+            'LON': ['LONGITUDE', 'LON'],
+            'DATA_REF': ['DATAOCORRENCIA', 'DATA_OCORRENCIA_BO', 'DATA_OCORRENCIA', 'DATA_REF'],
+            'HORA_REF': ['HORAOCORRENCIA', 'HORA_OCORRENCIA_BO', 'HORA_REF'],
+            'NATUREZA_RAW': ['RUBRICA', 'NATUREZA_APURADA', 'NATUREZA']
         }
-        renomear = {orig: alvo for orig, alvo in mapeamento.items() if orig in df.columns}
-        return df.rename(renomear)
+        
+        colunas_finais = {}
+        # Para cada destino (ex: LAT), procura qual das opções originais existe no DF
+        for destino, opcoes in mapeamento.items():
+            for opt in opcoes:
+                if opt in df.columns:
+                    colunas_finais[opt] = destino
+                    break # Encontrou a melhor opção, para de procurar para esse destino
+        
+        # 3. Mantém apenas as colunas mapeadas e as outras que não causam conflito
+        # Isso mata o erro de 'duplicate column'
+        return df.rename(colunas_finais).select([c for c in colunas_finais.values()])
 
     def executar(self):
         s = requests.Session()
-        s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=5)))
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=3)))
         s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'})
 
         print("Sincronizando base 2022-2026...", flush=True)
@@ -88,14 +93,14 @@ class SafeDriverMotor:
                         pl.concat(abas_ano, how="diagonal").write_parquet(arq_raw)
                         print(f" -> Ano {ano} OK.", flush=True)
                     if os.path.exists(temp): os.remove(temp)
-                    time.sleep(3)
                 else: print(f" -> Erro ano {ano}: Status {r.status_code}")
             except Exception as e: print(f" -> Falha ano {ano}: {str(e)}")
 
         arquivos = [str(f) for f in self.pastas["raw"].glob("*.parquet")]
         if not arquivos: return
 
-        print("Iniciando limpeza e filtros geográficos SP...", flush=True)
+        print("Limpando e filtrando dados de SP...", flush=True)
+        # Scan individual para evitar SchemaError de colunas extras como 'NOME_MUNICIPIO'
         lfs = [pl.scan_parquet(f) for f in arquivos]
         lf = pl.concat(lfs, how="diagonal")
         
@@ -130,17 +135,17 @@ class SafeDriverMotor:
             ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
         ]).collect()
 
-        # ANONIMIZAÇÃO E LIMPEZA LGPD (Garante que o teste passe)
+        # ANONIMIZAÇÃO E SEGURANÇA LGPD
         df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO"))
         
-        # Identifica qualquer coluna sensível (que tenha NUM e não seja ANONIMO)
+        # Remove colunas sensíveis (que tenham NUM) e as temporárias auxiliares
         cols_limpeza = [c for c in df_prata.columns if ("NUM" in c.upper() and "ANON" not in c.upper())]
-        cols_limpeza += ["DATA_REF", "HORA_REF", "H_INT"] # Remove colunas de tempo originais
+        cols_limpeza += ["DATA_REF", "HORA_REF", "H_INT", "NATUREZA_RAW"]
         
         df_prata = df_prata.drop([c for c in cols_limpeza if c in df_prata.columns])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        print("Gerando predição de risco...", flush=True)
+        print("IA e Sincronização Cloudflare...", flush=True)
         coords = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         df_final = df_prata.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
@@ -155,7 +160,6 @@ class SafeDriverMotor:
         fato = fato.with_columns(pl.Series("RISCO_SCORE", np.round(np.expm1(modelo.predict(X)), 2)))
 
         fato.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
-        print("Sincronizando Cloudflare R2...", flush=True)
         for f in self.raiz.rglob("datalake/*/*"):
             if f.is_file():
                 self.s3.upload_file(str(f), self.r2_cfg["bucket"], f.relative_to(self.raiz).as_posix())
