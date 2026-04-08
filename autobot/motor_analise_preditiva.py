@@ -10,7 +10,7 @@ import numpy as np
 import h3, holidays, boto3
 from catboost import CatBoostRegressor
 
-# Desativa alertas de certificado inseguro do site da SSP
+# Desativa alertas chatos de certificado do site do governo
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 print("[SISTEMA] Processamento iniciado.", flush=True)
@@ -37,51 +37,52 @@ class SafeDriverMotor:
         
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
 
-    def normalizar_colunas(self, df):
-        cols_vistas = set()
-        cols_para_manter = []
-        for c in df.columns:
-            c_norm = c.upper().strip()
-            if c_norm not in cols_vistas:
-                cols_para_manter.append(c)
-                cols_vistas.add(c_norm)
+    def limpar_esquema(self, df):
+        # 1. Normaliza nomes originais (Caps e Trim)
+        df.columns = [c.upper().strip() for c in df.columns]
         
-        df = df.select(cols_para_manter)
-        df = df.rename({c: re.sub(r'[^A-Z0-9]', '_', c.upper().strip()) for c in df.columns})
+        # 2. Mata duplicatas físicas (colunas com o mesmo nome exato no Excel)
+        cols_unicas = []
+        vistas = set()
+        for c in df.columns:
+            if c not in vistas:
+                cols_unicas.append(c)
+                vistas.add(c)
+        df = df.select(cols_unicas)
 
+        # 3. Dicionário de Tradução (Primeira que achar, leva)
         mapeamento = {
-            'LATITUDE': 'LAT', 'LAT': 'LAT', 'LONGITUDE': 'LON', 'LON': 'LON',
+            'LATITUDE': 'LAT', 'LAT': 'LAT',
+            'LONGITUDE': 'LON', 'LON': 'LON',
             'DATAOCORRENCIA': 'DATA_REF', 'DATA_OCORRENCIA_BO': 'DATA_REF',
             'HORAOCORRENCIA': 'HORA_REF', 'HORA_OCORRENCIA_BO': 'HORA_REF',
             'RUBRICA': 'NATUREZA_RAW', 'NATUREZA_APURADA': 'NATUREZA_RAW'
         }
         
-        colunas_atuais = df.columns
-        renomear = {orig: alvo for orig, alvo in mapeamento.items() if orig in colunas_atuais and alvo not in df.columns}
+        renomear = {}
+        alvos_preenchidos = set()
+        for original, alvo in mapeamento.items():
+            if original in df.columns and alvo not in alvos_preenchidos:
+                # Se o alvo já existe no DF como coluna original, não tenta renomear outra pra ela
+                if alvo in df.columns and original != alvo:
+                    continue
+                renomear[original] = alvo
+                alvos_preenchidos.add(alvo)
+        
         return df.rename(renomear)
 
     def executar(self):
-        # 1. Configuração de Sessão Camuflada
         s = requests.Session()
-        retries = Retry(total=5, backoff_factor=5, status_forcelist=[403, 500, 502, 503, 504])
-        s.mount('https://', HTTPAdapter(max_retries=retries))
-        
-        # Headers mais densos para evitar bloqueio
-        s.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Connection': 'keep-alive'
-        })
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=5)))
+        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'})
 
-        print("Iniciando sincronização (2022-2026)...", flush=True)
+        print("Sincronizando base 2022-2026...", flush=True)
         for ano in range(2022, self.hoje.year + 1):
             arq_raw = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if arq_raw.exists() and ano < self.hoje.year: continue
 
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             try:
-                # O verify=False ignora erros de SSL do servidor da SSP
                 r = s.get(url, timeout=300, verify=False)
                 if r.status_code == 200:
                     temp = self.pastas["raw"] / "temp.xlsx"
@@ -89,28 +90,27 @@ class SafeDriverMotor:
                     
                     import fastexcel
                     excel = fastexcel.read_excel(str(temp))
-                    abas = []
+                    abas_ano = []
                     for aba in excel.sheet_names:
                         df_tmp = pl.read_excel(str(temp), sheet_name=aba, engine="calamine")
                         if len(df_tmp.columns) > 5:
-                            df_tmp = self.normalizar_colunas(df_tmp)
+                            df_tmp = self.limpar_esquema(df_tmp)
                             if "LAT" in df_tmp.columns and "DATA_REF" in df_tmp.columns:
-                                abas.append(df_tmp.with_columns(pl.all().cast(pl.String)))
-                    if abas:
-                        pl.concat(abas, how="diagonal").write_parquet(arq_raw)
+                                abas_ano.append(df_tmp.with_columns(pl.all().cast(pl.String)))
+                    
+                    if abas_ano:
+                        pl.concat(abas_ano, how="diagonal").write_parquet(arq_raw)
                         print(f" -> Ano {ano} OK.", flush=True)
                     os.remove(temp)
-                    time.sleep(5) # Delay de segurança anti-ban
-                else: 
-                    print(f" -> Erro no ano {ano}: Status {r.status_code}")
-            except Exception as e: 
-                print(f" -> Falha no ano {ano}: {str(e)}")
+                    time.sleep(3)
+                else: print(f" -> Erro ano {ano}: Status {r.status_code}")
+            except Exception as e: print(f" -> Falha ano {ano}: {str(e)}")
 
-        # 2. Processamento Lazy
         arquivos = [str(f) for f in self.pastas["raw"].glob("*.parquet")]
         if not arquivos: return
 
-        print("Processando dados e IA...", flush=True)
+        print("Iniciando limpeza e filtros geográficos SP...", flush=True)
+        # Processamento Lazy para não estourar RAM
         lf = pl.scan_parquet(arquivos)
         
         df_prata = lf.with_columns([
@@ -144,11 +144,11 @@ class SafeDriverMotor:
             ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
         ]).collect()
 
+        # Anonimização LGPD
         df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")).drop(["DATA_REF", "HORA_REF", "H_INT"])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        # 3. IA e Cloudflare
-        print("Finalizando mapa e Cloudflare...", flush=True)
+        print("Gerando predição de risco...", flush=True)
         coords = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         df_final = df_prata.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
@@ -163,6 +163,7 @@ class SafeDriverMotor:
         fato = fato.with_columns(pl.Series("RISCO_SCORE", np.round(np.expm1(modelo.predict(X)), 2)))
 
         fato.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
+        print("Sincronizando Cloudflare R2...", flush=True)
         for f in self.raiz.rglob("datalake/*/*"):
             if f.is_file():
                 self.s3.upload_file(str(f), self.r2_cfg["bucket"], f.relative_to(self.raiz).as_posix())
