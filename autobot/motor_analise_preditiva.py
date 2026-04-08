@@ -35,10 +35,7 @@ class SafeDriverMotor:
         self.datas_feriados = list(self.cal_feriados.keys())
 
     def normalizador_semantico(self, df):
-        # Transforma tudo em Caps e remove espaços/pontos para comparação
         df = df.rename({c: re.sub(r'[^A-Z0-9]', '_', c.upper().strip()) for c in df.columns})
-        
-        # Mapeamento robusto para os nomes de coluna que variam entre 2022-2026
         mapeamento = {
             'LATITUDE': 'LAT', 'LAT': 'LAT',
             'LONGITUDE': 'LON', 'LON': 'LON',
@@ -46,13 +43,8 @@ class SafeDriverMotor:
             'HORAOCORRENCIA': 'HORA_REF', 'HORA_OCORRENCIA_BO': 'HORA_REF', 'HORA_OCORRENCIA': 'HORA_REF',
             'RUBRICA': 'NATUREZA_RAW', 'NATUREZA_APURADA': 'NATUREZA_RAW'
         }
-        
         colunas_atuais = df.columns
-        renomear = {}
-        for original, alvo in mapeamento.items():
-            if original in colunas_atuais and alvo not in renomear.values():
-                renomear[original] = alvo
-        
+        renomear = {orig: alvo for orig, alvo in mapeamento.items() if orig in colunas_atuais}
         return df.rename(renomear)
 
     def classificar_natureza(self, rubrica):
@@ -79,14 +71,24 @@ class SafeDriverMotor:
         except: return "MADRUGADA"
 
     def executar(self):
-        # 1. Extração
+        # 1. Extração com Identidade de Navegador
         print("Sincronizando base histórica (2022-2026)...", flush=True)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        }
+
         for ano in range(2022, self.hoje.year + 1):
             arq_raw = self.pastas["raw"] / f"ssp_{ano}.parquet"
-            if arq_raw.exists() and ano < self.hoje.year: continue
+            # Se o arquivo já existe e não é o ano atual, pula
+            if arq_raw.exists() and ano < self.hoje.year: 
+                print(f" -> Ano {ano} já está em cache local.", flush=True)
+                continue
+
             try:
                 url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                r = requests.get(url, timeout=120, verify=False)
+                r = requests.get(url, headers=headers, timeout=180, verify=False)
+                
                 if r.status_code == 200:
                     temp = self.pastas["raw"] / "temp.xlsx"
                     with open(temp, "wb") as f: f.write(r.content)
@@ -97,20 +99,28 @@ class SafeDriverMotor:
                     for aba in excel.sheet_names:
                         df_tmp = pl.read_excel(str(temp), sheet_name=aba, engine="calamine")
                         if len(df_tmp.columns) > 5:
-                            # Normaliza cada aba individualmente antes de empilhar
                             df_tmp = self.normalizador_semantico(df_tmp)
                             df_ano.append(df_tmp.with_columns(pl.all().cast(pl.String)))
+                    
                     if df_ano:
                         pl.concat(df_ano, how="diagonal").write_parquet(arq_raw)
+                        print(f" -> Sucesso ao processar {ano}.", flush=True)
                     os.remove(temp)
-            except: print(f"Aviso: Falha ao baixar ano {ano}.")
+                else:
+                    print(f" -> Aviso: Servidor SSP recusou o ano {ano} (Status: {r.status_code})", flush=True)
+            except Exception as e:
+                print(f" -> Erro técnico no ano {ano}: {str(e)}", flush=True)
 
         # 2. Processamento
-        print("Processando limpeza e anonimização...", flush=True)
+        print("Lendo e fundindo arquivos do Data Lake...", flush=True)
         arquivos = list(self.pastas["raw"].glob("*.parquet"))
+        if not arquivos:
+            print("[ERRO] Nenhum arquivo disponível para processar.")
+            return
+
         df = pl.concat([pl.read_parquet(str(f)) for f in arquivos], how="diagonal")
         
-        # Agora usamos os nomes normalizados (DATA_REF, LAT, LON, etc)
+        print("Iniciando limpeza, filtros e predição...", flush=True)
         df_prata = df.with_columns([
             pl.col("DATA_REF").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DT"),
             pl.col("LAT").str.replace(",", ".").cast(pl.Float32, strict=False),
@@ -123,14 +133,14 @@ class SafeDriverMotor:
              (pl.col("DATA_REF").str.slice(8, 2).cast(pl.Int8).is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
         ]).filter(pl.col("LAT").is_not_null() & pl.col("DT").is_not_null())
 
+        # LGPD
         df_prata = df_prata.with_columns(
             pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")
         ).drop(["DATA_REF", "HORA_REF"])
         
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        # 3. Predição
-        print("Gerando indicadores de risco...", flush=True)
+        # 3. Predição e Mapa de Risco
         coords = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         df_final = df_prata.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
@@ -146,8 +156,9 @@ class SafeDriverMotor:
         modelo = CatBoostRegressor(iterations=50, silent=True).fit(X, y)
         fato = fato.with_columns(pl.Series("RISCO_SCORE", np.round(np.expm1(modelo.predict(X)), 2)))
 
-        # 4. Sincronização
+        # 4. Sincronização Cloudflare R2
         fato.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
+        print("Sincronizando Data Lake com Cloudflare R2...", flush=True)
         for f in self.raiz.rglob("datalake/*/*"):
             if f.is_file():
                 self.s3.upload_file(str(f), self.r2_cfg["bucket"], f.relative_to(self.raiz).as_posix())
