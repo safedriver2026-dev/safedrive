@@ -54,16 +54,7 @@ class SafeDriverMotor:
             'HORAOCORRENCIA': 'HORA_REF', 'HORA_OCORRENCIA_BO': 'HORA_REF',
             'RUBRICA': 'NATUREZA_RAW', 'NATUREZA_APURADA': 'NATUREZA_RAW'
         }
-        
-        renomear = {}
-        alvos_preenchidos = set()
-        for original, alvo in mapeamento.items():
-            if original in df.columns and alvo not in alvos_preenchidos:
-                if alvo in df.columns and original != alvo:
-                    continue
-                renomear[original] = alvo
-                alvos_preenchidos.add(alvo)
-        
+        renomear = {orig: alvo for orig, alvo in mapeamento.items() if orig in df.columns}
         return df.rename(renomear)
 
     def executar(self):
@@ -76,7 +67,7 @@ class SafeDriverMotor:
             arq_raw = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if arq_raw.exists() and ano < self.hoje.year: continue
 
-            url = f"https://www.ssp.sp.gov.br/assets/statistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             try:
                 r = s.get(url, timeout=300, verify=False)
                 if r.status_code == 200:
@@ -104,7 +95,7 @@ class SafeDriverMotor:
         arquivos = [str(f) for f in self.pastas["raw"].glob("*.parquet")]
         if not arquivos: return
 
-        print("Limpando e filtrando coordenadas de SP...", flush=True)
+        print("Iniciando limpeza e filtros geográficos SP...", flush=True)
         lfs = [pl.scan_parquet(f) for f in arquivos]
         lf = pl.concat(lfs, how="diagonal")
         
@@ -139,15 +130,14 @@ class SafeDriverMotor:
             ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
         ]).collect()
 
-        # ANONIMIZAÇÃO REAL: Gera o hash e EXCLUI qualquer coluna com "NUM" (como NUM_BO)
+        # ANONIMIZAÇÃO E LIMPEZA LGPD (Garante que o teste passe)
         df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO"))
         
-        # Identifica colunas sensíveis remanescentes (que contêm NUM mas não são o ID_ANONIMO)
-        cols_para_excluir = [c for c in df_prata.columns if "NUM" in c.upper() and "ANON" not in c.upper()]
-        cols_para_excluir += ["DATA_REF", "HORA_REF", "H_INT"] # Remove também os tempos originais
+        # Identifica qualquer coluna sensível (que tenha NUM e não seja ANONIMO)
+        cols_limpeza = [c for c in df_prata.columns if ("NUM" in c.upper() and "ANON" not in c.upper())]
+        cols_limpeza += ["DATA_REF", "HORA_REF", "H_INT"] # Remove colunas de tempo originais
         
-        df_prata = df_prata.drop([c for c in cols_para_excluir if c in df_prata.columns])
-        
+        df_prata = df_prata.drop([c for c in cols_limpeza if c in df_prata.columns])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
         print("Gerando predição de risco...", flush=True)
