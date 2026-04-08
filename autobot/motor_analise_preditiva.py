@@ -10,7 +10,7 @@ import numpy as np
 import h3, holidays, boto3
 from catboost import CatBoostRegressor
 
-# Desativa alertas chatos de certificado do site do governo
+# Desativa alertas de SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 print("[SISTEMA] Processamento iniciado.", flush=True)
@@ -38,10 +38,7 @@ class SafeDriverMotor:
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
 
     def limpar_esquema(self, df):
-        # 1. Normaliza nomes originais (Caps e Trim)
         df.columns = [c.upper().strip() for c in df.columns]
-        
-        # 2. Mata duplicatas físicas (colunas com o mesmo nome exato no Excel)
         cols_unicas = []
         vistas = set()
         for c in df.columns:
@@ -50,7 +47,6 @@ class SafeDriverMotor:
                 vistas.add(c)
         df = df.select(cols_unicas)
 
-        # 3. Dicionário de Tradução (Primeira que achar, leva)
         mapeamento = {
             'LATITUDE': 'LAT', 'LAT': 'LAT',
             'LONGITUDE': 'LON', 'LON': 'LON',
@@ -63,7 +59,6 @@ class SafeDriverMotor:
         alvos_preenchidos = set()
         for original, alvo in mapeamento.items():
             if original in df.columns and alvo not in alvos_preenchidos:
-                # Se o alvo já existe no DF como coluna original, não tenta renomear outra pra ela
                 if alvo in df.columns and original != alvo:
                     continue
                 renomear[original] = alvo
@@ -101,7 +96,7 @@ class SafeDriverMotor:
                     if abas_ano:
                         pl.concat(abas_ano, how="diagonal").write_parquet(arq_raw)
                         print(f" -> Ano {ano} OK.", flush=True)
-                    os.remove(temp)
+                    if os.path.exists(temp): os.remove(temp)
                     time.sleep(3)
                 else: print(f" -> Erro ano {ano}: Status {r.status_code}")
             except Exception as e: print(f" -> Falha ano {ano}: {str(e)}")
@@ -110,8 +105,10 @@ class SafeDriverMotor:
         if not arquivos: return
 
         print("Iniciando limpeza e filtros geográficos SP...", flush=True)
-        # Processamento Lazy para não estourar RAM
-        lf = pl.scan_parquet(arquivos)
+        
+        # CORREÇÃO AQUI: Fusão diagonal para aceitar esquemas diferentes entre os anos
+        lfs = [pl.scan_parquet(f) for f in arquivos]
+        lf = pl.concat(lfs, how="diagonal")
         
         df_prata = lf.with_columns([
             pl.col("DATA_REF").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DT"),
@@ -144,7 +141,6 @@ class SafeDriverMotor:
             ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
         ]).collect()
 
-        # Anonimização LGPD
         df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")).drop(["DATA_REF", "HORA_REF", "H_INT"])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
