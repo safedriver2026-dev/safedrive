@@ -30,6 +30,10 @@ class MotorSafeDriverCloud:
     def __init__(self):
         self.raiz = Path(".")
         self.bucket_nome = os.environ.get("GCP_BUCKET_NAME")
+        
+        if not self.bucket_nome:
+            raise ValueError("[ERRO_FATAL] A variável de ambiente GCP_BUCKET_NAME não foi injetada pelo GitHub Actions.")
+            
         self.pastas = {
             "bruto": self.raiz / "datalake" / "raw",
             "processado": self.raiz / "datalake" / "prata",
@@ -40,8 +44,8 @@ class MotorSafeDriverCloud:
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         self.hoje = datetime.now()
         
-        # Alinhamento nativo com o projeto do Google Cloud
-        self.storage_client = storage.Client(project="safe-driver-fc3a9")
+        # Apontamento restaurado para o projeto de faturamento onde o balde reside fisicamente
+        self.storage_client = storage.Client(project="sandbox-suprimentos")
         
         self.assinaturas_seguranca = {}
         self.anomalias_detectadas = 0
@@ -148,7 +152,7 @@ class MotorSafeDriverCloud:
 
             try:
                 print(f"[COLETOR_DADOS] Forçando extração do servidor SSP para o ano {ano}...", flush=True)
-                r = sessao.get(url, stream=True, verify=False, timeout=180) # Timeout estendido para arquivos maiores
+                r = sessao.get(url, stream=True, verify=False, timeout=180) 
                 
                 if r.status_code == 200:
                     temp_xlsx = self.pastas["bruto"] / "temp.xlsx"
@@ -161,7 +165,6 @@ class MotorSafeDriverCloud:
                     df_abas_validas = []
                     indicadores_matriz = ['NUMBO', 'NUMEROBO', 'BOLETIM', 'LATITUDE', 'DATAOCORRENCIA']
                     
-                    # SCANNER MULTI-ABA: Vasculha todas as abas e empilha as que contêm dados
                     for aba in excel.sheet_names:
                         df_temp = pl.read_excel(str(temp_xlsx), sheet_name=aba, engine="calamine")
                         colunas_achatadas = [self.achatar_texto(c) for c in df_temp.columns]
@@ -200,13 +203,12 @@ class MotorSafeDriverCloud:
                 print(f"[ALERTA_REDE] Falha catastrófica ao processar o ano {ano}: {str(e)}", flush=True)
 
         if arquivos_baixados_com_sucesso == 0 and not list(self.pastas["bruto"].glob("*.parquet")):
-            raise RuntimeError("[ERRO_FATAL] O Protocolo de Caçada esgotou todas as tentativas e o repositório permanece vazio. O servidor governamental está inacessível. Sistema abortando.")
+            raise RuntimeError("[ERRO_FATAL] O Protocolo de Caçada esgotou todas as tentativas e o repositório permanece vazio.")
 
     def executar_limpeza_dados(self):
         print("[REFINADOR_DADOS] Executando rotinas de higienização, isolamento geoespacial e rastreio volumétrico.", flush=True)
         arquivos = list(self.pastas["bruto"].glob("*.parquet"))
         
-        # PATCH DE SCHEMA DRIFT: Empilhamento Diagonal por Ano
         lista_lazyframes = [pl.scan_parquet(str(f)) for f in arquivos]
         lf = pl.concat(lista_lazyframes, how="diagonal")
         
@@ -234,7 +236,7 @@ class MotorSafeDriverCloud:
 
         print("[PROTOCOLO_PRIVACIDADE] Anonimizando identificadores públicos. Destruindo NUM_BO e gerando chaves sintéticas.", flush=True)
         df_processado = df_processado.with_columns(
-            pl.format("SEC_KEY_{}", pl.col("NUM_BO").hash(42)).alias("ID_ANONIMO")
+            pl.format("SEC_KEY_{}", pl.col("NUM_BO").fill_null("SINTETICO").hash(42)).alias("ID_ANONIMO")
         ).drop("NUM_BO")
 
         coords = df_processado.select(["LAT", "LON"]).unique().to_pandas()
@@ -298,10 +300,9 @@ class MotorSafeDriverCloud:
 
 ## 3. Relatório Operacional Algorítmico
 * **Tempo Total de Execução:** {tempo_decorrido} segundos
-* **Conformidade de Privacidade (LGPD):** ATIVA (Identificadores BO permanentemente destruídos e mascarados).
-* **Variáveis Temporais Injetadas:** Mês Sazonal, Fim de Semana (Flag), Feriados Nacionais/Estaduais (SP).
-* **Ciclo Econômico:** Mapeamento de janela de liquidez (Dias de Pagamento).
-* **Mecanismo de Reconhecimento:** Scanner Colunar Multi-Aba e Analisador Semântico (Concatenação Diagonal).
+* **Conformidade de Privacidade (LGPD):** ATIVA (Identificadores permanentemente destruídos).
+* **Ciclo Econômico e Sazonalidade:** Ativos e Injetados.
+* **Mecanismo de Reconhecimento:** Scanner Colunar Multi-Aba.
 * **Mecanismo de Fusão Preditiva:** Ativo (CatBoost Regressor 70% + LightGBM Regressor 30%)
 
 ---
@@ -368,7 +369,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "6.5.0-final"
+            "versao_sistema": "6.6.0-seguranca-maxima"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
@@ -381,9 +382,12 @@ class MotorSafeDriverCloud:
         
         print("[SINCRONIZACAO_REMOTA] Transmitindo pacotes processados e relatórios para armazenamento.", flush=True)
         balde_nuvem = self.storage_client.bucket(self.bucket_nome)
+        
         for f in self.raiz.rglob("datalake/*/*"):
             if f.is_file():
-                balde_nuvem.blob(str(f.relative_to(self.raiz))).upload_from_filename(str(f))
+                # Correção de Caminhos: Garante envio seguro (.as_posix) impedindo quebras de diretório em nuvem
+                caminho_blob = f.relative_to(self.raiz).as_posix()
+                balde_nuvem.blob(caminho_blob).upload_from_filename(str(f))
 
         webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
         if webhook_sucesso:
