@@ -40,6 +40,7 @@ class MotorSafeDriverCloud:
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         self.hoje = datetime.now()
         
+        # Alinhamento nativo com o projeto do Google Cloud
         self.storage_client = storage.Client(project="safe-driver-fc3a9")
         
         self.assinaturas_seguranca = {}
@@ -147,7 +148,7 @@ class MotorSafeDriverCloud:
 
             try:
                 print(f"[COLETOR_DADOS] Forçando extração do servidor SSP para o ano {ano}...", flush=True)
-                r = sessao.get(url, stream=True, verify=False, timeout=120)
+                r = sessao.get(url, stream=True, verify=False, timeout=180) # Timeout estendido para arquivos maiores
                 
                 if r.status_code == 200:
                     temp_xlsx = self.pastas["bruto"] / "temp.xlsx"
@@ -166,14 +167,12 @@ class MotorSafeDriverCloud:
                         colunas_achatadas = [self.achatar_texto(c) for c in df_temp.columns]
                         
                         if any(ind in colunas_achatadas for ind in indicadores_matriz) and len(df_temp.columns) > 5:
-                            # Normaliza as colunas de cada aba antes de juntá-las para evitar desalinhamento
                             df_temp = self.normalizador_semantico(df_temp, ano)
                             df_temp = df_temp.with_columns(pl.all().cast(pl.String))
                             df_abas_validas.append(df_temp)
                             print(f"[COLETOR_DADOS] Matriz validada e extraída da aba: '{aba}'.", flush=True)
                             
                     if df_abas_validas:
-                        # Concatenação diagonal resolve pequenas discrepâncias de colunas entre semestres
                         df_novo = pl.concat(df_abas_validas, how="diagonal")
                         print(f"[COLETOR_DADOS] Fusão de {len(df_abas_validas)} aba(s) concluída para o ano {ano}.", flush=True)
                     else:
@@ -207,7 +206,9 @@ class MotorSafeDriverCloud:
         print("[REFINADOR_DADOS] Executando rotinas de higienização, isolamento geoespacial e rastreio volumétrico.", flush=True)
         arquivos = list(self.pastas["bruto"].glob("*.parquet"))
         
-        lf = pl.scan_parquet([str(f) for f in arquivos])
+        # PATCH DE SCHEMA DRIFT: Empilhamento Diagonal por Ano
+        lista_lazyframes = [pl.scan_parquet(str(f)) for f in arquivos]
+        lf = pl.concat(lista_lazyframes, how="diagonal")
         
         self.registros_brutos = lf.select(pl.len()).collect().item()
         
@@ -300,7 +301,7 @@ class MotorSafeDriverCloud:
 * **Conformidade de Privacidade (LGPD):** ATIVA (Identificadores BO permanentemente destruídos e mascarados).
 * **Variáveis Temporais Injetadas:** Mês Sazonal, Fim de Semana (Flag), Feriados Nacionais/Estaduais (SP).
 * **Ciclo Econômico:** Mapeamento de janela de liquidez (Dias de Pagamento).
-* **Mecanismo de Reconhecimento:** Scanner Colunar Multi-Aba e Analisador Semântico.
+* **Mecanismo de Reconhecimento:** Scanner Colunar Multi-Aba e Analisador Semântico (Concatenação Diagonal).
 * **Mecanismo de Fusão Preditiva:** Ativo (CatBoost Regressor 70% + LightGBM Regressor 30%)
 
 ---
@@ -367,7 +368,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "6.4.0-multitab-concat"
+            "versao_sistema": "6.5.0-final"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
