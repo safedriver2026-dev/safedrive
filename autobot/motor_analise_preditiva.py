@@ -1,23 +1,22 @@
-import sys, os, json, requests, traceback, hashlib, gc, warnings, re, unicodedata
+import sys, os, requests, traceback, hashlib, gc, warnings, re
 from pathlib import Path
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import polars as pl
 import pandas as pd
 import numpy as np
 import h3, holidays, boto3
-from sklearn.preprocessing import StandardScaler
 from catboost import CatBoostRegressor
 
-# Configurações de ambiente
 warnings.filterwarnings("ignore")
-print("[SISTEMA] Motor SafeDriver v9.4 iniciado.", flush=True)
+print("[SISTEMA] Processamento iniciado.", flush=True)
 
 class SafeDriverMotor:
     def __init__(self):
         self.raiz = Path(".")
         self.hoje = datetime.now()
         
-        # Sanitização de Segredos Cloudflare R2
         def clean(key): return os.environ.get(key, "").strip()
         self.r2_cfg = {
             "url": clean("R2_ENDPOINT_URL"),
@@ -26,143 +25,124 @@ class SafeDriverMotor:
             "bucket": clean("R2_BUCKET_NAME")
         }
         
-        # Estrutura de Datalake
-        self.pastas = {p: self.raiz / "datalake" / p for p in ["raw", "prata", "ouro", "auditoria"]}
+        self.pastas = {p: self.raiz / "datalake" / p for p in ["raw", "prata", "ouro"]}
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
 
-        # Conexão S3-Compatible
         self.s3 = boto3.client('s3', endpoint_url=self.r2_cfg["url"], 
                                aws_access_key_id=self.r2_cfg["key"], 
                                aws_secret_access_key=self.r2_cfg["secret"], region_name="auto")
         
-        # Inteligência de Calendário (SP)
-        self.cal_feriados = holidays.Brazil(subdiv='SP', years=range(2022, self.hoje.year + 1))
-        self.datas_feriados = list(self.cal_feriados.keys())
+        self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, self.hoje.year + 1)).keys())
 
-    def normalizador_semantico(self, df):
-        # Limpeza de nomes e remoção de duplicatas de colunas
+    def normalizar_colunas(self, df):
         df = df.rename({c: re.sub(r'[^A-Z0-9]', '_', c.upper().strip()) for c in df.columns})
-        
         mapeamento = {
-            'LATITUDE': 'LAT', 'LAT': 'LAT',
-            'LONGITUDE': 'LON', 'LON': 'LON',
-            'DATAOCORRENCIA': 'DATA_REF', 'DATA_OCORRENCIA_BO': 'DATA_REF', 'DATA_OCORRENCIA': 'DATA_REF',
+            'LATITUDE': 'LAT', 'LAT': 'LAT', 'LONGITUDE': 'LON', 'LON': 'LON',
+            'DATAOCORRENCIA': 'DATA_REF', 'DATA_OCORRENCIA_BO': 'DATA_REF',
             'HORAOCORRENCIA': 'HORA_REF', 'HORA_OCORRENCIA_BO': 'HORA_REF',
             'RUBRICA': 'NATUREZA_RAW', 'NATUREZA_APURADA': 'NATUREZA_RAW'
         }
-        
         colunas_atuais = df.columns
         renomear = {}
-        alvos_ocupados = set()
-
-        for original, alvo in mapeamento.items():
-            if original in colunas_atuais and alvo not in alvos_ocupados:
-                renomear[original] = alvo
-                alvos_ocupados.add(alvo)
-        
+        ocupados = set()
+        for orig, alvo in mapeamento.items():
+            if orig in colunas_atuais and alvo not in ocupados:
+                renomear[orig] = alvo
+                ocupados.add(alvo)
         return df.select(pl.all().unique()).rename(renomear)
 
-    def classificar_natureza(self, rubrica):
+    def classificar_dados(self, rubrica):
         r = str(rubrica).upper()
-        if any(x in r for x in ["HOMICIDIO", "LESAO", "AMEACA", "ESTUPRO", "LATROCINIO", "RIXA"]):
-            return "CONTRA_A_PESSOA"
-        if any(x in r for x in ["ROUBO", "FURTO", "ESTELIONATO", "DANO", "RECEPTACAO"]):
-            return "AO_PATRIMONIO"
-        return "OUTROS"
+        # Natureza
+        natureza = "OUTROS"
+        if any(x in r for x in ["HOMICIDIO", "LESAO", "AMEACA", "ESTUPRO", "LATROCINIO"]): natureza = "CONTRA_A_PESSOA"
+        elif any(x in r for x in ["ROUBO", "FURTO", "ESTELIONATO", "DANO"]): natureza = "AO_PATRIMONIO"
+        # Perfil
+        perfil = "PEDESTRE"
+        if any(x in r for x in ["VEICULO", "CARGA", "AUTO", "MOTO", "ONIBUS"]): perfil = "MOTORISTA"
+        elif any(x in r for x in ["BICICLETA", "BIKE"]): perfil = "CICLISTA"
+        return natureza, perfil
 
-    def categorizar_perfil(self, rubrica):
-        r = str(rubrica).upper()
-        if any(x in r for x in ["VEICULO", "CARGA", "AUTO", "MOTO", "ONIBUS"]): return "MOTORISTA"
-        if any(x in r for x in ["BICICLETA", "BIKE"]): return "CICLISTA"
-        return "PEDESTRE"
-
-    def definir_turno(self, hora):
-        try:
-            h = int(str(hora)[:2])
-            if 6 <= h < 12: return "MANHA"
-            if 12 <= h < 18: return "TARDE"
-            if 18 <= h < 24: return "NOITE"
-            return "MADRUGADA"
-        except: return "MADRUGADA"
-
-    def validar_geografia(self, df):
-        # Filtro de Bounding Box para o Estado de São Paulo
-        return df.filter(
-            (pl.col("LAT").is_between(-25.5, -19.5)) & 
-            (pl.col("LON").is_between(-53.5, -44.0))
-        )
+    def get_session(self):
+        s = requests.Session()
+        retries = Retry(total=5, backoff_factor=3, status_forcelist=[500, 502, 503, 504])
+        s.mount('https://', HTTPAdapter(max_retries=retries))
+        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        return s
 
     def executar(self):
-        # 1. Coleta Histórica 2022-2026
-        print("Sincronizando base histórica 2022-2026...", flush=True)
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        session = self.get_session()
+        print("Sincronizando arquivos SSP (2022-2026)...", flush=True)
 
         for ano in range(2022, self.hoje.year + 1):
             arq_raw = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if arq_raw.exists() and ano < self.hoje.year: continue
 
+            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             try:
-                url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-                r = requests.get(url, headers=headers, timeout=180, verify=False)
+                r = session.get(url, timeout=300, verify=False)
                 if r.status_code == 200:
                     temp = self.pastas["raw"] / "temp.xlsx"
                     with open(temp, "wb") as f: f.write(r.content)
                     
                     import fastexcel
                     excel = fastexcel.read_excel(str(temp))
-                    df_ano = []
+                    abas = []
                     for aba in excel.sheet_names:
                         df_tmp = pl.read_excel(str(temp), sheet_name=aba, engine="calamine")
                         if len(df_tmp.columns) > 5:
-                            df_tmp = self.normalizador_semantico(df_tmp)
+                            df_tmp = self.normalizar_colunas(df_tmp)
                             if "LAT" in df_tmp.columns and "DATA_REF" in df_tmp.columns:
-                                df_ano.append(df_tmp.with_columns(pl.all().cast(pl.String)))
+                                abas.append(df_tmp.with_columns(pl.all().cast(pl.String)))
                     
-                    if df_ano:
-                        pl.concat(df_ano, how="diagonal").write_parquet(arq_raw)
-                        print(f" -> Ano {ano} processado.", flush=True)
-                    if os.path.exists(temp): os.remove(temp)
-            except: print(f" -> Falha ao baixar ano {ano}.")
+                    if abas:
+                        pl.concat(abas, how="diagonal").write_parquet(arq_raw)
+                        print(f" -> Ano {ano} OK.", flush=True)
+                    os.remove(temp)
+                else: print(f" -> Erro no ano {ano}: Status {r.status_code}")
+            except Exception as e: print(f" -> Falha técnica no ano {ano}: {str(e)}")
 
-        # 2. Processamento de Camada Prata
-        print("Processando camadas (Lazy Loading)...", flush=True)
+        # Processamento e Filtro Geográfico SP
         arquivos = list(self.pastas["raw"].glob("*.parquet"))
         if not arquivos: return
 
-        lf = pl.scan_parquet([str(f) for f in arquivos])
+        print("Limpando e filtrando coordenadas de SP...", flush=True)
+        df = pl.concat([pl.read_parquet(str(f)) for f in arquivos], how="diagonal")
         
-        df_prata = lf.with_columns([
+        df_prata = df.with_columns([
             pl.col("DATA_REF").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DT"),
             pl.col("LAT").str.replace(",", ".").cast(pl.Float32, strict=False),
             pl.col("LON").str.replace(",", ".").cast(pl.Float32, strict=False),
-            pl.col("NATUREZA_RAW").map_elements(self.classificar_natureza, return_dtype=pl.String).alias("NATUREZA_CRIME"),
-            pl.col("NATUREZA_RAW").map_elements(self.categorizar_perfil, return_dtype=pl.String).alias("PERFIL"),
-            pl.col("HORA_REF").map_elements(self.definir_turno, return_dtype=pl.String).alias("TURNO"),
-            pl.col("DATA_REF").str.strptime(pl.Date, "%Y-%m-%d", strict=False).is_in(self.datas_feriados).cast(pl.Int8).alias("IS_FERIADO"),
-            ((pl.col("DATA_REF").str.slice(8, 2).cast(pl.Int8).is_between(28, 31)) | 
-             (pl.col("DATA_REF").str.slice(8, 2).cast(pl.Int8).is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
-        ]).filter(pl.col("LAT").is_not_null() & pl.col("DT").is_not_null()).collect()
+            pl.col("HORA_REF").str.slice(0, 2).cast(pl.Int8, strict=False).alias("H_INT")
+        ]).filter(
+            (pl.col("LAT").is_between(-25.5, -19.5)) & 
+            (pl.col("LON").is_between(-53.5, -44.0)) &
+            (pl.col("DT").is_not_null())
+        )
 
-        # Filtragem Geográfica SP
-        df_prata = self.validar_geografia(df_prata)
-        
-        # Anonimização LGPD
-        df_prata = df_prata.with_columns(
-            pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")
-        ).drop(["DATA_REF", "HORA_REF"])
-        
+        # Classificação de Perfil, Natureza e Turno
+        df_prata = df_prata.with_columns([
+            pl.col("NATUREZA_RAW").map_elements(lambda x: self.classificar_dados(x)[0], return_dtype=pl.String).alias("NATUREZA_CRIME"),
+            pl.col("NATUREZA_RAW").map_elements(lambda x: self.classificar_dados(x)[1], return_dtype=pl.String).alias("PERFIL"),
+            pl.when(pl.col("H_INT").is_between(6, 11)).then(pl.lit("MANHA"))
+              .when(pl.col("H_INT").is_between(12, 17)).then(pl.lit("TARDE"))
+              .when(pl.col("H_INT").is_between(18, 23)).then(pl.lit("NOITE"))
+              .otherwise(pl.lit("MADRUGADA")).alias("TURNO"),
+            pl.col("DT").dt.date().is_in(self.feriados).cast(pl.Int8).alias("IS_FERIADO"),
+            ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
+        ])
+
+        # Anonimização e IA
+        df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")).drop(["DATA_REF", "HORA_REF", "H_INT"])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        # 3. Inteligência Preditiva (Camada Ouro)
-        print("Geoprocessamento e IA...", flush=True)
+        print("Calculando risco geoespacial...", flush=True)
         coords = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         df_final = df_prata.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
 
         fato = df_final.group_by(["H3", "PERFIL", "TURNO", "NATUREZA_CRIME", "IS_FERIADO", "IS_PAGAMENTO"]).agg([
-            pl.len().alias("INCIDENTES"),
-            pl.col("LAT").mean().alias("LAT_M"),
-            pl.col("LON").mean().alias("LON_M")
+            pl.len().alias("INCIDENTES"), pl.col("LAT").mean().alias("LAT_M"), pl.col("LON").mean().alias("LON_M")
         ])
 
         X = fato.select(["LAT_M", "LON_M", "IS_FERIADO", "IS_PAGAMENTO"]).to_pandas()
@@ -170,9 +150,8 @@ class SafeDriverMotor:
         modelo = CatBoostRegressor(iterations=100, silent=True).fit(X, y)
         fato = fato.with_columns(pl.Series("RISCO_SCORE", np.round(np.expm1(modelo.predict(X)), 2)))
 
-        # 4. Sincronização Cloudflare R2
         fato.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
-        print("Transmitindo Data Lake para Cloudflare R2...", flush=True)
+        print("Sincronizando Cloudflare...", flush=True)
         for f in self.raiz.rglob("datalake/*/*"):
             if f.is_file():
                 self.s3.upload_file(str(f), self.r2_cfg["bucket"], f.relative_to(self.raiz).as_posix())
