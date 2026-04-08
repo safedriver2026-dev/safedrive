@@ -1,14 +1,17 @@
-import sys, os, requests, traceback, hashlib, gc, warnings, re
+import sys, os, requests, traceback, hashlib, gc, warnings, re, time
 from pathlib import Path
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3
 import polars as pl
 import pandas as pd
 import numpy as np
 import h3, holidays, boto3
 from catboost import CatBoostRegressor
 
+# Desativa alertas de certificado inseguro do site da SSP
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 print("[SISTEMA] Processamento iniciado.", flush=True)
 
@@ -35,7 +38,6 @@ class SafeDriverMotor:
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
 
     def normalizar_colunas(self, df):
-        # Remove duplicados físicos e padroniza nomes
         cols_vistas = set()
         cols_para_manter = []
         for c in df.columns:
@@ -59,18 +61,27 @@ class SafeDriverMotor:
         return df.rename(renomear)
 
     def executar(self):
-        # 1. Download Resiliente
+        # 1. Configuração de Sessão Camuflada
         s = requests.Session()
-        s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=3)))
-        s.headers.update({'User-Agent': 'Mozilla/5.0'})
+        retries = Retry(total=5, backoff_factor=5, status_forcelist=[403, 500, 502, 503, 504])
+        s.mount('https://', HTTPAdapter(max_retries=retries))
+        
+        # Headers mais densos para evitar bloqueio
+        s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive'
+        })
 
-        print("Sincronizando arquivos (2022-2026)...", flush=True)
+        print("Iniciando sincronização (2022-2026)...", flush=True)
         for ano in range(2022, self.hoje.year + 1):
             arq_raw = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if arq_raw.exists() and ano < self.hoje.year: continue
 
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             try:
+                # O verify=False ignora erros de SSL do servidor da SSP
                 r = s.get(url, timeout=300, verify=False)
                 if r.status_code == 200:
                     temp = self.pastas["raw"] / "temp.xlsx"
@@ -89,14 +100,17 @@ class SafeDriverMotor:
                         pl.concat(abas, how="diagonal").write_parquet(arq_raw)
                         print(f" -> Ano {ano} OK.", flush=True)
                     os.remove(temp)
-            except: print(f" -> Falha no download do ano {ano}.")
+                    time.sleep(5) # Delay de segurança anti-ban
+                else: 
+                    print(f" -> Erro no ano {ano}: Status {r.status_code}")
+            except Exception as e: 
+                print(f" -> Falha no ano {ano}: {str(e)}")
 
-        # 2. Processamento de Alta Performance (Lazy)
+        # 2. Processamento Lazy
         arquivos = [str(f) for f in self.pastas["raw"].glob("*.parquet")]
         if not arquivos: return
 
-        print("Processando inteligência de dados...", flush=True)
-        # Usamos scan_parquet para economizar RAM
+        print("Processando dados e IA...", flush=True)
         lf = pl.scan_parquet(arquivos)
         
         df_prata = lf.with_columns([
@@ -109,7 +123,6 @@ class SafeDriverMotor:
             (pl.col("LON").is_between(-53.5, -44.0)) &
             (pl.col("DT").is_not_null())
         ).with_columns([
-            # Classificação Nativa Polars (Muito mais rápido que map_rows)
             pl.when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("HOMICIDIO|LESAO|AMEACA|ESTUPRO|LATROCINIO"))
               .then(pl.lit("CONTRA_A_PESSOA"))
               .when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("ROUBO|FURTO|ESTELIONATO|DANO"))
@@ -129,13 +142,13 @@ class SafeDriverMotor:
 
             pl.col("DT").dt.date().is_in(self.feriados).cast(pl.Int8).alias("IS_FERIADO"),
             ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
-        ]).collect() # Aqui o Polars executa tudo otimizado
+        ]).collect()
 
         df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")).drop(["DATA_REF", "HORA_REF", "H_INT"])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        # 3. IA e Sincronização
-        print("Finalizando mapa de risco e Cloudflare...", flush=True)
+        # 3. IA e Cloudflare
+        print("Finalizando mapa e Cloudflare...", flush=True)
         coords = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         df_final = df_prata.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
