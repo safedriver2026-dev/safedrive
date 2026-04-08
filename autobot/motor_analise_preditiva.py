@@ -39,7 +39,9 @@ class MotorSafeDriverCloud:
         }
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         self.hoje = datetime.now()
-        self.storage_client = storage.Client(project="sandbox-suprimentos")
+        
+        # [ALINHAMENTO DE PROJETO] Configuração realinhada para o projeto nativo da credencial
+        self.storage_client = storage.Client(project="safe-driver-fc3a9")
         
         self.assinaturas_seguranca = {}
         self.anomalias_detectadas = 0
@@ -200,9 +202,7 @@ class MotorSafeDriverCloud:
         print("[REFINADOR_DADOS] Executando rotinas de higienização, isolamento geoespacial e rastreio volumétrico.", flush=True)
         arquivos = list(self.pastas["bruto"].glob("*.parquet"))
         
-        # PATCH APLICADO: Concatenação Diagonal para ignorar divergência de colunas (Schema Drift) entre os anos
-        lfs = [pl.scan_parquet(str(f)) for f in arquivos]
-        lf = pl.concat(lfs, how="diagonal")
+        lf = pl.scan_parquet([str(f) for f in arquivos])
         
         self.registros_brutos = lf.select(pl.len()).collect().item()
         
@@ -295,7 +295,7 @@ class MotorSafeDriverCloud:
 * **Conformidade de Privacidade (LGPD):** ATIVA (Identificadores BO permanentemente destruídos e mascarados).
 * **Variáveis Temporais Injetadas:** Mês Sazonal, Fim de Semana (Flag), Feriados Nacionais/Estaduais (SP).
 * **Ciclo Econômico:** Mapeamento de janela de liquidez (Dias de Pagamento).
-* **Mecanismo de Reconhecimento:** Scanner Colunar, Analisador Semântico de Esquema e Fusão Diagonal.
+* **Mecanismo de Reconhecimento:** Scanner Colunar e Analisador Semântico de Esquema.
 * **Mecanismo de Fusão Preditiva:** Ativo (CatBoost Regressor 70% + LightGBM Regressor 30%)
 
 ---
@@ -362,7 +362,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "6.3.2-patch-schema-drift"
+            "versao_sistema": "6.3.2-alinhamento-gcp"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
@@ -379,10 +379,11 @@ class MotorSafeDriverCloud:
             if f.is_file():
                 balde_nuvem.blob(str(f.relative_to(self.raiz))).upload_from_filename(str(f))
 
-        if self.webhook_sucesso:
+        webhook_sucesso = os.environ.get("DISCORD_SUCESSO")
+        if webhook_sucesso:
             print("[TRANSMISSAO_DISCORD] Enviando relatório executivo via webhook.", flush=True)
             carga_util = dict(content=relatorio_markdown[:1950])
-            requests.post(self.webhook_sucesso, json=carga_util)
+            requests.post(webhook_sucesso, json=carga_util)
 
 if __name__ == "__main__":
     try:
