@@ -40,7 +40,6 @@ class MotorSafeDriverCloud:
         for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
         self.hoje = datetime.now()
         
-        # [ALINHAMENTO DE PROJETO] Configuração realinhada para o projeto nativo da credencial
         self.storage_client = storage.Client(project="safe-driver-fc3a9")
         
         self.assinaturas_seguranca = {}
@@ -158,25 +157,31 @@ class MotorSafeDriverCloud:
                     import fastexcel
                     excel = fastexcel.read_excel(str(temp_xlsx))
                     
-                    df_novo = None
+                    df_abas_validas = []
                     indicadores_matriz = ['NUMBO', 'NUMEROBO', 'BOLETIM', 'LATITUDE', 'DATAOCORRENCIA']
                     
+                    # SCANNER MULTI-ABA: Vasculha todas as abas e empilha as que contêm dados
                     for aba in excel.sheet_names:
                         df_temp = pl.read_excel(str(temp_xlsx), sheet_name=aba, engine="calamine")
                         colunas_achatadas = [self.achatar_texto(c) for c in df_temp.columns]
                         
                         if any(ind in colunas_achatadas for ind in indicadores_matriz) and len(df_temp.columns) > 5:
-                            df_novo = df_temp
-                            print(f"[COLETOR_DADOS] Matriz validada de forma colunar na aba: '{aba}'. Capa ignorada.", flush=True)
-                            break
+                            # Normaliza as colunas de cada aba antes de juntá-las para evitar desalinhamento
+                            df_temp = self.normalizador_semantico(df_temp, ano)
+                            df_temp = df_temp.with_columns(pl.all().cast(pl.String))
+                            df_abas_validas.append(df_temp)
+                            print(f"[COLETOR_DADOS] Matriz validada e extraída da aba: '{aba}'.", flush=True)
                             
-                    if df_novo is None:
+                    if df_abas_validas:
+                        # Concatenação diagonal resolve pequenas discrepâncias de colunas entre semestres
+                        df_novo = pl.concat(df_abas_validas, how="diagonal")
+                        print(f"[COLETOR_DADOS] Fusão de {len(df_abas_validas)} aba(s) concluída para o ano {ano}.", flush=True)
+                    else:
                         aba_mais_colunas = max(excel.sheet_names, key=lambda x: len(pl.read_excel(str(temp_xlsx), sheet_name=x, engine="calamine").columns))
                         print(f"[ALERTA_ESQUEMA] Identificadores ausentes. Selecionando por densidade colunar na aba: '{aba_mais_colunas}'.", flush=True)
                         df_novo = pl.read_excel(str(temp_xlsx), sheet_name=aba_mais_colunas, engine="calamine")
-                    
-                    df_novo = self.normalizador_semantico(df_novo, ano)
-                    df_novo = df_novo.with_columns(pl.all().cast(pl.String))
+                        df_novo = self.normalizador_semantico(df_novo, ano)
+                        df_novo = df_novo.with_columns(pl.all().cast(pl.String))
                     
                     if arquivo_bruto.exists():
                         df_final = pl.concat([pl.read_parquet(arquivo_bruto), df_novo], how="diagonal")
@@ -189,11 +194,11 @@ class MotorSafeDriverCloud:
                     os.remove(temp_xlsx)
                     gc.collect()
                     arquivos_baixados_com_sucesso += 1
-                    print(f"[COLETOR_DADOS] Ingestão do ano {ano} concluída e mapeada com sucesso.", flush=True)
+                    print(f"[COLETOR_DADOS] Ingestão do ano {ano} salva com sucesso.", flush=True)
                 else:
                     print(f"[ALERTA_REDE] O servidor SSP recusou todas as tentativas para o ano {ano} (HTTP {r.status_code}).", flush=True)
             except Exception as e:
-                print(f"[ALERTA_REDE] Esgotamento de tentativas para o ano {ano}: {str(e)}", flush=True)
+                print(f"[ALERTA_REDE] Falha catastrófica ao processar o ano {ano}: {str(e)}", flush=True)
 
         if arquivos_baixados_com_sucesso == 0 and not list(self.pastas["bruto"].glob("*.parquet")):
             raise RuntimeError("[ERRO_FATAL] O Protocolo de Caçada esgotou todas as tentativas e o repositório permanece vazio. O servidor governamental está inacessível. Sistema abortando.")
@@ -295,7 +300,7 @@ class MotorSafeDriverCloud:
 * **Conformidade de Privacidade (LGPD):** ATIVA (Identificadores BO permanentemente destruídos e mascarados).
 * **Variáveis Temporais Injetadas:** Mês Sazonal, Fim de Semana (Flag), Feriados Nacionais/Estaduais (SP).
 * **Ciclo Econômico:** Mapeamento de janela de liquidez (Dias de Pagamento).
-* **Mecanismo de Reconhecimento:** Scanner Colunar e Analisador Semântico de Esquema.
+* **Mecanismo de Reconhecimento:** Scanner Colunar Multi-Aba e Analisador Semântico.
 * **Mecanismo de Fusão Preditiva:** Ativo (CatBoost Regressor 70% + LightGBM Regressor 30%)
 
 ---
@@ -362,7 +367,7 @@ class MotorSafeDriverCloud:
             "total_ocorrencias_validadas": self.registros_validados,
             "anomalias_estatisticas_isoladas": self.anomalias_detectadas,
             "assinaturas_seguranca": self.assinaturas_seguranca,
-            "versao_sistema": "6.3.2-alinhamento-gcp"
+            "versao_sistema": "6.4.0-multitab-concat"
         }
         with open(self.pastas["auditoria"] / "auditoria.json", "w") as f:
             json.dump(manifesto, f, indent=4)
