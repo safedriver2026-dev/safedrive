@@ -36,9 +36,9 @@ class SafeDriver:
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
         self.meta = self.pastas["raw"] / "meta.json"
 
-    def cdc_check(self, ano, url):
+    def cdc_check(self, ano, url, sessao):
         try:
-            r = requests.head(url, timeout=30, verify=False)
+            r = sessao.head(url, timeout=30, verify=False)
             size = int(r.headers.get('Content-Length', 0))
             if self.meta.exists():
                 with open(self.meta, 'r') as f:
@@ -55,41 +55,54 @@ class SafeDriver:
 
     def processar(self):
         s = requests.Session()
-        s.mount('https://', HTTPAdapter(max_retries=Retry(total=3)))
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
+        
+        # MÁSCARA DE NAVEGADOR: Evita bloqueios de Firewall da SSP-SP
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        })
+        
         novo, anos = False, []
 
         for ano in range(2022, datetime.now().year + 1):
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             
-            run, sz = self.cdc_check(ano, url)
+            run, sz = self.cdc_check(ano, url, s)
             path = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if not run and path.exists(): anos.append(ano); continue
 
-            r = s.get(url, timeout=300, verify=False)
-            if r.status_code == 200:
-                novo = True
-                tmp = self.pastas["raw"] / "tmp.xlsx"
-                with open(tmp, "wb") as f: f.write(r.content)
-                import fastexcel
-                ex = fastexcel.read_excel(str(tmp))
-                abas = []
-                for n in ex.sheet_names:
-                    df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
-                    if len(df.columns) > 5:
-                        df.columns = [c.upper().strip() for c in df.columns]
-                        m = {'LAT':['LATITUDE','LAT'],'LON':['LONGITUDE','LON'],'D':['DATAOCORRENCIA','DATA_REF'],'H':['HORAOCORRENCIA','HORA_REF'],'N':['RUBRICA','NATUREZA']}
-                        f_cols = {v[0]: k for k, v in m.items() if any(x in df.columns for x in v)}
-                        if 'LAT' in f_cols.values(): abas.append(df.rename(f_cols).select(list(f_cols.values())).with_columns(pl.all().cast(pl.String)))
-                if abas:
-                    pl.concat(abas, how="diagonal").write_parquet(path)
-                    anos.append(ano)
-                    m_data = json.load(open(self.meta)) if self.meta.exists() else {}
-                    m_data[str(ano)] = sz
-                    with open(self.meta, 'w') as f: json.dump(m_data, f)
-                if os.path.exists(tmp): os.remove(tmp)
+            # BLOCO DE RESILIÊNCIA: Tenta baixar, mas se a SSP cair, ele não quebra tudo
+            try:
+                r = s.get(url, timeout=120, verify=False)
+                if r.status_code == 200:
+                    novo = True
+                    tmp = self.pastas["raw"] / "tmp.xlsx"
+                    with open(tmp, "wb") as f: f.write(r.content)
+                    import fastexcel
+                    ex = fastexcel.read_excel(str(tmp))
+                    abas = []
+                    for n in ex.sheet_names:
+                        df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
+                        if len(df.columns) > 5:
+                            df.columns = [c.upper().strip() for c in df.columns]
+                            m = {'LAT':['LATITUDE','LAT'],'LON':['LONGITUDE','LON'],'D':['DATAOCORRENCIA','DATA_REF'],'H':['HORAOCORRENCIA','HORA_REF'],'N':['RUBRICA','NATUREZA']}
+                            f_cols = {v[0]: k for k, v in m.items() if any(x in df.columns for x in v)}
+                            if 'LAT' in f_cols.values(): abas.append(df.rename(f_cols).select(list(f_cols.values())).with_columns(pl.all().cast(pl.String)))
+                    if abas:
+                        pl.concat(abas, how="diagonal").write_parquet(path)
+                        anos.append(ano)
+                        m_data = json.load(open(self.meta)) if self.meta.exists() else {}
+                        m_data[str(ano)] = sz
+                        with open(self.meta, 'w') as f: json.dump(m_data, f)
+                    if os.path.exists(tmp): os.remove(tmp)
+            except Exception as e:
+                print(f"⚠️ Aviso: SSP-SP instável para o ano {ano}. Ignorando atualização deste arquivo.", file=sys.stderr)
+                continue
 
+        # Se não baixou nada novo E já tem os dados antigos processados, ele encerra de boas
         if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
-            self.discord.notificar(self.sucesso, "SafeDriver Sync", "Sem novos dados na SSP.", 3066993)
+            self.discord.notificar(self.sucesso, "SafeDriver Sync", "Sem novos dados acessíveis na SSP hoje.", 3066993)
             return
 
         lf = pl.concat([pl.scan_parquet(f) for f in self.pastas["raw"].glob("*.parquet")], how="diagonal")
