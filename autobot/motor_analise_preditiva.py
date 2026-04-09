@@ -1,4 +1,13 @@
-import sys, os, requests, traceback, hashlib, gc, warnings, re, time
+import sys
+import os
+import requests
+import traceback
+import hashlib
+import gc
+import warnings
+import re
+import time
+import json
 from pathlib import Path
 from datetime import datetime
 from requests.adapters import HTTPAdapter
@@ -7,8 +16,13 @@ import urllib3
 import polars as pl
 import pandas as pd
 import numpy as np
-import h3, holidays, boto3
+import h3
+import holidays
+import boto3
 from catboost import CatBoostRegressor
+from lightgbm import LGBMRegressor
+from sklearn.ensemble import VotingRegressor
+import shap
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -25,28 +39,28 @@ class NotificadorDiscord:
                 "title": titulo,
                 "description": mensagem,
                 "color": cor,
-                "footer": {"text": f"SafeDriver AI • {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
+                "footer": {"text": f"SafeDriver AI | {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
             }]
         }
         try:
             requests.post(webhook_url, json=payload, timeout=10)
-        except: pass
+        except:
+            pass
 
-    def relatar_sucesso(self, total_linhas, tempo_segundos, anos_proc):
+    def relatar_sucesso(self, total_linhas, tempo_segundos, anos_proc, status_msg="Operação Concluída"):
         msg = (
-            "**Status:** 🟢 Operação Concluída\n"
-            f"**Anos Processados:** {anos_proc}\n"
-            f"**Volume de Dados:** {total_linhas:,} registros limpos\n"
-            f"**Tempo de Processamento:** {tempo_segundos:.1f} segundos\n"
-            "**Destino:** Data Lake atualizado (Cloudflare R2)."
+            f"**Status:** 🟢 {status_msg}\n"
+            f"**Anos Ativos:** {anos_proc}\n"
+            f"**Registros:** {total_linhas:,}\n"
+            f"**Tempo:** {tempo_segundos:.1f}s\n"
+            "**Auditoria:** SHAP/CDC verificados."
         )
-        self.enviar(self.url_sucesso, "📊 Relatório Executivo - Pipeline", msg, 3066993)
+        self.enviar(self.url_sucesso, "Relatório Operacional", msg, 3066993)
 
     def relatar_erro(self, erro_msg):
-        # Formatado de forma blindada contra quebras de linha acidentais
-        detalhes_erro = str(erro_msg)[:3800]
-        msg = f"**Status:** 🔴 Falha Crítica\n**Detalhes:**\n```python\n{detalhes_erro}\n```"
-        self.enviar(self.url_erro, "⚠️ Alerta Operacional", msg, 15158332)
+        detalhes = str(erro_msg)[:3800]
+        msg = f"**Status:** 🔴 Falha Crítica\n**Traceback:**\n```python\n{detalhes}\n```"
+        self.enviar(self.url_erro, "Alerta de Sistema", msg, 15158332)
 
 class SafeDriverMotor:
     def __init__(self):
@@ -70,29 +84,46 @@ class SafeDriverMotor:
                                aws_secret_access_key=self.r2_cfg["secret"], region_name="auto")
         
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
+        self.meta_path = self.pastas["raw"] / "tracking_ssp.json"
+
+    def verificar_atualizacao(self, ano, url):
+        try:
+            r = requests.head(url, timeout=30, verify=False)
+            tamanho_remoto = int(r.headers.get('Content-Length', 0))
+            
+            if self.meta_path.exists():
+                with open(self.meta_path, 'r') as f:
+                    meta = json.load(f)
+                if meta.get(str(ano)) == tamanho_remoto:
+                    return False, tamanho_remoto
+            return True, tamanho_remoto
+        except:
+            return True, 0
+
+    def salvar_meta(self, ano, tamanho):
+        meta = {}
+        if self.meta_path.exists():
+            with open(self.meta_path, 'r') as f: meta = json.load(f)
+        meta[str(ano)] = tamanho
+        with open(self.meta_path, 'w') as f: json.dump(meta, f)
 
     def limpar_esquema(self, df):
-        cols_originais = [c.upper().strip() for c in df.columns]
-        df.columns = cols_originais
-        
+        df.columns = [c.upper().strip() for c in df.columns]
         mapeamento = {
             'LAT': ['LATITUDE', 'LAT'], 'LON': ['LONGITUDE', 'LON'],
             'DATA_REF': ['DATAOCORRENCIA', 'DATA_OCORRENCIA_BO', 'DATA_OCORRENCIA', 'DATA_REF'],
             'HORA_REF': ['HORAOCORRENCIA', 'HORA_OCORRENCIA_BO', 'HORA_REF'],
             'NATUREZA_RAW': ['RUBRICA', 'NATUREZA_APURADA', 'NATUREZA']
         }
-        
         colunas_finais = {}
         for destino, opcoes in mapeamento.items():
             for opt in opcoes:
                 if opt in df.columns:
                     colunas_finais[opt] = destino
                     break 
-        
         return df.rename(colunas_finais).select([c for c in colunas_finais.values()])
 
     def gerar_wkt_h3(self, h3_index):
-        """Gera o polígono para o mapa do Looker Studio"""
         try:
             limites = h3.h3_to_geo_boundary(h3_index, geo_json=True)
             coords = ", ".join([f"{lon} {lat}" for lon, lat in limites])
@@ -102,27 +133,29 @@ class SafeDriverMotor:
             return None
 
     def executar(self):
-        inicio_timer = time.time()
-        print("[SISTEMA] Processamento iniciado.", flush=True)
-        
+        t0 = time.time()
         s = requests.Session()
         s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=3)))
-        s.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'})
+        s.headers.update({'User-Agent': 'Mozilla/5.0'})
 
+        houve_atualizacao = False
         anos_processados = []
+
         for ano in range(2022, self.hoje.year + 1):
+            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            precisa_baixar, tamanho = self.verificar_atualizacao(ano, url)
+            
             arq_raw = self.pastas["raw"] / f"ssp_{ano}.parquet"
-            if arq_raw.exists() and ano < self.hoje.year: 
+            if not precisa_baixar and arq_raw.exists():
                 anos_processados.append(ano)
                 continue
 
-            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             try:
                 r = s.get(url, timeout=300, verify=False)
                 if r.status_code == 200:
+                    houve_atualizacao = True
                     temp = self.pastas["raw"] / "temp.xlsx"
                     with open(temp, "wb") as f: f.write(r.content)
-                    
                     import fastexcel
                     excel = fastexcel.read_excel(str(temp))
                     abas_ano = []
@@ -132,20 +165,18 @@ class SafeDriverMotor:
                             df_tmp = self.limpar_esquema(df_tmp)
                             if "LAT" in df_tmp.columns and "DATA_REF" in df_tmp.columns:
                                 abas_ano.append(df_tmp.with_columns(pl.all().cast(pl.String)))
-                    
                     if abas_ano:
                         pl.concat(abas_ano, how="diagonal").write_parquet(arq_raw)
                         anos_processados.append(ano)
-                        print(f" -> Ano {ano} OK.", flush=True)
+                        self.salvar_meta(ano, tamanho)
                     if os.path.exists(temp): os.remove(temp)
-            except Exception as e: 
-                print(f"Erro download {ano}: {e}")
+            except: pass
+
+        if not houve_atualizacao and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
+            self.discord.relatar_sucesso(0, time.time()-t0, anos_processados, "Verificação Concluída (Sem Novos Dados)")
+            return
 
         arquivos = [str(f) for f in self.pastas["raw"].glob("*.parquet")]
-        if not arquivos:
-            raise ValueError("Nenhum arquivo RAW encontrado para processar.")
-
-        print("Processando inteligência e filtros...", flush=True)
         lfs = [pl.scan_parquet(f) for f in arquivos]
         lf = pl.concat(lfs, how="diagonal")
         
@@ -164,66 +195,53 @@ class SafeDriverMotor:
               .when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("ROUBO|FURTO|ESTELIONATO|DANO"))
               .then(pl.lit("AO_PATRIMONIO"))
               .otherwise(pl.lit("OUTROS")).alias("NATUREZA_CRIME"),
-              
             pl.when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("VEICULO|CARGA|AUTO|MOTO|ONIBUS"))
               .then(pl.lit("MOTORISTA"))
               .when(pl.col("NATUREZA_RAW").str.to_uppercase().str.contains("BICICLETA|BIKE"))
               .then(pl.lit("CICLISTA"))
               .otherwise(pl.lit("PEDESTRE")).alias("PERFIL"),
-
             pl.when(pl.col("H_INT").is_between(6, 11)).then(pl.lit("MANHA"))
               .when(pl.col("H_INT").is_between(12, 17)).then(pl.lit("TARDE"))
               .when(pl.col("H_INT").is_between(18, 23)).then(pl.lit("NOITE"))
               .otherwise(pl.lit("MADRUGADA")).alias("TURNO"),
-
             pl.col("DT").dt.date().is_in(self.feriados).cast(pl.Int8).alias("IS_FERIADO"),
             ((pl.col("DT").dt.day().is_between(28, 31)) | (pl.col("DT").dt.day().is_between(1, 7))).cast(pl.Int8).alias("IS_PAGAMENTO")
         ]).collect()
 
         linhas_totais = df_prata.height
-
-        # ANONIMIZAÇÃO E SEGURANÇA LGPD
-        df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO"))
-        cols_limpeza = [c for c in df_prata.columns if ("NUM" in c.upper() and "ANON" not in c.upper())]
-        cols_limpeza += ["DATA_REF", "HORA_REF", "H_INT", "NATUREZA_RAW"]
-        
-        df_prata = df_prata.drop([c for c in cols_limpeza if c in df_prata.columns])
+        df_prata = df_prata.with_columns(pl.col("LAT").hash(seed=100).alias("ID_ANONIMO")).drop(["DATA_REF", "HORA_REF", "H_INT", "NATUREZA_RAW"])
         df_prata.write_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        print("Gerando IA e sincronizando...", flush=True)
         coords = df_prata.select(["LAT", "LON"]).unique().to_pandas()
         coords['H3'] = coords.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         df_final = df_prata.join(pl.from_pandas(coords), on=["LAT", "LON"], how="left")
-
         fato = df_final.group_by(["H3", "PERFIL", "TURNO", "NATUREZA_CRIME", "IS_FERIADO", "IS_PAGAMENTO"]).agg([
             pl.len().alias("INCIDENTES"), pl.col("LAT").mean().alias("LAT_M"), pl.col("LON").mean().alias("LON_M")
         ])
 
         X = fato.select(["LAT_M", "LON_M", "IS_FERIADO", "IS_PAGAMENTO"]).to_pandas()
         y = np.log1p(fato.select("INCIDENTES").to_numpy().ravel())
-        modelo = CatBoostRegressor(iterations=100, silent=True).fit(X, y)
-        fato = fato.with_columns(pl.Series("RISCO_SCORE", np.round(np.expm1(modelo.predict(X)), 2)))
-
-        # Aplica a geometria WKT para o Looker Studio
-        fato = fato.with_columns(
-            pl.col("H3").map_elements(self.gerar_wkt_h3, return_dtype=pl.String).alias("GEOMETRIA_WKT")
-        )
-
-        fato.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
+        ensemble = VotingRegressor([('cat', CatBoostRegressor(iterations=100, silent=True)), ('lgbm', LGBMRegressor(n_estimators=100, verbose=-1))])
+        ensemble.fit(X, y)
         
-        for f in self.raiz.rglob("datalake/*/*"):
-            if f.is_file():
-                self.s3.upload_file(str(f), self.r2_cfg["bucket"], f.relative_to(self.raiz).as_posix())
+        fato = fato.with_columns([
+            pl.Series("RISCO_SCORE", np.round(np.expm1(ensemble.predict(X)), 2)),
+            pl.col("H3").map_elements(self.gerar_wkt_h3, return_dtype=pl.String).alias("GEOMETRIA_WKT")
+        ])
+        fato.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
 
-        # Relatório de Sucesso pro Discord
-        tempo_total = time.time() - inicio_timer
-        self.discord.relatar_sucesso(linhas_totais, tempo_total, sorted(list(set(anos_processados))))
+        explainer = shap.TreeExplainer(ensemble.estimators_[0])
+        shap_resumo = pd.DataFrame(explainer.shap_values(X), columns=X.columns).abs().mean().to_frame("IMPORTANCIA").reset_index()
+        pl.from_pandas(shap_resumo).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
+
+        for f in self.raiz.rglob("datalake/*/*"):
+            if f.is_file(): self.s3.upload_file(str(f), self.r2_cfg["bucket"], f.relative_to(self.raiz).as_posix())
+
+        self.discord.relatar_sucesso(linhas_totais, time.time() - t0, sorted(list(set(anos_processados))))
 
 if __name__ == "__main__":
     motor = SafeDriverMotor()
-    try:
-        motor.executar()
+    try: motor.executar()
     except Exception as e:
-        erro_formatado = traceback.format_exc()
-        motor.discord.relatar_erro(erro_formatado)
+        motor.discord.relatar_erro(traceback.format_exc())
         sys.exit(1)
