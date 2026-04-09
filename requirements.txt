@@ -11,5 +11,5 @@ lightgbm
 scikit-learn
 shap
 fastexcel
-calamine
+python-calamine
 pytest
