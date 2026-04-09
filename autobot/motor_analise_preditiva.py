@@ -54,10 +54,22 @@ class SafeDriver:
         except: return None
 
     def processar(self):
+        # 🧹 AUTO-CURA: Limpeza rigorosa do Cache Envenenado antes de começar
+        print("Verificando integridade do cache local...", file=sys.stdout)
+        for f in self.pastas["raw"].glob("*.parquet"):
+            try:
+                cols = pl.scan_parquet(f).columns
+                if "D" not in cols:
+                    f.unlink()
+                    print(f"🗑️ Arquivo corrompido deletado: {f.name}", file=sys.stdout)
+            except Exception:
+                try: f.unlink()
+                except: pass
+
         s = requests.Session()
         s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
         
-        # MÁSCARA DE NAVEGADOR: Evita bloqueios de Firewall da SSP-SP
+        # Máscara para evitar bloqueio da SSP
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
@@ -67,12 +79,11 @@ class SafeDriver:
 
         for ano in range(2022, datetime.now().year + 1):
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            path = self.pastas["raw"] / f"ssp_{ano}.parquet"
             
             run, sz = self.cdc_check(ano, url, s)
-            path = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if not run and path.exists(): anos.append(ano); continue
 
-            # BLOCO DE RESILIÊNCIA: Tenta baixar, mas se a SSP cair, ele não quebra tudo
             try:
                 r = s.get(url, timeout=120, verify=False)
                 if r.status_code == 200:
@@ -82,13 +93,33 @@ class SafeDriver:
                     import fastexcel
                     ex = fastexcel.read_excel(str(tmp))
                     abas = []
+                    
+                    # MAPEAMENTO DE COLUNAS BLINDADO
+                    mapping = {
+                        'LAT': ['LATITUDE', 'LAT', 'Y'],
+                        'LON': ['LONGITUDE', 'LON', 'X'],
+                        'D': ['DATAOCORRENCIA', 'DATA_FATO', 'DATA_REF', 'DATA'],
+                        'H': ['HORAOCORRENCIA', 'HORA_FATO', 'HORA_REF', 'HORA'],
+                        'N': ['RUBRICA', 'NATUREZA', 'NATUREZA_APURADA']
+                    }
+                    
                     for n in ex.sheet_names:
                         df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
                         if len(df.columns) > 5:
                             df.columns = [c.upper().strip() for c in df.columns]
-                            m = {'LAT':['LATITUDE','LAT'],'LON':['LONGITUDE','LON'],'D':['DATAOCORRENCIA','DATA_REF'],'H':['HORAOCORRENCIA','HORA_REF'],'N':['RUBRICA','NATUREZA']}
-                            f_cols = {v[0]: k for k, v in m.items() if any(x in df.columns for x in v)}
-                            if 'LAT' in f_cols.values(): abas.append(df.rename(f_cols).select(list(f_cols.values())).with_columns(pl.all().cast(pl.String)))
+                            
+                            f_cols = {}
+                            for target, aliases in mapping.items():
+                                for col in df.columns:
+                                    if col in aliases:
+                                        f_cols[col] = target
+                                        break
+                            
+                            # GATILHO DE SEGURANÇA: Só salva se achar as 5 colunas perfeitamente
+                            if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
+                                df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
+                                abas.append(df_clean)
+                                
                     if abas:
                         pl.concat(abas, how="diagonal").write_parquet(path)
                         anos.append(ano)
@@ -97,15 +128,21 @@ class SafeDriver:
                         with open(self.meta, 'w') as f: json.dump(m_data, f)
                     if os.path.exists(tmp): os.remove(tmp)
             except Exception as e:
-                print(f"⚠️ Aviso: SSP-SP instável para o ano {ano}. Ignorando atualização deste arquivo.", file=sys.stderr)
+                print(f"⚠️ SSP-SP offline para {ano}. Usando cache histórico.", file=sys.stderr)
                 continue
 
-        # Se não baixou nada novo E já tem os dados antigos processados, ele encerra de boas
-        if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
-            self.discord.notificar(self.sucesso, "SafeDriver Sync", "Sem novos dados acessíveis na SSP hoje.", 3066993)
+        # Validação final de segurança para não explodir o pipeline
+        arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
+        if not arquivos_limpos:
+            self.discord.notificar(self.sucesso, "SafeDriver Sync", "SSP inacessível e sem cache disponível.", 3066993)
             return
 
-        lf = pl.concat([pl.scan_parquet(f) for f in self.pastas["raw"].glob("*.parquet")], how="diagonal")
+        lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
+        
+        # Garante que a coluna D existe antes de continuar
+        if "D" not in lf.columns:
+            raise ValueError("Erro fatal: A coluna D ainda não existe nos arquivos baixados.")
+
         prata = lf.with_columns([
             pl.col("D").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DT"),
             pl.col("LAT").str.replace(",",".").cast(pl.Float32, strict=False),
