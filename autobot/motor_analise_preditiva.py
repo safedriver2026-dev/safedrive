@@ -8,6 +8,8 @@ import h3, holidays, boto3, shap
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.ensemble import VotingRegressor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -32,7 +34,7 @@ class Telemetria:
         payload = {
             "embeds": [{
                 "title": f"🟢 {titulo}",
-                "description": "**Relatório Executivo SafeDriver**\nO motor preditivo sincronizou os dados da SSP e atualizou o modelo com sucesso.",
+                "description": "**Relatório Executivo SafeDriver**\nO motor preditivo sincronizou toda a base histórica da SSP em paralelo e atualizou o modelo com sucesso.",
                 "color": 3066993, 
                 "fields": [
                     {"name": "📊 Volumetria (Camada Prata)", "value": f"{registros:,} ocorrências", "inline": True},
@@ -57,7 +59,6 @@ class Telemetria:
         self._enviar_webhook(self.sucesso, payload)
 
     def notificar_erro(self, titulo, erro_msg):
-        # Solução para evitar falhas de formatação Markdown que quebram o código
         bloco_inicio = "```python\n"
         bloco_fim = "\n```"
         resumo_erro = erro_msg[:1000]
@@ -89,28 +90,24 @@ class SafeDriver:
             self.bucket = cfg["R2_BUCKET_NAME"]
         else:
             self.s3 = None
+            
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
         self.meta = self.pastas["raw"] / "meta.json"
+        self.meta_lock = Lock() # Trava de segurança para as threads não atropelarem o JSON
 
     def cdc_check(self, ano, url, sessao):
         try:
-            # Trocando HEAD por GET com stream=True para driblar firewalls que bloqueiam HEAD
             r = sessao.get(url, timeout=30, verify=False, stream=True)
-            if r.status_code != 200:
-                print(f"⚠️ [CDC] Servidor recusou a conexão para {ano}. Status Code: {r.status_code}", file=sys.stderr)
-                return True, 0 # Força tentar baixar de novo
-            
+            if r.status_code != 200: return True, 0
             size = int(r.headers.get('Content-Length', 0))
-            r.close() # Fecha a conexão rápido, pois só queriamos o tamanho
-            
-            if self.meta.exists():
-                with open(self.meta, 'r') as f:
-                    if json.load(f).get(str(ano)) == size: 
-                        return False, size
+            r.close()
+            with self.meta_lock:
+                if self.meta.exists():
+                    with open(self.meta, 'r') as f:
+                        if json.load(f).get(str(ano)) == size: 
+                            return False, size
             return True, size
-        except Exception as e: 
-            print(f"⚠️ [CDC] Erro ao checar tamanho de {ano}: {e}", file=sys.stderr)
-            return True, 0
+        except: return True, 0
 
     def wkt(self, h3_id):
         try:
@@ -119,103 +116,125 @@ class SafeDriver:
             return f"POLYGON(({pts}, {b[0][0]} {b[0][1]}))"
         except: return None
 
+    def baixar_e_processar_ano(self, ano, sessao):
+        """Função isolada para ser executada em paralelo pelas Threads"""
+        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+        path_final = self.pastas["raw"] / f"ssp_{ano}.parquet"
+        path_tmp = self.pastas["raw"] / f"ssp_{ano}.download"
+        xlsx_tmp = self.pastas["raw"] / f"tmp_{ano}.xlsx"
+
+        run, sz = self.cdc_check(ano, url, sessao)
+        if not run and path_final.exists():
+            return False, ano # False = Não houve dados novos
+
+        try:
+            print(f"📥 [Thread {ano}] Iniciando download em streaming...", file=sys.stdout)
+            r = sessao.get(url, timeout=(30, 900), verify=False, stream=True)
+            
+            if r.status_code != 200:
+                print(f"❌ [Thread {ano}] Conexão recusada pela SSP.", file=sys.stderr)
+                return False, ano
+
+            # Download atômico do Excel
+            with open(xlsx_tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=4096 * 1024): # 4MB chunks para fluidez
+                    if chunk: f.write(chunk)
+                            
+            print(f"✅ [Thread {ano}] Download concluído. Processando precisão das colunas...", file=sys.stdout)
+            import fastexcel
+            ex = fastexcel.read_excel(str(xlsx_tmp))
+            abas = []
+            
+            mapping = {
+                'LAT': ['LATITUDE', 'LAT', 'Y'], 'LON': ['LONGITUDE', 'LON', 'X'],
+                'D': ['DATAOCORRENCIA', 'DATA_FATO', 'DATA_REF', 'DATA'],
+                'H': ['HORAOCORRENCIA', 'HORA_FATO', 'HORA_REF', 'HORA'],
+                'N': ['RUBRICA', 'NATUREZA', 'NATUREZA_APURADA']
+            }
+            
+            for n in ex.sheet_names:
+                df = pl.read_excel(str(xlsx_tmp), sheet_name=n, engine="calamine")
+                if len(df.columns) > 5:
+                    df.columns = [c.upper().strip() for c in df.columns]
+                    f_cols = {}
+                    for target, aliases in mapping.items():
+                        for col in df.columns:
+                            if col in aliases:
+                                f_cols[col] = target
+                                break
+                    if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
+                        df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
+                        abas.append(df_clean)
+                        
+            if abas:
+                # Escrita Atômica: Salva num arquivo .download primeiro
+                pl.concat(abas, how="diagonal").write_parquet(path_tmp)
+                
+                # Se chegou aqui sem erro, renomeia garantindo que o arquivo está íntegro
+                path_tmp.replace(path_final)
+                
+                with self.meta_lock:
+                    m_data = json.load(open(self.meta)) if self.meta.exists() else {}
+                    m_data[str(ano)] = sz
+                    with open(self.meta, 'w') as f: json.dump(m_data, f)
+                    
+            if xlsx_tmp.exists(): xlsx_tmp.unlink()
+            if path_tmp.exists(): path_tmp.unlink() # Limpa lixo se deu erro no meio
+            
+            return True, ano # True = Sucesso com dados novos
+            
+        except Exception as e:
+            print(f"❌ [Thread {ano}] Falha de rede ou timeout: {e}", file=sys.stderr)
+            if xlsx_tmp.exists(): xlsx_tmp.unlink()
+            if path_tmp.exists(): path_tmp.unlink()
+            return False, ano
+
     def processar(self):
         print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
         for f in self.pastas["raw"].glob("*.parquet"):
             try:
-                cols = pl.scan_parquet(f).columns
-                if "D" not in cols:
-                    f.unlink()
-                    print(f"🗑️ Cache corrompido removido: {f.name}")
+                if "D" not in pl.scan_parquet(f).columns: f.unlink()
             except:
                 try: f.unlink()
                 except: pass
 
+        # Remove lixos temporários de execuções mortas
+        for f in self.pastas["raw"].glob("*.download"): f.unlink()
+        for f in self.pastas["raw"].glob("*.xlsx"): f.unlink()
+
         s = requests.Session()
-        retries = Retry(total=3, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
+        retries = Retry(total=5, backoff_factor=3, status_forcelist=[403, 429, 500, 502, 503, 504], allowed_methods=["HEAD", "GET", "OPTIONS"])
         s.mount('https://', HTTPAdapter(max_retries=retries))
-        
-        # 🛡️ SUPER HEADERS: Simulando um navegador real, vindo do próprio site da SSP, em Português
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://www.ssp.sp.gov.br/estatistica",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1"
+            "Connection": "keep-alive"
         })
         
-        novo, anos = False, []
+        novo_dado = False
+        anos_para_baixar = list(range(2022, datetime.now().year + 1))
 
-        for ano in range(2022, datetime.now().year + 1):
-            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-            path = self.pastas["raw"] / f"ssp_{ano}.parquet"
-            
-            run, sz = self.cdc_check(ano, url, s)
-            if not run and path.exists(): 
-                anos.append(ano)
-                continue
-
-            try:
-                print(f"📥 Baixando SSP {ano}...", file=sys.stdout)
-                r = s.get(url, timeout=(15, 300), verify=False, stream=True)
-                
-                if r.status_code == 200:
-                    novo = True
-                    tmp = self.pastas["raw"] / "tmp.xlsx"
-                    with open(tmp, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192 * 1024): 
-                            if chunk: f.write(chunk)
-                                
-                    import fastexcel
-                    ex = fastexcel.read_excel(str(tmp))
-                    abas = []
-                    
-                    mapping = {
-                        'LAT': ['LATITUDE', 'LAT', 'Y'], 'LON': ['LONGITUDE', 'LON', 'X'],
-                        'D': ['DATAOCORRENCIA', 'DATA_FATO', 'DATA_REF', 'DATA'],
-                        'H': ['HORAOCORRENCIA', 'HORA_FATO', 'HORA_REF', 'HORA'],
-                        'N': ['RUBRICA', 'NATUREZA', 'NATUREZA_APURADA']
-                    }
-                    
-                    for n in ex.sheet_names:
-                        df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
-                        if len(df.columns) > 5:
-                            df.columns = [c.upper().strip() for c in df.columns]
-                            f_cols = {}
-                            for target, aliases in mapping.items():
-                                for col in df.columns:
-                                    if col in aliases:
-                                        f_cols[col] = target
-                                        break
-                            if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
-                                df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
-                                abas.append(df_clean)
-                                
-                    if abas:
-                        pl.concat(abas, how="diagonal").write_parquet(path)
-                        anos.append(ano)
-                        m_data = json.load(open(self.meta)) if self.meta.exists() else {}
-                        m_data[str(ano)] = sz
-                        with open(self.meta, 'w') as f: json.dump(m_data, f)
-                    if os.path.exists(tmp): os.remove(tmp)
-                else:
-                    print(f"❌ [ERRO CRÍTICO] A SSP recusou a conexão para {ano}. Status retornado: {r.status_code}", file=sys.stderr)
-            except Exception as e: 
-                print(f"❌ [FALHA DE REDE] Erro ao conectar na SSP para {ano}: {e}", file=sys.stderr)
-                continue
+        # 🚀 MULTITHREADING: Abre 3 threads para baixar os anos simultaneamente
+        print("⚡ Iniciando processamento paralelo (Multithreading)...", file=sys.stdout)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futuros = [executor.submit(self.baixar_e_processar_ano, ano, s) for ano in anos_para_baixar]
+            for futuro in as_completed(futuros):
+                sucesso, ano = futuro.result()
+                if sucesso: novo_dado = True
 
         arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
         if not arquivos_limpos:
-            self.discord.notificar_erro("SafeDriver Sync", "A Secretaria de Segurança (SSP) está indisponível ou bloqueando o acesso e não há base histórica local.")
+            self.discord.notificar_erro("SafeDriver Sync", "SSP inacessível e sem base de cache para fallback.")
             return
 
-        if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
-            print("Nenhuma atualização pendente.")
+        if not novo_dado and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
+            print("Nenhuma atualização pendente.", file=sys.stdout)
             self.discord.notificar_info("SafeDriver Informação", "O pipeline rodou, mas os dados da SSP já estão atualizados na versão mais recente.")
             return
 
-        print("⚙️ Processando Camada Prata (Traduzindo variáveis)...", file=sys.stdout)
+        print("⚙️ Processando Camada Prata (Traduzindo Variáveis de Negócio)...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
         prata = lf.with_columns([
             pl.col("D").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DATA_FATO"),
@@ -231,7 +250,7 @@ class SafeDriver:
 
         prata.with_columns(pl.col("LAT").hash().alias("ID_ANONIMO")).drop(["DATA_FATO","H","HORA_CRIME","N"]).write_parquet(self.pastas["prata"] / "camada_prata.parquet")
         
-        print("🧠 Treinando IA Preditiva...", file=sys.stdout)
+        print("🧠 Treinando Rede Preditiva H3...", file=sys.stdout)
         c = prata.select(["LAT","LON"]).unique().to_pandas()
         c['CODIGO_H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(["CODIGO_H3","PERIODO_DIA","TIPO_CRIME","EH_FERIADO","SEMANA_PAGAMENTO"]).agg([
@@ -265,7 +284,7 @@ class SafeDriver:
             except: status_cloud = "⚠️ Falha no Backup R2"
         
         tempo_total = time.time() - self.t_inicio
-        self.discord.notificar_sucesso("Execução Concluída", tempo_total, prata.height, risco_avg, status_cloud)
+        self.discord.notificar_sucesso("TCC SafeDriver Executado", tempo_total, prata.height, risco_avg, status_cloud)
 
 if __name__ == "__main__":
     app = SafeDriver()
