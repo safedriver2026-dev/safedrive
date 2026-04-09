@@ -21,7 +21,7 @@ jobs:
           restore-keys: |
             raw-data-
       - name: Install Dependencies
-        run: pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest
+        run: pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest pyarrow
       - name: Execute Motor
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
