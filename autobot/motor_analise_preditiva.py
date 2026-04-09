@@ -94,13 +94,23 @@ class SafeDriver:
 
     def cdc_check(self, ano, url, sessao):
         try:
-            r = sessao.head(url, timeout=30, verify=False)
+            # Trocando HEAD por GET com stream=True para driblar firewalls que bloqueiam HEAD
+            r = sessao.get(url, timeout=30, verify=False, stream=True)
+            if r.status_code != 200:
+                print(f"⚠️ [CDC] Servidor recusou a conexão para {ano}. Status Code: {r.status_code}", file=sys.stderr)
+                return True, 0 # Força tentar baixar de novo
+            
             size = int(r.headers.get('Content-Length', 0))
+            r.close() # Fecha a conexão rápido, pois só queriamos o tamanho
+            
             if self.meta.exists():
                 with open(self.meta, 'r') as f:
-                    if json.load(f).get(str(ano)) == size: return False, size
+                    if json.load(f).get(str(ano)) == size: 
+                        return False, size
             return True, size
-        except: return True, 0
+        except Exception as e: 
+            print(f"⚠️ [CDC] Erro ao checar tamanho de {ano}: {e}", file=sys.stderr)
+            return True, 0
 
     def wkt(self, h3_id):
         try:
@@ -122,11 +132,17 @@ class SafeDriver:
                 except: pass
 
         s = requests.Session()
-        retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        retries = Retry(total=3, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
         s.mount('https://', HTTPAdapter(max_retries=retries))
+        
+        # 🛡️ SUPER HEADERS: Simulando um navegador real, vindo do próprio site da SSP, em Português
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.ssp.sp.gov.br/estatistica",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
         })
         
         novo, anos = False, []
@@ -183,16 +199,20 @@ class SafeDriver:
                         m_data[str(ano)] = sz
                         with open(self.meta, 'w') as f: json.dump(m_data, f)
                     if os.path.exists(tmp): os.remove(tmp)
-            except: continue
+                else:
+                    print(f"❌ [ERRO CRÍTICO] A SSP recusou a conexão para {ano}. Status retornado: {r.status_code}", file=sys.stderr)
+            except Exception as e: 
+                print(f"❌ [FALHA DE REDE] Erro ao conectar na SSP para {ano}: {e}", file=sys.stderr)
+                continue
 
         arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
         if not arquivos_limpos:
-            self.discord.notificar_erro("SafeDriver Sync", "A Secretaria de Segurança (SSP) está indisponível e não há base histórica local.")
+            self.discord.notificar_erro("SafeDriver Sync", "A Secretaria de Segurança (SSP) está indisponível ou bloqueando o acesso e não há base histórica local.")
             return
 
         if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
             print("Nenhuma atualização pendente.")
-            self.discord.notificar_info("SafeDriver Informação", "O pipeline foi executado, mas os dados da SSP já estão atualizados na versão mais recente.")
+            self.discord.notificar_info("SafeDriver Informação", "O pipeline rodou, mas os dados da SSP já estão atualizados na versão mais recente.")
             return
 
         print("⚙️ Processando Camada Prata (Traduzindo variáveis)...", file=sys.stdout)
