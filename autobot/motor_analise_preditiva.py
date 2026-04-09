@@ -45,9 +45,3 @@ class NotificadorDiscord:
     def relatar_erro(self, erro_msg):
         msg = f"**Status:** 🔴 Falha Crítica\n**Detalhes:**\n
 http://googleusercontent.com/immersive_entry_chip/0
-
-### O que acontece agora?
-* **Se der certo:** Ele vai pegar o número exato de linhas que a IA mastigou (usando `df_prata.height`), o tempo exato em segundos e os anos que foram compilados, montando um card Verde no seu servidor.
-* **Se der pau:** Qualquer `Exception` (seja de conexão, Polars ou do CatBoost) cai no bloco `try...except` na última linha, formata a pilha de erros e lança um card Vermelho, permitindo que você veja onde quebrou pelo celular sem precisar abrir o GitHub Actions.
-
-Mande um `git push`. O pipeline não está mais "mudo".
