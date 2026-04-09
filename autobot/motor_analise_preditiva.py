@@ -92,9 +92,24 @@ class SafeDriver:
             size = int(r.headers.get('Content-Length', 0))
             if self.meta.exists():
                 with open(self.meta, 'r') as f:
-                    if json.load(f).get(str(ano)) == size: return False, size
+                    dados_meta = json.load(f).get(str(ano))
+                    if isinstance(dados_meta, dict):
+                        if dados_meta.get("tamanho_bytes") == size: return False, size
+                    elif dados_meta == size:
+                        return False, size
             return True, size
         except: return True, 0
+
+    def calcular_sha256(self, caminho_arquivo):
+        sha256_hash = hashlib.sha256()
+        try:
+            with open(caminho_arquivo, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096 * 1024), b""):
+                    sha256_hash.update(byte_block)
+            return sha256_hash.hexdigest()
+        except Exception as e:
+            print(f"⚠️ Erro ao calcular SHA-256: {e}")
+            return None
 
     def wkt(self, h3_id):
         try:
@@ -143,47 +158,67 @@ class SafeDriver:
                     with open(tmp, "wb") as f:
                         f.write(r.content)
                                 
-                    print(f"✅ Download {ano} concluído! Processando...", file=sys.stdout)
+                    print(f"✅ Download {ano} concluído! Inspecionando abas...", file=sys.stdout)
                     import fastexcel
                     ex = fastexcel.read_excel(str(tmp))
                     abas = []
                     
                     mapping = {
-                        'LAT': ['LATITUDE', 'LAT', 'Y'], 'LON': ['LONGITUDE', 'LON', 'X'],
-                        'D': ['DATAOCORRENCIA', 'DATA_FATO', 'DATA_REF', 'DATA'],
-                        'H': ['HORAOCORRENCIA', 'HORA_FATO', 'HORA_REF', 'HORA'],
-                        'N': ['RUBRICA', 'NATUREZA', 'NATUREZA_APURADA']
+                        'LAT': ['LATITUDE', 'LAT', 'Y'], 
+                        'LON': ['LONGITUDE', 'LON', 'X'],
+                        'D': ['DATA_OCORRENCIA', 'DATAOCORRENCIA', 'DATA_FATO', 'DATA_DO_FATO', 'DATA_REF'],
+                        'H': ['HORA_OCORRENCIA', 'HORAOCORRENCIA', 'HORA_FATO', 'HORA_DO_FATO', 'HORA_REF'],
+                        'N': ['NATUREZA_APURADA', 'RUBRICA']
                     }
                     
                     for n in ex.sheet_names:
                         df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
+                        
                         if len(df.columns) > 5:
-                            df.columns = [c.upper().strip() for c in df.columns]
+                            df.columns = [str(c).upper().strip().replace('\n', '').replace('\r', '').replace(' ', '_') for c in df.columns]
+                            
                             f_cols = {}
                             for target, aliases in mapping.items():
-                                for col in df.columns:
-                                    if col in aliases:
-                                        f_cols[col] = target
+                                for alias in aliases:
+                                    encontrou = False
+                                    for col in df.columns:
+                                        if alias in col:
+                                            if target in ['D', 'H'] and ('REGISTRO' in col or 'COMUNICACAO' in col or 'ELABORACAO' in col):
+                                                continue
+                                            
+                                            f_cols[col] = target
+                                            encontrou = True
+                                            break
+                                    if encontrou:
                                         break
-                            if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
-                                df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
+                            
+                            if len(f_cols) == 5:
+                                df_clean = df.select(list(f_cols.keys())).rename(f_cols).with_columns(pl.all().cast(pl.String))
                                 abas.append(df_clean)
+                                print(f"   -> Lote de dados extraído da aba: '{n}'", file=sys.stdout)
+                            else:
+                                print(f"   -> Ignorando capa/dicionário: '{n}'", file=sys.stdout)
                                 
                     if abas:
                         pl.concat(abas, how="diagonal").write_parquet(path)
                         anos.append(ano)
+                        
+                        assinatura_sha256 = self.calcular_sha256(str(tmp))
+                        print(f"🔒 Assinatura SHA-256 ({ano}): {assinatura_sha256}", file=sys.stdout)
+                        
                         m_data = json.load(open(self.meta)) if self.meta.exists() else {}
-                        m_data[str(ano)] = sz
+                        m_data[str(ano)] = {"tamanho_bytes": sz, "sha256": assinatura_sha256}
                         with open(self.meta, 'w') as f: json.dump(m_data, f)
+                    else:
+                        raise Exception(f"Nenhum dado criminal estruturado encontrado no arquivo de {ano}.")
+                        
                     if os.path.exists(tmp): os.remove(tmp)
                 else:
                     msg_erro = f"Status Code inesperado: {r.status_code}"
                     print(f"❌ {msg_erro}", file=sys.stderr)
-                    # Forçando a exceção para estourar no Actions
                     raise Exception(msg_erro)
                     
             except Exception as e: 
-                # Se falhar no download ou extração, lança a exceção para o bloco principal
                 print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
                 raise e 
 
@@ -255,16 +290,10 @@ if __name__ == "__main__":
     try:
         app.processar()
     except Exception as e:
-        # Pega a linha exata e a pilha de erros (Stacktrace)
         err = traceback.format_exc()
-        # Imprime na tela do GitHub Actions em vermelho/erro
         print("\n" + "="*50, file=sys.stderr)
         print("🚨 ERRO FATAL NO PIPELINE 🚨", file=sys.stderr)
         print("="*50, file=sys.stderr)
         print(err, file=sys.stderr)
-        
-        # Manda para o Discord
         app.discord.notificar_erro("Falha Sistêmica", err)
-        
-        # O pulo do gato: Força a falha no GitHub Actions (Exit code 1)
         sys.exit(1)
