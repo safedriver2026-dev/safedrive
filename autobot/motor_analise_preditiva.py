@@ -14,203 +14,59 @@ warnings.filterwarnings("ignore")
 
 class Telemetria:
     def __init__(self):
-        self.sucesso = os.environ.get("DISCORD_SUCESSO", "").strip()
-        self.erro = os.environ.get("DISCORD_ERRO", "").strip()
+        self.sucesso = os.environ.get("DISCORD_SUCESSO", "").strip(' "\'')
+        self.erro = os.environ.get("DISCORD_ERRO", "").strip(' "\'')
 
-    def notificar(self, url, titulo, corpo, cor):
-        if not url: return
-        payload = {"embeds": [{"title": titulo, "description": corpo, "color": cor, "footer": {"text": f"SafeDriver AI | {datetime.now().strftime('%H:%M')}"}}]}
-        try: requests.post(url, json=payload, timeout=10)
-        except: pass
+    def notificar_sucesso(self, titulo, tempo_execucao, registros, media_risco, status_s3):
+        if not self.sucesso or not self.sucesso.startswith("https://discord"):
+            print("⚠️ Webhook de sucesso ausente ou inválido.", file=sys.stderr)
+            return
 
-class SafeDriver:
-    def __init__(self):
-        self.t_inicio = time.time()
-        self.discord = Telemetria()
-        self.pastas = {p: Path(f"datalake/{p}") for p in ["raw", "prata", "ouro"]}
-        for p in self.pastas.values(): p.mkdir(parents=True, exist_ok=True)
-        
-        cfg = {k: os.environ.get(k, "").strip() for k in ["R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME"]}
-        self.s3 = boto3.client('s3', endpoint_url=cfg["R2_ENDPOINT_URL"], aws_access_key_id=cfg["R2_ACCESS_KEY_ID"], aws_secret_access_key=cfg["R2_SECRET_ACCESS_KEY"], region_name="auto")
-        self.bucket = cfg["R2_BUCKET_NAME"]
-        self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
-        self.meta = self.pastas["raw"] / "meta.json"
+        payload = {
+            "embeds": [{
+                "title": f"🟢 {titulo}",
+                "description": "**Relatório Executivo Diário**\nO pipeline concluiu a sincronização e modelagem com sucesso.",
+                "color": 3066993,
+                "fields": [
+                    {"name": "📊 Volumetria (Camada Prata)", "value": f"{registros:,} registros", "inline": True},
+                    {"name": "⚠️ Risco Médio Global", "value": f"{media_risco:.2f}", "inline": True},
+                    {"name": "⏱️ Tempo de Execução", "value": f"{tempo_execucao:.1f}s", "inline": True},
+                    {"name": "☁️ Backup Cloudflare R2", "value": status_s3, "inline": False}
+                ],
+                "footer": {"text": f"SafeDriver AI • {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
+            }]
+        }
 
-    def cdc_check(self, ano, url, sessao):
         try:
-            r = sessao.head(url, timeout=30, verify=False)
-            size = int(r.headers.get('Content-Length', 0))
-            if self.meta.exists():
-                with open(self.meta, 'r') as f:
-                    if json.load(f).get(str(ano)) == size: return False, size
-            return True, size
-        except: return True, 0
+            requests.post(self.sucesso, json=payload, timeout=10)
+        except Exception as e:
+            print(f"Erro ao enviar webhook: {e}", file=sys.stderr)
 
-    def wkt(self, h3_id):
-        try:
-            b = h3.h3_to_geo_boundary(h3_id, geo_json=True)
-            pts = ", ".join([f"{ln} {lt}" for ln, lt in b])
-            return f"POLYGON(({pts}, {b[0][0]} {b[0][1]}))"
-        except: return None
+    def notificar_erro(self, titulo, erro_msg):
+        if not self.erro or not self.erro.startswith("https://discord"):
+            print("⚠️ Webhook de erro ausente ou inválido.", file=sys.stderr)
+            return
 
-    def processar(self):
-        # 1. AUTO-CURA: Limpa arquivos zumbis/corrompidos do cache
-        print("Verificando integridade da base histórica local...", file=sys.stdout)
-        for f in self.pastas["raw"].glob("*.parquet"):
-            try:
-                cols = pl.scan_parquet(f).columns
-                if "D" not in cols:
-                    f.unlink()
-                    print(f"🗑️ Arquivo corrompido deletado: {f.name}", file=sys.stdout)
-            except Exception:
-                try: f.unlink()
-                except: pass
+        stacktrace = str(erro_msg)
+        if len(stacktrace) > 1000:
+            stacktrace = stacktrace[:1000] + "..."
 
-        # 2. SESSÃO BLINDADA: Retentativas inteligentes e Máscara de Navegador
-        s = requests.Session()
-        retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
-        s.mount('https://', HTTPAdapter(max_retries=retries))
-        
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive"
-        })
-        
-        novo, anos = False, []
-
-        # 3. CAPTURA DA BASE HISTÓRICA (2022 até Hoje)
-        for ano in range(2022, datetime.now().year + 1):
-            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-            path = self.pastas["raw"] / f"ssp_{ano}.parquet"
-            
-            run, sz = self.cdc_check(ano, url, s)
-            if not run and path.exists(): 
-                anos.append(ano)
-                continue
-
-            try:
-                print(f"📥 Baixando base da SSP ({ano})...", file=sys.stdout)
-                
-                # DOWNLOAD EM STREAMING (Não estoura a memória)
-                r = s.get(url, timeout=(15, 300), verify=False, stream=True)
-                
-                if r.status_code == 200:
-                    novo = True
-                    tmp = self.pastas["raw"] / "tmp.xlsx"
-                    
-                    # Salvando em blocos de 8MB
-                    with open(tmp, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192 * 1024): 
-                            if chunk: f.write(chunk)
-                                
-                    print(f"✅ Download {ano} concluído. Processando colunas...", file=sys.stdout)
-                    import fastexcel
-                    ex = fastexcel.read_excel(str(tmp))
-                    abas = []
-                    
-                    # DICIONÁRIO DE MAPEAMENTO (Garante que vai ler certo, não importa o nome da coluna)
-                    mapping = {
-                        'LAT': ['LATITUDE', 'LAT', 'Y'],
-                        'LON': ['LONGITUDE', 'LON', 'X'],
-                        'D': ['DATAOCORRENCIA', 'DATA_FATO', 'DATA_REF', 'DATA'],
-                        'H': ['HORAOCORRENCIA', 'HORA_FATO', 'HORA_REF', 'HORA'],
-                        'N': ['RUBRICA', 'NATUREZA', 'NATUREZA_APURADA']
+        payload = {
+            "embeds": [{
+                "title": f"🔴 {titulo}",
+                "description": "**Falha Crítica no Pipeline MLOps**",
+                "color": 15158332,
+                "fields": [
+                    {
+                        "name": "Stacktrace Resumido",
+                        "value": f"```{stacktrace}```"
                     }
-                    
-                    for n in ex.sheet_names:
-                        df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
-                        if len(df.columns) > 5:
-                            df.columns = [c.upper().strip() for c in df.columns]
-                            f_cols = {}
-                            for target, aliases in mapping.items():
-                                for col in df.columns:
-                                    if col in aliases:
-                                        f_cols[col] = target
-                                        break
-                            
-                            # FILTRO DE SEGURANÇA
-                            if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
-                                df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
-                                abas.append(df_clean)
-                                
-                    if abas:
-                        pl.concat(abas, how="diagonal").write_parquet(path)
-                        anos.append(ano)
-                        m_data = json.load(open(self.meta)) if self.meta.exists() else {}
-                        m_data[str(ano)] = sz
-                        with open(self.meta, 'w') as f: json.dump(m_data, f)
-                    if os.path.exists(tmp): os.remove(tmp)
-            except Exception as e:
-                print(f"⚠️ SSP-SP offline/instável para o ano {ano}. Usando cache.", file=sys.stderr)
-                continue
+                ],
+                "footer": {"text": f"SafeDriver AI • {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
+            }]
+        }
 
-        # 4. VALIDAÇÃO DE SEGURANÇA (Se o site da SSP morreu de vez e não temos cache)
-        arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
-        if not arquivos_limpos:
-            self.discord.notificar(self.discord.sucesso, "SafeDriver Sync", "SSP inacessível e sem cache.", 3066993)
-            return
-
-        if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
-            self.discord.notificar(self.discord.sucesso, "SafeDriver Sync", "Base histórica já consolidada. Sem novidades na SSP.", 3066993)
-            return
-
-        # 5. ENGENHARIA DE DADOS (Transformação Lazy em Lote)
-        print("⚙️ Construindo Camada Prata e Features...", file=sys.stdout)
-        lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
-        
-        if "D" not in lf.columns:
-            raise ValueError("Erro fatal de Schema: A coluna D desapareceu.")
-
-        prata = lf.with_columns([
-            pl.col("D").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DT"),
-            pl.col("LAT").str.replace(",",".").cast(pl.Float32, strict=False),
-            pl.col("LON").str.replace(",",".").cast(pl.Float32, strict=False),
-            pl.col("H").str.slice(0,2).cast(pl.Int8, strict=False).alias("HR")
-        ]).filter(pl.col("LAT").is_between(-25.5, -19.5)).with_columns([
-            pl.when(pl.col("N").str.to_uppercase().str.contains("ROUBO|FURTO")).then(pl.lit("PATRIMONIO")).otherwise(pl.lit("PESSOA")).alias("NATUREZA_CRIME"),
-            pl.when(pl.col("HR").is_between(6,18)).then(pl.lit("DIA")).otherwise(pl.lit("NOITE")).alias("TURNO"),
-            pl.col("DT").dt.date().is_in(self.feriados).cast(pl.Int8).alias("IS_FERIADO"),
-            ((pl.col("DT").dt.day().is_between(28,31))|(pl.col("DT").dt.day().is_between(1,7))).cast(pl.Int8).alias("IS_PAGAMENTO")
-        ]).collect()
-
-        prata.with_columns(pl.col("LAT").hash().alias("ID_ANONIMO")).drop(["D","H","HR","N"]).write_parquet(self.pastas["prata"] / "camada_prata.parquet")
-        
-        # 6. ENGENHARIA ESPACIAL (H3 Grid)
-        c = prata.select(["LAT","LON"]).unique().to_pandas()
-        c['H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
-        fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(["H3","TURNO","NATUREZA_CRIME","IS_FERIADO","IS_PAGAMENTO"]).agg([pl.len().alias("INCIDENTES"), pl.col("LAT").mean().alias("LAT_M"), pl.col("LON").mean().alias("LON_M")])
-        
-        # 7. MACHINE LEARNING (Treino do Ensemble)
-        print("🧠 Treinando IA Preditiva...", file=sys.stdout)
-        X = fato.select(["LAT_M","LON_M","IS_FERIADO","IS_PAGAMENTO"]).to_pandas()
-        y = np.log1p(fato.select("INCIDENTES").to_numpy().ravel())
-        ens = VotingRegressor([('c', CatBoostRegressor(iterations=100, silent=True)), ('l', LGBMRegressor(n_estimators=100, verbose=-1))]).fit(X, y)
-        
-        # 8. CAMADA OURO E SHAP (Dashboard Final)
-        fato.with_columns([
-            pl.Series("RISCO_SCORE", np.round(np.expm1(ens.predict(X)), 2)),
-            pl.col("H3").map_elements(self.wkt, return_dtype=pl.String).alias("GEOMETRIA_WKT")
-        ]).write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
-
-        sd = pd.DataFrame(shap.TreeExplainer(ens.estimators_[0]).shap_values(X), columns=X.columns).abs().mean().to_frame("IMPORTANCIA").reset_index()
-        sd.columns = ["FEATURE", "IMPORTANCIA"]
-        pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
-
-        # 9. BACKUP NO R2 / S3
-        for f in self.pastas["ouro"].glob("*.parquet"):
-            self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
-        
-        self.discord.notificar(self.discord.sucesso, "SafeDriver OK", f"Processada a Base Histórica com {prata.height:,} registros.", 3066993)
-
-if __name__ == "__main__":
-    app = SafeDriver()
-    try:
-        app.processar()
-    except Exception:
-        err = traceback.format_exc()
-        print(err, file=sys.stderr)
-        msg_erro = "Erro Critico:\n" + err[:1800]
-        app.discord.notificar(app.discord.erro, "SafeDriver FAIL", msg_erro, 15158332)
-        sys.exit(1)
+        try:
+            requests.post(self.erro, json=payload, timeout=10)
+        except Exception as e:
+            print(f"Erro ao enviar webhook de erro: {e}", file=sys.stderr)
