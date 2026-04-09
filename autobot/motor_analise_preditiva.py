@@ -107,9 +107,36 @@ class SafeDriver:
                 for byte_block in iter(lambda: f.read(4096 * 1024), b""):
                     sha256_hash.update(byte_block)
             return sha256_hash.hexdigest()
-        except Exception as e:
-            print(f"⚠️ Erro ao calcular SHA-256: {e}")
+        except Exception:
             return None
+
+    def baixar_robusto(self, url, caminho_tmp, sessao):
+        max_tentativas = 10
+        for tentativa in range(max_tentativas):
+            try:
+                tamanho_atual = os.path.getsize(caminho_tmp) if os.path.exists(caminho_tmp) else 0
+                headers = {}
+                if tamanho_atual > 0:
+                    headers['Range'] = f'bytes={tamanho_atual}-'
+                
+                with sessao.get(url, headers=headers, stream=True, timeout=(30, 120), verify=False) as r:
+                    if r.status_code == 416:
+                        return True
+                    if r.status_code not in (200, 206):
+                        time.sleep(5)
+                        continue
+                        
+                    modo = 'ab' if r.status_code == 206 else 'wb'
+                    
+                    with open(caminho_tmp, modo) as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                return True
+            except Exception as e:
+                print(f"⚠️ Ligação caiu (Tentativa {tentativa+1}/{max_tentativas}). A retomar download...", file=sys.stdout)
+                time.sleep(5)
+        return False
 
     def wkt(self, h3_id):
         try:
@@ -124,15 +151,14 @@ class SafeDriver:
             try:
                 if "D" not in pl.scan_parquet(f).columns:
                     f.unlink()
-                    print(f"🗑️ Cache corrompido removido: {f.name}")
             except:
                 try: f.unlink()
                 except: pass
 
         s = requests.Session()
-        s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=2)))
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
         s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept": "*/*"
         })
         
@@ -141,6 +167,7 @@ class SafeDriver:
         for ano in range(2022, datetime.now().year + 1):
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             path = self.pastas["raw"] / f"ssp_{ano}.parquet"
+            tmp = self.pastas["raw"] / f"tmp_{ano}.xlsx"
             
             run, sz = self.cdc_check(ano, url, s)
             if not run and path.exists(): 
@@ -148,18 +175,14 @@ class SafeDriver:
                 continue
 
             try:
-                print(f"📥 Baixando SSP {ano} (Streaming Longo)...", file=sys.stdout)
+                print(f"📥 Baixando SSP {ano} (Resiliente)...", file=sys.stdout)
                 
-                r = s.get(url, timeout=(60, 1800), verify=False, stream=True)
+                if os.path.exists(tmp): os.remove(tmp)
                 
-                if r.status_code == 200:
+                sucesso_download = self.baixar_robusto(url, str(tmp), s)
+                
+                if sucesso_download:
                     novo = True
-                    tmp = self.pastas["raw"] / "tmp.xlsx"
-                    with open(tmp, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                f.write(chunk)
-                                
                     print(f"✅ Download {ano} concluído! Inspecionando abas...", file=sys.stdout)
                     import fastexcel
                     ex = fastexcel.read_excel(str(tmp))
@@ -197,9 +220,6 @@ class SafeDriver:
                             if len(f_cols) == 5:
                                 df_clean = df.select(list(f_cols.keys())).rename(f_cols).with_columns(pl.all().cast(pl.String))
                                 abas.append(df_clean)
-                                print(f"   -> Lote de dados extraído da aba: '{n}'", file=sys.stdout)
-                            else:
-                                print(f"   -> Ignorando capa/dicionário: '{n}'", file=sys.stdout)
                                 
                     if abas:
                         pl.concat(abas, how="diagonal").write_parquet(path)
@@ -212,16 +232,15 @@ class SafeDriver:
                         m_data[str(ano)] = {"tamanho_bytes": sz, "sha256": assinatura_sha256}
                         with open(self.meta, 'w') as f: json.dump(m_data, f)
                     else:
-                        raise Exception(f"Nenhum dado criminal estruturado encontrado no arquivo de {ano}.")
+                        raise Exception(f"Nenhum dado criminal estruturado encontrado.")
                         
                     if os.path.exists(tmp): os.remove(tmp)
                 else:
-                    msg_erro = f"Status Code inesperado: {r.status_code}"
-                    print(f"❌ {msg_erro}", file=sys.stderr)
-                    raise Exception(msg_erro)
+                    raise Exception(f"Falha ao baixar arquivo apos multiplas tentativas.")
                     
             except Exception as e: 
                 print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
+                if os.path.exists(tmp): os.remove(tmp)
                 raise e 
 
         arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
