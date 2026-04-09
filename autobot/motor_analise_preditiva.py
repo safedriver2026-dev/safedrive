@@ -78,7 +78,8 @@ class SafeDriver:
                         df.columns = [c.upper().strip() for c in df.columns]
                         m = {'LAT':['LATITUDE','LAT'],'LON':['LONGITUDE','LON'],'D':['DATAOCORRENCIA','DATA_REF'],'H':['HORAOCORRENCIA','HORA_REF'],'N':['RUBRICA','NATUREZA']}
                         f_cols = {v[0]: k for k, v in m.items() if any(x in df.columns for x in v)}
-                        if 'LAT' in f_cols.values(): abas.append(df.rename(f_cols).select(list(f_cols.values())).with_columns(pl.all().cast(pl.String)))
+                        if 'LAT' in f_cols.values():
+                            abas.append(df.rename(f_cols).select(list(f_cols.values())).with_columns(pl.all().cast(pl.String)))
                 if abas:
                     pl.concat(abas, how="diagonal").write_parquet(path)
                     anos.append(ano)
@@ -108,25 +109,50 @@ class SafeDriver:
         
         c = prata.select(["LAT","LON"]).unique().to_pandas()
         c['H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
-        fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(["H3","TURNO","NATUREZA_CRIME","IS_FERIADO","IS_PAGAMENTO"]).agg([pl.len().alias("INCIDENTES"), pl.col("LAT").mean().alias("LAT_M"), pl.col("LON").mean().alias("LON_M")])
+        
+        fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(
+            ["H3","TURNO","NATUREZA_CRIME","IS_FERIADO","IS_PAGAMENTO"]
+        ).agg([
+            pl.len().alias("INCIDENTES"),
+            pl.col("LAT").mean().alias("LAT_M"),
+            pl.col("LON").mean().alias("LON_M")
+        ]).with_columns([
+            pl.when(pl.col("NATUREZA_CRIME") == "PATRIMONIO")
+              .then(pl.lit("ECONOMICO"))
+              .otherwise(pl.lit("PESSOAL"))
+              .alias("PERFIL")
+        ])
         
         X = fato.select(["LAT_M","LON_M","IS_FERIADO","IS_PAGAMENTO"]).to_pandas()
         y = np.log1p(fato.select("INCIDENTES").to_numpy().ravel())
-        ens = VotingRegressor([('c', CatBoostRegressor(iterations=100, silent=True)), ('l', LGBMRegressor(n_estimators=100, verbose=-1))]).fit(X, y)
+
+        ens = VotingRegressor([
+            ('c', CatBoostRegressor(iterations=100, silent=True)),
+            ('l', LGBMRegressor(n_estimators=100, verbose=-1))
+        ]).fit(X, y)
         
         fato.with_columns([
             pl.Series("RISCO_SCORE", np.round(np.expm1(ens.predict(X)), 2)),
             pl.col("H3").map_elements(self.wkt, return_dtype=pl.String).alias("GEOMETRIA_WKT")
         ]).write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
 
-        sd = pd.DataFrame(shap.TreeExplainer(ens.estimators_[0]).shap_values(X), columns=X.columns).abs().mean().to_frame("IMPORTANCIA").reset_index()
+        sd = pd.DataFrame(
+            shap.TreeExplainer(ens.estimators_[0]).shap_values(X),
+            columns=X.columns
+        ).abs().mean().to_frame("IMPORTANCIA").reset_index()
+
         sd.columns = ["FEATURE", "IMPORTANCIA"]
         pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
 
         for f in self.pastas["ouro"].glob("*.parquet"):
             self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
         
-        self.discord.notificar(self.sucesso, "SafeDriver OK", f"Processados {prata.height:,} registros.", 3066993)
+        self.discord.notificar(
+            self.discord.sucesso,
+            "SafeDriver OK",
+            f"Processados {prata.height:,} registros.",
+            3066993
+        )
 
 if __name__ == "__main__":
     app = SafeDriver()
@@ -135,5 +161,9 @@ if __name__ == "__main__":
     except Exception:
         err = traceback.format_exc()
         print(err, file=sys.stderr)
-        app.discord.notificar(app.discord.erro, "SafeDriver FAIL", f"
-http://googleusercontent.com/immersive_entry_chip/0
+        app.discord.notificar(
+            app.discord.erro,
+            "SafeDriver FAIL",
+            f"{err}",
+            15158332
+        )
