@@ -2,17 +2,22 @@ name: SafeDriver Execução Diaria
 
 on:
   schedule:
-    - cron: '0 1 * * *' 
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
   run_motor:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Cache Data
         uses: actions/cache@v4
         with:
@@ -20,8 +25,19 @@ jobs:
           key: raw-data-${{ hashFiles('autobot/motor_analise_preditiva.py') }}
           restore-keys: |
             raw-data-
+
       - name: Install Dependencies
-        run: pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest pyarrow
+        run: |
+          pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest pyarrow
+
+      - name: Debug Secrets
+        run: |
+          echo "SUCESSO LENGTH: ${#DISCORD_SUCESSO}"
+          echo "ERRO LENGTH: ${#DISCORD_ERRO}"
+        env:
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+
       - name: Execute Motor
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -31,5 +47,6 @@ jobs:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -u autobot/motor_analise_preditiva.py
+
       - name: Security Audit
         run: pytest tests/test_seguranca.py -v
