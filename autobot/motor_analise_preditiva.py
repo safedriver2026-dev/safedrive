@@ -21,14 +21,14 @@ class Telemetria:
 
     def _enviar_webhook(self, url, payload):
         if not url or not url.startswith("https://discord"):
-            print("⚠️ AVISO: URL do Webhook ausente ou mal formatada.", file=sys.stderr)
+            print("[AVISO] URL do Webhook ausente ou mal formatada.", file=sys.stderr)
             return
         try:
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code >= 400:
-                print(f"❌ REJEIÇÃO DO DISCORD: Status {resp.status_code}", file=sys.stderr)
+                print(f"[ERRO] Rejeicao do Discord. Status: {resp.status_code}", file=sys.stderr)
         except Exception as e:
-            print(f"❌ FALHA CONEXÃO DISCORD: {e}", file=sys.stderr)
+            print(f"[ERRO] Falha de conexao com Discord: {e}", file=sys.stderr)
 
     def notificar_sucesso(self, titulo, tempo_execucao, registros, media_risco, status_s3):
         payload = {
@@ -37,8 +37,8 @@ class Telemetria:
                 "description": "**Relatório Executivo SafeDriver**\nO motor preditivo sincronizou toda a base histórica da SSP em paralelo e atualizou o modelo com sucesso.",
                 "color": 3066993, 
                 "fields": [
-                    {"name": "📊 Volumetria (Camada Prata)", "value": f"{registros:,} ocorrências", "inline": True},
-                    {"name": "⚠️ Risco Médio", "value": f"{media_risco:.2f} pontos", "inline": True},
+                    {"name": "📊 Volumetria (Camada Prata)", "value": f"{registros:,} ocorrencias", "inline": True},
+                    {"name": "⚠️ Risco Medio Global", "value": f"{media_risco:.2f} pontos", "inline": True},
                     {"name": "⏱️ Tempo de Processamento", "value": f"{tempo_execucao:.1f} segundos", "inline": True},
                     {"name": "☁️ Backup Cloudflare R2", "value": status_s3, "inline": False}
                 ],
@@ -59,18 +59,19 @@ class Telemetria:
         self._enviar_webhook(self.sucesso, payload)
 
     def notificar_erro(self, titulo, erro_msg):
-        bloco_inicio = "```python\n"
-        bloco_fim = "\n```"
-        resumo_erro = erro_msg[:1000]
-        valor_stacktrace = f"{bloco_inicio}{resumo_erro}{bloco_fim}"
+        # Quebra isolada de string para evitar truncamento no terminal/chat
+        marca_inicio = "```python\n"
+        marca_fim = "\n```"
+        resumo = erro_msg[:1000]
+        stacktrace_seguro = f"{marca_inicio}{resumo}{marca_fim}"
 
         payload = {
             "embeds": [{
                 "title": f"🔴 {titulo}",
-                "description": "**Falha Crítica no Pipeline MLOps**",
+                "description": "**Falha Critica no Pipeline MLOps**",
                 "color": 15158332,
                 "fields": [
-                    {"name": "Detalhes Técnicos do Erro", "value": valor_stacktrace, "inline": False}
+                    {"name": "Detalhes Tecnicos do Erro", "value": stacktrace_seguro, "inline": False}
                 ],
                 "footer": {"text": f"SafeDriver AI Alerts • {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
             }]
@@ -93,7 +94,7 @@ class SafeDriver:
             
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
         self.meta = self.pastas["raw"] / "meta.json"
-        self.meta_lock = Lock() # Trava de segurança para as threads não atropelarem o JSON
+        self.meta_lock = Lock()
 
     def cdc_check(self, ano, url, sessao):
         try:
@@ -117,7 +118,6 @@ class SafeDriver:
         except: return None
 
     def baixar_e_processar_ano(self, ano, sessao):
-        """Função isolada para ser executada em paralelo pelas Threads"""
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
         path_final = self.pastas["raw"] / f"ssp_{ano}.parquet"
         path_tmp = self.pastas["raw"] / f"ssp_{ano}.download"
@@ -125,22 +125,21 @@ class SafeDriver:
 
         run, sz = self.cdc_check(ano, url, sessao)
         if not run and path_final.exists():
-            return False, ano # False = Não houve dados novos
+            return False, ano 
 
         try:
-            print(f"📥 [Thread {ano}] Iniciando download em streaming...", file=sys.stdout)
+            print(f"[PROCESSAMENTO PARALELO] Iniciando download SSP Ano: {ano}", file=sys.stdout)
             r = sessao.get(url, timeout=(30, 900), verify=False, stream=True)
             
             if r.status_code != 200:
-                print(f"❌ [Thread {ano}] Conexão recusada pela SSP.", file=sys.stderr)
+                print(f"[ERRO REDE] Conexao recusada pela SSP. Ano: {ano}", file=sys.stderr)
                 return False, ano
 
-            # Download atômico do Excel
             with open(xlsx_tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4096 * 1024): # 4MB chunks para fluidez
+                for chunk in r.iter_content(chunk_size=4096 * 1024):
                     if chunk: f.write(chunk)
                             
-            print(f"✅ [Thread {ano}] Download concluído. Processando precisão das colunas...", file=sys.stdout)
+            print(f"[SUCESSO] Download do Ano {ano} concluido. Processando arquivo Excel.", file=sys.stdout)
             import fastexcel
             ex = fastexcel.read_excel(str(xlsx_tmp))
             abas = []
@@ -167,10 +166,7 @@ class SafeDriver:
                         abas.append(df_clean)
                         
             if abas:
-                # Escrita Atômica: Salva num arquivo .download primeiro
                 pl.concat(abas, how="diagonal").write_parquet(path_tmp)
-                
-                # Se chegou aqui sem erro, renomeia garantindo que o arquivo está íntegro
                 path_tmp.replace(path_final)
                 
                 with self.meta_lock:
@@ -179,18 +175,18 @@ class SafeDriver:
                     with open(self.meta, 'w') as f: json.dump(m_data, f)
                     
             if xlsx_tmp.exists(): xlsx_tmp.unlink()
-            if path_tmp.exists(): path_tmp.unlink() # Limpa lixo se deu erro no meio
+            if path_tmp.exists(): path_tmp.unlink() 
             
-            return True, ano # True = Sucesso com dados novos
+            return True, ano 
             
         except Exception as e:
-            print(f"❌ [Thread {ano}] Falha de rede ou timeout: {e}", file=sys.stderr)
+            print(f"[FALHA TIMEOUT] Excecao na Thread Ano {ano}: {e}", file=sys.stderr)
             if xlsx_tmp.exists(): xlsx_tmp.unlink()
             if path_tmp.exists(): path_tmp.unlink()
             return False, ano
 
     def processar(self):
-        print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
+        print("[SISTEMA] Iniciando Verificacao de Integridade (Self-Healing)...", file=sys.stdout)
         for f in self.pastas["raw"].glob("*.parquet"):
             try:
                 if "D" not in pl.scan_parquet(f).columns: f.unlink()
@@ -198,7 +194,6 @@ class SafeDriver:
                 try: f.unlink()
                 except: pass
 
-        # Remove lixos temporários de execuções mortas
         for f in self.pastas["raw"].glob("*.download"): f.unlink()
         for f in self.pastas["raw"].glob("*.xlsx"): f.unlink()
 
@@ -216,8 +211,7 @@ class SafeDriver:
         novo_dado = False
         anos_para_baixar = list(range(2022, datetime.now().year + 1))
 
-        # 🚀 MULTITHREADING: Abre 3 threads para baixar os anos simultaneamente
-        print("⚡ Iniciando processamento paralelo (Multithreading)...", file=sys.stdout)
+        print("[SISTEMA] Disparando Pool de Conexoes Paralelas (Multithreading)...", file=sys.stdout)
         with ThreadPoolExecutor(max_workers=3) as executor:
             futuros = [executor.submit(self.baixar_e_processar_ano, ano, s) for ano in anos_para_baixar]
             for futuro in as_completed(futuros):
@@ -226,15 +220,15 @@ class SafeDriver:
 
         arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
         if not arquivos_limpos:
-            self.discord.notificar_erro("SafeDriver Sync", "SSP inacessível e sem base de cache para fallback.")
+            self.discord.notificar_erro("Falha de Sincronizacao", "Portal SSP inoperante e sem cache local integro.")
             return
 
         if not novo_dado and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
-            print("Nenhuma atualização pendente.", file=sys.stdout)
-            self.discord.notificar_info("SafeDriver Informação", "O pipeline rodou, mas os dados da SSP já estão atualizados na versão mais recente.")
+            print("[SISTEMA] Arquivos locais atualizados. Nenhuma operacao pendente.", file=sys.stdout)
+            self.discord.notificar_info("Status Operacional", "Sincronizacao executada. Nenhum dado novo detectado na fonte original.")
             return
 
-        print("⚙️ Processando Camada Prata (Traduzindo Variáveis de Negócio)...", file=sys.stdout)
+        print("[ENGENHARIA DADOS] Transformando Camada Prata e Traduzindo Variaveis...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
         prata = lf.with_columns([
             pl.col("D").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DATA_FATO"),
@@ -250,7 +244,7 @@ class SafeDriver:
 
         prata.with_columns(pl.col("LAT").hash().alias("ID_ANONIMO")).drop(["DATA_FATO","H","HORA_CRIME","N"]).write_parquet(self.pastas["prata"] / "camada_prata.parquet")
         
-        print("🧠 Treinando Rede Preditiva H3...", file=sys.stdout)
+        print("[MLOPS] Treinando Ensemble Preditivo (Malha Espacial H3)...", file=sys.stdout)
         c = prata.select(["LAT","LON"]).unique().to_pandas()
         c['CODIGO_H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(["CODIGO_H3","PERIODO_DIA","TIPO_CRIME","EH_FERIADO","SEMANA_PAGAMENTO"]).agg([
@@ -275,16 +269,17 @@ class SafeDriver:
         sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
         pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
 
-        status_cloud = "❌ Desconectado"
+        status_cloud = "Desconectado"
         if self.s3:
             try:
                 for f in self.pastas["ouro"].glob("*.parquet"):
                     self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
-                status_cloud = "✅ Upload Realizado"
-            except: status_cloud = "⚠️ Falha no Backup R2"
+                status_cloud = "Upload Realizado (R2 Storage)"
+            except: status_cloud = "Falha Critica Backup Cloud"
         
         tempo_total = time.time() - self.t_inicio
-        self.discord.notificar_sucesso("TCC SafeDriver Executado", tempo_total, prata.height, risco_avg, status_cloud)
+        print(f"[SISTEMA] Processo Finalizado. Tempo: {tempo_total:.2f}s.", file=sys.stdout)
+        self.discord.notificar_sucesso("Execucao Finalizada", tempo_total, prata.height, risco_avg, status_cloud)
 
 if __name__ == "__main__":
     app = SafeDriver()
@@ -292,6 +287,6 @@ if __name__ == "__main__":
         app.processar()
     except Exception:
         err = traceback.format_exc()
-        print(err, file=sys.stderr)
-        app.discord.notificar_erro("Falha Sistêmica", err)
+        print(f"[ERRO CRITICO] O pipeline encerrou inesperadamente:\n{err}", file=sys.stderr)
+        app.discord.notificar_erro("Falha Sistemica (Core)", err)
         sys.exit(1)
