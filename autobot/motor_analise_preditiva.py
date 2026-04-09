@@ -130,7 +130,7 @@ class SafeDriver:
                 except: pass
 
         s = requests.Session()
-        s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=5, backoff_factor=2)))
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "*/*"
@@ -148,15 +148,17 @@ class SafeDriver:
                 continue
 
             try:
-                print(f"📥 Baixando SSP {ano} (Download Direto)...", file=sys.stdout)
+                print(f"📥 Baixando SSP {ano} (Streaming Longo)...", file=sys.stdout)
                 
-                r = s.get(url, timeout=180, verify=False)
+                r = s.get(url, timeout=(60, 1800), verify=False, stream=True)
                 
                 if r.status_code == 200:
                     novo = True
                     tmp = self.pastas["raw"] / "tmp.xlsx"
                     with open(tmp, "wb") as f:
-                        f.write(r.content)
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                f.write(chunk)
                                 
                     print(f"✅ Download {ano} concluído! Inspecionando abas...", file=sys.stdout)
                     import fastexcel
