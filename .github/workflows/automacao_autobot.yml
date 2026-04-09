@@ -1,35 +1,35 @@
-name: SafeDriver Pipeline
+name: SafeDriver Execução Diaria
 
 on:
   schedule:
     - cron: '0 1 * * *' 
-  workflow_dispatch: # Permite rodar manualmente pelo botao do GitHub
+  workflow_dispatch:
 
 jobs:
-  run-pipeline:
+  run_motor:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do Codigo
-        uses: actions/checkout@v4
-
-      - name: Configurar Python 3.12
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
-
-      - name: Instalar Bibliotecas
-        run: |
-          pip install polars pandas numpy h3 fastexcel python-calamine openpyxl requests holidays scikit-learn catboost pyarrow boto3 pytest
-
-      - name: Executar Motor de Dados
+      - name: Cache Data
+        uses: actions/cache@v4
+        with:
+          path: datalake/raw
+          key: raw-data-${{ hashFiles('autobot/motor_analise_preditiva.py') }}
+          restore-keys: |
+            raw-data-
+      - name: Install Dependencies
+        run: pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel calamine pytest
+      - name: Execute Motor
         env:
-          # Credenciais do Cloudflare R2 (Devem estar no Settings > Secrets do GitHub)
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -u autobot/motor_analise_preditiva.py
-
-      - name: Validar Integridade (Testes)
+      - name: Security Audit
         run: pytest tests/test_seguranca.py -v
