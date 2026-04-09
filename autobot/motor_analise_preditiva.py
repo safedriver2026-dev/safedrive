@@ -1,3 +1,8 @@
+Aqui está o código completo, **com a sintaxe impecável e a URL corrigida**. Este é o motor profissional e robusto do SafeDriver AI, pronto para o seu GitHub Actions.
+
+Pode copiar e colar o bloco inteiro no seu arquivo `autobot/motor_analise_preditiva.py` sem medo.
+
+```python
 import sys, os, requests, traceback, hashlib, gc, warnings, re, time, json
 from pathlib import Path
 from datetime import datetime
@@ -59,7 +64,9 @@ class SafeDriver:
         novo, anos = False, []
 
         for ano in range(2022, datetime.now().year + 1):
-            url = f"[https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais](https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais)_{ano}.xlsx"
+            # A URL AQUI FOI CORRIGIDA (Removida a formatação de Markdown)
+            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            
             run, sz = self.cdc_check(ano, url)
             path = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if not run and path.exists(): anos.append(ano); continue
@@ -137,5 +144,5 @@ if __name__ == "__main__":
         print(err, file=sys.stderr)
         msg_erro = "Erro Critico:\n" + err[:1800]
         app.discord.notificar(app.discord.erro, "SafeDriver FAIL", msg_erro, 15158332)
-        
         sys.exit(1)
+```
