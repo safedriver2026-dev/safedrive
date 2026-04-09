@@ -30,6 +30,9 @@ jobs:
         run: |
           pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest pyarrow
 
+      # =========================
+      # DEBUG DOS SECRETS
+      # =========================
       - name: Debug Secrets
         run: |
           echo "SUCESSO LENGTH: ${#DISCORD_SUCESSO}"
@@ -38,6 +41,17 @@ jobs:
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
 
+      # =========================
+      # TESTE DIRETO DO WEBHOOK
+      # =========================
+      - name: Test Discord Webhook
+        run: python -c "import os,requests;url=os.getenv('DISCORD_SUCESSO');print('Webhook carregado:',bool(url));print('Status:',requests.post(url,json={'content':'🚀 TESTE SAFE DRIVER'}).status_code if url else 'SEM URL')"
+        env:
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+
+      # =========================
+      # EXECUÇÃO DO MOTOR
+      # =========================
       - name: Execute Motor
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -48,5 +62,17 @@ jobs:
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python -u autobot/motor_analise_preditiva.py
 
+      # =========================
+      # TESTES
+      # =========================
       - name: Security Audit
         run: pytest tests/test_seguranca.py -v
+
+      # =========================
+      # FALLBACK
+      # =========================
+      - name: Fallback Discord
+        if: failure()
+        run: python -c "import os,requests;url=os.getenv('DISCORD_ERRO');requests.post(url,json={'content':'🔥 SafeDriver FALHOU'}) if url else print('Sem webhook erro')"
+        env:
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
