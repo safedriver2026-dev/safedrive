@@ -59,7 +59,7 @@ class SafeDriver:
         novo, anos = False, []
 
         for ano in range(2022, datetime.now().year + 1):
-            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            url = f"[https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais](https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais)_{ano}.xlsx"
             run, sz = self.cdc_check(ano, url)
             path = self.pastas["raw"] / f"ssp_{ano}.parquet"
             if not run and path.exists(): anos.append(ano); continue
@@ -135,5 +135,7 @@ if __name__ == "__main__":
     except Exception:
         err = traceback.format_exc()
         print(err, file=sys.stderr)
-        app.discord.notificar(app.discord.erro, "SafeDriver FAIL", f"
-http://googleusercontent.com/immersive_entry_chip/0
+        msg_erro = "Erro Critico:\n" + err[:1800]
+        app.discord.notificar(app.discord.erro, "SafeDriver FAIL", msg_erro, 15158332)
+        
+        sys.exit(1)
