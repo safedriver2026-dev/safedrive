@@ -3,18 +3,16 @@ import polars as pl
 from pathlib import Path
 
 def test_check_ouro():
-    """Garante que a camada final tem todas as colunas para o Power BI"""
     caminho = Path("datalake/ouro/dashboard_final.parquet")
     if not caminho.exists():
         pytest.skip("Arquivo Ouro não gerado - Pule este teste.")
     
     df = pl.read_parquet(caminho)
-    cols = ["PERFIL", "TURNO", "NATUREZA_CRIME", "IS_PAGAMENTO", "IS_FERIADO", "RISCO_SCORE", "H3"]
+    cols = ["PERFIL", "TURNO", "NATUREZA_CRIME", "IS_PAGAMENTO", "IS_FERIADO", "RISCO_SCORE", "H3", "GEOMETRIA_WKT"]
     for c in cols:
-        assert c in df.columns, f"Coluna {c} ausente."
+        assert c in df.columns
 
 def test_filtro_sp():
-    """Garante que nenhum dado fora de SP passou pelo filtro"""
     caminho = Path("datalake/ouro/dashboard_final.parquet")
     if not caminho.exists():
         pytest.skip("Arquivo Ouro não gerado.")
@@ -24,11 +22,10 @@ def test_filtro_sp():
     assert fora_sp.height == 0
 
 def test_lgpd():
-    """Verifica se dados sensíveis (NUM_BO, etc) foram removidos da camada Prata"""
     caminho = Path("datalake/prata/camada_prata.parquet")
     if caminho.exists():
         df = pl.read_parquet(caminho)
         for c in df.columns:
             c_upper = c.upper()
             if "NUM" in c_upper:
-                assert "ANON" in c_upper, f"Coluna sensível detectada: {c}"
+                assert "ANON" in c_upper
