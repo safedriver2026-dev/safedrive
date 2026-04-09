@@ -59,7 +59,6 @@ class Telemetria:
         self._enviar_webhook(self.sucesso, payload)
 
     def notificar_erro(self, titulo, erro_msg):
-        # Quebra isolada de string para evitar truncamento no terminal/chat
         marca_inicio = "```python\n"
         marca_fim = "\n```"
         resumo = erro_msg[:1000]
@@ -95,6 +94,38 @@ class SafeDriver:
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
         self.meta = self.pastas["raw"] / "meta.json"
         self.meta_lock = Lock()
+
+    def verificar_base_zuada(self):
+        """Auditoria Rigorosa: Verifica se os arquivos no disco estao integros e usaveis."""
+        print("[SISTEMA] Iniciando varredura na base local em busca de arquivos corrompidos...", file=sys.stdout)
+        colunas_vitais = {'LAT', 'LON', 'D', 'H', 'N'}
+        
+        for arquivo in self.pastas["raw"].glob("*.parquet"):
+            try:
+                # 1. O arquivo abre? (Verifica corrupcao fisica)
+                df_scan = pl.scan_parquet(arquivo)
+                colunas_presentes = set(df_scan.columns)
+                
+                # 2. Tem todas as colunas obrigatorias?
+                if not colunas_vitais.issubset(colunas_presentes):
+                    arquivo.unlink()
+                    print(f"[AUTO-CURA] Arquivo {arquivo.name} estava sem colunas vitais e foi deletado.", file=sys.stdout)
+                    continue
+                    
+                # 3. O arquivo esta vazio? (0 registros gravados)
+                if df_scan.head(1).collect().height == 0:
+                    arquivo.unlink()
+                    print(f"[AUTO-CURA] Arquivo {arquivo.name} estava vazio e foi deletado.", file=sys.stdout)
+                    
+            except Exception as e:
+                # Cai aqui se o parquet estiver tao destruido que o polars nem consegue ler o schema
+                print(f"[AUTO-CURA] Arquivo {arquivo.name} corrompido fisicamente. Deletado.", file=sys.stdout)
+                try: arquivo.unlink()
+                except: pass
+
+        # Remove lixos temporarios de execucoes abortadas
+        for f in self.pastas["raw"].glob("*.download"): f.unlink()
+        for f in self.pastas["raw"].glob("*.xlsx"): f.unlink()
 
     def cdc_check(self, ano, url, sessao):
         try:
@@ -186,16 +217,8 @@ class SafeDriver:
             return False, ano
 
     def processar(self):
-        print("[SISTEMA] Iniciando Verificacao de Integridade (Self-Healing)...", file=sys.stdout)
-        for f in self.pastas["raw"].glob("*.parquet"):
-            try:
-                if "D" not in pl.scan_parquet(f).columns: f.unlink()
-            except:
-                try: f.unlink()
-                except: pass
-
-        for f in self.pastas["raw"].glob("*.download"): f.unlink()
-        for f in self.pastas["raw"].glob("*.xlsx"): f.unlink()
+        # 1. Executa a auditoria total da base local antes de comecar a rede
+        self.verificar_base_zuada()
 
         s = requests.Session()
         retries = Retry(total=5, backoff_factor=3, status_forcelist=[403, 429, 500, 502, 503, 504], allowed_methods=["HEAD", "GET", "OPTIONS"])
@@ -279,7 +302,7 @@ class SafeDriver:
         
         tempo_total = time.time() - self.t_inicio
         print(f"[SISTEMA] Processo Finalizado. Tempo: {tempo_total:.2f}s.", file=sys.stdout)
-        self.discord.notificar_sucesso("Execucao Finalizada", tempo_total, prata.height, risco_avg, status_cloud)
+        self.discord.notificar_sucesso("TCC SafeDriver Executado", tempo_total, prata.height, risco_avg, status_cloud)
 
 if __name__ == "__main__":
     app = SafeDriver()
