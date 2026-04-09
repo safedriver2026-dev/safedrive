@@ -54,8 +54,8 @@ class SafeDriver:
         except: return None
 
     def processar(self):
-        # 🧹 AUTO-CURA: Limpeza rigorosa do Cache Envenenado antes de começar
-        print("Verificando integridade do cache local...", file=sys.stdout)
+        # 1. AUTO-CURA: Limpa arquivos zumbis/corrompidos do cache
+        print("Verificando integridade da base histórica local...", file=sys.stdout)
         for f in self.pastas["raw"].glob("*.parquet"):
             try:
                 cols = pl.scan_parquet(f).columns
@@ -66,35 +66,51 @@ class SafeDriver:
                 try: f.unlink()
                 except: pass
 
+        # 2. SESSÃO BLINDADA: Retentativas inteligentes e Máscara de Navegador
         s = requests.Session()
-        s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
+        retries = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+        s.mount('https://', HTTPAdapter(max_retries=retries))
         
-        # Máscara para evitar bloqueio da SSP
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive"
         })
         
         novo, anos = False, []
 
+        # 3. CAPTURA DA BASE HISTÓRICA (2022 até Hoje)
         for ano in range(2022, datetime.now().year + 1):
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             path = self.pastas["raw"] / f"ssp_{ano}.parquet"
             
             run, sz = self.cdc_check(ano, url, s)
-            if not run and path.exists(): anos.append(ano); continue
+            if not run and path.exists(): 
+                anos.append(ano)
+                continue
 
             try:
-                r = s.get(url, timeout=120, verify=False)
+                print(f"📥 Baixando base da SSP ({ano})...", file=sys.stdout)
+                
+                # DOWNLOAD EM STREAMING (Não estoura a memória)
+                r = s.get(url, timeout=(15, 300), verify=False, stream=True)
+                
                 if r.status_code == 200:
                     novo = True
                     tmp = self.pastas["raw"] / "tmp.xlsx"
-                    with open(tmp, "wb") as f: f.write(r.content)
+                    
+                    # Salvando em blocos de 8MB
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192 * 1024): 
+                            if chunk: f.write(chunk)
+                                
+                    print(f"✅ Download {ano} concluído. Processando colunas...", file=sys.stdout)
                     import fastexcel
                     ex = fastexcel.read_excel(str(tmp))
                     abas = []
                     
-                    # MAPEAMENTO DE COLUNAS BLINDADO
+                    # DICIONÁRIO DE MAPEAMENTO (Garante que vai ler certo, não importa o nome da coluna)
                     mapping = {
                         'LAT': ['LATITUDE', 'LAT', 'Y'],
                         'LON': ['LONGITUDE', 'LON', 'X'],
@@ -107,7 +123,6 @@ class SafeDriver:
                         df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
                         if len(df.columns) > 5:
                             df.columns = [c.upper().strip() for c in df.columns]
-                            
                             f_cols = {}
                             for target, aliases in mapping.items():
                                 for col in df.columns:
@@ -115,7 +130,7 @@ class SafeDriver:
                                         f_cols[col] = target
                                         break
                             
-                            # GATILHO DE SEGURANÇA: Só salva se achar as 5 colunas perfeitamente
+                            # FILTRO DE SEGURANÇA
                             if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
                                 df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
                                 abas.append(df_clean)
@@ -128,20 +143,25 @@ class SafeDriver:
                         with open(self.meta, 'w') as f: json.dump(m_data, f)
                     if os.path.exists(tmp): os.remove(tmp)
             except Exception as e:
-                print(f"⚠️ SSP-SP offline para {ano}. Usando cache histórico.", file=sys.stderr)
+                print(f"⚠️ SSP-SP offline/instável para o ano {ano}. Usando cache.", file=sys.stderr)
                 continue
 
-        # Validação final de segurança para não explodir o pipeline
+        # 4. VALIDAÇÃO DE SEGURANÇA (Se o site da SSP morreu de vez e não temos cache)
         arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
         if not arquivos_limpos:
-            self.discord.notificar(self.sucesso, "SafeDriver Sync", "SSP inacessível e sem cache disponível.", 3066993)
+            self.discord.notificar(self.discord.sucesso, "SafeDriver Sync", "SSP inacessível e sem cache.", 3066993)
             return
 
+        if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
+            self.discord.notificar(self.discord.sucesso, "SafeDriver Sync", "Base histórica já consolidada. Sem novidades na SSP.", 3066993)
+            return
+
+        # 5. ENGENHARIA DE DADOS (Transformação Lazy em Lote)
+        print("⚙️ Construindo Camada Prata e Features...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
         
-        # Garante que a coluna D existe antes de continuar
         if "D" not in lf.columns:
-            raise ValueError("Erro fatal: A coluna D ainda não existe nos arquivos baixados.")
+            raise ValueError("Erro fatal de Schema: A coluna D desapareceu.")
 
         prata = lf.with_columns([
             pl.col("D").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DT"),
@@ -157,14 +177,18 @@ class SafeDriver:
 
         prata.with_columns(pl.col("LAT").hash().alias("ID_ANONIMO")).drop(["D","H","HR","N"]).write_parquet(self.pastas["prata"] / "camada_prata.parquet")
         
+        # 6. ENGENHARIA ESPACIAL (H3 Grid)
         c = prata.select(["LAT","LON"]).unique().to_pandas()
         c['H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(["H3","TURNO","NATUREZA_CRIME","IS_FERIADO","IS_PAGAMENTO"]).agg([pl.len().alias("INCIDENTES"), pl.col("LAT").mean().alias("LAT_M"), pl.col("LON").mean().alias("LON_M")])
         
+        # 7. MACHINE LEARNING (Treino do Ensemble)
+        print("🧠 Treinando IA Preditiva...", file=sys.stdout)
         X = fato.select(["LAT_M","LON_M","IS_FERIADO","IS_PAGAMENTO"]).to_pandas()
         y = np.log1p(fato.select("INCIDENTES").to_numpy().ravel())
         ens = VotingRegressor([('c', CatBoostRegressor(iterations=100, silent=True)), ('l', LGBMRegressor(n_estimators=100, verbose=-1))]).fit(X, y)
         
+        # 8. CAMADA OURO E SHAP (Dashboard Final)
         fato.with_columns([
             pl.Series("RISCO_SCORE", np.round(np.expm1(ens.predict(X)), 2)),
             pl.col("H3").map_elements(self.wkt, return_dtype=pl.String).alias("GEOMETRIA_WKT")
@@ -174,10 +198,11 @@ class SafeDriver:
         sd.columns = ["FEATURE", "IMPORTANCIA"]
         pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
 
+        # 9. BACKUP NO R2 / S3
         for f in self.pastas["ouro"].glob("*.parquet"):
             self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
         
-        self.discord.notificar(self.sucesso, "SafeDriver OK", f"Processados {prata.height:,} registros.", 3066993)
+        self.discord.notificar(self.discord.sucesso, "SafeDriver OK", f"Processada a Base Histórica com {prata.height:,} registros.", 3066993)
 
 if __name__ == "__main__":
     app = SafeDriver()
