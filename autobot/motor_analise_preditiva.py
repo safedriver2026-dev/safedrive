@@ -89,7 +89,7 @@ class SafeDriver:
                 if os.path.exists(tmp): os.remove(tmp)
 
         if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
-            self.discord.notificar(self.sucesso, "SafeDriver Sync", "Sem novos dados na SSP.", 3066993)
+            self.discord.notificar(self.discord.sucesso, "SafeDriver Sync", "Sem novos dados na SSP.", 3066993)
             return
 
         lf = pl.concat([pl.scan_parquet(f) for f in self.pastas["raw"].glob("*.parquet")], how="diagonal")
@@ -109,23 +109,14 @@ class SafeDriver:
         
         c = prata.select(["LAT","LON"]).unique().to_pandas()
         c['H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
-        
-        fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(
-            ["H3","TURNO","NATUREZA_CRIME","IS_FERIADO","IS_PAGAMENTO"]
-        ).agg([
+        fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(["H3","TURNO","NATUREZA_CRIME","IS_FERIADO","IS_PAGAMENTO"]).agg([
             pl.len().alias("INCIDENTES"),
             pl.col("LAT").mean().alias("LAT_M"),
             pl.col("LON").mean().alias("LON_M")
-        ]).with_columns([
-            pl.when(pl.col("NATUREZA_CRIME") == "PATRIMONIO")
-              .then(pl.lit("ECONOMICO"))
-              .otherwise(pl.lit("PESSOAL"))
-              .alias("PERFIL")
         ])
         
         X = fato.select(["LAT_M","LON_M","IS_FERIADO","IS_PAGAMENTO"]).to_pandas()
         y = np.log1p(fato.select("INCIDENTES").to_numpy().ravel())
-
         ens = VotingRegressor([
             ('c', CatBoostRegressor(iterations=100, silent=True)),
             ('l', LGBMRegressor(n_estimators=100, verbose=-1))
@@ -147,12 +138,7 @@ class SafeDriver:
         for f in self.pastas["ouro"].glob("*.parquet"):
             self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
         
-        self.discord.notificar(
-            self.discord.sucesso,
-            "SafeDriver OK",
-            f"Processados {prata.height:,} registros.",
-            3066993
-        )
+        self.discord.notificar(self.discord.sucesso, "SafeDriver OK", f"Processados {prata.height:,} registros.", 3066993)
 
 if __name__ == "__main__":
     app = SafeDriver()
@@ -164,6 +150,9 @@ if __name__ == "__main__":
         app.discord.notificar(
             app.discord.erro,
             "SafeDriver FAIL",
-            f"{err}",
+            f"""Erro crítico no pipeline SafeDriver:
+
+{err}
+""",
             15158332
         )
