@@ -84,8 +84,8 @@ class SafeDriver:
                     anos.append(ano)
                     m_data = json.load(open(self.meta)) if self.meta.exists() else {}
                     m_data[str(ano)] = sz
-                    json.dump(m_data, open(self.meta, 'w'))
-                os.remove(tmp)
+                    with open(self.meta, 'w') as f: json.dump(m_data, f)
+                if os.path.exists(tmp): os.remove(tmp)
 
         if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
             self.discord.notificar(self.sucesso, "SafeDriver Sync", "Sem novos dados na SSP.", 3066993)
@@ -130,8 +130,10 @@ class SafeDriver:
 
 if __name__ == "__main__":
     app = SafeDriver()
-    try: app.processar()
+    try:
+        app.processar()
     except Exception:
-        err = traceback.format_exc(); print(err, file=sys.stderr)
+        err = traceback.format_exc()
+        print(err, file=sys.stderr)
         app.discord.notificar(app.discord.erro, "SafeDriver FAIL", f"
 http://googleusercontent.com/immersive_entry_chip/0
