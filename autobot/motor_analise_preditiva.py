@@ -8,8 +8,6 @@ import h3, holidays, boto3, shap
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.ensemble import VotingRegressor
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -21,24 +19,22 @@ class Telemetria:
 
     def _enviar_webhook(self, url, payload):
         if not url or not url.startswith("https://discord"):
-            print("[AVISO] URL do Webhook ausente ou mal formatada.", file=sys.stderr)
+            print("⚠️ AVISO: URL do Webhook ausente.", file=sys.stderr)
             return
         try:
-            resp = requests.post(url, json=payload, timeout=10)
-            if resp.status_code >= 400:
-                print(f"[ERRO] Rejeicao do Discord. Status: {resp.status_code}", file=sys.stderr)
+            requests.post(url, json=payload, timeout=10)
         except Exception as e:
-            print(f"[ERRO] Falha de conexao com Discord: {e}", file=sys.stderr)
+            print(f"❌ FALHA CONEXÃO DISCORD: {e}", file=sys.stderr)
 
     def notificar_sucesso(self, titulo, tempo_execucao, registros, media_risco, status_s3):
         payload = {
             "embeds": [{
                 "title": f"🟢 {titulo}",
-                "description": "**Relatório Executivo SafeDriver**\nO motor preditivo sincronizou toda a base histórica da SSP em paralelo e atualizou o modelo com sucesso.",
+                "description": "**Relatório Executivo SafeDriver**\nO motor preditivo sincronizou os dados da SSP e atualizou o modelo com sucesso.",
                 "color": 3066993, 
                 "fields": [
-                    {"name": "📊 Volumetria (Camada Prata)", "value": f"{registros:,} ocorrencias", "inline": True},
-                    {"name": "⚠️ Risco Medio Global", "value": f"{media_risco:.2f} pontos", "inline": True},
+                    {"name": "📊 Volumetria (Camada Prata)", "value": f"{registros:,} ocorrências", "inline": True},
+                    {"name": "⚠️ Risco Médio", "value": f"{media_risco:.2f} pontos", "inline": True},
                     {"name": "⏱️ Tempo de Processamento", "value": f"{tempo_execucao:.1f} segundos", "inline": True},
                     {"name": "☁️ Backup Cloudflare R2", "value": status_s3, "inline": False}
                 ],
@@ -59,19 +55,15 @@ class Telemetria:
         self._enviar_webhook(self.sucesso, payload)
 
     def notificar_erro(self, titulo, erro_msg):
-        marca_inicio = "```python\n"
-        marca_fim = "\n```"
-        resumo = erro_msg[:1000]
-        stacktrace_seguro = f"{marca_inicio}{resumo}{marca_fim}"
-
+        ticks = chr(96) * 3
+        stack = f"{ticks}python\n{erro_msg[:1000]}\n{ticks}"
+        
         payload = {
             "embeds": [{
                 "title": f"🔴 {titulo}",
-                "description": "**Falha Critica no Pipeline MLOps**",
+                "description": "**Falha Crítica no Pipeline**",
                 "color": 15158332,
-                "fields": [
-                    {"name": "Detalhes Tecnicos do Erro", "value": stacktrace_seguro, "inline": False}
-                ],
+                "fields": [{"name": "Detalhes Técnicos", "value": stack, "inline": False}],
                 "footer": {"text": f"SafeDriver AI Alerts • {datetime.now().strftime('%d/%m/%Y %H:%M')}"}
             }]
         }
@@ -93,51 +85,14 @@ class SafeDriver:
             
         self.feriados = list(holidays.Brazil(subdiv='SP', years=range(2022, 2027)).keys())
         self.meta = self.pastas["raw"] / "meta.json"
-        self.meta_lock = Lock()
-
-    def verificar_base_zuada(self):
-        """Auditoria Rigorosa: Verifica se os arquivos no disco estao integros e usaveis."""
-        print("[SISTEMA] Iniciando varredura na base local em busca de arquivos corrompidos...", file=sys.stdout)
-        colunas_vitais = {'LAT', 'LON', 'D', 'H', 'N'}
-        
-        for arquivo in self.pastas["raw"].glob("*.parquet"):
-            try:
-                # 1. O arquivo abre? (Verifica corrupcao fisica)
-                df_scan = pl.scan_parquet(arquivo)
-                colunas_presentes = set(df_scan.columns)
-                
-                # 2. Tem todas as colunas obrigatorias?
-                if not colunas_vitais.issubset(colunas_presentes):
-                    arquivo.unlink()
-                    print(f"[AUTO-CURA] Arquivo {arquivo.name} estava sem colunas vitais e foi deletado.", file=sys.stdout)
-                    continue
-                    
-                # 3. O arquivo esta vazio? (0 registros gravados)
-                if df_scan.head(1).collect().height == 0:
-                    arquivo.unlink()
-                    print(f"[AUTO-CURA] Arquivo {arquivo.name} estava vazio e foi deletado.", file=sys.stdout)
-                    
-            except Exception as e:
-                # Cai aqui se o parquet estiver tao destruido que o polars nem consegue ler o schema
-                print(f"[AUTO-CURA] Arquivo {arquivo.name} corrompido fisicamente. Deletado.", file=sys.stdout)
-                try: arquivo.unlink()
-                except: pass
-
-        # Remove lixos temporarios de execucoes abortadas
-        for f in self.pastas["raw"].glob("*.download"): f.unlink()
-        for f in self.pastas["raw"].glob("*.xlsx"): f.unlink()
 
     def cdc_check(self, ano, url, sessao):
         try:
-            r = sessao.get(url, timeout=30, verify=False, stream=True)
-            if r.status_code != 200: return True, 0
+            r = sessao.head(url, timeout=30, verify=False)
             size = int(r.headers.get('Content-Length', 0))
-            r.close()
-            with self.meta_lock:
-                if self.meta.exists():
-                    with open(self.meta, 'r') as f:
-                        if json.load(f).get(str(ano)) == size: 
-                            return False, size
+            if self.meta.exists():
+                with open(self.meta, 'r') as f:
+                    if json.load(f).get(str(ano)) == size: return False, size
             return True, size
         except: return True, 0
 
@@ -148,110 +103,102 @@ class SafeDriver:
             return f"POLYGON(({pts}, {b[0][0]} {b[0][1]}))"
         except: return None
 
-    def baixar_e_processar_ano(self, ano, sessao):
-        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-        path_final = self.pastas["raw"] / f"ssp_{ano}.parquet"
-        path_tmp = self.pastas["raw"] / f"ssp_{ano}.download"
-        xlsx_tmp = self.pastas["raw"] / f"tmp_{ano}.xlsx"
-
-        run, sz = self.cdc_check(ano, url, sessao)
-        if not run and path_final.exists():
-            return False, ano 
-
-        try:
-            print(f"[PROCESSAMENTO PARALELO] Iniciando download SSP Ano: {ano}", file=sys.stdout)
-            r = sessao.get(url, timeout=(30, 900), verify=False, stream=True)
-            
-            if r.status_code != 200:
-                print(f"[ERRO REDE] Conexao recusada pela SSP. Ano: {ano}", file=sys.stderr)
-                return False, ano
-
-            with open(xlsx_tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4096 * 1024):
-                    if chunk: f.write(chunk)
-                            
-            print(f"[SUCESSO] Download do Ano {ano} concluido. Processando arquivo Excel.", file=sys.stdout)
-            import fastexcel
-            ex = fastexcel.read_excel(str(xlsx_tmp))
-            abas = []
-            
-            mapping = {
-                'LAT': ['LATITUDE', 'LAT', 'Y'], 'LON': ['LONGITUDE', 'LON', 'X'],
-                'D': ['DATAOCORRENCIA', 'DATA_FATO', 'DATA_REF', 'DATA'],
-                'H': ['HORAOCORRENCIA', 'HORA_FATO', 'HORA_REF', 'HORA'],
-                'N': ['RUBRICA', 'NATUREZA', 'NATUREZA_APURADA']
-            }
-            
-            for n in ex.sheet_names:
-                df = pl.read_excel(str(xlsx_tmp), sheet_name=n, engine="calamine")
-                if len(df.columns) > 5:
-                    df.columns = [c.upper().strip() for c in df.columns]
-                    f_cols = {}
-                    for target, aliases in mapping.items():
-                        for col in df.columns:
-                            if col in aliases:
-                                f_cols[col] = target
-                                break
-                    if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
-                        df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
-                        abas.append(df_clean)
-                        
-            if abas:
-                pl.concat(abas, how="diagonal").write_parquet(path_tmp)
-                path_tmp.replace(path_final)
-                
-                with self.meta_lock:
-                    m_data = json.load(open(self.meta)) if self.meta.exists() else {}
-                    m_data[str(ano)] = sz
-                    with open(self.meta, 'w') as f: json.dump(m_data, f)
-                    
-            if xlsx_tmp.exists(): xlsx_tmp.unlink()
-            if path_tmp.exists(): path_tmp.unlink() 
-            
-            return True, ano 
-            
-        except Exception as e:
-            print(f"[FALHA TIMEOUT] Excecao na Thread Ano {ano}: {e}", file=sys.stderr)
-            if xlsx_tmp.exists(): xlsx_tmp.unlink()
-            if path_tmp.exists(): path_tmp.unlink()
-            return False, ano
-
     def processar(self):
-        # 1. Executa a auditoria total da base local antes de comecar a rede
-        self.verificar_base_zuada()
+        print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
+        for f in self.pastas["raw"].glob("*.parquet"):
+            try:
+                if "D" not in pl.scan_parquet(f).columns:
+                    f.unlink()
+                    print(f"🗑️ Cache corrompido removido: {f.name}")
+            except:
+                try: f.unlink()
+                except: pass
 
         s = requests.Session()
-        retries = Retry(total=5, backoff_factor=3, status_forcelist=[403, 429, 500, 502, 503, 504], allowed_methods=["HEAD", "GET", "OPTIONS"])
-        s.mount('https://', HTTPAdapter(max_retries=retries))
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
         s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://www.ssp.sp.gov.br/estatistica",
-            "Connection": "keep-alive"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*"
         })
         
-        novo_dado = False
-        anos_para_baixar = list(range(2022, datetime.now().year + 1))
+        novo, anos = False, []
 
-        print("[SISTEMA] Disparando Pool de Conexoes Paralelas (Multithreading)...", file=sys.stdout)
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futuros = [executor.submit(self.baixar_e_processar_ano, ano, s) for ano in anos_para_baixar]
-            for futuro in as_completed(futuros):
-                sucesso, ano = futuro.result()
-                if sucesso: novo_dado = True
+        for ano in range(2022, datetime.now().year + 1):
+            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            path = self.pastas["raw"] / f"ssp_{ano}.parquet"
+            
+            run, sz = self.cdc_check(ano, url, s)
+            if not run and path.exists(): 
+                anos.append(ano)
+                continue
+
+            try:
+                print(f"📥 Baixando SSP {ano} (Download Direto)...", file=sys.stdout)
+                
+                r = s.get(url, timeout=180, verify=False)
+                
+                if r.status_code == 200:
+                    novo = True
+                    tmp = self.pastas["raw"] / "tmp.xlsx"
+                    with open(tmp, "wb") as f:
+                        f.write(r.content)
+                                
+                    print(f"✅ Download {ano} concluído! Processando...", file=sys.stdout)
+                    import fastexcel
+                    ex = fastexcel.read_excel(str(tmp))
+                    abas = []
+                    
+                    mapping = {
+                        'LAT': ['LATITUDE', 'LAT', 'Y'], 'LON': ['LONGITUDE', 'LON', 'X'],
+                        'D': ['DATAOCORRENCIA', 'DATA_FATO', 'DATA_REF', 'DATA'],
+                        'H': ['HORAOCORRENCIA', 'HORA_FATO', 'HORA_REF', 'HORA'],
+                        'N': ['RUBRICA', 'NATUREZA', 'NATUREZA_APURADA']
+                    }
+                    
+                    for n in ex.sheet_names:
+                        df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
+                        if len(df.columns) > 5:
+                            df.columns = [c.upper().strip() for c in df.columns]
+                            f_cols = {}
+                            for target, aliases in mapping.items():
+                                for col in df.columns:
+                                    if col in aliases:
+                                        f_cols[col] = target
+                                        break
+                            if all(k in f_cols.values() for k in ['LAT', 'LON', 'D', 'H', 'N']):
+                                df_clean = df.rename(f_cols).select(['LAT', 'LON', 'D', 'H', 'N']).with_columns(pl.all().cast(pl.String))
+                                abas.append(df_clean)
+                                
+                    if abas:
+                        pl.concat(abas, how="diagonal").write_parquet(path)
+                        anos.append(ano)
+                        m_data = json.load(open(self.meta)) if self.meta.exists() else {}
+                        m_data[str(ano)] = sz
+                        with open(self.meta, 'w') as f: json.dump(m_data, f)
+                    if os.path.exists(tmp): os.remove(tmp)
+                else:
+                    msg_erro = f"Status Code inesperado: {r.status_code}"
+                    print(f"❌ {msg_erro}", file=sys.stderr)
+                    # Forçando a exceção para estourar no Actions
+                    raise Exception(msg_erro)
+                    
+            except Exception as e: 
+                # Se falhar no download ou extração, lança a exceção para o bloco principal
+                print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
+                raise e 
 
         arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
         if not arquivos_limpos:
-            self.discord.notificar_erro("Falha de Sincronizacao", "Portal SSP inoperante e sem cache local integro.")
+            msg = "Portal SSP inoperante e sem cache local integro."
+            self.discord.notificar_erro("SafeDriver Sync", msg)
+            raise Exception(msg)
+
+        if not novo and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
+            print("Nenhuma atualização pendente.")
+            self.discord.notificar_info("SafeDriver Info", "Sistema sincronizado com a SSP.")
             return
 
-        if not novo_dado and (self.pastas["ouro"] / "dashboard_final.parquet").exists():
-            print("[SISTEMA] Arquivos locais atualizados. Nenhuma operacao pendente.", file=sys.stdout)
-            self.discord.notificar_info("Status Operacional", "Sincronizacao executada. Nenhum dado novo detectado na fonte original.")
-            return
-
-        print("[ENGENHARIA DADOS] Transformando Camada Prata e Traduzindo Variaveis...", file=sys.stdout)
+        print("⚙️ Construindo Camada Prata...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
         prata = lf.with_columns([
             pl.col("D").str.strptime(pl.Datetime, "%Y-%m-%d", strict=False).alias("DATA_FATO"),
@@ -267,7 +214,7 @@ class SafeDriver:
 
         prata.with_columns(pl.col("LAT").hash().alias("ID_ANONIMO")).drop(["DATA_FATO","H","HORA_CRIME","N"]).write_parquet(self.pastas["prata"] / "camada_prata.parquet")
         
-        print("[MLOPS] Treinando Ensemble Preditivo (Malha Espacial H3)...", file=sys.stdout)
+        print("🧠 Treinando IA Preditiva...", file=sys.stdout)
         c = prata.select(["LAT","LON"]).unique().to_pandas()
         c['CODIGO_H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
         fato = prata.join(pl.from_pandas(c), on=["LAT","LON"]).group_by(["CODIGO_H3","PERIODO_DIA","TIPO_CRIME","EH_FERIADO","SEMANA_PAGAMENTO"]).agg([
@@ -292,24 +239,32 @@ class SafeDriver:
         sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
         pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
 
-        status_cloud = "Desconectado"
+        status_cloud = "❌ Desconectado"
         if self.s3:
             try:
                 for f in self.pastas["ouro"].glob("*.parquet"):
                     self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
-                status_cloud = "Upload Realizado (R2 Storage)"
-            except: status_cloud = "Falha Critica Backup Cloud"
+                status_cloud = "✅ Upload Realizado"
+            except: status_cloud = "⚠️ Falha no Backup R2"
         
         tempo_total = time.time() - self.t_inicio
-        print(f"[SISTEMA] Processo Finalizado. Tempo: {tempo_total:.2f}s.", file=sys.stdout)
-        self.discord.notificar_sucesso("TCC SafeDriver Executado", tempo_total, prata.height, risco_avg, status_cloud)
+        self.discord.notificar_sucesso("Execução Concluída", tempo_total, prata.height, risco_avg, status_cloud)
 
 if __name__ == "__main__":
     app = SafeDriver()
     try:
         app.processar()
-    except Exception:
+    except Exception as e:
+        # Pega a linha exata e a pilha de erros (Stacktrace)
         err = traceback.format_exc()
-        print(f"[ERRO CRITICO] O pipeline encerrou inesperadamente:\n{err}", file=sys.stderr)
-        app.discord.notificar_erro("Falha Sistemica (Core)", err)
+        # Imprime na tela do GitHub Actions em vermelho/erro
+        print("\n" + "="*50, file=sys.stderr)
+        print("🚨 ERRO FATAL NO PIPELINE 🚨", file=sys.stderr)
+        print("="*50, file=sys.stderr)
+        print(err, file=sys.stderr)
+        
+        # Manda para o Discord
+        app.discord.notificar_erro("Falha Sistêmica", err)
+        
+        # O pulo do gato: Força a falha no GitHub Actions (Exit code 1)
         sys.exit(1)
