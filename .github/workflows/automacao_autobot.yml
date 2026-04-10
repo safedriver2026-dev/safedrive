@@ -2,8 +2,8 @@ name: SafeDriver MLOps Pipeline
 
 on:
   schedule:
-    - cron: '0 8 * * *' # Roda todos os dias às 8h da manhã
-  workflow_dispatch: # Permite rodar manualmente no botão
+    - cron: '0 3 * * *' 
+  workflow_dispatch: 
 
 jobs:
   run-pipeline:
