@@ -198,20 +198,36 @@ class SafeDriver:
         self.meta = self.pastas["raw"] / "meta.json"
 
     # ------------------- Download / Bronze -------------------
-    def cdc_check(self, ano, url, sessao):
+    def cdc_check(self, ano, url, sessao, path_parquet: Path):
+        """
+        Decide se precisa baixar.
+        Regra: se não consigo determinar o remoto, mas tenho parquet local, NÃO baixo.
+        """
         try:
-            r = sessao.head(url, timeout=30, verify=False)
+            r = sessao.head(url, timeout=30, verify=False, allow_redirects=True)
             size = int(r.headers.get("Content-Length", 0))
+
+            # Se servidor não informa tamanho, mas já tenho cache local, não baixa
+            if size <= 0 and path_parquet.exists():
+                return False, size
+
             if self.meta.exists():
                 with open(self.meta, "r") as f:
-                    dados_meta = json.load(f).get(str(ano))
-                    if isinstance(dados_meta, dict):
-                        if dados_meta.get("tamanho_bytes") == size:
-                            return False, size
-                    elif dados_meta == size:
-                        return False, size
+                    m = json.load(f).get(str(ano))
+
+                if (
+                    isinstance(m, dict)
+                    and m.get("tamanho_bytes") == size
+                    and path_parquet.exists()
+                ):
+                    return False, size
+
             return True, size
+
         except Exception:
+            # Se HEAD falhou, mas já tenho cache local, não baixa
+            if path_parquet.exists():
+                return False, 0
             return True, 0
 
     def calcular_sha256(self, caminho_arquivo):
@@ -273,6 +289,30 @@ class SafeDriver:
             return f"POLYGON(({pts}, {b[0][0]} {b[0][1]}))"
         except Exception:
             return None
+
+    def base_raw_completa(self, anos) -> bool:
+        """
+        Considera a base completa se:
+        - existe parquet ssp_{ano}.parquet para todos os anos
+        - e o meta.json tem registro para todos os anos
+        """
+        try:
+            if not self.meta.exists():
+                return False
+
+            with open(self.meta, "r") as f:
+                meta = json.load(f)
+
+            for ano in anos:
+                path = self.pastas["raw"] / f"ssp_{ano}.parquet"
+                if not path.exists():
+                    return False
+                if str(ano) not in meta:
+                    return False
+
+            return True
+        except Exception:
+            return False
 
     # ------------------- Publicação BigQuery -------------------
     def publicar_bigquery_a_partir_de_arquivos(
@@ -372,7 +412,23 @@ class SafeDriver:
         novo = False
 
         # ---------------- Bronze / Download ----------------
-        for ano in range(2022, datetime.now().year + 1):
+        ano_atual = datetime.now().year
+        anos_todos = list(range(2022, ano_atual + 1))
+
+        if self.base_raw_completa(anos_todos):
+            anos_para_checar = [ano_atual]
+            print(
+                f"📌 Base RAW completa. Checando somente o ano atual: {ano_atual}.",
+                file=sys.stdout,
+            )
+        else:
+            anos_para_checar = anos_todos
+            print(
+                f"📌 Base RAW incompleta. Checando todos os anos: {anos_todos[0]}–{anos_todos[-1]}.",
+                file=sys.stdout,
+            )
+
+        for ano in anos_para_checar:
             url = (
                 "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/"
                 f"SPDadosCriminais_{ano}.xlsx"
@@ -380,7 +436,7 @@ class SafeDriver:
             path = self.pastas["raw"] / f"ssp_{ano}.parquet"
             tmp = self.pastas["raw"] / f"tmp_{ano}.xlsx"
 
-            run, sz = self.cdc_check(ano, url, s)
+            run, sz = self.cdc_check(ano, url, s, path)
             if not run and path.exists():
                 continue
 
