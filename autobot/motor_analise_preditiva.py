@@ -566,7 +566,6 @@ class SafeDriver:
             except Exception as e:
                 status_bq = f"⚠️ Falha ao publicar no BigQuery: {e}"
                 print(status_bq, file=sys.stderr)
-                # Alerta informativo no Discord (não é erro fatal do pipeline)
                 self.discord.notificar_info(
                     "SafeDriver BigQuery",
                     f"O pipeline executou, mas houve falha ao atualizar o BigQuery:\n`{e}`",
