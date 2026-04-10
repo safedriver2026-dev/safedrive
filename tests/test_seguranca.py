@@ -29,7 +29,6 @@ def test_lgpd():
     if not p.exists():
         pytest.skip("Arquivo ausente")
     df = pl.read_parquet(p)
-    # Nenhuma coluna com "NUM" (evita CPF/placa etc.) e presença de ID_ANONIMO
     assert not any("NUM" in c.upper() for c in df.columns)
     assert "ID_ANONIMO" in df.columns
 
