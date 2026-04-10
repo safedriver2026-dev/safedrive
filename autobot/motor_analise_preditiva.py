@@ -1,4 +1,4 @@
-import sys, os, requests, traceback, hashlib, gc, warnings, re, time, json
+import sys, os, requests, traceback, hashlib, warnings, time, json
 from pathlib import Path
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
@@ -15,6 +15,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
 
+# --------------------------------------------------------------------
+# Utilitários de data/hora e BigQuery
+# --------------------------------------------------------------------
 def hora_brasilia() -> datetime:
     """Retorna datetime no fuso horário de Brasília (UTC-3), baseado em UTC do servidor."""
     return datetime.utcnow() - timedelta(hours=3)
@@ -49,6 +52,9 @@ def tabela_existe_bigquery(projeto: str, dataset: str, tabela: str, cred_json: s
         return False
 
 
+# --------------------------------------------------------------------
+# Telemetria (Discord)
+# --------------------------------------------------------------------
 class Telemetria:
     def __init__(self):
         self.sucesso = os.environ.get("DISCORD_SUCESSO", "").strip(' "\'')
@@ -136,6 +142,9 @@ class Telemetria:
         self._enviar_webhook(self.erro, payload)
 
 
+# --------------------------------------------------------------------
+# SafeDriver Engine
+# --------------------------------------------------------------------
 class SafeDriver:
     def __init__(self):
         self.t_inicio = time.time()
@@ -163,6 +172,7 @@ class SafeDriver:
         self.feriados = list(holidays.Brazil(subdiv="SP", years=range(2022, 2027)).keys())
         self.meta = self.pastas["raw"] / "meta.json"
 
+    # ------------------- Download / Bronze -------------------
     def cdc_check(self, ano, url, sessao):
         try:
             r = sessao.head(url, timeout=30, verify=False)
@@ -229,6 +239,7 @@ class SafeDriver:
         except:
             return None
 
+    # ------------------- Publicação BigQuery -------------------
     def publicar_bigquery_a_partir_de_arquivos(self, bq_project, bq_dataset, bq_cred_json):
         """
         Se as tabelas não existirem no BigQuery, mas os arquivos locais existirem,
@@ -249,40 +260,21 @@ class SafeDriver:
             return "✅ Tabelas já existem no BigQuery e estão disponíveis para o BI."
 
         try:
-            # Lê arquivos locais
             dash_path = self.pastas["ouro"] / "dashboard_final.parquet"
             valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
             shap_path = self.pastas["ouro"] / "shap_audit.parquet"
 
             if dash_path.exists():
                 df_dash = pl.read_parquet(dash_path)
-                enviar_para_bigquery(
-                    df_dash,
-                    tabela="sd_dashboard_final",
-                    projeto=bq_project,
-                    dataset=bq_dataset,
-                    cred_json=bq_cred_json,
-                )
+                enviar_para_bigquery(df_dash, "sd_dashboard_final", bq_project, bq_dataset, bq_cred_json)
 
             if valid_path.exists():
                 df_valid = pl.read_parquet(valid_path)
-                enviar_para_bigquery(
-                    df_valid,
-                    tabela="sd_validacao_modelo",
-                    projeto=bq_project,
-                    dataset=bq_dataset,
-                    cred_json=bq_cred_json,
-                )
+                enviar_para_bigquery(df_valid, "sd_validacao_modelo", bq_project, bq_dataset, bq_cred_json)
 
             if shap_path.exists():
                 df_shap = pl.read_parquet(shap_path)
-                enviar_para_bigquery(
-                    df_shap,
-                    tabela="sd_shap_audit",
-                    projeto=bq_project,
-                    dataset=bq_dataset,
-                    cred_json=bq_cred_json,
-                )
+                enviar_para_bigquery(df_shap, "sd_shap_audit", bq_project, bq_dataset, bq_cred_json)
 
             status_bq = "✅ Tabelas criadas/atualizadas no BigQuery a partir dos arquivos locais."
             print("✅ Publicação no BigQuery concluída (arquivos locais).", file=sys.stdout)
@@ -296,6 +288,7 @@ class SafeDriver:
 
         return status_bq
 
+    # ------------------- Orquestração -------------------
     def processar(self):
         print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
 
@@ -321,7 +314,7 @@ class SafeDriver:
 
         novo = False
 
-        # ETL BRONZE (download SSP + cache)
+        # ---------------- Bronze / Download ----------------
         for ano in range(2022, datetime.now().year + 1):
             url = (
                 "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/"
@@ -441,12 +434,12 @@ class SafeDriver:
             self.discord.notificar_erro("SafeDriver Sync", msg)
             raise Exception(msg)
 
-        # Variáveis do BigQuery (para decidir se precisa publicar mesmo sem reconstruir)
+        # BigQuery envs
         bq_project = os.environ.get("BQ_PROJECT_ID")
         bq_dataset = os.environ.get("BQ_DATASET_ID")
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
-        # DECISÃO: preciso reconstruir Prata/Ouro?
+        # ---------------- Decisão de rebuild ----------------
         ouro_path = self.pastas["ouro"] / "dashboard_final.parquet"
         valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
         precisa_reconstruir = True
@@ -463,15 +456,16 @@ class SafeDriver:
             except Exception:
                 precisa_reconstruir = True
 
-        # Se NÃO precisa reconstruir modelo, mas BQ pode estar vazio
+        # --------------- Caso NÃO precise rebuild ---------------
         if not precisa_reconstruir:
             print("Nenhuma atualização pendente. Camada Ouro já aderente às novas regras.", file=sys.stdout)
 
+            # Garante que BigQuery está sincronizado mesmo assim
             status_bq = self.publicar_bigquery_a_partir_de_arquivos(
                 bq_project, bq_dataset, bq_cred_json
             )
 
-            # Backup R2 mesmo assim (re-sube se necessário)
+            # Backup R2
             status_cloud = "❌ Desconectado"
             if self.s3:
                 try:
@@ -481,9 +475,6 @@ class SafeDriver:
                 except:
                     status_cloud = "⚠️ Falha no Backup R2"
 
-            # Cálculo de métricas básicas para o resumo (usando camada prata existente, se quiser)
-            # Aqui, como não reconstruímos a prata, não temos 'prata' em memória.
-            # Então só manda um resumo genérico:
             tempo_total = time.time() - self.t_inicio
             self.discord.notificar_sucesso(
                 "Execução Concluída (Sem Rebuild de Modelo)",
@@ -495,7 +486,7 @@ class SafeDriver:
             )
             return
 
-        # CAMADA PRATA
+        # --------------- PRATA ---------------
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
         prata = (
@@ -569,7 +560,7 @@ class SafeDriver:
             self.pastas["prata"] / "camada_prata.parquet"
         )
 
-        # CAMADA OURO (modelo)
+        # --------------- OURO / Modelo ---------------
         print("🧠 Treinando IA Preditiva...", file=sys.stdout)
         c = prata.select(["LAT", "LON"]).unique().to_pandas()
         c["CODIGO_H3"] = c.apply(
@@ -622,7 +613,7 @@ class SafeDriver:
 
         fato_ouro.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
 
-        # CAMADA DE VALIDAÇÃO (real x previsto por H3)
+        # --------------- Validação ---------------
         prata_h3 = prata.join(pl.from_pandas(c), on=["LAT", "LON"])
         crimes_reais = (
             prata_h3.group_by("CODIGO_H3")
@@ -635,7 +626,7 @@ class SafeDriver:
         validacao = crimes_reais.join(escore_medio, on="CODIGO_H3", how="inner")
         validacao.write_parquet(self.pastas["ouro"] / "validacao_modelo.parquet")
 
-        # INTERPRETABILIDADE (SHAP)
+        # --------------- SHAP ---------------
         sd = pd.DataFrame(
             shap.TreeExplainer(ens.estimators_[0]).shap_values(X),
             columns=X.columns,
@@ -643,12 +634,12 @@ class SafeDriver:
         sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
         pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
 
-        # PUBLICAÇÃO NO BIGQUERY (rebuild completo)
+        # --------------- BigQuery ---------------
         status_bq = self.publicar_bigquery_a_partir_de_arquivos(
             bq_project, bq_dataset, bq_cred_json
         )
 
-        # BACKUP R2
+        # --------------- Backup R2 ---------------
         status_cloud = "❌ Desconectado"
         if self.s3:
             try:
