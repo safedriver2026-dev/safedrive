@@ -44,7 +44,9 @@ class Telemetria:
                     {"name": "⏱️ Tempo de Processamento", "value": f"{tempo_execucao:.1f} segundos", "inline": True},
                     {"name": "☁️ Backup Cloudflare R2", "value": status_s3, "inline": False}
                 ],
-                "footer": {"text": f"SafeDriver AI • Data/Hora: {hora_brasilia().strftime('%d/%m/%Y %H:%M')}"}
+                "footer": {
+                    "text": f"SafeDriver AI • Data/Hora: {hora_brasilia().strftime('%d/%m/%Y %H:%M')}"
+                }
             }]
         }
         self._enviar_webhook(self.sucesso, payload)
@@ -55,7 +57,9 @@ class Telemetria:
                 "title": f"🔵 {titulo}",
                 "description": corpo,
                 "color": 3447003,
-                "footer": {"text": f"SafeDriver AI • Data/Hora: {hora_brasilia().strftime('%d/%m/%Y %H:%M')}"}
+                "footer": {
+                    "text": f"SafeDriver AI • Data/Hora: {hora_brasilia().strftime('%d/%m/%Y %H:%M')}"
+                }
             }]
         }
         self._enviar_webhook(self.sucesso, payload)
@@ -70,7 +74,9 @@ class Telemetria:
                 "description": "**Falha Crítica no Pipeline**",
                 "color": 15158332,
                 "fields": [{"name": "Detalhes Técnicos", "value": stack, "inline": False}],
-                "footer": {"text": f"SafeDriver AI Alerts • {hora_brasilia().strftime('%d/%m/%Y %H:%M')}"}
+                "footer": {
+                    "text": f"SafeDriver AI Alerts • {hora_brasilia().strftime('%d/%m/%Y %H:%M')}"
+                }
             }]
         }
         self._enviar_webhook(self.erro, payload)
@@ -84,7 +90,10 @@ class SafeDriver:
         for p in self.pastas.values():
             p.mkdir(parents=True, exist_ok=True)
 
-        cfg = {k: os.environ.get(k, "").strip() for k in ["R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME"]}
+        cfg = {
+            k: os.environ.get(k, "").strip()
+            for k in ["R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME"]
+        }
         if all(cfg.values()):
             self.s3 = boto3.client(
                 's3',
@@ -150,7 +159,10 @@ class SafeDriver:
                                 f.write(chunk)
                 return True
             except Exception as e:
-                print(f"⚠️ Ligação caiu (Tentativa {tentativa+1}/{max_tentativas}). A retomar download...", file=sys.stdout)
+                print(
+                    f"⚠️ Ligação caiu (Tentativa {tentativa+1}/{max_tentativas}). A retomar download...",
+                    file=sys.stdout
+                )
                 time.sleep(5)
         return False
 
@@ -220,7 +232,13 @@ class SafeDriver:
                         df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
 
                         if len(df.columns) > 5:
-                            df.columns = [str(c).upper().strip().replace('\n', '').replace('\r', '').replace(' ', '_') for c in df.columns]
+                            df.columns = [
+                                str(c).upper().strip()
+                                .replace('\n', '')
+                                .replace('\r', '')
+                                .replace(' ', '_')
+                                for c in df.columns
+                            ]
 
                             f_cols = {}
                             for target, aliases in mapping.items():
@@ -228,7 +246,11 @@ class SafeDriver:
                                     encontrou = False
                                     for col in df.columns:
                                         if alias in col:
-                                            if target in ['D', 'H'] and ('REGISTRO' in col or 'COMUNICACAO' in col or 'ELABORACAO' in col):
+                                            if target in ['D', 'H'] and (
+                                                'REGISTRO' in col or
+                                                'COMUNICACAO' in col or
+                                                'ELABORACAO' in col
+                                            ):
                                                 continue
 
                                             f_cols[col] = target
@@ -257,12 +279,12 @@ class SafeDriver:
                         with open(self.meta, 'w') as f:
                             json.dump(m_data, f)
                     else:
-                        raise Exception(f"Nenhum dado criminal estruturado encontrado.")
+                        raise Exception("Nenhum dado criminal estruturado encontrado.")
 
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 else:
-                    raise Exception(f"Falha ao baixar arquivo apos multiplas tentativas.")
+                    raise Exception("Falha ao baixar arquivo apos multiplas tentativas.")
 
             except Exception as e:
                 print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
@@ -332,6 +354,7 @@ class SafeDriver:
         print("🧠 Treinando IA Preditiva...", file=sys.stdout)
         c = prata.select(["LAT", "LON"]).unique().to_pandas()
         c['CODIGO_H3'] = c.apply(lambda r: h3.latlng_to_cell(r['LAT'], r['LON'], 8), axis=1)
+
         fato = (
             prata.join(pl.from_pandas(c), on=["LAT", "LON"])
                  .group_by(["CODIGO_H3", "PERIODO_DIA", "TIPO_CRIME", "PERFIL_VITIMA", "EH_FERIADO", "SEMANA_PAGAMENTO"])
@@ -352,6 +375,7 @@ class SafeDriver:
         preds = ens.predict(X)
         risco_avg = np.mean(np.expm1(preds))
 
+        # Garantir que PERFIL_VITIMA esteja na camada ouro
         fato_ouro = fato.with_columns([
             pl.Series("ESCORE_RISCO", np.round(np.expm1(preds), 2)),
             pl.col("CODIGO_H3").map_elements(self.wkt, return_dtype=pl.String).alias("GEOMETRIA_WKT")
