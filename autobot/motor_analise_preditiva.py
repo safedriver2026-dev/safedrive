@@ -49,7 +49,7 @@ class Telemetria:
         except Exception as e:
             print(f"❌ FALHA CONEXÃO DISCORD: {e}", file=sys.stderr)
 
-    def notificar_sucesso(self, titulo, tempo_execucao, registros, media_risco, status_s3):
+    def notificar_sucesso(self, titulo, tempo_execucao, registros, media_risco, status_s3, status_bq):
         payload = {
             "embeds": [{
                 "title": f"🟢 {titulo}",
@@ -77,6 +77,11 @@ class Telemetria:
                     {
                         "name": "☁️ Backup Cloudflare R2",
                         "value": status_s3,
+                        "inline": False,
+                    },
+                    {
+                        "name": "📡 Publicação BigQuery",
+                        "value": status_bq,
                         "inline": False,
                     },
                 ],
@@ -213,7 +218,7 @@ class SafeDriver:
     def processar(self):
         print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
 
-        # Self-healing da bronze
+        # Self-healing da Bronze
         for f in self.pastas["raw"].glob("*.parquet"):
             try:
                 if "D" not in pl.scan_parquet(f).columns:
@@ -368,7 +373,6 @@ class SafeDriver:
                     for c in ["ESCORE_RISCO", "GEOMETRIA_WKT", "CODIGO_H3", "PERFIL_VITIMA"]
                 )
                 if colunas_ok and not novo:
-                    # Dados SSP não mudaram e ouro está aderente às regras
                     precisa_reconstruir = False
             except Exception:
                 precisa_reconstruir = True
@@ -533,6 +537,7 @@ class SafeDriver:
         bq_dataset = os.environ.get("BQ_DATASET_ID")
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
+        status_bq = "🔌 BigQuery desativado (variáveis de ambiente não configuradas)."
         if bq_project and bq_dataset and bq_cred_json:
             try:
                 enviar_para_bigquery(
@@ -556,9 +561,16 @@ class SafeDriver:
                     dataset=bq_dataset,
                     cred_json=bq_cred_json,
                 )
+                status_bq = "✅ Tabelas sd_dashboard_final, sd_validacao_modelo e sd_shap_audit atualizadas."
                 print("✅ Tabelas publicadas no BigQuery com sucesso.", file=sys.stdout)
             except Exception as e:
-                print(f"⚠️ Falha ao publicar no BigQuery: {e}", file=sys.stderr)
+                status_bq = f"⚠️ Falha ao publicar no BigQuery: {e}"
+                print(status_bq, file=sys.stderr)
+                # Alerta informativo no Discord (não é erro fatal do pipeline)
+                self.discord.notificar_info(
+                    "SafeDriver BigQuery",
+                    f"O pipeline executou, mas houve falha ao atualizar o BigQuery:\n`{e}`",
+                )
 
         # BACKUP R2
         status_cloud = "❌ Desconectado"
@@ -572,7 +584,12 @@ class SafeDriver:
 
         tempo_total = time.time() - self.t_inicio
         self.discord.notificar_sucesso(
-            "Execução Concluída", tempo_total, prata.height, risco_avg, status_cloud
+            "Execução Concluída",
+            tempo_total,
+            prata.height,
+            risco_avg,
+            status_cloud,
+            status_bq,
         )
 
 
