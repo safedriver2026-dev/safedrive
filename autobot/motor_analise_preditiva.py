@@ -20,19 +20,33 @@ def hora_brasilia() -> datetime:
     return datetime.utcnow() - timedelta(hours=3)
 
 
+def criar_cliente_bq(projeto: str, cred_json: str) -> bigquery.Client:
+    info = json.loads(cred_json)
+    credentials = service_account.Credentials.from_service_account_info(info)
+    return bigquery.Client(project=projeto, credentials=credentials)
+
+
 def enviar_para_bigquery(df_pl: pl.DataFrame, tabela: str, projeto: str, dataset: str, cred_json: str):
     """
     Envia um DataFrame Polars para uma tabela do BigQuery.
     Sobrescreve a tabela (WRITE_TRUNCATE) em cada execução.
     """
     df_pd = df_pl.to_pandas()
-    info = json.loads(cred_json)
-    credentials = service_account.Credentials.from_service_account_info(info)
-    client = bigquery.Client(project=projeto, credentials=credentials)
+    client = criar_cliente_bq(projeto, cred_json)
     tabela_id = f"{projeto}.{dataset}.{tabela}"
     job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     job = client.load_table_from_dataframe(df_pd, tabela_id, job_config=job_config)
     job.result()
+
+
+def tabela_existe_bigquery(projeto: str, dataset: str, tabela: str, cred_json: str) -> bool:
+    """Verifica se uma tabela existe no BigQuery."""
+    try:
+        client = criar_cliente_bq(projeto, cred_json)
+        client.get_table(f"{projeto}.{dataset}.{tabela}")
+        return True
+    except Exception:
+        return False
 
 
 class Telemetria:
@@ -215,6 +229,73 @@ class SafeDriver:
         except:
             return None
 
+    def publicar_bigquery_a_partir_de_arquivos(self, bq_project, bq_dataset, bq_cred_json):
+        """
+        Se as tabelas não existirem no BigQuery, mas os arquivos locais existirem,
+        publica direto a partir dos .parquet sem recalcular o modelo.
+        """
+        status_bq = "🔌 BigQuery desativado (variáveis de ambiente não configuradas)."
+
+        if not (bq_project and bq_dataset and bq_cred_json):
+            return status_bq
+
+        # Verifica existência das tabelas no BQ
+        dashboard_ok = tabela_existe_bigquery(bq_project, bq_dataset, "sd_dashboard_final", bq_cred_json)
+        validacao_ok = tabela_existe_bigquery(bq_project, bq_dataset, "sd_validacao_modelo", bq_cred_json)
+        shap_ok = tabela_existe_bigquery(bq_project, bq_dataset, "sd_shap_audit", bq_cred_json)
+
+        # Se todas existem, não precisa reenviar
+        if dashboard_ok and validacao_ok and shap_ok:
+            return "✅ Tabelas já existem no BigQuery e estão disponíveis para o BI."
+
+        try:
+            # Lê arquivos locais
+            dash_path = self.pastas["ouro"] / "dashboard_final.parquet"
+            valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
+            shap_path = self.pastas["ouro"] / "shap_audit.parquet"
+
+            if dash_path.exists():
+                df_dash = pl.read_parquet(dash_path)
+                enviar_para_bigquery(
+                    df_dash,
+                    tabela="sd_dashboard_final",
+                    projeto=bq_project,
+                    dataset=bq_dataset,
+                    cred_json=bq_cred_json,
+                )
+
+            if valid_path.exists():
+                df_valid = pl.read_parquet(valid_path)
+                enviar_para_bigquery(
+                    df_valid,
+                    tabela="sd_validacao_modelo",
+                    projeto=bq_project,
+                    dataset=bq_dataset,
+                    cred_json=bq_cred_json,
+                )
+
+            if shap_path.exists():
+                df_shap = pl.read_parquet(shap_path)
+                enviar_para_bigquery(
+                    df_shap,
+                    tabela="sd_shap_audit",
+                    projeto=bq_project,
+                    dataset=bq_dataset,
+                    cred_json=bq_cred_json,
+                )
+
+            status_bq = "✅ Tabelas criadas/atualizadas no BigQuery a partir dos arquivos locais."
+            print("✅ Publicação no BigQuery concluída (arquivos locais).", file=sys.stdout)
+        except Exception as e:
+            status_bq = f"⚠️ Falha ao publicar no BigQuery (arquivos locais): {e}"
+            print(status_bq, file=sys.stderr)
+            self.discord.notificar_info(
+                "SafeDriver BigQuery",
+                f"O pipeline executou, mas houve falha ao atualizar o BigQuery:\n`{e}`",
+            )
+
+        return status_bq
+
     def processar(self):
         print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
 
@@ -360,6 +441,11 @@ class SafeDriver:
             self.discord.notificar_erro("SafeDriver Sync", msg)
             raise Exception(msg)
 
+        # Variáveis do BigQuery (para decidir se precisa publicar mesmo sem reconstruir)
+        bq_project = os.environ.get("BQ_PROJECT_ID")
+        bq_dataset = os.environ.get("BQ_DATASET_ID")
+        bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
+
         # DECISÃO: preciso reconstruir Prata/Ouro?
         ouro_path = self.pastas["ouro"] / "dashboard_final.parquet"
         valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
@@ -377,10 +463,35 @@ class SafeDriver:
             except Exception:
                 precisa_reconstruir = True
 
+        # Se NÃO precisa reconstruir modelo, mas BQ pode estar vazio
         if not precisa_reconstruir:
-            print("Nenhuma atualização pendente. Camada Ouro já aderente às novas regras.")
-            self.discord.notificar_info(
-                "SafeDriver Info", "Sistema sincronizado com a SSP e regras de negócio."
+            print("Nenhuma atualização pendente. Camada Ouro já aderente às novas regras.", file=sys.stdout)
+
+            status_bq = self.publicar_bigquery_a_partir_de_arquivos(
+                bq_project, bq_dataset, bq_cred_json
+            )
+
+            # Backup R2 mesmo assim (re-sube se necessário)
+            status_cloud = "❌ Desconectado"
+            if self.s3:
+                try:
+                    for f in self.pastas["ouro"].glob("*.parquet"):
+                        self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
+                    status_cloud = "✅ Upload Realizado"
+                except:
+                    status_cloud = "⚠️ Falha no Backup R2"
+
+            # Cálculo de métricas básicas para o resumo (usando camada prata existente, se quiser)
+            # Aqui, como não reconstruímos a prata, não temos 'prata' em memória.
+            # Então só manda um resumo genérico:
+            tempo_total = time.time() - self.t_inicio
+            self.discord.notificar_sucesso(
+                "Execução Concluída (Sem Rebuild de Modelo)",
+                tempo_total,
+                registros=0,
+                media_risco=0.0,
+                status_s3=status_cloud,
+                status_bq=status_bq,
             )
             return
 
@@ -532,44 +643,10 @@ class SafeDriver:
         sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
         pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
 
-        # PUBLICAÇÃO NO BIGQUERY (opcional, se envs estiverem definidos)
-        bq_project = os.environ.get("BQ_PROJECT_ID")
-        bq_dataset = os.environ.get("BQ_DATASET_ID")
-        bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
-
-        status_bq = "🔌 BigQuery desativado (variáveis de ambiente não configuradas)."
-        if bq_project and bq_dataset and bq_cred_json:
-            try:
-                enviar_para_bigquery(
-                    fato_ouro,
-                    tabela="sd_dashboard_final",
-                    projeto=bq_project,
-                    dataset=bq_dataset,
-                    cred_json=bq_cred_json,
-                )
-                enviar_para_bigquery(
-                    validacao,
-                    tabela="sd_validacao_modelo",
-                    projeto=bq_project,
-                    dataset=bq_dataset,
-                    cred_json=bq_cred_json,
-                )
-                enviar_para_bigquery(
-                    pl.from_pandas(sd),
-                    tabela="sd_shap_audit",
-                    projeto=bq_project,
-                    dataset=bq_dataset,
-                    cred_json=bq_cred_json,
-                )
-                status_bq = "✅ Tabelas sd_dashboard_final, sd_validacao_modelo e sd_shap_audit atualizadas."
-                print("✅ Tabelas publicadas no BigQuery com sucesso.", file=sys.stdout)
-            except Exception as e:
-                status_bq = f"⚠️ Falha ao publicar no BigQuery: {e}"
-                print(status_bq, file=sys.stderr)
-                self.discord.notificar_info(
-                    "SafeDriver BigQuery",
-                    f"O pipeline executou, mas houve falha ao atualizar o BigQuery:\n`{e}`",
-                )
+        # PUBLICAÇÃO NO BIGQUERY (rebuild completo)
+        status_bq = self.publicar_bigquery_a_partir_de_arquivos(
+            bq_project, bq_dataset, bq_cred_json
+        )
 
         # BACKUP R2
         status_cloud = "❌ Desconectado"
