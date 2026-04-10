@@ -29,6 +29,7 @@ def test_lgpd():
     if not p.exists():
         pytest.skip("Arquivo ausente")
     df = pl.read_parquet(p)
+    # Nenhuma coluna com "NUM" (evita CPF/placa etc.) e presença de ID_ANONIMO
     assert not any("NUM" in c.upper() for c in df.columns)
     assert "ID_ANONIMO" in df.columns
 
@@ -46,6 +47,4 @@ def test_validacao_real_previsto():
     if not p.exists():
         pytest.skip("Arquivo de validação ausente")
     df = pl.read_parquet(p)
-    assert "CRIMES_REAIS" in df.columns
-    assert "ESCORE_RISCO" in df.columns
-    assert "CODIGO_H3" in df.columns
+    assert all(c in df.columns for c in ["CRIMES_REAIS", "ESCORE_RISCO", "CODIGO_H3"])
