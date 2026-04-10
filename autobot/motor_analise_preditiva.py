@@ -8,6 +8,8 @@ import h3, holidays, boto3, shap
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.ensemble import VotingRegressor
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -16,6 +18,26 @@ warnings.filterwarnings("ignore")
 def hora_brasilia() -> datetime:
     """Retorna datetime no fuso horário de Brasília (UTC-3), baseado em UTC do servidor."""
     return datetime.utcnow() - timedelta(hours=3)
+
+
+def enviar_para_bigquery(df_pl: pl.DataFrame, tabela: str, projeto: str, dataset: str, cred_json: str):
+    """
+    Envia um DataFrame Polars para uma tabela do BigQuery.
+    Sobrescreve a tabela (WRITE_TRUNCATE) em cada execução.
+    """
+    # Converte Polars -> Pandas
+    df_pd = df_pl.to_pandas()
+
+    # Constrói credenciais a partir do JSON em string (vem da variável de ambiente)
+    info = json.loads(cred_json)
+    credentials = service_account.Credentials.from_service_account_info(info)
+
+    client = bigquery.Client(project=projeto, credentials=credentials)
+    tabela_id = f"{projeto}.{dataset}.{tabela}"
+
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+    job = client.load_table_from_dataframe(df_pd, tabela_id, job_config=job_config)
+    job.result()
 
 
 class Telemetria:
@@ -158,9 +180,9 @@ class SafeDriver:
                             if chunk:
                                 f.write(chunk)
                 return True
-            except Exception as e:
+            except Exception:
                 print(
-                    f"⚠️ Ligação caiu (Tentativa {tentativa+1}/{max_tentativas}). A retomar download...",
+                    f"⚠️ Conexão caiu (Tentativa {tentativa+1}/{max_tentativas}). Tentando retomar o download...",
                     file=sys.stdout
                 )
                 time.sleep(5)
@@ -375,7 +397,6 @@ class SafeDriver:
         preds = ens.predict(X)
         risco_avg = np.mean(np.expm1(preds))
 
-        # Garantir que PERFIL_VITIMA esteja na camada ouro
         fato_ouro = fato.with_columns([
             pl.Series("ESCORE_RISCO", np.round(np.expm1(preds), 2)),
             pl.col("CODIGO_H3").map_elements(self.wkt, return_dtype=pl.String).alias("GEOMETRIA_WKT")
@@ -404,6 +425,38 @@ class SafeDriver:
         ).abs().mean().to_frame("GRAU_IMPORTANCIA").reset_index()
         sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
         pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
+
+        # Publicação opcional no BigQuery (usando secrets configurados no GitHub)
+        bq_project = os.environ.get("BQ_PROJECT_ID")
+        bq_dataset = os.environ.get("BQ_DATASET_ID")
+        bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
+
+        if bq_project and bq_dataset and bq_cred_json:
+            try:
+                enviar_para_bigquery(
+                    fato_ouro,
+                    tabela="sd_dashboard_final",
+                    projeto=bq_project,
+                    dataset=bq_dataset,
+                    cred_json=bq_cred_json,
+                )
+                enviar_para_bigquery(
+                    validacao,
+                    tabela="sd_validacao_modelo",
+                    projeto=bq_project,
+                    dataset=bq_dataset,
+                    cred_json=bq_cred_json,
+                )
+                enviar_para_bigquery(
+                    pl.from_pandas(sd),
+                    tabela="sd_shap_audit",
+                    projeto=bq_project,
+                    dataset=bq_dataset,
+                    cred_json=bq_cred_json,
+                )
+                print("✅ Tabelas publicadas no BigQuery com sucesso.", file=sys.stdout)
+            except Exception as e:
+                print(f"⚠️ Falha ao publicar no BigQuery: {e}", file=sys.stderr)
 
         status_cloud = "❌ Desconectado"
         if self.s3:
