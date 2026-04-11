@@ -27,8 +27,12 @@ jobs:
 
       - name: Instalar Dependências
         run: |
-          pip install --upgrade pip
-          pip install polars pandas numpy h3-py==4.0.0 holidays boto3 shap catboost lightgbm scikit-learn google-cloud-bigquery fastexcel
+          # Atualizar pip para a versão mais recente
+          python -m pip install --upgrade pip
+          # Instalar ferramentas de build que podem ser necessárias para h3-py
+          pip install setuptools wheel
+          # Instalar as bibliotecas, forçando a não usar cache para h3-py
+          pip install --no-cache-dir polars pandas numpy h3-py==4.0.0 catboost lightgbm scikit-learn h3 holidays boto3 shap google-cloud-bigquery google-auth-oauthlib fastexcel
 
       - name: Verificar Versão do H3 (Debug)
         run: |
