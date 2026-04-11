@@ -8,64 +8,64 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+
+    env:
+      R2_ENDPOINT_URL:      ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+      DISCORD_SUCESSO:      ${{ secrets.DISCORD_SUCESSO }}
+      DISCORD_ERRO:         ${{ secrets.DISCORD_ERRO }}
+      BQ_PROJECT_ID:        ${{ secrets.BQ_PROJECT_ID }}
+      BQ_DATASET:           ${{ secrets.BQ_DATASET }}
+      BQ_CREDENTIALS_JSON:  ${{ secrets.BQ_CREDENTIALS_JSON }}
+
     steps:
-      - name: Checkout do Repositório
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar Miniconda
+      - name: Configurar Conda
         uses: conda-incubator/setup-miniconda@v3
         with:
-          python-version: '3.9'
-          channels: conda-forge
           activate-environment: safedriver_env
+          environment-file: environment.yml
           auto-activate-base: false
+          python-version: "3.10"
 
-      - name: Instalar Dependências do Sistema
-        shell: bash -l {0}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential python3-dev libmagic1
-
-      - name: Instalar Bibliotecas Python
+      - name: Instalar Dependências
         shell: bash -l {0}
         run: |
           conda activate safedriver_env
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir \
+          pip install --upgrade pip
+          pip install \
             polars \
             pandas \
+            openpyxl \
+            pyarrow \
             numpy \
+            boto3 \
+            requests \
+            urllib3 \
+            google-cloud-bigquery \
+            google-cloud-bigquery-storage \
+            google-auth \
+            db-dtypes \
             catboost \
             lightgbm \
             scikit-learn \
-            holidays \
-            boto3 \
             shap \
-            google-cloud-bigquery \
-            google-auth-oauthlib \
-            openpyxl \
+            h3 \
+            holidays \
             python-magic \
-            requests \
-            pytest
-          conda install -c conda-forge h3-py -y
+            joblib
 
-      - name: Executar Pipeline SafeDriver
+      - name: Executar Pipeline
         shell: bash -l {0}
-        env:
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-          BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
         run: |
           conda activate safedriver_env
-          python -u autobot/motor_analise_preditiva.py
+          python autobot/motor_analise_preditiva.py
 
-      - name: Rodar Testes de Segurança e Qualidade
+      - name: Testes
         shell: bash -l {0}
         run: |
           conda activate safedriver_env
