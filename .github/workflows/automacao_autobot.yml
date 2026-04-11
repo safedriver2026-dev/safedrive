@@ -20,19 +20,34 @@ jobs:
           activate-environment: safedriver_env
           auto-activate-base: false
 
-      - name: Instalar Dependências do Sistema (para compilação)
+      - name: Instalar Dependências do Sistema
         shell: bash -l {0}
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3-dev
+          sudo apt-get install -y build-essential python3-dev libmagic1
 
       - name: Instalar Bibliotecas Python
         shell: bash -l {0}
         run: |
           conda activate safedriver_env
           python -m pip install --upgrade pip
-          pip install --no-cache-dir polars pandas numpy catboost lightgbm scikit-learn holidays boto3 shap google-cloud-bigquery google-auth-oauthlib fastexcel python-magic
-          conda install -c conda-forge h3-py -y # Instala h3-py via conda-forge
+          pip install --no-cache-dir \
+            polars \
+            pandas \
+            numpy \
+            catboost \
+            lightgbm \
+            scikit-learn \
+            holidays \
+            boto3 \
+            shap \
+            google-cloud-bigquery \
+            google-auth-oauthlib \
+            openpyxl \
+            python-magic \
+            requests \
+            pytest
+          conda install -c conda-forge h3-py -y
 
       - name: Executar Pipeline SafeDriver
         shell: bash -l {0}
