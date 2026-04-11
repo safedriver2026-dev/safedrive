@@ -95,7 +95,7 @@ class Telemetria:
                             "inline": True,
                         },
                         {
-                            "name": "⚠️ Risco Médio",
+                            "name": "⚠️ Risco Médio (volume)",
                             "value": f"{media_risco:.2f} pontos",
                             "inline": True,
                         },
@@ -371,14 +371,12 @@ class SafeDriver:
     # ------------------- Reconstrução Ouro / Validação / SHAP -------------------
     def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
         """
-        Reconstroi a camada Ouro (dashboard_final), a validação (validacao_modelo)
+        Reconstrói a camada Ouro (dashboard_final), a validação (validacao_modelo)
         e o SHAP (shap_audit) usando a camada Prata existente.
 
-        Melhorias conceituais:
-        - Previsão a nível H3 com alvo sqrt(CRIMES_REAIS)
-        - Pesos por faixa de crime (mais peso em áreas críticas)
-        - Inclusão de CRIMES_PONDERADOS (peso penal) como feature
-        - Novas features comportamentais e geográficas
+        Opção A: dois modelos separados
+        - Modelo 1: Volume (alvo sqrt(CRIMES_REAIS))
+        - Modelo 2: Penal (alvo sqrt(CRIMES_PONDERADOS))
         """
 
         prata_path = self.pastas["prata"] / "camada_prata.parquet"
@@ -388,7 +386,7 @@ class SafeDriver:
             )
 
         print(
-            "♻️ Recalculando Camada Ouro, Validação e SHAP a partir da Prata (H3+ melhorado)...",
+            "♻️ Recalculando Camada Ouro, Validação e SHAP (Modelos Volume + Penal)...",
             file=sys.stdout,
         )
 
@@ -463,12 +461,7 @@ class SafeDriver:
             )
         )
 
-        # ---------- Treino do modelo ----------
-        print(
-            "🧠 Re-treinando modelo preditivo (H3+, alvo sqrt, pesos por faixa + input penal)...",
-            file=sys.stdout,
-        )
-
+        # ---------- Matriz X comum ----------
         X = features_h3.select(
             [
                 "LATITUDE_MEDIA",
@@ -489,19 +482,23 @@ class SafeDriver:
             ]
         ).to_pandas()
 
-        crimes_np = (
+        # =======================
+        # Modelo 1 – Volume
+        # =======================
+        print("🧠 Treinando Modelo 1 (Volume de crimes)...", file=sys.stdout)
+
+        crimes_volume = (
             features_h3.select("CRIMES_REAIS").to_numpy().ravel().astype(float)
         )
-        y = np.sqrt(crimes_np)
+        y_vol = np.sqrt(crimes_volume)
 
-        # pesos por faixa de crime (mantém teste compatível com CSV)
-        pesos = np.ones_like(crimes_np, dtype=float)
-        pesos[(crimes_np >= 21) & (crimes_np <= 50)] = 1.5
-        pesos[(crimes_np > 50) & (crimes_np < 100)] = 2.0
-        pesos[crimes_np >= 100] = 3.0
-        pesos = pesos / pesos.mean()
+        pesos_vol = np.ones_like(crimes_volume, dtype=float)
+        pesos_vol[(crimes_volume >= 21) & (crimes_volume <= 50)] = 1.5
+        pesos_vol[(crimes_volume > 50) & (crimes_volume < 100)] = 2.0
+        pesos_vol[crimes_volume >= 100] = 3.0
+        pesos_vol = pesos_vol / pesos_vol.mean()
 
-        cat_model = CatBoostRegressor(
+        cat_vol = CatBoostRegressor(
             iterations=400,
             depth=6,
             l2_leaf_reg=3.0,
@@ -509,7 +506,7 @@ class SafeDriver:
             loss_function="RMSE",
             silent=True,
         )
-        lgbm_model = LGBMRegressor(
+        lgbm_vol = LGBMRegressor(
             n_estimators=600,
             max_depth=-1,
             learning_rate=0.05,
@@ -520,30 +517,82 @@ class SafeDriver:
             verbose=-1,
         )
 
-        cat_model.fit(X, y, sample_weight=pesos)
-        lgbm_model.fit(X, y, sample_weight=pesos)
+        cat_vol.fit(X, y_vol, sample_weight=pesos_vol)
+        lgbm_vol.fit(X, y_vol, sample_weight=pesos_vol)
 
-        ens = VotingRegressor(
+        ens_vol = VotingRegressor(
             [
-                ("c", cat_model),
-                ("l", lgbm_model),
+                ("cv", cat_vol),
+                ("lv", lgbm_vol),
             ]
-        ).fit(X, y, sample_weight=pesos)
+        ).fit(X, y_vol, sample_weight=pesos_vol)
 
-        preds = ens.predict(X)
-        y_hat = np.square(preds)
-        y_hat = np.clip(y_hat, 0, None)
+        preds_vol = ens_vol.predict(X)
+        y_hat_vol = np.square(preds_vol)
+        y_hat_vol = np.clip(y_hat_vol, 0, None)
+        risco_volume_medio = float(y_hat_vol.mean())
 
-        risco_avg = float(y_hat.mean())
+        # =======================
+        # Modelo 2 – Penal
+        # =======================
+        print("🧠 Treinando Modelo 2 (Gravidade penal)...", file=sys.stdout)
+
+        crimes_penal = (
+            features_h3.select("CRIMES_PONDERADOS").to_numpy().ravel().astype(float)
+        )
+        y_pen = np.sqrt(crimes_penal)
+
+        # pesos_penal podem reforçar muito penal alto
+        pesos_pen = np.ones_like(crimes_penal, dtype=float)
+        q75_pen = np.nanpercentile(crimes_penal[crimes_penal > 0], 75)
+        pesos_pen[crimes_penal >= q75_pen] = 2.0
+        pesos_pen[crimes_penal == 0] = 0.5
+        pesos_pen = pesos_pen / pesos_pen.mean()
+
+        cat_pen = CatBoostRegressor(
+            iterations=400,
+            depth=6,
+            l2_leaf_reg=3.0,
+            learning_rate=0.05,
+            loss_function="RMSE",
+            silent=True,
+        )
+        lgbm_pen = LGBMRegressor(
+            n_estimators=600,
+            max_depth=-1,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=0.5,
+            objective="regression",
+            verbose=-1,
+        )
+
+        cat_pen.fit(X, y_pen, sample_weight=pesos_pen)
+        lgbm_pen.fit(X, y_pen, sample_weight=pesos_pen)
+
+        ens_pen = VotingRegressor(
+            [
+                ("cp", cat_pen),
+                ("lp", lgbm_pen),
+            ]
+        ).fit(X, y_pen, sample_weight=pesos_pen)
+
+        preds_pen = ens_pen.predict(X)
+        y_hat_pen = np.square(preds_pen)
+        y_hat_pen = np.clip(y_hat_pen, 0, None)
 
         # ---------- Camada Ouro ----------
         print(
-            "💾 Gerando camada Ouro (dashboard_final H3+ melhorado)...",
+            "💾 Gerando camada Ouro (ESCORE_VOLUME + ESCORE_PENAL por H3)...",
             file=sys.stdout,
         )
 
         fato_ouro = features_h3.with_columns(
-            [pl.Series("ESCORE_RISCO", np.round(y_hat, 2))]
+            [
+                pl.Series("ESCORE_VOLUME", np.round(y_hat_vol, 2)),
+                pl.Series("ESCORE_PENAL", np.round(y_hat_pen, 2)),
+            ]
         )
 
         # GEOMETRIA WKT opcional
@@ -566,51 +615,81 @@ class SafeDriver:
         fato_ouro.write_parquet(ouro_path)
 
         # ---------- Validação ----------
-        print("✅ Construindo tabela de validação...", file=sys.stdout)
+        print("✅ Construindo tabela de validação (volume x penal)...", file=sys.stdout)
 
         validacao = fato_ouro.select(
             [
                 "CODIGO_H3",
                 "CRIMES_REAIS",
                 "CRIMES_PONDERADOS",
-                "ESCORE_RISCO",
+                "ESCORE_VOLUME",
+                "ESCORE_PENAL",
                 "LATITUDE_MEDIA",
                 "LONGITUDE_MEDIA",
             ]
         ).with_columns(
             [
-                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
+                # Erros em volume
+                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_VOLUME"))
                 .abs()
-                .alias("ERRO_ABS"),
+                .alias("ERRO_ABS_VOLUME"),
                 (
-                    (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
+                    (pl.col("CRIMES_REAIS") - pl.col("ESCORE_VOLUME"))
                     .abs()
                     / pl.when(pl.col("CRIMES_REAIS") > 0)
                     .then(pl.col("CRIMES_REAIS"))
                     .otherwise(None)
-                ).alias("ERRO_PERC_ABS"),
+                ).alias("ERRO_PERC_VOLUME"),
+                # Erros em penal
+                (pl.col("CRIMES_PONDERADOS") - pl.col("ESCORE_PENAL"))
+                .abs()
+                .alias("ERRO_ABS_PENAL"),
+                (
+                    (pl.col("CRIMES_PONDERADOS") - pl.col("ESCORE_PENAL"))
+                    .abs()
+                    / pl.when(pl.col("CRIMES_PONDERADOS") > 0)
+                    .then(pl.col("CRIMES_PONDERADOS"))
+                    .otherwise(None)
+                ).alias("ERRO_PERC_PENAL"),
             ]
         )
 
         valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
         validacao.write_parquet(valid_path)
 
-        # ---------- SHAP ----------
-        print("📊 Calculando SHAP (CatBoost)...", file=sys.stdout)
+        # ---------- SHAP (volume) ----------
+        print("📊 Calculando SHAP (Modelo de Volume)...", file=sys.stdout)
 
-        sd = (
+        sd_vol = (
             pd.DataFrame(
-                shap.TreeExplainer(cat_model).shap_values(X),
+                shap.TreeExplainer(cat_vol).shap_values(X),
                 columns=X.columns,
             )
             .abs()
             .mean()
-            .to_frame("GRAU_IMPORTANCIA")
+            .to_frame("GRAU_IMPORTANCIA_VOLUME")
             .reset_index()
         )
-        sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
+        sd_vol.columns = ["VARIAVEL", "GRAU_IMPORTANCIA_VOLUME"]
+
+        # ---------- SHAP (penal) ----------
+        print("📊 Calculando SHAP (Modelo Penal)...", file=sys.stdout)
+
+        sd_pen = (
+            pd.DataFrame(
+                shap.TreeExplainer(cat_pen).shap_values(X),
+                columns=X.columns,
+            )
+            .abs()
+            .mean()
+            .to_frame("GRAU_IMPORTANCIA_PENAL")
+            .reset_index()
+        )
+        sd_pen.columns = ["VARIAVEL", "GRAU_IMPORTANCIA_PENAL"]
+
+        shap_df = sd_vol.merge(sd_pen, on="VARIAVEL", how="outer")
         shap_path = self.pastas["ouro"] / "shap_audit.parquet"
-        pl.from_pandas(sd).write_parquet(shap_path)
+        pl.from_pandas(shap_df).write_parquet(shap_path)
 
         # ---------- BigQuery ----------
         status_bq = self.publicar_bigquery_a_partir_de_arquivos(
@@ -631,10 +710,10 @@ class SafeDriver:
 
         tempo_total = time.time() - self.t_inicio
         self.discord.notificar_sucesso(
-            "Reconstrução da Camada Ouro/Validação (SafeDriver H3+ Penal)",
+            "Reconstrução da Camada Ouro/Validação (Modelos Volume + Penal)",
             tempo_total,
             features_h3.height,
-            risco_avg,
+            risco_volume_medio,
             status_cloud,
             status_bq,
         )
@@ -856,7 +935,6 @@ class SafeDriver:
                     )
                     .cast(pl.Int8)
                     .alias("SEMANA_PAGAMENTO"),
-                    # PERFIL_VITIMA mais robusto (ciclista / pedestre / moto / motorista)
                     pl.when(
                         pl.col("N")
                         .str.to_uppercase()
@@ -883,11 +961,11 @@ class SafeDriver:
                     .then(pl.lit("MOTORISTA"))
                     .otherwise(pl.lit("GERAL"))
                     .alias("PERFIL_VITIMA"),
-                    # PESO_PENAL baseado em gravidade (pode ser refinado por artigo)
+                    # PESO_PENAL: gravidade jurídica aproximada
                     pl.when(
                         pl.col("N")
                         .str.to_uppercase()
-                        .str.contains("LATROCINIO|HOMICIDIO|SEQUESTRO|CARCERE")
+                        .str.contains("LATROCINIO|HOMICIDIO|HOMICÍDIO|SEQUESTRO|CÁRCERE|CARCERE")
                     )
                     .then(pl.lit(5))
                     .when(
