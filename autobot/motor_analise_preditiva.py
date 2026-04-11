@@ -36,7 +36,7 @@ def enviar_para_bigquery(
     df_pd = df_pl.to_pandas()
     client = criar_cliente_bq(projeto, cred_json)
     tabela_id = f"{projeto}.{dataset}.{tabela}"
-    job_config = bigquery.LoadJobJobConfig(write_disposition="WRITE_TRUNCATE")
+    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
     job = client.load_table_from_dataframe(df_pd, tabela_id, job_config=job_config)
     job.result()
 
@@ -192,160 +192,124 @@ class SafeDriver:
                     m = json.load(f).get(str(ano))
 
                 if (
-                    isinstance(m, dict)
+                    m
                     and m.get("tamanho_bytes") == size
-                    and path_parquet.exists()
+                    and m.get("sha256") == self.calcular_sha256(str(path_parquet))
                 ):
+                    print(f"✅ CDC: Arquivo {ano} inalterado.", file=sys.stdout)
                     return False, size
-
+            print(f"🔄 CDC: Arquivo {ano} alterado ou novo. Baixando...", file=sys.stdout)
             return True, size
-
-        except Exception:
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ CDC: Falha ao verificar {ano} (conexão ou 404): {e}", file=sys.stderr)
             if path_parquet.exists():
+                print(f"✅ CDC: Usando cache local para {ano}.", file=sys.stdout)
                 return False, 0
+            print(f"❌ CDC: Sem cache local para {ano}. Requer download.", file=sys.stderr)
+            return True, 0
+        except Exception as e:
+            print(f"❌ CDC: Erro inesperado ao verificar {ano}: {e}", file=sys.stderr)
             return True, 0
 
     def calcular_sha256(self, caminho_arquivo):
         sha256_hash = hashlib.sha256()
-        try:
-            with open(caminho_arquivo, "rb") as f:
-                for byte_block in iter(lambda: f.read(4096 * 1024), b""):
-                    sha256_hash.update(byte_block)
-            return sha256_hash.hexdigest()
-        except Exception as e:
-            print(f"Erro ao calcular SHA256 para {caminho_arquivo}: {e}", file=sys.stderr)
-            return None
+        with open(caminho_arquivo, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
 
-    def baixar_robusto(self, url, path, sessao, max_tentativas=5):
+    def baixar_robusto(self, url, destino, sessao, max_tentativas=5, atraso_base=5):
         for tentativa in range(max_tentativas):
             try:
-                with sessao.get(url, stream=True, timeout=60, verify=False) as r:
+                with sessao.get(url, stream=True, timeout=30, verify=False) as r:
                     r.raise_for_status()
-                    with open(path, "wb") as f:
+                    with open(destino, "wb") as f:
                         for chunk in r.iter_content(chunk_size=8192):
                             f.write(chunk)
                 return True
             except requests.exceptions.RequestException as e:
-                print(f"Falha na tentativa {tentativa + 1} de {max_tentativas} para {url}: {e}", file=sys.stderr)
-                time.sleep(2 ** tentativa)
+                print(f"❌ Erro ao baixar {url} (tentativa {tentativa + 1}/{max_tentativas}): {e}", file=sys.stderr)
+                time.sleep(atraso_base * (2**tentativa))
         return False
-
-    def wkt(self, h3_id):
-        if not isinstance(h3_id, str):
-            return None
-        try:
-            boundary = h3.h3_to_geo_boundary(h3_id)
-            return f"POLYGON (({' '.join([f'{lon} {lat}' for lat, lon in boundary])}, {boundary[0][1]} {boundary[0][0]}))"
-        except Exception:
-            return None
-
-    def publicar_bigquery_a_partir_de_arquivos(self, bq_project, bq_dataset, bq_cred_json):
-        status_bq = "✅ Sucesso"
-        try:
-            for camada in ["ouro"]:
-                for arquivo in self.pastas[camada].glob("*.parquet"):
-                    tabela_nome = arquivo.stem
-                    df_pl = pl.read_parquet(arquivo)
-                    enviar_para_bigquery(df_pl, tabela_nome, bq_project, bq_dataset, bq_cred_json)
-                    print(f"✅ Tabela {tabela_nome} publicada no BigQuery.", file=sys.stdout)
-        except Exception as e:
-            status_bq = f"❌ Falha: {e}"
-            print(f"❌ Erro ao publicar no BigQuery: {e}", file=sys.stderr)
-        return status_bq
 
     def sincronizar_raw(self):
         sessao = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET"],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        sessao.mount("https://", adapter)
-        sessao.mount("http://", adapter)
+        retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        sessao.mount("https://", HTTPAdapter(max_retries=retries))
 
-        ano_atual = hora_brasilia().year
-        anos_para_processar = [ano_atual]
-
-        for ano in anos_para_processar:
-            # CORREÇÃO: Atualização da URL de download da SSP
+        anos = range(2022, hora_brasilia().year + 1)
+        for ano in anos:
             url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-            path = self.pastas["raw"] / f"DadosBO_{ano}.parquet"
-            tmp = self.pastas["raw"] / f"DadosBO_{ano}.xlsx"
+            path = self.pastas["raw"] / f"SPDadosCriminais_{ano}.parquet"
+            tmp = self.pastas["raw"] / f"SPDadosCriminais_{ano}.xlsx"
 
-            print(f"🔄 Baixando e processando dados para o ano: {ano}", file=sys.stdout)
+            baixar, size = self.cdc_check(ano, url, sessao, path)
+
+            if not baixar:
+                continue
 
             try:
-                deve_baixar, sz = self.cdc_check(ano, url, sessao, path)
+                print(f"⬇️ Baixando dados de {ano}...", file=sys.stdout)
+                if self.baixar_robusto(url, tmp, sessao):
+                    print(f"✅ Download de {ano} concluído. Processando...", file=sys.stdout)
+                    abas = []
+                    excel_file = pl.read_excel(tmp, sheet_id=0, engine="calamine")
 
-                if deve_baixar:
-                    print(f"⬇️ Baixando {url}...", file=sys.stdout)
-                    if self.baixar_robusto(url, tmp, sessao):
-                        print(f"✅ Download de {ano} concluído.", file=sys.stdout)
-                        df = pl.read_excel(tmp, engine="openpyxl")
+                    # Mapeamento flexível de colunas
+                    col_map = {
+                        "ANO_BO": "ANO_BO", "ANO BO": "ANO_BO",
+                        "NUM_BO": "NUM_BO", "NUM BO": "NUM_BO",
+                        "DELEGACIA": "DELEGACIA",
+                        "DATA_FATO": "D", "DATA FATO": "D",
+                        "HORA_FATO": "H", "HORA FATO": "H",
+                        "LATITUDE": "LAT",
+                        "LONGITUDE": "LON",
+                        "NATUREZA_CRIME": "N", "NATUREZA CRIME": "N",
+                    }
 
-                        abas = []
-                        for sheet_name in df.sheet_names:
-                            df_sheet = pl.read_excel(tmp, sheet_name=sheet_name, engine="openpyxl")
+                    # Tenta encontrar as colunas em cada aba
+                    for sheet_name in excel_file.sheet_names:
+                        df = pl.read_excel(tmp, sheet_name=sheet_name, engine="calamine")
+                        f_cols = {}
+                        for original_col, target_col in col_map.items():
+                            if original_col in df.columns:
+                                f_cols[original_col] = target_col
 
-                            f_cols = {}
-                            col_map = {
-                                "ANO_BO": "A", "ANO BO": "A", "ANO": "A",
-                                "MES": "M", "MES_FATO": "M",
-                                "DATA_FATO": "D", "DATA FATO": "D",
-                                "HORA_FATO": "H", "HORA FATO": "H", "HORA": "H",
-                                "LATITUDE": "LAT", "LAT": "LAT",
-                                "LONGITUDE": "LON", "LON": "LON",
-                                "RUBRICA": "N", "NATUREZA": "N",
-                                "DESCR_TIPO_BOP": "N"
-                            }
-
-                            for col in df_sheet.columns:
-                                for original, target in col_map.items():
-                                    if original in col.upper().replace(" ", "_"):
-                                        if target in f_cols.values():
-                                            continue
-                                        f_cols[col] = target
-                                        break
-
-                            if len(f_cols) >= 5: # Ajustado para >= 5 para ser mais flexível
-                                df_clean = (
-                                    df_sheet.select(list(f_cols.keys()))
-                                    .rename(f_cols)
-                                    .with_columns(pl.all().cast(pl.String))
-                                )
-                                abas.append(df_clean)
-
-                        if abas:
-                            pl.concat(abas, how="diagonal").write_parquet(path)
-
-                            assinatura_sha256 = self.calcular_sha256(str(tmp))
-                            print(
-                                f"🔒 Assinatura SHA-256 ({ano}): {assinatura_sha256}",
-                                file=sys.stdout,
+                        # Garante que as colunas essenciais para o processamento estejam presentes
+                        if all(col in f_cols.values() for col in ["D", "LAT", "LON", "H", "N"]):
+                            df_clean = (
+                                df.select(list(f_cols.keys()))
+                                .rename(f_cols)
+                                .with_columns(pl.all().cast(pl.String))
                             )
+                            abas.append(df_clean)
 
-                            m_data = json.load(open(self.meta)) if self.meta.exists() else {}
-                            m_data[str(ano)] = {
-                                "tamanho_bytes": sz,
-                                "sha256": assinatura_sha256,
-                            }
-                            with open(self.meta, "w") as f:
-                                json.dump(m_data, f)
-                        else:
-                            print(f"⚠️ Nenhum dado criminal estruturado encontrado na planilha {ano}. Pulando.", file=sys.stderr)
-                            if os.path.exists(tmp):
-                                os.remove(tmp)
-                            continue
+                    if abas:
+                        pl.concat(abas, how="diagonal").write_parquet(path)
 
+                        assinatura_sha256 = self.calcular_sha256(str(tmp))
+                        print(
+                            f"🔒 Assinatura SHA-256 ({ano}): {assinatura_sha256}",
+                            file=sys.stdout,
+                        )
+
+                        m_data = json.load(open(self.meta)) if self.meta.exists() else {}
+                        m_data[str(ano)] = {
+                            "tamanho_bytes": size, # Usar o size obtido do HEAD request
+                            "sha256": assinatura_sha256,
+                        }
+                        with open(self.meta, "w") as f:
+                            json.dump(m_data, f)
+                    else:
+                        print(f"⚠️ Nenhum dado criminal estruturado encontrado na planilha {ano}. Pulando.", file=sys.stderr)
                         if os.path.exists(tmp):
                             os.remove(tmp)
-                    else:
-                        raise Exception(f"Falha ao baixar arquivo {ano} apos multiplas tentativas.")
+                        continue
 
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
                 else:
-                    print(f"✅ Dados de {ano} já atualizados ou sem alterações.", file=sys.stdout)
+                    raise Exception(f"Falha ao baixar arquivo {ano} apos multiplas tentativas.")
 
             except Exception as e:
                 print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
@@ -357,15 +321,213 @@ class SafeDriver:
                 )
                 continue
 
-        arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
-        if not arquivos_limpos:
-            msg = "Portal SSP inoperante e sem cache local integro. Nenhum arquivo RAW válido encontrado."
-            self.discord.notificar_erro("SafeDriver Sync", msg)
-            raise Exception(msg)
+    def wkt(self, h3_id: str) -> str:
+        if not isinstance(h3_id, str):
+            return None
+        try:
+            boundary = h3.h3_to_geo_boundary(h3_id, geo_json=True)
+            return f"POLYGON (({', '.join([f'{lon} {lat}' for lon, lat in boundary])}))"
+        except Exception:
+            return None
+
+    def publicar_bigquery_a_partir_de_arquivos(self, bq_project, bq_dataset, bq_cred_json):
+        status_bq = "✅ Sucesso"
+        try:
+            for pasta in ["ouro"]:
+                for arquivo in self.pastas[pasta].glob("*.parquet"):
+                    df = pl.read_parquet(arquivo)
+                    tabela_nome = arquivo.stem
+                    enviar_para_bigquery(df, tabela_nome, bq_project, bq_dataset, bq_cred_json)
+                    print(f"📡 Publicado {tabela_nome} no BigQuery.", file=sys.stdout)
+        except Exception as e:
+            status_bq = f"❌ Falha: {e}"
+            print(f"❌ Erro ao publicar no BigQuery: {e}", file=sys.stderr)
+        return status_bq
+
+    def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
+        print("✨ Construindo Camada Ouro...", file=sys.stdout)
+        prata = pl.read_parquet(self.pastas["prata"] / "camada_prata.parquet")
+
+        features_h3 = (
+            prata.group_by("CODIGO_H3")
+            .agg(
+                pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
+                pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
+                pl.col("LAT").std().fill_null(0).alias("LAT_STD"),
+                pl.col("LON").std().fill_null(0).alias("LON_STD"),
+                pl.col("ID_ANONIMO").count().alias("CRIMES_REAIS"),
+                (pl.col("TIPO_CRIME") == "PATRIMONIO").sum().alias("PATRIMONIO_COUNT"),
+                (pl.col("PERFIL_VITIMA") == "MOTORISTA").sum().alias("MOTORISTA_COUNT"),
+                (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").sum().alias("MOTO_COUNT"),
+                (pl.col("PERFIL_VITIMA") == "PEDESTRE").sum().alias("PEDESTRE_COUNT"), # Adicionado
+                (pl.col("PERFIL_VITIMA") == "CICLISTA").sum().alias("CICLISTA_COUNT"), # Adicionado
+                (pl.col("EH_FERIADO") == 1).sum().alias("FERIADO_COUNT"),
+                (pl.col("SEMANA_PAGAMENTO") == 1).sum().alias("PAGAMENTO_COUNT"),
+                (pl.col("PERIODO_DETALHADO") == "MANHA").sum().alias("MANHA_COUNT"),
+                (pl.col("PERIODO_DETALHADO") == "TARDE").sum().alias("TARDE_COUNT"),
+                (pl.col("PERIODO_DETALHADO") == "NOITE").sum().alias("NOITE_COUNT"),
+                (pl.col("PERIODO_DETALHADO") == "MADRUGADA").sum().alias("MADRUGADA_COUNT"),
+                pl.col("PESO_PENAL").sum().alias("PESO_PENAL_TOTAL"),
+                pl.col("ANO").unique().count().alias("ANOS_COM_CRIMES"),
+            )
+            .with_columns(
+                (pl.col("PATRIMONIO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_PATRIMONIO"),
+                (pl.col("MOTORISTA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MOTORISTA"),
+                (pl.col("MOTO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MOTO"),
+                (pl.col("PEDESTRE_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_PEDESTRE"), # Adicionado
+                (pl.col("CICLISTA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_CICLISTA"), # Adicionado
+                (pl.col("FERIADO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_FERIADO"),
+                (pl.col("PAGAMENTO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_PAGAMENTO"),
+                (pl.col("MANHA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MANHA"),
+                (pl.col("TARDE_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_TARDE"),
+                (pl.col("NOITE_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_NOITE"),
+                (pl.col("MADRUGADA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MADRUGADA"),
+                (pl.col("CRIMES_REAIS") / pl.col("ANOS_COM_CRIMES")).alias("CRIMES_POR_ANO"),
+                (pl.col("PESO_PENAL_TOTAL") / pl.col("ANOS_COM_CRIMES")).alias("CRIMES_POND_POR_ANO"),
+            )
+            .with_columns(
+                (pl.col("PROP_NOITE") * pl.col("PROP_PATRIMONIO")).alias("RISCO_NOITE_PATRIMONIO"),
+                (pl.col("PROP_MOTO") * pl.col("PROP_NOITE")).alias("RISCO_MOTO_NOITE"),
+                (pl.col("PROP_MOTORISTA") * pl.col("PROP_PAGAMENTO")).alias("RISCO_MOTORISTA_PAGTO"),
+            )
+            .drop(
+                [
+                    "PATRIMONIO_COUNT",
+                    "MOTORISTA_COUNT",
+                    "MOTO_COUNT",
+                    "PEDESTRE_COUNT", # Adicionado
+                    "CICLISTA_COUNT", # Adicionado
+                    "FERIADO_COUNT",
+                    "PAGAMENTO_COUNT",
+                    "MANHA_COUNT",
+                    "TARDE_COUNT",
+                    "NOITE_COUNT",
+                    "MADRUGADA_COUNT",
+                    "PESO_PENAL_TOTAL",
+                    "ANOS_COM_CRIMES",
+                ]
+            )
+            .with_columns(
+                pl.col("CODIGO_H3")
+                .map_elements(self.wkt, return_dtype=pl.String)
+                .alias("GEOMETRIA_WKT")
+            )
+        )
+
+        features_modelo = [
+            "LATITUDE_MEDIA",
+            "LONGITUDE_MEDIA",
+            "LAT_STD",
+            "LON_STD",
+            "CRIMES_POR_ANO",
+            "PROP_PATRIMONIO",
+            "PROP_MOTORISTA",
+            "PROP_MOTO",
+            "PROP_PEDESTRE", # Adicionado
+            "PROP_CICLISTA", # Adicionado
+            "PROP_FERIADO",
+            "PROP_PAGAMENTO",
+            "PROP_MANHA",
+            "PROP_TARDE",
+            "PROP_NOITE",
+            "PROP_MADRUGADA",
+            "RISCO_NOITE_PATRIMONIO",
+            "RISCO_MOTO_NOITE",
+            "RISCO_MOTORISTA_PAGTO",
+        ]
+        X = features_h3.select(features_modelo).to_pandas()
+        y_volume = features_h3.select("CRIMES_REAIS").to_pandas().squeeze()
+        y_penal = features_h3.select("CRIMES_POND_POR_ANO").to_pandas().squeeze()
+
+        model_volume = VotingRegressor(
+            estimators=[
+                ("cat", CatBoostRegressor(random_state=42, verbose=0)),
+                ("lgbm", LGBMRegressor(random_state=42)),
+            ]
+        )
+        model_volume.fit(X, y_volume)
+        features_h3 = features_h3.with_columns(
+            pl.Series(
+                "ESCORE_RISCO_VOLUME", model_volume.predict(X), dtype=pl.Float64
+            ).alias("ESCORE_RISCO")
+        )
+
+        model_penal = VotingRegressor(
+            estimators=[
+                ("cat", CatBoostRegressor(random_state=42, verbose=0)),
+                ("lgbm", LGBMRegressor(random_state=42)),
+            ]
+        )
+        model_penal.fit(X, y_penal)
+        features_h3 = features_h3.with_columns(
+            pl.Series(
+                "ESCORE_RISCO_PENAL", model_penal.predict(X), dtype=pl.Float64
+            ).alias("ESCORE_RISCO_PENAL")
+        )
+
+        dashboard_final = features_h3.select(
+            [
+                "CODIGO_H3",
+                "GEOMETRIA_WKT",
+                "LATITUDE_MEDIA",
+                "LONGITUDE_MEDIA",
+                "CRIMES_REAIS",
+                "ESCORE_RISCO",
+                "ESCORE_RISCO_PENAL",
+                "PROP_PATRIMONIO",
+                "PROP_MOTORISTA",
+                "PROP_MOTO",
+                "PROP_PEDESTRE", # Adicionado
+                "PROP_CICLISTA", # Adicionado
+                "PROP_FERIADO",
+                "PROP_PAGAMENTO",
+                "PROP_MANHA",
+                "PROP_TARDE",
+                "PROP_NOITE",
+                "PROP_MADRUGADA",
+                "RISCO_NOITE_PATRIMONIO",
+                "RISCO_MOTO_NOITE",
+                "RISCO_MOTORISTA_PAGTO",
+                "LAT_STD",
+                "LON_STD",
+                "CRIMES_POR_ANO",
+                "CRIMES_POND_POR_ANO",
+            ]
+        )
+        dashboard_final.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
+
+        validacao_modelo = features_h3.select(
+            ["CODIGO_H3", "CRIMES_REAIS", "ESCORE_RISCO"]
+        ).with_columns(
+            (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO")).abs().alias("ERRO_ABS")
+        )
+        validacao_modelo.write_parquet(self.pastas["ouro"] / "validacao_modelo.parquet")
+
+        explainer = shap.TreeExplainer(model_volume)
+        shap_values = explainer.shap_values(X)
+        shap_sum = np.abs(shap_values).mean(axis=0)
+        shap_importance = pl.DataFrame(
+            {
+                "VARIAVEL": X.columns,
+                "GRAU_IMPORTANCIA": shap_sum,
+            }
+        ).sort("GRAU_IMPORTANCIA", descending=True)
+        shap_importance.write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
+
+        self.publicar_bigquery_a_partir_de_arquivos(bq_project, bq_dataset, bq_cred_json)
+
+    def processar(self):
+        self.sincronizar_raw()
 
         bq_project = os.environ.get("BQ_PROJECT_ID")
         bq_dataset = os.environ.get("BQ_DATASET_ID")
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
+
+        arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
+        if not arquivos_limpos:
+            msg = "Nenhum arquivo RAW válido encontrado após sincronização."
+            self.discord.notificar_erro("SafeDriver Sync", msg)
+            raise Exception(msg)
 
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
@@ -467,6 +629,14 @@ class SafeDriver:
                     .otherwise(pl.lit(1))
                     .alias("PESO_PENAL"),
                 ]
+            )
+            .with_columns(
+                pl.struct(["LAT", "LON"])
+                .map_elements(
+                    lambda coords: h3.geo_to_h3(coords["LAT"], coords["LON"], 9),
+                    return_dtype=pl.String,
+                )
+                .alias("CODIGO_H3")
             )
             .collect(streaming=True)
         )
