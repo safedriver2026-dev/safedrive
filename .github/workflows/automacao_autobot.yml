@@ -1,5 +1,5 @@
 # .github/workflows/automacao_autobot.yml
-name: SafeDriver Execução Diaria
+name: SafeDriver_Motor_V1.0.0
 
 on:
   schedule:
@@ -11,42 +11,38 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      R2_ENDPOINT_URL:        ${{ secrets.R2_ENDPOINT_URL }}
-      R2_ACCESS_KEY_ID:       ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY:   ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET_NAME:         ${{ secrets.R2_BUCKET_NAME }}
-      DISCORD_SUCESSO:        ${{ secrets.DISCORD_SUCESSO }}
-      DISCORD_ERRO:           ${{ secrets.DISCORD_ERRO }}
-      BQ_PROJECT_ID:          ${{ secrets.BQ_PROJECT_ID }}
-      BQ_DATASET_ID:          ${{ secrets.BQ_DATASET_ID }}
+      R2_ENDPOINT_URL:         ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID:        ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY:    ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME:          ${{ secrets.R2_BUCKET_NAME }}
+      DISCORD_SUCESSO:         ${{ secrets.DISCORD_SUCESSO }}
+      DISCORD_ERRO:            ${{ secrets.DISCORD_ERRO }}
+      BQ_PROJECT_ID:           ${{ secrets.BQ_PROJECT_ID }}
+      BQ_DATASET_ID:           ${{ secrets.BQ_DATASET_ID }}
       BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
+      LGPD_SALT:               ${{ secrets.LGPD_SALT }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar Conda
-        uses: conda-incubator/setup-miniconda@v3
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
         with:
-          activate-environment: safedriver_env
-          environment-file: environment.yml
-          auto-activate-base: false
           python-version: "3.11"
 
       - name: Sanitizar Secrets
-        shell: bash -l {0}
         run: |
-          echo "R2_ACCESS_KEY_ID=$(echo "$R2_ACCESS_KEY_ID" | tr -d '\n\r ')"              >> $GITHUB_ENV
-          echo "R2_SECRET_ACCESS_KEY=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d '\n\r ')"      >> $GITHUB_ENV
-          echo "R2_ENDPOINT_URL=$(echo "$R2_ENDPOINT_URL" | tr -d '\n\r ')"                >> $GITHUB_ENV
-          echo "R2_BUCKET_NAME=$(echo "$R2_BUCKET_NAME" | tr -d '\n\r ')"                  >> $GITHUB_ENV
-          echo "BQ_PROJECT_ID=$(echo "$BQ_PROJECT_ID" | tr -d '\n\r ')"                    >> $GITHUB_ENV
-          echo "BQ_DATASET_ID=$(echo "$BQ_DATASET_ID" | tr -d '\n\r ')"                    >> $GITHUB_ENV
+          echo "R2_ACCESS_KEY_ID=$(echo "$R2_ACCESS_KEY_ID" | tr -d '\n\r ')"             >> $GITHUB_ENV
+          echo "R2_SECRET_ACCESS_KEY=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d '\n\r ')"     >> $GITHUB_ENV
+          echo "R2_ENDPOINT_URL=$(echo "$R2_ENDPOINT_URL" | tr -d '\n\r ')"               >> $GITHUB_ENV
+          echo "R2_BUCKET_NAME=$(echo "$R2_BUCKET_NAME" | tr -d '\n\r ')"                 >> $GITHUB_ENV
+          echo "BQ_PROJECT_ID=$(echo "$BQ_PROJECT_ID" | tr -d '\n\r ')"                   >> $GITHUB_ENV
+          echo "BQ_DATASET_ID=$(echo "$BQ_DATASET_ID" | tr -d '\n\r ')"                   >> $GITHUB_ENV
+          echo "LGPD_SALT=$(echo "$LGPD_SALT" | tr -d '\n\r ')"                           >> $GITHUB_ENV
 
       - name: Instalar Dependências
-        shell: bash -l {0}
         run: |
-          conda activate safedriver_env
           pip install --upgrade pip
           pip install \
             polars \
@@ -66,16 +62,11 @@ jobs:
             shap \
             h3 \
             holidays \
-            joblib
+            joblib \
+            pytest
 
       - name: Executar Pipeline
-        shell: bash -l {0}
-        run: |
-          conda activate safedriver_env
-          python autobot/motor_analise_preditiva.py
+        run: python autobot/motor_analise_preditiva.py
 
       - name: Testes
-        shell: bash -l {0}
-        run: |
-          conda activate safedriver_env
-          pytest tests/test_seguranca.py -v
+        run: pytest tests/test_seguranca.py -v
