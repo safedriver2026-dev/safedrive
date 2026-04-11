@@ -78,7 +78,7 @@ SINONIMOS = {
     "NOME_DEPARTAMENTO":  ["DEPARTAMENTO", "DEPTO"],
     "NOME_SECCIONAL":     ["SECCIONAL"],
     "NOME_DELEGACIA":     ["DELEGACIA"],
-    "NOME_MUNICIPIO":     ["MUNICIPIO", "MUN", "CIDADE"],
+    "NOME_MUNICIPIO":     ["MUNICIPIO", "MUN", "CIDADE"], # Adicionado "CIDADE" aqui
     "LOGRADOURO":         ["RUA", "ENDERECO"],
     "NUMERO_LOGRADOURO":  ["NUMERO", "NUM_LOGRADOURO"],
     "BAIRRO":             ["NOME_BAIRRO"],
@@ -173,18 +173,22 @@ def baixar_ssp(ano: int) -> pd.DataFrame | None:
             df_consolidado = pd.DataFrame()
 
             for sheet_name in excel_file.sheet_names:
-                if "Campos da Tabela_SPDADOS" in sheet_name:
+                if "Campos da Tabela_SPDADOS" in sheet_name.upper(): # Ignorar case-insensitive
                     continue
 
                 try:
-                    df_sheet = excel_file.parse(sheet_name, dtype=str) # Ler tudo como string
+                    # Ler tudo como string para evitar problemas de tipo na RAW
+                    df_sheet = excel_file.parse(sheet_name, dtype=str)
+
+                    # Normalizar nomes de colunas para a detecção
+                    df_sheet.columns = [normalizar_texto(col) for col in df_sheet.columns]
 
                     colunas_presentes = [col for col in COLUNAS_CRITICAS_SSP if col in df_sheet.columns]
-                    if len(colunas_presentes) >= 5: # Critério de 5 colunas críticas
+                    if len(colunas_presentes) >= 5:
                         print(f"[SSP] Aba '{sheet_name}' identificada como dados para o ano {ano}.")
                         df_consolidado = pd.concat([df_consolidado, df_sheet], ignore_index=True)
                     else:
-                        print(f"[SSP] Aba '{sheet_name}' ignorada (poucas colunas críticas).")
+                        print(f"[SSP] Aba '{sheet_name}' ignorada (poucas colunas críticas ou não é aba de dados).")
                 except Exception as e:
                     print(f"[SSP] Erro ao processar aba '{sheet_name}' para {ano}: {e}")
 
@@ -196,18 +200,68 @@ def baixar_ssp(ano: int) -> pd.DataFrame | None:
 
         except requests.exceptions.RequestException as e:
             print(f"[SSP] Erro ao baixar {url} (tentativa {tentativa}/{SSP_MAX_TENTATIVAS}): {e}")
-            if tentativa < SSP_MAX_TENTATIVAS:
-                time.sleep(5 * tentativa)
+            time.sleep(5)
     print(f"[SSP] Falha ao baixar {url} após {SSP_MAX_TENTATIVAS} tentativas.")
     return None
 
-class DiscordNotifier:
-    def __init__(self, webhook_sucesso: str, webhook_erro: str):
-        self.webhook_sucesso = webhook_sucesso
-        self.webhook_erro = webhook_erro
+class TrackingSSP:
+    def __init__(self, s3_client, bucket_name, key):
+        self.s3 = s3_client
+        self.bucket = bucket_name
+        self.key = key
+        self.dados = self._carregar_tracking()
 
-    def _enviar_mensagem(self, webhook_url: str, titulo: str, descricao: str, cor: int):
-        if not webhook_url:
+    def _carregar_tracking(self):
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=self.key)
+            content = response["Body"].read().decode("utf-8")
+            tracking_data = json.loads(content)
+
+            # Migração defensiva: se encontrar int onde deveria ser dict, corrige
+            for ano, info in tracking_data.items():
+                if isinstance(info, int):
+                    tracking_data[ano] = {"tamanho_bytes": info, "hash_sha256": ""}
+            return tracking_data
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                print("[Tracking] tracking_ssp.json não encontrado — iniciando do zero.")
+                return {}
+            else:
+                raise
+        except json.JSONDecodeError:
+            print("[Tracking] tracking_ssp.json corrompido — iniciando do zero.")
+            return {}
+
+    def salvar_tracking(self):
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=self.key,
+            Body=json.dumps(self.dados, indent=2).encode("utf-8"),
+            ContentType="application/json"
+        )
+
+    def precisa_processar(self, ano: int, tamanho_bytes: int, hash_sha256: str) -> bool:
+        ano_str = str(ano)
+        if ano_str not in self.dados:
+            return True
+
+        info_existente = self.dados[ano_str]
+        return (info_existente.get("tamanho_bytes") != tamanho_bytes or
+                info_existente.get("hash_sha256") != hash_sha256)
+
+    def atualizar_tracking(self, ano: int, tamanho_bytes: int, hash_sha256: str):
+        self.dados[str(ano)] = {
+            "tamanho_bytes": tamanho_bytes,
+            "hash_sha256": hash_sha256,
+            "ultima_atualizacao": hora_brasilia().isoformat()
+        }
+
+class DiscordNotifier:
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
+
+    def _enviar_mensagem(self, titulo: str, descricao: str, cor: int):
+        if not self.webhook_url:
             return
         payload = {
             "embeds": [{
@@ -219,125 +273,77 @@ class DiscordNotifier:
             }]
         }
         try:
-            requests.post(webhook_url, json=payload, timeout=10)
+            requests.post(self.webhook_url, json=payload, timeout=10)
         except requests.exceptions.RequestException as e:
             print(f"[Discord] Erro ao enviar mensagem: {e}")
 
     def alerta_erro(self, run_id: str, titulo: str, detalhes: str):
-        desc = f"**Run ID:** `{run_id}`\n**Detalhes:** ```{detalhes}```"
-        self._enviar_mensagem(self.webhook_erro, f"🚨 {titulo}", desc, 15158332)
+        desc = f"**Run ID:** `{run_id}`\n\n**Detalhes:**\n```\n{detalhes}\n```"
+        self._enviar_mensagem(f"🚨 {titulo}", desc, 15158332)
 
-    def relatorio_executivo(self, run_id: str, tempo: float, n_registros: int, mae: float, r2: float, melhoria: float, top_municipio: str, top_shap_feature: str):
+    def relatorio_executivo(self, run_id: str, tempo: float, n_ouro: int, mae: float, r2: float,
+                            melhoria: float, top_municipio: str, top_shap_feature: str):
         desc = (
             f"**Run ID:** `{run_id}`\n"
             f"**Tempo de Execução:** `{tempo:.1f}s`\n"
-            f"**Registros Ouro Gerados:** `{n_registros}`\n"
-            f"**MAE do Modelo:** `{mae:.4f}`\n"
-            f"**R² do Modelo:** `{r2:.4f}`\n"
-            f"**Melhoria em MAE (vs. anterior):** `{melhoria:.2f}%`\n"
-            f"**Município de Maior Risco (predito):** `{top_municipio}`\n"
-            f"**Feature Mais Impactante (SHAP):** `{top_shap_feature}`"
+            f"**Registros Ouro:** `{n_ouro}`\n"
+            f"**MAE:** `{mae:.4f}`\n"
+            f"**R²:** `{r2:.4f}`\n"
+            f"**Melhoria em relação ao ano anterior:** `{melhoria:.2%}`\n"
+            f"**Município de Maior Risco:** `{top_municipio}`\n"
+            f"**Feature Mais Impactante:** `{top_shap_feature}`"
         )
-        self._enviar_mensagem(self.webhook_sucesso, f"✅ Execução Concluída - {NOME_SISTEMA}", desc, 3066993)
+        self._enviar_mensagem(f"✅ Execução Concluída - Relatório Executivo", desc, 3066993)
 
-    def relatorio_operacional(self, run_id: str, n_raw: int, n_prata: int, n_ouro: int, mae: float, r2: float, mae_ant: float, anos_processados: list, status_bq: str, shap_top3: list, prefixo_raw: str):
-        shap_str = "\n".join([f"- `{f}`: `{v:.2f}`" for f, v in shap_top3])
+    def relatorio_operacional(self, run_id: str, n_raw: int, n_prata: int, n_ouro: int,
+                               mae: float, r2: float, mae_ant: float, anos_processados: list,
+                               status_bq: str, shap_top3: list, r2_prefixo_raw: str):
+        shap_str = "\n".join([f"- {f}: {v:.4f}" for f, v in shap_top3])
         desc = (
             f"**Run ID:** `{run_id}`\n"
-            f"**Dados Raw Processados:** `{n_raw}`\n"
-            f"**Dados Prata Gerados:** `{n_prata}`\n"
-            f"**Dados Ouro Gerados:** `{n_ouro}`\n"
+            f"**Dados RAW processados:** `{n_raw}`\n"
+            f"**Dados PRATA gerados:** `{n_prata}`\n"
+            f"**Dados OURO gerados:** `{n_ouro}`\n"
             f"**Anos Processados:** `{', '.join(map(str, anos_processados))}`\n"
-            f"**Prefixo R2 Raw:** `{prefixo_raw}`\n"
             f"**MAE Atual:** `{mae:.4f}` (Anterior: `{mae_ant:.4f}`)\n"
             f"**R² Atual:** `{r2:.4f}`\n"
             f"**Status BigQuery:** `{status_bq}`\n"
-            f"**Top 3 Features SHAP:**\n{shap_str}"
+            f"**Top 3 Features SHAP:**\n```\n{shap_str}\n```\n"
+            f"**Prefixo R2 RAW:** `{r2_prefixo_raw}`"
         )
-        self._enviar_mensagem(self.webhook_sucesso, f"📊 Detalhes Operacionais - {NOME_SISTEMA}", desc, 16776960)
+        self._enviar_mensagem(f"📊 Execução Concluída - Relatório Operacional", desc, 10181046)
 
     def sem_novidades(self, run_id: str, tempo: float):
-        desc = f"**Run ID:** `{run_id}`\n**Tempo de Execução:** `{tempo:.1f}s`\nNenhum dado novo ou alterado para processar."
-        self._enviar_mensagem(self.webhook_sucesso, f"💤 Sem Novidades - {NOME_SISTEMA}", desc, 10070709)
-
-class TrackingSSP:
-    def __init__(self, s3_client, bucket_name: str, tracking_key: str):
-        self.s3 = s3_client
-        self.bucket = bucket_name
-        self.key = tracking_key
-        self.dados = self._carregar_tracking()
-
-    def _carregar_tracking(self) -> dict:
-        try:
-            response = self.s3.get_object(Bucket=self.bucket, Key=self.key)
-            content = response["Body"].read().decode("utf-8")
-            tracking_raw = json.loads(content)
-
-            # Migração defensiva: se encontrar int onde deveria ser dict, converte
-            migrated_tracking = {}
-            for ano, info in tracking_raw.items():
-                if isinstance(info, int):
-                    migrated_tracking[ano] = {"tamanho_bytes": info, "hash_sha256": "legacy_hash"}
-                else:
-                    migrated_tracking[ano] = info
-            return migrated_tracking
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                print("[Tracking] tracking_ssp.json não encontrado — iniciando do zero.")
-                return {}
-            else:
-                raise
-        except Exception as e:
-            print(f"[Tracking] Erro ao carregar tracking_ssp.json: {e} — iniciando do zero.")
-            return {}
-
-    def salvar_tracking(self):
-        try:
-            self.s3.put_object(
-                Bucket=self.bucket,
-                Key=self.key,
-                Body=json.dumps(self.dados, indent=2).encode("utf-8"),
-                ContentType="application/json"
-            )
-        except Exception as e:
-            print(f"[Tracking] Erro ao salvar tracking_ssp.json: {e}")
-
-    def precisa_processar(self, ano: int, tamanho_bytes: int, hash_sha256: str) -> bool:
-        ano_str = str(ano)
-        if ano_str not in self.dados:
-            return True
-
-        info_existente = self.dados[ano_str]
-        if info_existente.get("tamanho_bytes") != tamanho_bytes or info_existente.get("hash_sha256") != hash_sha256:
-            return True
-        return False
-
-    def atualizar_tracking(self, ano: int, tamanho_bytes: int, hash_sha256: str):
-        self.dados[str(ano)] = {"tamanho_bytes": tamanho_bytes, "hash_sha256": hash_sha256}
+        desc = (
+            f"**Run ID:** `{run_id}`\n"
+            f"**Tempo de Execução:** `{tempo:.1f}s`\n"
+            f"Nenhum dado RAW novo ou alterado foi encontrado para processamento."
+        )
+        self._enviar_mensagem(f"💤 Execução Concluída - Sem Novidades", desc, 16776960)
 
 class SafeDriver:
     def __init__(self):
         self.run_id = run_id_curto()
         self.t_inicio = time.time()
         self.anos_processados = []
-        self.df_raw = pl.DataFrame()
 
+        r2_access_key_id = sanitizar_secret(os.environ.get("R2_ACCESS_KEY_ID", ""))
+        r2_secret_access_key = sanitizar_secret(os.environ.get("R2_SECRET_ACCESS_KEY", ""))
+        r2_endpoint_url = sanitizar_secret(os.environ.get("R2_ENDPOINT_URL", ""))
         self.r2_bucket = sanitizar_secret(os.environ.get("R2_BUCKET_NAME", ""))
+
         self.s3 = boto3.client(
             "s3",
-            endpoint_url=sanitizar_secret(os.environ.get("R2_ENDPOINT_URL", "")),
-            aws_access_key_id=sanitizar_secret(os.environ.get("R2_ACCESS_KEY_ID", "")),
-            aws_secret_access_key=sanitizar_secret(os.environ.get("R2_SECRET_ACCESS_KEY", "")),
+            endpoint_url=r2_endpoint_url,
+            aws_access_key_id=r2_access_key_id,
+            aws_secret_access_key=r2_secret_access_key,
+            config=boto3.session.Config(signature_version="s3v4")
         )
         self.tracking = TrackingSSP(self.s3, self.r2_bucket, R2_TRACKING)
-
-        webhook_sucesso = sanitizar_secret(os.environ.get("DISCORD_SUCESSO", ""))
-        webhook_erro = sanitizar_secret(os.environ.get("DISCORD_ERRO", ""))
-        self.discord = DiscordNotifier(webhook_sucesso, webhook_erro)
-
+        self.discord = DiscordNotifier(os.environ.get("DISCORD_WEBHOOK_URL"))
         self.lgpd_salt = sanitizar_secret(os.environ.get("LGPD_SALT", ""))
-        if not self.lgpd_salt:
-            raise ValueError("LGPD_SALT não configurado. Anonimização não pode ser garantida.")
+
+        self.df_raw = pl.DataFrame()
 
     def sincronizar_raw(self):
         print("[sincronizar_raw_inicio]")
@@ -345,132 +351,191 @@ class SafeDriver:
 
         for ano in ANOS_DISPONIVEIS:
             r2_key = f"{R2_PREFIXO_RAW}ssp_{ano}.parquet"
+            df_ano = pl.DataFrame()
 
             try:
                 response = self.s3.get_object(Bucket=self.r2_bucket, Key=r2_key)
                 parquet_data = response["Body"].read()
-                current_hash = hashlib.sha256(parquet_data).hexdigest()
-                current_size = len(parquet_data)
+                tamanho_bytes = len(parquet_data)
+                hash_sha256 = hashlib.sha256(parquet_data).hexdigest()
 
-                if self.tracking.precisa_processar(ano, current_size, current_hash):
-                    print(f"[R2] {r2_key} alterado ou novo — processando.")
+                if self.tracking.precisa_processar(ano, tamanho_bytes, hash_sha256):
+                    print(f"[R2] {r2_key} encontrado, mas alterado ou não rastreado — processando.")
                     df_ano = pl.read_parquet(BytesIO(parquet_data))
-                    df_raw_acumulado = pl.concat([df_raw_acumulado, df_ano])
-                    self.anos_processados.append(ano)
-                    self.tracking.atualizar_tracking(ano, current_size, current_hash)
+                    self.tracking.atualizar_tracking(ano, tamanho_bytes, hash_sha256)
                 else:
-                    print(f"[R2] {r2_key} inalterado — pulando.")
+                    print(f"[R2] {r2_key} encontrado e inalterado — ignorando.")
+                    continue
+
             except ClientError as e:
                 if e.response["Error"]["Code"] == "NoSuchKey":
                     print(f"[R2] {r2_key} não existe — tentando baixar da SSP-SP.")
-                    df_ssp = baixar_ssp(ano)
-                    if df_ssp is not None and not df_ssp.empty:
+                    df_ssp_pandas = baixar_ssp(ano)
+
+                    if df_ssp_pandas is not None and not df_ssp_pandas.empty:
                         # Forçar todas as colunas para string antes de converter para Polars
-                        for col in df_ssp.columns:
-                            df_ssp[col] = df_ssp[col].astype(str)
+                        # Isso garante que o Polars não infira tipos numéricos incorretamente
+                        # e evita o ShapeError na concatenação devido a tipos diferentes
+                        for col in df_ssp_pandas.columns:
+                            df_ssp_pandas[col] = df_ssp_pandas[col].astype(str)
 
-                        df_ano = pl.from_pandas(df_ssp)
+                        df_ano = pl.from_pandas(df_ssp_pandas)
+                        df_ano = renomear_sinonimos(df_ano) # Renomear colunas aqui
 
-                        parquet_buffer = BytesIO()
-                        df_ano.write_parquet(parquet_buffer)
-                        parquet_buffer.seek(0)
+                        # Salvar no R2 após download e renomeação
+                        buffer = BytesIO()
+                        df_ano.write_parquet(buffer)
+                        buffer.seek(0)
+                        self.s3.put_object(Bucket=self.r2_bucket, Key=r2_key, Body=buffer.getvalue())
 
-                        current_hash = hashlib.sha256(parquet_buffer.getvalue()).hexdigest()
-                        current_size = len(parquet_buffer.getvalue())
-
-                        self.s3.put_object(
-                            Bucket=self.r2_bucket,
-                            Key=r2_key,
-                            Body=parquet_buffer.getvalue(),
-                            ContentType="application/octet-stream"
-                        )
+                        tamanho_bytes = buffer.tell()
+                        hash_sha256 = hashlib.sha256(buffer.getvalue()).hexdigest()
+                        self.tracking.atualizar_tracking(ano, tamanho_bytes, hash_sha256)
                         print(f"[R2] {r2_key} salvo no R2 após download da SSP-SP.")
-                        df_raw_acumulado = pl.concat([df_raw_acumulado, df_ano])
-                        self.anos_processados.append(ano)
-                        self.tracking.atualizar_tracking(ano, current_size, current_hash)
                     else:
-                        print(f"[SSP] Falha ao obter dados da SSP-SP para o ano {ano}.")
+                        print(f"[SSP] Não foi possível obter dados para o ano {ano}.")
+                        continue
                 else:
-                    print(f"[R2] Erro ao acessar {r2_key}: {e}")
+                    raise
+
+            if not df_ano.is_empty():
+                df_raw_acumulado = pl.concat([df_raw_acumulado, df_ano])
+                self.anos_processados.append(ano)
 
         self.tracking.salvar_tracking()
         self.df_raw = df_raw_acumulado
-        print(f"[raw] {len(self.df_raw)} registros acumulados.")
-        print("[sincronizar_raw_fim]")
+        print(f"[sincronizar_raw_fim] {len(self.df_raw)} registros RAW acumulados.")
 
-    def construir_prata(self) -> pl.DataFrame:
+    def construir_prata(self):
         print("[construir_prata_inicio]")
         if self.df_raw.is_empty():
-            print("[prata] df_raw vazio, pulando construção da camada prata.")
+            print("[prata] df_raw está vazio, pulando construção da camada prata.")
             return pl.DataFrame()
 
         df_prata = self.df_raw.clone()
 
+        # Renomear colunas (já feito em sincronizar_raw, mas reforçar aqui para segurança)
         df_prata = renomear_sinonimos(df_prata)
 
+        # Filtrar apenas colunas relevantes para a camada prata
+        colunas_prata = [
+            "DATA_OCORRENCIA_BO", "HORA_OCORRENCIA_BO", "LATITUDE", "LONGITUDE",
+            "RUBRICA", "NOME_MUNICIPIO", "LOGRADOURO", "BAIRRO", "NUMERO_LOGRADOURO"
+        ]
+        df_prata = df_prata.select([col for col in colunas_prata if col in df_prata.columns])
+
+        # Tipagem e tratamento de nulos/inválidos
         df_prata = df_prata.with_columns([
-            pl.col("LATITUDE").cast(pl.Float64, strict=False).alias("LATITUDE_F"),
-            pl.col("LONGITUDE").cast(pl.Float64, strict=False).alias("LONGITUDE_F"),
-            pl.col("DATA_OCORRENCIA_BO").str.to_datetime("%d/%m/%Y", strict=False).alias("DATA_OCORRENCIA_BO_DT"),
-            pl.col("HORA_OCORRENCIA_BO").str.slice(0, 5).alias("HORA_OCORRENCIA_BO_STR"),
-            pl.col("RUBRICA").map_elements(normalizar_texto, return_type=pl.String).alias("RUBRICA_NORMALIZADA"),
-            pl.col("NOME_MUNICIPIO").map_elements(normalizar_texto, return_type=pl.String).alias("NOME_MUNICIPIO_NORMALIZADO"),
+            pl.col("DATA_OCORRENCIA_BO").str.to_date("%d/%m/%Y", strict=False).alias("DATA_OCORRENCIA_BO"),
+            pl.col("HORA_OCORRENCIA_BO").str.slice(0, 5).alias("HORA_OCORRENCIA_BO"), # Garantir HH:MM
+            pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).alias("LATITUDE"),
+            pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).alias("LONGITUDE"),
+            pl.col("RUBRICA").apply(normalizar_texto).alias("RUBRICA_NORMALIZADA"),
+            pl.col("NOME_MUNICIPIO").apply(normalizar_texto).alias("NOME_MUNICIPIO_NORMALIZADO"),
+            pl.col("LOGRADOURO").apply(normalizar_texto).alias("LOGRADOURO_NORMALIZADO"),
+            pl.col("BAIRRO").apply(normalizar_texto).alias("BAIRRO_NORMALIZADO"),
+            pl.col("NUMERO_LOGRADOURO").str.replace(",", ".").cast(pl.Float64, strict=False).alias("NUMERO_LOGRADOURO"),
         ])
 
+        # Remover linhas com datas nulas ou rubricas vazias
         df_prata = df_prata.filter(
-            (pl.col("LATITUDE_F").is_between(SP_LAT_MIN, SP_LAT_MAX)) &
-            (pl.col("LONGITUDE_F").is_between(SP_LON_MIN, SP_LON_MAX)) &
-            (pl.col("DATA_OCORRENCIA_BO_DT").is_not_null()) &
-            (pl.col("RUBRICA_NORMALIZADA").is_in(list(PESO_PENAL_BASE.keys()))) # Filtrar apenas crimes de interesse
+            pl.col("DATA_OCORRENCIA_BO").is_not_null() &
+            pl.col("RUBRICA_NORMALIZADA").is_not_null() &
+            pl.col("RUBRICA_NORMALIZADA").str.len_bytes() > 0
         )
 
+        # Filtrar rubricas que não estão em PESO_PENAL_BASE (exclui acidentes, tráfico, etc.)
+        rubricas_validas = set(PESO_PENAL_BASE.keys())
+        df_prata = df_prata.filter(pl.col("RUBRICA_NORMALIZADA").is_in(list(rubricas_validas)))
+
+        # Tratamento de coordenadas inválidas/ausentes (conforme PDF)
+        # Marcar como nulo se for 0.0 ou fora dos limites de SP
         df_prata = df_prata.with_columns([
-            pl.col("DATA_OCORRENCIA_BO_DT").dt.year().alias("ANO"),
-            pl.col("DATA_OCORRENCIA_BO_DT").dt.month().alias("MES"),
-            pl.col("DATA_OCORRENCIA_BO_DT").dt.weekday().alias("DIA_SEMANA"),
-            pl.col("HORA_OCORRENCIA_BO_STR").map_elements(classificar_periodo, return_type=pl.String).alias("PERIODO_DIA"),
-            pl.col("HORA_OCORRENCIA_BO_STR").map_elements(lambda h: 1 if classificar_periodo(h) in ["NOITE", "MADRUGADA"] else 0, return_type=pl.Int8).alias("IS_NOITE_MADRUGADA"),
-            pl.struct(["LATITUDE_F", "LONGITUDE_F"]).map_elements(
-                lambda coords: h3.geo_to_h3(coords["LATITUDE_F"], coords["LONGITUDE_F"], H3_RESOLUCAO),
-                return_type=pl.String
-            ).alias("H3_INDEX"),
-            pl.col("LOGRADOURO").map_elements(lambda x: anonimizar_campo(x, self.lgpd_salt), return_type=pl.String).alias("LOGRADOURO_ANONIMIZADO"),
-            pl.col("BAIRRO").map_elements(lambda x: anonimizar_campo(x, self.lgpd_salt), return_type=pl.String).alias("BAIRRO_ANONIMIZADO"),
-            pl.col("NOME_MUNICIPIO").map_elements(lambda x: anonimizar_campo(x, self.lgpd_salt), return_type=pl.String).alias("NOME_MUNICIPIO_ANONIMIZADO"),
-            pl.col("DATA_OCORRENCIA_BO_DT").map_elements(lambda d: 1 if d in holidays.HolidayBase(country='BR', state='SP', years=d.year) else 0, return_type=pl.Int8).alias("IS_FERIADO"),
-            pl.col("RUBRICA_NORMALIZADA").map_elements(lambda r: 1 if r in ["ROUBO", "FURTO", "ROUBO DE VEICULO", "FURTO DE VEICULO", "ROUBO DE MOTOCICLETA", "FURTO DE MOTOCICLETA", "ROUBO DE CARGA"] else 0, return_type=pl.Int8).alias("IS_PATRIMONIO"),
-            pl.col("RUBRICA_NORMALIZADA").map_elements(lambda r: 1 if r in ["HOMICIDIO DOLOSO", "LATROCINIO", "EXTORSAO MEDIANTE SEQUESTRO", "ESTUPRO", "LESAO CORPORAL DOLOSA", "PORTE ILEGAL DE ARMA"] else 0, return_type=pl.Int8).alias("IS_VIOLENCIA_PESSOA"),
+            pl.when(
+                (pl.col("LATITUDE").is_null()) | (pl.col("LATITUDE") == 0.0) |
+                (pl.col("LATITUDE") < SP_LAT_MIN) | (pl.col("LATITUDE") > SP_LAT_MAX)
+            ).then(pl.lit(None, pl.Float64))
+            .otherwise(pl.col("LATITUDE")).alias("LATITUDE_F"),
+            pl.when(
+                (pl.col("LONGITUDE").is_null()) | (pl.col("LONGITUDE") == 0.0) |
+                (pl.col("LONGITUDE") < SP_LON_MIN) | (pl.col("LONGITUDE") > SP_LON_MAX)
+            ).then(pl.lit(None, pl.Float64))
+            .otherwise(pl.col("LONGITUDE")).alias("LONGITUDE_F"),
         ])
 
+        # Preencher LATITUDE_F e LONGITUDE_F nulas com a média do município para H3
+        # (temporário, idealmente seria geocodificação)
+        df_prata = df_prata.with_columns([
+            pl.col("LATITUDE_F").fill_null(strategy="mean").over("NOME_MUNICIPIO_NORMALIZADO"),
+            pl.col("LONGITUDE_F").fill_null(strategy="mean").over("NOME_MUNICIPIO_NORMALIZADO"),
+        ])
+        # Se ainda houver nulos (município com todas as coords nulas), preencher com a média geral
+        df_prata = df_prata.with_columns([
+            pl.col("LATITUDE_F").fill_null(df_prata["LATITUDE_F"].mean()),
+            pl.col("LONGITUDE_F").fill_null(df_prata["LONGITUDE_F"].mean()),
+        ])
+
+        # Filtrar linhas onde LATITUDE_F ou LONGITUDE_F ainda são nulas após preenchimento
+        df_prata = df_prata.filter(
+            pl.col("LATITUDE_F").is_not_null() & pl.col("LONGITUDE_F").is_not_null()
+        )
+
+        # Geração de H3 Index
         df_prata = df_prata.with_columns(
-            pl.struct(["RUBRICA_NORMALIZADA", "HORA_OCORRENCIA_BO_STR"]).map_elements(
-                lambda s: calcular_escore(s["RUBRICA_NORMALIZADA"], s["HORA_OCORRENCIA_BO_STR"], "PEDESTRE")
-            ).alias("ESCORE_TOTAL_OCORRENCIA")
+            pl.struct(["LATITUDE_F", "LONGITUDE_F"])
+            .apply(lambda x: h3.geo_to_h3(x["LATITUDE_F"], x["LONGITUDE_F"], H3_RESOLUCAO))
+            .alias("H3_INDEX")
         )
 
+        # Anonimização de campos sensíveis
         df_prata = df_prata.with_columns([
-            pl.struct(["RUBRICA_NORMALIZADA", "HORA_OCORRENCIA_BO_STR"]).map_elements(
-                lambda s: calcular_escores_todos_perfis(s["RUBRICA_NORMALIZADA"], s["HORA_OCORRENCIA_BO_STR"])["ESCORE_MOTORISTA"]
-            ).alias("ESCORE_MOTORISTA"),
-            pl.struct(["RUBRICA_NORMALIZADA", "HORA_OCORRENCIA_BO_STR"]).map_elements(
-                lambda s: calcular_escores_todos_perfis(s["RUBRICA_NORMALIZADA"], s["HORA_OCORRENCIA_BO_STR"])["ESCORE_MOTOCICLISTA"]
-            ).alias("ESCORE_MOTOCICLISTA"),
-            pl.struct(["RUBRICA_NORMALIZADA", "HORA_OCORRENCIA_BO_STR"]).map_elements(
-                lambda s: calcular_escores_todos_perfis(s["RUBRICA_NORMALIZADA"], s["HORA_OCORRENCIA_BO_STR"])["ESCORE_PEDESTRE"]
-            ).alias("ESCORE_PEDESTRE"),
-            pl.struct(["RUBRICA_NORMALIZADA", "HORA_OCORRENCIA_BO_STR"]).map_elements(
-                lambda s: calcular_escores_todos_perfis(s["RUBRICA_NORMALIZADA"], s["HORA_OCORRENCIA_BO_STR"])["ESCORE_CICLISTA"]
-            ).alias("ESCORE_CICLISTA"),
+            pl.col("LOGRADOURO_NORMALIZADO").apply(lambda x: anonimizar_campo(x, self.lgpd_salt)).alias("LOGRADOURO_ANONIMIZADO"),
+            pl.col("BAIRRO_NORMALIZADO").apply(lambda x: anonimizar_campo(x, self.lgpd_salt)).alias("BAIRRO_ANONIMIZADO"),
+            pl.col("NOME_MUNICIPIO_NORMALIZADO").apply(lambda x: anonimizar_campo(x, self.lgpd_salt)).alias("NOME_MUNICIPIO_ANONIMIZADO"),
         ])
 
-        print(f"[prata] {len(df_prata)} registros gerados.")
-        print("[construir_prata_fim]")
+        # Features de tempo
+        df_prata = df_prata.with_columns([
+            pl.col("DATA_OCORRENCIA_BO").dt.year().alias("ANO"),
+            pl.col("DATA_OCORRENCIA_BO").dt.month().alias("MES"),
+            pl.col("DATA_OCORRENCIA_BO").dt.weekday().alias("DIA_SEMANA"),
+            pl.col("HORA_OCORRENCIA_BO").apply(classificar_periodo).alias("PERIODO_DIA"),
+            pl.col("HORA_OCORRENCIA_BO").apply(lambda h: 1 if classificar_periodo(h) in ["NOITE", "MADRUGADA"] else 0).alias("IS_NOITE_MADRUGADA"),
+        ])
+
+        # Feriados
+        br_holidays = holidays.Brazil(state='SP', years=self.anos_processados)
+        df_prata = df_prata.with_columns(
+            pl.col("DATA_OCORRENCIA_BO").apply(lambda d: 1 if d in br_holidays else 0).alias("IS_FERIADO")
+        )
+
+        # Classificação de tipo de crime
+        df_prata = df_prata.with_columns([
+            pl.col("RUBRICA_NORMALIZADA").apply(lambda r: 1 if r in ["ROUBO", "FURTO", "ROUBO DE VEICULO", "FURTO DE VEICULO", "ROUBO DE MOTOCICLETA", "FURTO DE MOTOCICLETA", "ROUBO DE CARGA"] else 0).alias("IS_PATRIMONIO"),
+            pl.col("RUBRICA_NORMALIZADA").apply(lambda r: 1 if r in ["HOMICIDIO DOLOSO", "LATROCINIO", "EXTORSAO MEDIANTE SEQUESTRO", "ESTUPRO", "LESAO CORPORAL DOLOSA"] else 0).alias("IS_VIOLENCIA_PESSOA"),
+        ])
+
+        # Cálculo de escores por perfil
+        df_prata = df_prata.with_columns([
+            pl.struct(["RUBRICA_NORMALIZADA", "HORA_OCORRENCIA_BO"])
+            .apply(lambda x: calcular_escores_todos_perfis(x["RUBRICA_NORMALIZADA"], x["HORA_OCORRENCIA_BO"]))
+            .alias("ESCORES_PERFIL")
+        ])
+        df_prata = df_prata.unnest("ESCORES_PERFIL")
+
+        # Escore total da ocorrência
+        df_prata = df_prata.with_columns(
+            (pl.col("ESCORE_MOTORISTA") + pl.col("ESCORE_MOTOCICLISTA") +
+             pl.col("ESCORE_PEDESTRE") + pl.col("ESCORE_CICLISTA")).alias("ESCORE_TOTAL_OCORRENCIA")
+        )
+
+        print(f"[construir_prata_fim] {len(df_prata)} registros PRATA gerados.")
         return df_prata
 
-    def construir_ouro(self, df_prata: pl.DataFrame, bq_project: str, bq_dataset: str, bq_cred: str) -> tuple | None:
+    def construir_ouro(self, df_prata: pl.DataFrame, bq_project: str, bq_dataset: str, bq_cred: str):
         print("[construir_ouro_inicio]")
         if df_prata.is_empty():
-            print("[ouro] df_prata vazio, pulando construção da camada ouro.")
+            print("[ouro] df_prata está vazio, pulando construção da camada ouro.")
             return None
 
         df_agregado = df_prata.group_by(["H3_INDEX", "ANO"]).agg([
@@ -530,69 +595,72 @@ class SafeDriver:
         oof_preds = np.zeros(len(X))
         oof_targets = np.zeros(len(X))
 
+        mae_ant = 0.0
+        r2_ant = 0.0
+
         for fold, (train_index, test_index) in enumerate(tscv.split(X, y, anos)):
             print(f"[modelo] Treinando Fold {fold+1}...")
             X_train, X_test = X.iloc[train_index], X.iloc[test_index]
             y_train, y_test = y.iloc[train_index], y.iloc[test_index]
 
             model.fit(X_train, y_train.values.ravel())
-            oof_preds[test_index] = model.predict(X_test)
+
+            preds = model.predict(X_test)
+            oof_preds[test_index] = preds
             oof_targets[test_index] = y_test.values.ravel()
 
-        mae = mean_absolute_error(oof_targets, oof_preds)
-        r2 = r2_score(oof_targets, oof_preds)
-        print(f"[modelo] MAE: {mae:.4f}, R2: {r2:.4f}")
+            if fold == tscv.n_splits - 1: # Último fold para métricas e SHAP
+                mae = mean_absolute_error(y_test, preds)
+                r2 = r2_score(y_test, preds)
+                print(f"[modelo] MAE no último fold: {mae:.4f}")
+                print(f"[modelo] R² no último fold: {r2:.4f}")
 
-        mae_ant = float(os.environ.get("MAE_ANTERIOR", "0.0"))
-        melhoria = ((mae_ant - mae) / mae_ant) * 100 if mae_ant > 0 else 0.0
-        if mae_ant == 0.0:
-            print("[modelo] Primeira execução ou MAE anterior não disponível.")
-        elif melhoria > 0:
-            print(f"[modelo] Melhoria no MAE: {melhoria:.2f}%")
-        else:
-            print(f"[modelo] Piora no MAE: {melhoria:.2f}%")
+                # Calcular SHAP para o último fold
+                try:
+                    explainer = shap.TreeExplainer(model.estimators_[0]) # Usar LGBM para SHAP
+                    shap_values = explainer.shap_values(X_test)
 
-        model_key = f"{R2_PREFIXO_MODELO}modelo_{NOME_SISTEMA}_{hora_brasilia().strftime('%Y%m%d%H%M%S')}.joblib"
-        model_buffer = BytesIO()
-        joblib.dump(model, model_buffer)
-        model_buffer.seek(0)
-        self.s3.put_object(
-            Bucket=self.r2_bucket,
-            Key=model_key,
-            Body=model_buffer.getvalue(),
-            ContentType="application/octet-stream"
-        )
-        print(f"[R2] Modelo salvo como {model_key}.")
+                    if isinstance(shap_values, list): # Para modelos multi-output
+                        shap_values = shap_values[0]
 
-        explainer = shap.TreeExplainer(model.estimators_[0]) # Usar o primeiro estimador para SHAP
-        shap_values = explainer.shap_values(X_test)
+                    shap_sum = np.abs(shap_values).mean(axis=0)
+                    shap_features = pd.DataFrame(list(zip(X_test.columns, shap_sum)), columns=['feature','shap_value'])
+                    shap_features = shap_features.sort_values(by='shap_value', ascending=False)
 
-        if isinstance(shap_values, list):
-            shap_values = np.array(shap_values).mean(axis=0)
+                    top_shap_feature = shap_features.iloc[0]['feature']
+                    shap_top3 = shap_features.head(3).to_dict('records')
+                    print(f"[modelo] Top feature SHAP: {top_shap_feature}")
+                except Exception as e:
+                    print(f"[modelo] Erro ao calcular SHAP: {e}")
+                    top_shap_feature = "N/A"
+                    shap_top3 = []
 
-        feature_importance = pd.DataFrame({
-            'feature': features,
-            'shap_abs_mean': np.abs(shap_values).mean(axis=0)
-        }).sort_values(by='shap_abs_mean', ascending=False)
+        # Comparar com o ano anterior (se houver)
+        if len(self.anos_processados) > 1:
+            ano_anterior = max(self.anos_processados) - 1
+            preds_ano_anterior = oof_preds[anos == ano_anterior]
+            targets_ano_anterior = oof_targets[anos == ano_anterior]
+            if len(preds_ano_anterior) > 0:
+                mae_ant = mean_absolute_error(targets_ano_anterior, preds_ano_anterior)
+                print(f"[modelo] MAE do ano anterior: {mae_ant:.4f}")
 
-        top_shap_feature = feature_importance.iloc[0]['feature']
-        shap_top3 = feature_importance.head(3).values.tolist()
+        melhoria = 0.0
+        if mae_ant > 0:
+            melhoria = (mae_ant - mae) / mae_ant
 
-        df_agregado = df_agregado.with_columns(pl.Series(name="ESCORE_PREDITO", values=model.predict(X)))
+        # Adicionar previsões ao DataFrame agregado
+        df_agregado = df_agregado.with_columns(pl.Series(name="ESCORE_PREDITO", values=oof_preds))
 
-        top_municipio = df_agregado.group_by("MUNICIPIO_DOMINANTE").agg(pl.col("ESCORE_PREDITO").sum().alias("SOMA_ESCORE_PREDITO")).sort("SOMA_ESCORE_PREDITO", descending=True).head(1).select("MUNICIPIO_DOMINANTE").item()
+        # Salvar modelo
+        modelo_key = f"{R2_PREFIXO_MODELO}modelo_{hora_brasilia().strftime('%Y%m%d_%H%M%S')}.joblib"
+        buffer_modelo = BytesIO()
+        joblib.dump(model, buffer_modelo)
+        buffer_modelo.seek(0)
+        self.s3.put_object(Bucket=self.r2_bucket, Key=modelo_key, Body=buffer_modelo.getvalue())
+        print(f"[modelo] Modelo salvo em {modelo_key}")
 
-        ouro_key = f"{R2_PREFIXO_OURO}ouro_h3_{hora_brasilia().strftime('%Y%m%d%H%M%S')}.parquet"
-        ouro_buffer = BytesIO()
-        df_agregado.write_parquet(ouro_buffer)
-        ouro_buffer.seek(0)
-        self.s3.put_object(
-            Bucket=self.r2_bucket,
-            Key=ouro_key,
-            Body=ouro_buffer.getvalue(),
-            ContentType="application/octet-stream"
-        )
-        print(f"[R2] Camada ouro salva como {ouro_key}.")
+        # Identificar município dominante para o relatório executivo
+        top_municipio = df_agregado.group_by("MUNICIPIO_DOMINANTE").agg(pl.col("QTD_CRIMES").sum().alias("TOTAL_CRIMES")).sort("TOTAL_CRIMES", descending=True).head(1).select("MUNICIPIO_DOMINANTE").item()
 
         ouro_pl = df_agregado.select([
             "H3_INDEX", "QTD_CRIMES", "ESCORE_TOTAL", "ESCORE_MEDIO",
