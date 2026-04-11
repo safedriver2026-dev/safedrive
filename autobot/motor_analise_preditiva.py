@@ -156,13 +156,10 @@ class SafeDriver:
             p.mkdir(parents=True, exist_ok=True)
 
         cfg = {
-            k: os.environ.get(k, "").strip()
-            for k in [
-                "R2_ENDPOINT_URL",
-                "R2_ACCESS_KEY_ID",
-                "R2_SECRET_ACCESS_KEY",
-                "R2_BUCKET_NAME",
-            ]
+            k: os.environ.get("R2_ENDPOINT_URL", "").strip(),
+            "R2_ACCESS_KEY_ID": os.environ.get("R2_ACCESS_KEY_ID", "").strip(),
+            "R2_SECRET_ACCESS_KEY": os.environ.get("R2_SECRET_ACCESS_KEY", "").strip(),
+            "R2_BUCKET_NAME": os.environ.get("R2_BUCKET_NAME", "").strip(),
         }
         if all(cfg.values()):
             self.s3 = boto3.client(
@@ -209,238 +206,92 @@ class SafeDriver:
 
     def calcular_sha256(self, caminho_arquivo):
         sha256_hash = hashlib.sha256()
-        try:
-            with open(caminho_arquivo, "rb") as f:
-                for byte_block in iter(lambda: f.read(4096 * 1024), b""):
-                    sha256_hash.update(byte_block)
-            return sha256_hash.hexdigest()
-        except Exception:
-            return None
+        with open(caminho_arquivo, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
 
-    def baixar_robusto(self, url, caminho_tmp, sessao):
-        max_tentativas = 10
-        for tentativa in range(max_tentativas):
+    def baixar_robusto(self, url, destino, sessao, tentativas=5, atraso=5):
+        for i in range(tentativas):
             try:
-                tamanho_atual = (
-                    os.path.getsize(caminho_tmp)
-                    if os.path.exists(caminho_tmp)
-                    else 0
-                )
-                headers = {}
-                if tamanho_atual > 0:
-                    headers["Range"] = f"bytes={tamanho_atual}-"
-
-                with sessao.get(
-                    url,
-                    headers=headers,
-                    stream=True,
-                    timeout=(30, 120),
-                    verify=False,
-                ) as r:
-                    if r.status_code == 416:
-                        return True
-                    if r.status_code not in (200, 206):
-                        time.sleep(5)
-                        continue
-
-                    modo = "ab" if r.status_code == 206 else "wb"
-
-                    with open(caminho_tmp, modo) as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                f.write(chunk)
+                with sessao.get(url, stream=True, timeout=60, verify=False) as r:
+                    r.raise_for_status()
+                    with open(destino, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
                 return True
-            except Exception:
-                print(
-                    f"⚠️ Conexão caiu (Tentativa {tentativa+1}/{max_tentativas}). "
-                    "Tentando retomar o download...",
-                    file=sys.stdout,
-                )
-                time.sleep(5)
+            except requests.exceptions.RequestException as e:
+                print(f"Falha no download (tentativa {i+1}/{tentativas}): {e}", file=sys.stderr)
+                time.sleep(atraso)
         return False
 
-    def wkt(self, h3_id):
-        try:
-            boundary = h3.h3_to_geo_boundary(str(h3_id), geo_json=True)
-            coords = [f"{lon} {lat}" for lat, lon in boundary]
-            coords.append(coords[0])
-            return f"POLYGON(({', '.join(coords)}))"
-        except Exception as e:
-            print(f"Erro ao gerar WKT para H3 ID {h3_id}: {e}", file=sys.stderr)
-            return None
-
-    def base_raw_completa(self, anos) -> bool:
-        try:
-            if not self.meta.exists():
-                return False
-
-            with open(self.meta, "r") as f:
-                meta = json.load(f)
-
-            for ano in anos:
-                path = self.pastas["raw"] / f"ssp_{ano}.parquet"
-                if not path.exists():
-                    return False
-                if str(ano) not in meta:
-                    return False
-
-            return True
-        except Exception:
-            return False
-
-    def publicar_bigquery_a_partir_de_arquivos(
-        self, bq_project, bq_dataset, bq_cred_json
-    ):
-        status_bq = "🔌 BigQuery desativado (variáveis de ambiente não configuradas)."
-
-        if not (bq_project and bq_dataset and bq_cred_json):
-            return status_bq
-
-        try:
-            dash_path = self.pastas["ouro"] / "dashboard_final.parquet"
-            valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
-            shap_path = self.pastas["ouro"] / "shap_audit.parquet"
-
-            if dash_path.exists():
-                df_dash = pl.read_parquet(dash_path)
-                enviar_para_bigquery(
-                    df_dash, "sd_dashboard_final", bq_project, bq_dataset, bq_cred_json
-                )
-
-            if valid_path.exists():
-                df_valid = pl.read_parquet(valid_path)
-                enviar_para_bigquery(
-                    df_valid,
-                    "sd_validacao_modelo",
-                    bq_project,
-                    bq_dataset,
-                    bq_cred_json,
-                )
-
-            if shap_path.exists():
-                df_shap = pl.read_parquet(shap_path)
-                enviar_para_bigquery(
-                    df_shap, "sd_shap_audit", bq_project, bq_dataset, bq_cred_json
-                )
-
-            status_bq = (
-                "✅ Tabelas criadas/atualizadas no BigQuery a partir dos arquivos locais."
-            )
-            print("✅ Publicação no BigQuery concluída (arquivos locais).", file=sys.stdout)
-        except Exception as e:
-            status_bq = f"⚠️ Falha ao publicar no BigQuery (arquivos locais): {e}"
-            print(status_bq, file=sys.stderr)
-            self.discord.notificar_info(
-                "SafeDriver BigQuery",
-                f"O pipeline executou, mas houve falha ao atualizar o BigQuery:\n`{e}`",
-            )
-
-        return status_bq
-
     def sincronizar_raw(self):
-        print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
+        print("📌 Base RAW completa. Checando somente o ano atual: 2026.", file=sys.stdout)
         ano_atual = hora_brasilia().year
-        anos_processar = list(range(2015, ano_atual + 1))
+        anos_para_processar = [ano_atual]
 
-        if self.base_raw_completa(anos_processar):
-            print("📌 Base RAW completa. Checando somente o ano atual: 2026.", file=sys.stdout)
-            anos_processar = [ano_atual]
+        base_url = "https://www.ssp.sp.gov.br/transparenciassp/Download/excel/{}.xlsx"
+        colunas_ssp = {
+            "ANO_BO": "ANO",
+            "MES_BO": "MES",
+            "LATITUDE": "LAT",
+            "LONGITUDE": "LON",
+            "DATAOCORRENCIA": "D",
+            "HORAOCORRENCIA": "H",
+            "RUBRICA": "N",
+        }
 
-        s = requests.Session()
-        retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-        s.mount("https://", HTTPAdapter(max_retries=retries))
+        sessao = requests.Session()
+        retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        sessao.mount("https://", HTTPAdapter(max_retries=retries))
 
-        for ano in anos_processar:
-            url = (
-                "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/"
-                f"SPDadosCriminais_{ano}.xlsx"
-            )
-            path = self.pastas["raw"] / f"ssp_{ano}.parquet"
-            tmp = self.pastas["raw"] / f"tmp_{ano}.xlsx"
-
-            run, sz = self.cdc_check(ano, url, s, path)
-            if not run and path.exists():
-                print(f"⏩ Pulando download de {ano}: Arquivo local atualizado.", file=sys.stdout)
-                continue
+        for ano in anos_para_processar:
+            url = base_url.format(ano)
+            path = self.pastas["raw"] / f"{ano}.parquet"
+            tmp = self.pastas["raw"] / f"{ano}_temp.xlsx"
 
             try:
-                print(f"📥 Baixando SSP {ano} (Resiliente)...", file=sys.stdout)
+                deve_processar, _ = self.cdc_check(ano, url, sessao, path)
+                if not deve_processar:
+                    print(f"✅ Arquivo {ano}.parquet atualizado e sem alterações. Pulando.", file=sys.stdout)
+                    continue
 
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-
-                sucesso_download = self.baixar_robusto(url, str(tmp), s)
-
-                if sucesso_download:
-                    print(
-                        f"✅ Download {ano} concluído! Inspecionando abas...",
-                        file=sys.stdout,
-                    )
-                    import fastexcel
-
-                    ex = fastexcel.read_excel(str(tmp))
+                print(f"⬇️ Baixando e processando dados de {ano}...", file=sys.stdout)
+                if self.baixar_robusto(url, tmp, sessao):
                     abas = []
+                    xls = pd.ExcelFile(tmp)
+                    for sheet_name in xls.sheet_names:
+                        df = pl.read_excel(
+                            tmp,
+                            sheet_name=sheet_name,
+                            engine="fastexcel",
+                            read_options={"header_row": 0},
+                        )
 
-                    mapping = {
-                        "LAT": ["LATITUDE", "LAT", "Y"],
-                        "LON": ["LONGITUDE", "LON", "X"],
-                        "D": [
-                            "DATA_OCORRENCIA",
-                            "DATAOCORRENCIA",
-                            "DATA_FATO",
-                            "DATA_DO_FATO",
-                            "DATA_REF",
-                        ],
-                        "H": [
-                            "HORA_OCORRENCIA",
-                            "HORAOCORRENCIA",
-                            "HORA_FATO",
-                            "HORA_DO_FATO",
-                            "HORA_REF",
-                        ],
-                        "N": ["NATUREZA_APURADA", "RUBRICA"],
-                    }
+                        f_cols = {}
+                        for col_orig, target in colunas_ssp.items():
+                            encontrou = False
+                            for col in df.columns:
+                                if col_orig.upper() in col.upper():
+                                    if target in ["D", "H"] and (
+                                        "REGISTRO" in col.upper()
+                                        or "COMUNICACAO" in col.upper()
+                                        or "ELABORACAO" in col.upper()
+                                    ):
+                                        continue
+                                    f_cols[col] = target
+                                    encontrou = True
+                                    break
+                            if encontrou:
+                                break
 
-                    for n in ex.sheet_names:
-                        df = pl.read_excel(str(tmp), sheet_name=n, engine="calamine")
-
-                        if len(df.columns) > 5:
-                            df.columns = [
-                                str(c)
-                                .upper()
-                                .strip()
-                                .replace("\n", "")
-                                .replace("\r", "")
-                                .replace(" ", "_")
-                                for c in df.columns
-                            ]
-
-                            f_cols = {}
-                            for target, aliases in mapping.items():
-                                for alias in aliases:
-                                    encontrou = False
-                                    for col in df.columns:
-                                        if alias in col:
-                                            if target in ["D", "H"] and (
-                                                "REGISTRO" in col
-                                                or "COMUNICACAO" in col
-                                                or "ELABORACAO" in col
-                                            ):
-                                                continue
-
-                                            f_cols[col] = target
-                                            encontrou = True
-                                            break
-                                    if encontrou:
-                                        break
-
-                            if len(f_cols) == 5:
-                                df_clean = (
-                                    df.select(list(f_cols.keys()))
-                                    .rename(f_cols)
-                                    .with_columns(pl.all().cast(pl.String))
-                                )
-                                abas.append(df_clean)
+                        if len(f_cols) == 7:
+                            df_clean = (
+                                df.select(list(f_cols.keys()))
+                                .rename(f_cols)
+                                .with_columns(pl.all().cast(pl.String))
+                            )
+                            abas.append(df_clean)
 
                     if abas:
                         pl.concat(abas, how="diagonal").write_parquet(path)
