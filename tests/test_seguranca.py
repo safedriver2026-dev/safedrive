@@ -9,7 +9,7 @@ def test_check_ouro_schema():
     - chave H3
     - métricas de crimes reais e escore de risco
     - localização média
-    - features agregadas da Prata (proporções)
+    - features agregadas da Prata (proporções, incluindo períodos detalhados e perfis de vítima)
     """
     p = Path("datalake/ouro/dashboard_final.parquet")
     if not p.exists():
@@ -23,10 +23,17 @@ def test_check_ouro_schema():
         "ESCORE_RISCO",
         "LATITUDE_MEDIA",
         "LONGITUDE_MEDIA",
+        # Proporções de Período Detalhado
+        "PROP_MANHA",
+        "PROP_TARDE",
         "PROP_NOITE",
-        "PROP_PATRIMONIO",
+        "PROP_MADRUGADA",
+        # Proporções de Perfil de Vítima
+        "PROP_CICLISTA",
+        "PROP_PEDESTRE",
+        "PROP_MOTOCICLISTA",
         "PROP_MOTORISTA",
-        "PROP_MOTO",
+        "PROP_GERAL",
         "PROP_FERIADO",
         "PROP_PAGAMENTO",
     ]
