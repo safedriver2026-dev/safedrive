@@ -1,5 +1,4 @@
-# .github/workflows/automacao_autobot.yml
-name: SafeDriver_Motor_V1.0.0
+name: SafeDriver_Motor
 
 on:
   schedule:
@@ -45,7 +44,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install \
-            polars pandas pyarrow numpy boto3 requests urllib3 \
+            polars pandas pyarrow openpyxl numpy boto3 requests urllib3 \
             google-cloud-bigquery google-cloud-bigquery-storage \
             google-auth db-dtypes catboost lightgbm scikit-learn \
             shap h3 holidays joblib pytest
