@@ -1,3 +1,4 @@
+# .github/workflows/automacao_autobot.yml
 name: SafeDriver Execução Diaria
 
 on:
@@ -28,8 +29,17 @@ jobs:
         uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: safedriver_env
-          python-version: "3.10"
+          environment-file: environment.yml
           auto-activate-base: false
+          python-version: "3.11"
+
+      - name: Sanitizar Secrets
+        shell: bash -l {0}
+        run: |
+          echo "R2_ACCESS_KEY_ID=$(echo "$R2_ACCESS_KEY_ID" | tr -d '\n\r ')" >> $GITHUB_ENV
+          echo "R2_SECRET_ACCESS_KEY=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d '\n\r ')" >> $GITHUB_ENV
+          echo "R2_ENDPOINT_URL=$(echo "$R2_ENDPOINT_URL" | tr -d '\n\r ')" >> $GITHUB_ENV
+          echo "R2_BUCKET_NAME=$(echo "$R2_BUCKET_NAME" | tr -d '\n\r ')" >> $GITHUB_ENV
 
       - name: Instalar Dependências
         shell: bash -l {0}
@@ -55,9 +65,7 @@ jobs:
             shap \
             h3 \
             holidays \
-            python-magic \
-            joblib \
-            pytest
+            joblib
 
       - name: Executar Pipeline
         shell: bash -l {0}
