@@ -155,12 +155,14 @@ class SafeDriver:
         for p in self.pastas.values():
             p.mkdir(parents=True, exist_ok=True)
 
+        # CORREÇÃO: Inicialização correta do dicionário cfg
         cfg = {
-            k: os.environ.get("R2_ENDPOINT_URL", "").strip(),
+            "R2_ENDPOINT_URL": os.environ.get("R2_ENDPOINT_URL", "").strip(),
             "R2_ACCESS_KEY_ID": os.environ.get("R2_ACCESS_KEY_ID", "").strip(),
             "R2_SECRET_ACCESS_KEY": os.environ.get("R2_SECRET_ACCESS_KEY", "").strip(),
             "R2_BUCKET_NAME": os.environ.get("R2_BUCKET_NAME", "").strip(),
         }
+
         if all(cfg.values()):
             self.s3 = boto3.client(
                 "s3",
@@ -206,92 +208,79 @@ class SafeDriver:
 
     def calcular_sha256(self, caminho_arquivo):
         sha256_hash = hashlib.sha256()
-        with open(caminho_arquivo, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-
-    def baixar_robusto(self, url, destino, sessao, tentativas=5, atraso=5):
-        for i in range(tentativas):
-            try:
-                with sessao.get(url, stream=True, timeout=60, verify=False) as r:
-                    r.raise_for_status()
-                    with open(destino, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                return True
-            except requests.exceptions.RequestException as e:
-                print(f"Falha no download (tentativa {i+1}/{tentativas}): {e}", file=sys.stderr)
-                time.sleep(atraso)
-        return False
+        try:
+            with open(caminho_arquivo, "rb") as f:
+                for byte_block in iter(lambda: f.read(4096 * 1024), b""):
+                    sha256_hash.update(byte_block)
+            return sha256_hash.hexdigest()
+        except Exception as e:
+            print(f"❌ Erro ao calcular SHA-256 para {caminho_arquivo}: {e}", file=sys.stderr)
+            return None
 
     def sincronizar_raw(self):
         print("📌 Base RAW completa. Checando somente o ano atual: 2026.", file=sys.stdout)
+        s = requests.Session()
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        s.mount("https://", HTTPAdapter(max_retries=retries))
+
         ano_atual = hora_brasilia().year
         anos_para_processar = [ano_atual]
 
-        base_url = "https://www.ssp.sp.gov.br/transparenciassp/Download/excel/{}.xlsx"
-        colunas_ssp = {
-            "ANO_BO": "ANO",
-            "MES_BO": "MES",
-            "LATITUDE": "LAT",
-            "LONGITUDE": "LON",
-            "DATAOCORRENCIA": "D",
-            "HORAOCORRENCIA": "H",
-            "RUBRICA": "N",
-        }
-
-        sessao = requests.Session()
-        retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-        sessao.mount("https://", HTTPAdapter(max_retries=retries))
-
         for ano in anos_para_processar:
-            url = base_url.format(ano)
-            path = self.pastas["raw"] / f"{ano}.parquet"
-            tmp = self.pastas["raw"] / f"{ano}_temp.xlsx"
+            url = f"https://www.ssp.sp.gov.br/transparenciassp/Download.aspx?arquivo=DadosBO_{ano}.xls"
+            path = self.pastas["raw"] / f"DadosBO_{ano}.parquet"
+            tmp = self.pastas["raw"] / f"DadosBO_{ano}.xls"
 
             try:
-                deve_processar, _ = self.cdc_check(ano, url, sessao, path)
-                if not deve_processar:
-                    print(f"✅ Arquivo {ano}.parquet atualizado e sem alterações. Pulando.", file=sys.stdout)
-                    continue
+                precisa_atualizar, _ = self.cdc_check(ano, url, s, path)
 
-                print(f"⬇️ Baixando e processando dados de {ano}...", file=sys.stdout)
-                if self.baixar_robusto(url, tmp, sessao):
+                if precisa_atualizar:
+                    print(f"🔄 Baixando e processando dados para o ano: {ano}", file=sys.stdout)
+                    r = s.get(url, stream=True, timeout=30, verify=False)
+                    r.raise_for_status()
+
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
                     abas = []
-                    xls = pd.ExcelFile(tmp)
-                    for sheet_name in xls.sheet_names:
-                        df = pl.read_excel(
-                            tmp,
-                            sheet_name=sheet_name,
-                            engine="fastexcel",
-                            read_options={"header_row": 0},
-                        )
+                    with pd.ExcelFile(tmp) as xls:
+                        for sheet_name in xls.sheet_names:
+                            df = pd.read_excel(xls, sheet_name=sheet_name)
+                            f_cols = {}
+                            col_map = {
+                                "DataFato": ["DATA", "DATA FATO", "DATA_FATO", "D"],
+                                "HoraFato": ["HORA", "HORA FATO", "HORA_FATO", "H"],
+                                "Latitude": ["LATITUDE", "LAT"],
+                                "Longitude": ["LONGITUDE", "LON"],
+                                "Natureza": ["NATUREZA", "NATUREZA_CRIME", "N"],
+                            }
 
-                        f_cols = {}
-                        for col_orig, target in colunas_ssp.items():
-                            encontrou = False
-                            for col in df.columns:
-                                if col_orig.upper() in col.upper():
-                                    if target in ["D", "H"] and (
-                                        "REGISTRO" in col.upper()
-                                        or "COMUNICACAO" in col.upper()
-                                        or "ELABORACAO" in col.upper()
-                                    ):
-                                        continue
-                                    f_cols[col] = target
-                                    encontrou = True
-                                    break
-                            if encontrou:
-                                break
+                            for target, aliases in col_map.items():
+                                encontrou = False
+                                for alias in aliases:
+                                    for col in df.columns:
+                                        if alias.upper() in col.upper():
+                                            if target in ["DataFato", "HoraFato"] and (
+                                                "REGISTRO" in col.upper()
+                                                or "COMUNICACAO" in col.upper()
+                                                or "ELABORACAO" in col.upper()
+                                            ):
+                                                continue
 
-                        if len(f_cols) == 7:
-                            df_clean = (
-                                df.select(list(f_cols.keys()))
-                                .rename(f_cols)
-                                .with_columns(pl.all().cast(pl.String))
-                            )
-                            abas.append(df_clean)
+                                            f_cols[col] = target
+                                            encontrou = True
+                                            break
+                                    if encontrou:
+                                        break
+
+                            if len(f_cols) == 5:
+                                df_clean = (
+                                    pl.DataFrame(df.rename(columns=f_cols))
+                                    .select(list(f_cols.values()))
+                                    .with_columns(pl.all().cast(pl.String))
+                                )
+                                abas.append(df_clean)
 
                     if abas:
                         pl.concat(abas, how="diagonal").write_parquet(path)
@@ -304,7 +293,7 @@ class SafeDriver:
 
                         m_data = json.load(open(self.meta)) if self.meta.exists() else {}
                         m_data[str(ano)] = {
-                            "tamanho_bytes": sz,
+                            "tamanho_bytes": os.path.getsize(tmp),
                             "sha256": assinatura_sha256,
                         }
                         with open(self.meta, "w") as f:
@@ -318,7 +307,7 @@ class SafeDriver:
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 else:
-                    raise Exception(f"Falha ao baixar arquivo {ano} apos multiplas tentativas.")
+                    print(f"✅ Dados para o ano {ano} já atualizados e íntegros.", file=sys.stdout)
 
             except Exception as e:
                 print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
@@ -336,11 +325,244 @@ class SafeDriver:
             self.discord.notificar_erro("SafeDriver Sync", msg)
             raise Exception(msg)
 
+    def reconstruir_ouro_validacao_shap(self, bq_project: str, bq_dataset: str, bq_cred_json: str):
+        print("♻️ Recalculando Camada Ouro, Validação e SHAP (Modelos Volume + Penal)...", file=sys.stdout)
+
+        prata_path = self.pastas["prata"] / "camada_prata.parquet"
+        if not prata_path.exists():
+            raise Exception("Arquivo da camada Prata ausente. Execute o processamento RAW primeiro.")
+
+        prata = pl.read_parquet(prata_path)
+
+        prata = prata.with_columns(
+            pl.struct(["LAT", "LON"])
+            .map_elements(
+                lambda s: h3.geo_to_h3_cell(lat=s["LAT"], lng=s["LON"], res=9),
+                return_dtype=pl.String,
+            )
+            .alias("CODIGO_H3")
+        )
+
+        def wkt(h3_id: str) -> str:
+            if not isinstance(h3_id, str):
+                return None
+            boundary = h3.h3_to_geo_boundary(h3_id)
+            return f"POLYGON (({' '.join([f'{lon} {lat}' for lat, lon in boundary])}, {boundary[0][1]} {boundary[0][0]}))"
+
+        prata = prata.with_columns(
+            pl.col("CODIGO_H3")
+            .map_elements(wkt, return_dtype=pl.String)
+            .alias("GEOMETRIA_WKT")
+        )
+
+        features_h3 = (
+            prata.group_by("CODIGO_H3")
+            .agg(
+                pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
+                pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
+                pl.col("LAT").std().alias("LAT_STD"),
+                pl.col("LON").std().alias("LON_STD"),
+                pl.col("ANO").n_unique().alias("CRIMES_POR_ANO"),
+                pl.col("PESO_PENAL").sum().alias("CRIMES_POND_POR_ANO"),
+                pl.col("TIPO_CRIME")
+                .filter(pl.col("TIPO_CRIME") == "PATRIMONIO")
+                .count()
+                .alias("PATRIMONIO_COUNT"),
+                pl.col("PERFIL_VITIMA")
+                .filter(pl.col("PERFIL_VITIMA") == "MOTORISTA")
+                .count()
+                .alias("MOTORISTA_COUNT"),
+                pl.col("PERFIL_VITIMA")
+                .filter(pl.col("PERFIL_VITIMA") == "MOTOCICLISTA")
+                .count()
+                .alias("MOTOCICLISTA_COUNT"),
+                pl.col("PERFIL_VITIMA")
+                .filter(pl.col("PERFIL_VITIMA") == "CICLISTA")
+                .count()
+                .alias("CICLISTA_COUNT"),
+                pl.col("PERFIL_VITIMA")
+                .filter(pl.col("PERFIL_VITIMA") == "PEDESTRE")
+                .count()
+                .alias("PEDESTRE_COUNT"),
+                pl.col("PERFIL_VITIMA")
+                .filter(pl.col("PERFIL_VITIMA") == "GERAL")
+                .count()
+                .alias("GERAL_VITIMA_COUNT"),
+                pl.col("PERIODO_DETALHADO")
+                .filter(pl.col("PERIODO_DETALHADO") == "MANHA")
+                .count()
+                .alias("MANHA_COUNT"),
+                pl.col("PERIODO_DETALHADO")
+                .filter(pl.col("PERIODO_DETALHADO") == "TARDE")
+                .count()
+                .alias("TARDE_COUNT"),
+                pl.col("PERIODO_DETALHADO")
+                .filter(pl.col("PERIODO_DETALHADO") == "NOITE")
+                .count()
+                .alias("NOITE_COUNT"),
+                pl.col("PERIODO_DETALHADO")
+                .filter(pl.col("PERIODO_DETALHADO") == "MADRUGADA")
+                .count()
+                .alias("MADRUGADA_COUNT"),
+                pl.col("EH_FERIADO").sum().alias("FERIADO_COUNT"),
+                pl.col("SEMANA_PAGAMENTO").sum().alias("PAGAMENTO_COUNT"),
+                pl.count().alias("CRIMES_REAIS"),
+            )
+            .with_columns(
+                (pl.col("PATRIMONIO_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_PATRIMONIO"),
+                (pl.col("MOTORISTA_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_MOTORISTA"),
+                (pl.col("MOTOCICLISTA_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_MOTO"),
+                (pl.col("FERIADO_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_FERIADO"),
+                (pl.col("PAGAMENTO_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_PAGAMENTO"),
+                (pl.col("MANHA_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_MANHA"),
+                (pl.col("TARDE_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_TARDE"),
+                (pl.col("NOITE_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_NOITE"),
+                (pl.col("MADRUGADA_COUNT") / pl.col("CRIMES_REAIS"))
+                .fill_nan(0)
+                .alias("PROP_MADRUGADA"),
+                (pl.col("NOITE_COUNT") * pl.col("PROP_PATRIMONIO"))
+                .fill_nan(0)
+                .alias("RISCO_NOITE_PATRIMONIO"),
+                (pl.col("MOTOCICLISTA_COUNT") * pl.col("PROP_NOITE"))
+                .fill_nan(0)
+                .alias("RISCO_MOTO_NOITE"),
+                (pl.col("MOTORISTA_COUNT") * pl.col("PROP_PAGAMENTO"))
+                .fill_nan(0)
+                .alias("RISCO_MOTORISTA_PAGTO"),
+            )
+        )
+
+        features_modelo = [
+            "LATITUDE_MEDIA",
+            "LONGITUDE_MEDIA",
+            "PROP_PATRIMONIO",
+            "PROP_MOTORISTA",
+            "PROP_MOTO",
+            "PROP_FERIADO",
+            "PROP_PAGAMENTO",
+            "PROP_MANHA",
+            "PROP_TARDE",
+            "PROP_NOITE",
+            "PROP_MADRUGADA",
+            "RISCO_NOITE_PATRIMONIO",
+            "RISCO_MOTO_NOITE",
+            "RISCO_MOTORISTA_PAGTO",
+            "LAT_STD",
+            "LON_STD",
+            "CRIMES_POR_ANO",
+            "CRIMES_POND_POR_ANO",
+        ]
+
+        X = features_h3.select(features_modelo).to_pandas()
+        y_volume = features_h3.select("CRIMES_REAIS").to_pandas().squeeze()
+        y_penal = features_h3.select("CRIMES_POND_POR_ANO").to_pandas().squeeze()
+
+        model_volume = VotingRegressor(
+            estimators=[
+                ("cat", CatBoostRegressor(random_state=42, verbose=0)),
+                ("lgbm", LGBMRegressor(random_state=42)),
+            ]
+        )
+        model_volume.fit(X, y_volume)
+        features_h3 = features_h3.with_columns(
+            pl.Series(
+                "ESCORE_RISCO_VOLUME", model_volume.predict(X), dtype=pl.Float64
+            ).alias("ESCORE_RISCO")
+        )
+
+        model_penal = VotingRegressor(
+            estimators=[
+                ("cat", CatBoostRegressor(random_state=42, verbose=0)),
+                ("lgbm", LGBMRegressor(random_state=42)),
+            ]
+        )
+        model_penal.fit(X, y_penal)
+        features_h3 = features_h3.with_columns(
+            pl.Series(
+                "ESCORE_RISCO_PENAL", model_penal.predict(X), dtype=pl.Float64
+            ).alias("ESCORE_RISCO_PENAL")
+        )
+
+        dashboard_final = features_h3.select(
+            [
+                "CODIGO_H3",
+                "GEOMETRIA_WKT",
+                "LATITUDE_MEDIA",
+                "LONGITUDE_MEDIA",
+                "CRIMES_REAIS",
+                "ESCORE_RISCO",
+                "ESCORE_RISCO_PENAL",
+                "PROP_PATRIMONIO",
+                "PROP_MOTORISTA",
+                "PROP_MOTO",
+                "PROP_FERIADO",
+                "PROP_PAGAMENTO",
+                "PROP_MANHA",
+                "PROP_TARDE",
+                "PROP_NOITE",
+                "PROP_MADRUGADA",
+                "RISCO_NOITE_PATRIMONIO",
+                "RISCO_MOTO_NOITE",
+                "RISCO_MOTORISTA_PAGTO",
+                "LAT_STD",
+                "LON_STD",
+                "CRIMES_POR_ANO",
+                "CRIMES_POND_POR_ANO",
+            ]
+        )
+        dashboard_final.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
+
+        validacao_modelo = features_h3.select(
+            ["CODIGO_H3", "CRIMES_REAIS", "ESCORE_RISCO"]
+        ).with_columns(
+            (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO")).abs().alias("ERRO_ABS")
+        )
+        validacao_modelo.write_parquet(self.pastas["ouro"] / "validacao_modelo.parquet")
+
+        explainer = shap.TreeExplainer(model_volume)
+        shap_values = explainer.shap_values(X)
+        shap_sum = np.abs(shap_values).mean(axis=0)
+        shap_importance = pl.DataFrame(
+            {
+                "VARIAVEL": X.columns,
+                "GRAU_IMPORTANCIA": shap_sum,
+            }
+        ).sort("GRAU_IMPORTANCIA", descending=True)
+        shap_importance.write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
+
+        self.publicar_bigquery_a_partir_de_arquivos(bq_project, bq_dataset, bq_cred_json)
+
+    def processar(self):
+        print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
+        self.sincronizar_raw()
+
         bq_project = os.environ.get("BQ_PROJECT_ID")
         bq_dataset = os.environ.get("BQ_DATASET_ID")
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
+        arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
+        if not arquivos_limpos:
+            msg = "Nenhum arquivo RAW válido encontrado após sincronização."
+            self.discord.notificar_erro("SafeDriver Sync", msg)
+            raise Exception(msg)
+
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
 
         prata = (
