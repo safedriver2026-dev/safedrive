@@ -171,6 +171,7 @@ class SafeDriver:
         for p in self.pastas.values():
             p.mkdir(parents=True, exist_ok=True)
 
+        # Cloudflare R2 (S3 compatível)
         cfg = {
             k: os.environ.get(k, "").strip()
             for k in [
@@ -207,7 +208,6 @@ class SafeDriver:
             r = sessao.head(url, timeout=30, verify=False, allow_redirects=True)
             size = int(r.headers.get("Content-Length", 0))
 
-            # Se servidor não informa tamanho, mas já tenho cache local, não baixa
             if size <= 0 and path_parquet.exists():
                 return False, size
 
@@ -225,7 +225,6 @@ class SafeDriver:
             return True, size
 
         except Exception:
-            # Se HEAD falhou, mas já tenho cache local, não baixa
             if path_parquet.exists():
                 return False, 0
             return True, 0
@@ -283,12 +282,9 @@ class SafeDriver:
         return False
 
     def wkt(self, h3_id):
-        """
-        Gera WKT do hexágono H3.
-        Não é crítica para o pipeline; se falhar, retornamos None.
-        """
+        """Gera WKT do hexágono H3. Se falhar, retorna None."""
         try:
-            boundary = h3.h3_to_geo_boundary(h3_id, geo_json=True)  # [(lat, lon), ...]
+            boundary = h3.h3_to_geo_boundary(h3_id, geo_json=True)
             coords = [f"{lon} {lat}" for lat, lon in boundary]
             coords.append(coords[0])
             return f"POLYGON(({', '.join(coords)}))"
@@ -324,8 +320,8 @@ class SafeDriver:
         self, bq_project, bq_dataset, bq_cred_json
     ):
         """
-        Se as tabelas não existirem no BigQuery, mas os arquivos locais existirem,
-        publica direto a partir dos .parquet sem recalcular o modelo.
+        Publica a camada Ouro/Validação/SHAP no BigQuery a partir
+        dos arquivos locais .parquet.
         """
         status_bq = "🔌 BigQuery desativado (variáveis de ambiente não configuradas)."
 
@@ -343,7 +339,6 @@ class SafeDriver:
             bq_project, bq_dataset, "sd_shap_audit", bq_cred_json
         )
 
-        # Se todas existem, não precisa reenviar
         if dashboard_ok and validacao_ok and shap_ok:
             return "✅ Tabelas já existem no BigQuery e estão disponíveis para o BI."
 
@@ -377,9 +372,7 @@ class SafeDriver:
             status_bq = (
                 "✅ Tabelas criadas/atualizadas no BigQuery a partir dos arquivos locais."
             )
-            print(
-                "✅ Publicação no BigQuery concluída (arquivos locais).", file=sys.stdout
-            )
+            print("✅ Publicação no BigQuery concluída (arquivos locais).", file=sys.stdout)
         except Exception as e:
             status_bq = f"⚠️ Falha ao publicar no BigQuery (arquivos locais): {e}"
             print(status_bq, file=sys.stderr)
@@ -394,19 +387,19 @@ class SafeDriver:
     def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
         """
         Reconstroi a camada Ouro (dashboard_final), a validação (validacao_modelo)
-        e o SHAP (shap_audit) usando a camada Prata já existente.
+        e o SHAP (shap_audit) usando a camada Prata existente.
 
-        - Melhor granularidade: nível H3.
-        - Melhor uso da camada Prata: agrega variáveis comportamentais por H3.
-        - Modelo prevê diretamente CRIMES_REAIS por H3.
-        - Tenta gerar GEOMETRIA_WKT; se ficar toda nula, não mantém a coluna.
+        Melhorias:
+        - Previsão a nível H3 com alvo sqrt(CRIMES_REAIS)
+        - Pesos por faixa de crime (mais peso em áreas críticas)
+        - Novas features comportamentais e geográficas
         """
 
         prata_path = self.pastas["prata"] / "camada_prata.parquet"
         if not prata_path.exists():
             raise Exception("Camada Prata não encontrada. Não é possível reconstruir Ouro/Validação.")
 
-        print("♻️ Recalculando Camada Ouro, Validação e SHAP a partir da Prata...", file=sys.stdout)
+        print("♻️ Recalculando Camada Ouro, Validação e SHAP a partir da Prata (H3+ melhorado)...", file=sys.stdout)
 
         # ---------- Carrega camada Prata ----------
         prata = pl.read_parquet(prata_path)
@@ -418,7 +411,7 @@ class SafeDriver:
         )
         prata_h3 = prata.join(pl.from_pandas(c), on=["LAT", "LON"])
 
-        # ---------- FEATURES por H3 ----------
+        # ---------- Features por H3 ----------
         features_h3 = (
             prata_h3
             .group_by("CODIGO_H3")
@@ -427,47 +420,108 @@ class SafeDriver:
                     pl.len().alias("CRIMES_REAIS"),
                     pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
                     pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
+                    pl.col("LAT").std(ddof=1).fill_null(0.0).alias("LAT_STD"),
+                    pl.col("LON").std(ddof=1).fill_null(0.0).alias("LON_STD"),
                     (pl.col("PERIODO_DIA") == "NOITE").mean().alias("PROP_NOITE"),
                     (pl.col("TIPO_CRIME") == "PATRIMONIO").mean().alias("PROP_PATRIMONIO"),
                     (pl.col("PERFIL_VITIMA") == "MOTORISTA").mean().alias("PROP_MOTORISTA"),
                     (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").mean().alias("PROP_MOTO"),
                     pl.col("EH_FERIADO").mean().alias("PROP_FERIADO"),
                     pl.col("SEMANA_PAGAMENTO").mean().alias("PROP_PAGAMENTO"),
+                    pl.col("ANO").n_unique().alias("QTD_ANOS_OBSERVADOS"),
+                ]
+            )
+            .with_columns(
+                [
+                    # crimes por ano observado (aprox intensidade temporal)
+                    (
+                        pl.col("CRIMES_REAIS")
+                        / pl.when(pl.col("QTD_ANOS_OBSERVADOS") > 0)
+                        .then(pl.col("QTD_ANOS_OBSERVADOS"))
+                        .otherwise(1)
+                    )
+                    .cast(pl.Float64)
+                    .alias("CRIMES_POR_ANO"),
+                ]
+            )
+            .with_columns(
+                [
+                    (pl.col("PROP_NOITE") * pl.col("PROP_PATRIMONIO")).alias("RISCO_NOITE_PATRIMONIO"),
+                    (pl.col("PROP_MOTO") * pl.col("PROP_NOITE")).alias("RISCO_MOTO_NOITE"),
+                    (pl.col("PROP_MOTORISTA") * pl.col("PROP_PAGAMENTO")).alias("RISCO_MOTORISTA_PAGTO"),
                 ]
             )
         )
 
         # ---------- Treino do modelo ----------
-        print("🧠 Re-treinando modelo preditivo (nível H3)...", file=sys.stdout)
+        print("🧠 Re-treinando modelo preditivo (H3+, alvo sqrt, pesos por faixa)...", file=sys.stdout)
 
         X = features_h3.select(
             [
                 "LATITUDE_MEDIA",
                 "LONGITUDE_MEDIA",
+                "LAT_STD",
+                "LON_STD",
                 "PROP_NOITE",
                 "PROP_PATRIMONIO",
                 "PROP_MOTORISTA",
                 "PROP_MOTO",
                 "PROP_FERIADO",
                 "PROP_PAGAMENTO",
+                "CRIMES_POR_ANO",
+                "RISCO_NOITE_PATRIMONIO",
+                "RISCO_MOTO_NOITE",
+                "RISCO_MOTORISTA_PAGTO",
             ]
         ).to_pandas()
 
-        y = np.log1p(features_h3.select("CRIMES_REAIS").to_numpy().ravel())
+        crimes_np = features_h3.select("CRIMES_REAIS").to_numpy().ravel().astype(float)
+        y = np.sqrt(crimes_np)
+
+        # pesos por faixa de crime
+        pesos = np.ones_like(crimes_np, dtype=float)
+        pesos[(crimes_np >= 21) & (crimes_np <= 50)] = 1.5
+        pesos[(crimes_np > 50) & (crimes_np < 100)] = 2.0
+        pesos[crimes_np >= 100] = 3.0
+        pesos = pesos / pesos.mean()
+
+        cat_model = CatBoostRegressor(
+            iterations=400,
+            depth=6,
+            l2_leaf_reg=3.0,
+            learning_rate=0.05,
+            loss_function="RMSE",
+            silent=True,
+        )
+        lgbm_model = LGBMRegressor(
+            n_estimators=600,
+            max_depth=-1,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=0.5,
+            objective="regression",
+            verbose=-1,
+        )
+
+        cat_model.fit(X, y, sample_weight=pesos)
+        lgbm_model.fit(X, y, sample_weight=pesos)
 
         ens = VotingRegressor(
             [
-                ("c", CatBoostRegressor(iterations=300, silent=True)),
-                ("l", LGBMRegressor(n_estimators=400, verbose=-1)),
+                ("c", cat_model),
+                ("l", lgbm_model),
             ]
-        ).fit(X, y)
+        ).fit(X, y, sample_weight=pesos)
 
         preds = ens.predict(X)
-        y_hat = np.expm1(preds)
+        y_hat = np.square(preds)
+        y_hat = np.clip(y_hat, 0, None)
+
         risco_avg = float(y_hat.mean())
 
         # ---------- Camada Ouro ----------
-        print("💾 Gerando camada Ouro (dashboard_final)...", file=sys.stdout)
+        print("💾 Gerando camada Ouro (dashboard_final H3+ melhorado)...", file=sys.stdout)
 
         fato_ouro = features_h3.with_columns(
             [
@@ -475,18 +529,16 @@ class SafeDriver:
             ]
         )
 
-        # tentar gerar GEOMETRIA_WKT; se tudo None, descartamos a coluna
+        # GEOMETRIA WKT opcional
         try:
             fato_ouro = fato_ouro.with_columns(
                 pl.col("CODIGO_H3")
                 .map_elements(self.wkt, return_dtype=pl.String)
                 .alias("GEOMETRIA_WKT")
             )
-            # verifica se há pelo menos um valor não nulo
             if fato_ouro.select(pl.col("GEOMETRIA_WKT").is_not_null().sum())[0, 0] == 0:
                 fato_ouro = fato_ouro.drop("GEOMETRIA_WKT")
         except Exception:
-            # se der qualquer erro, garante que não deixa a coluna quebrada
             if "GEOMETRIA_WKT" in fato_ouro.columns:
                 fato_ouro = fato_ouro.drop("GEOMETRIA_WKT")
 
@@ -514,10 +566,10 @@ class SafeDriver:
         validacao.write_parquet(valid_path)
 
         # ---------- SHAP ----------
-        print("📊 Calculando SHAP...", file=sys.stdout)
+        print("📊 Calculando SHAP (CatBoost)...", file=sys.stdout)
 
         sd = pd.DataFrame(
-            shap.TreeExplainer(ens.estimators_[0]).shap_values(X),
+            shap.TreeExplainer(cat_model).shap_values(X),
             columns=X.columns,
         ).abs().mean().to_frame("GRAU_IMPORTANCIA").reset_index()
         sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
@@ -541,7 +593,7 @@ class SafeDriver:
 
         tempo_total = time.time() - self.t_inicio
         self.discord.notificar_sucesso(
-            "Reconstrução da Camada Ouro/Validação (SafeDriver H3+)",
+            "Reconstrução da Camada Ouro/Validação (SafeDriver H3+ Melhorado)",
             tempo_total,
             features_h3.height,
             risco_avg,
@@ -706,9 +758,7 @@ class SafeDriver:
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 else:
-                    raise Exception(
-                        "Falha ao baixar arquivo apos multiplas tentativas."
-                    )
+                    raise Exception("Falha ao baixar arquivo apos multiplas tentativas.")
 
             except Exception as e:
                 print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
@@ -735,7 +785,6 @@ class SafeDriver:
         if ouro_path.exists() and valid_path.exists():
             try:
                 df_ouro = pl.read_parquet(ouro_path)
-                # Novo formato esperado: H3 + crimes + score + lat/long
                 colunas_basicas = all(
                     c in df_ouro.columns
                     for c in [
@@ -758,12 +807,10 @@ class SafeDriver:
                 file=sys.stdout,
             )
 
-            # 1) BigQuery sincronizado mesmo sem rebuild
             status_bq = self.publicar_bigquery_a_partir_de_arquivos(
                 bq_project, bq_dataset, bq_cred_json
             )
 
-            # 2) Métricas reais a partir dos arquivos existentes
             registros = 0
             media_risco = 0.0
 
@@ -784,7 +831,6 @@ class SafeDriver:
                     file=sys.stderr,
                 )
 
-            # 3) Backup R2
             status_cloud = "❌ Desconectado"
             if self.s3:
                 try:
@@ -808,6 +854,7 @@ class SafeDriver:
         # --------------- PRATA ---------------
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
+
         prata = (
             lf.with_columns(
                 [
@@ -825,6 +872,8 @@ class SafeDriver:
             .filter(pl.col("LAT").is_between(-25.5, -19.5))
             .with_columns(
                 [
+                    pl.col("DATA_FATO").dt.year().alias("ANO"),
+                    pl.col("DATA_FATO").dt.month().alias("MES"),
                     pl.when(
                         pl.col("N").str.to_uppercase().str.contains("ROUBO|FURTO")
                     )
