@@ -20,11 +20,7 @@ from google.oauth2 import service_account
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
-# --------------------------------------------------------------------
-# Utilitários de data/hora e BigQuery
-# --------------------------------------------------------------------
 def hora_brasilia() -> datetime:
-    """Retorna datetime no fuso horário de Brasília (UTC-3), baseado em UTC do servidor."""
     return datetime.utcnow() - timedelta(hours=3)
 
 
@@ -37,10 +33,6 @@ def criar_cliente_bq(projeto: str, cred_json: str) -> bigquery.Client:
 def enviar_para_bigquery(
     df_pl: pl.DataFrame, tabela: str, projeto: str, dataset: str, cred_json: str
 ):
-    """
-    Envia um DataFrame Polars para uma tabela do BigQuery.
-    Sobrescreve a tabela (WRITE_TRUNCATE) em cada execução.
-    """
     df_pd = df_pl.to_pandas()
     client = criar_cliente_bq(projeto, cred_json)
     tabela_id = f"{projeto}.{dataset}.{tabela}"
@@ -50,7 +42,6 @@ def enviar_para_bigquery(
 
 
 def tabela_existe_bigquery(projeto: str, dataset: str, tabela: str, cred_json: str) -> bool:
-    """Verifica se uma tabela existe no BigQuery."""
     try:
         client = criar_cliente_bq(projeto, cred_json)
         client.get_table(f"{projeto}.{dataset}.{tabela}")
@@ -59,9 +50,6 @@ def tabela_existe_bigquery(projeto: str, dataset: str, tabela: str, cred_json: s
         return False
 
 
-# --------------------------------------------------------------------
-# Telemetria (Discord)
-# --------------------------------------------------------------------
 class Telemetria:
     def __init__(self):
         self.sucesso = os.environ.get("DISCORD_SUCESSO", "").strip(' "\'')
@@ -159,9 +147,6 @@ class Telemetria:
         self._enviar_webhook(self.erro, payload)
 
 
-# --------------------------------------------------------------------
-# SafeDriver Engine
-# --------------------------------------------------------------------
 class SafeDriver:
     def __init__(self):
         self.t_inicio = time.time()
@@ -170,7 +155,6 @@ class SafeDriver:
         for p in self.pastas.values():
             p.mkdir(parents=True, exist_ok=True)
 
-        # Cloudflare R2 (S3 compatível)
         cfg = {
             k: os.environ.get(k, "").strip()
             for k in [
@@ -197,12 +181,7 @@ class SafeDriver:
         )
         self.meta = self.pastas["raw"] / "meta.json"
 
-    # ------------------- Download / Bronze -------------------
     def cdc_check(self, ano, url, sessao, path_parquet: Path):
-        """
-        Decide se precisa baixar.
-        Regra: se não consigo determinar o remoto, mas tenho parquet local, NÃO baixo.
-        """
         try:
             r = sessao.head(url, timeout=30, verify=False, allow_redirects=True)
             size = int(r.headers.get("Content-Length", 0))
@@ -281,7 +260,6 @@ class SafeDriver:
         return False
 
     def wkt(self, h3_id):
-        """Gera WKT do hexágono H3. Se falhar, retorna None."""
         try:
             boundary = h3.h3_to_geo_boundary(h3_id, geo_json=True)
             coords = [f"{lon} {lat}" for lat, lon in boundary]
@@ -291,11 +269,6 @@ class SafeDriver:
             return None
 
     def base_raw_completa(self, anos) -> bool:
-        """
-        Considera a base completa se:
-        - existe parquet ssp_{ano}.parquet para todos os anos
-        - e o meta.json tem registro para todos os anos
-        """
         try:
             if not self.meta.exists():
                 return False
@@ -314,14 +287,9 @@ class SafeDriver:
         except Exception:
             return False
 
-    # ------------------- Publicação BigQuery -------------------
     def publicar_bigquery_a_partir_de_arquivos(
         self, bq_project, bq_dataset, bq_cred_json
     ):
-        """
-        Publica a camada Ouro/Validação/SHAP no BigQuery a partir
-        dos arquivos locais .parquet.
-        """
         status_bq = "🔌 BigQuery desativado (variáveis de ambiente não configuradas)."
 
         if not (bq_project and bq_dataset and bq_cred_json):
@@ -368,17 +336,7 @@ class SafeDriver:
 
         return status_bq
 
-    # ------------------- Reconstrução Ouro / Validação / SHAP -------------------
     def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
-        """
-        Reconstrói a camada Ouro (dashboard_final), a validação (validacao_modelo)
-        e o SHAP (shap_audit) usando a camada Prata existente.
-
-        Opção A: dois modelos separados
-        - Modelo 1: Volume (alvo sqrt(CRIMES_REAIS))
-        - Modelo 2: Penal (alvo sqrt(CRIMES_PONDERADOS))
-        """
-
         prata_path = self.pastas["prata"] / "camada_prata.parquet"
         if not prata_path.exists():
             raise Exception(
@@ -390,39 +348,38 @@ class SafeDriver:
             file=sys.stdout,
         )
 
-        # ---------- Carrega camada Prata ----------
         prata = pl.read_parquet(prata_path)
 
-        # ---------- Calcula H3 ----------
-        c = prata.select(["LAT", "LON"]).unique().to_pandas()
-        c["CODIGO_H3"] = c.apply(
-            lambda r: h3.latlng_to_cell(r["LAT"], r["LON"], 8), axis=1
+        prata = prata.with_columns(
+            pl.struct(["LAT", "LON"])
+            .map_elements(
+                lambda s: h3.geo_to_h3(
+                    lat=s["LAT"], lng=s["LON"], resolution=8
+                ),
+                return_dtype=pl.String,
+            )
+            .alias("CODIGO_H3")
         )
-        prata_h3 = prata.join(pl.from_pandas(c), on=["LAT", "LON"])
 
-        # ---------- Features por H3 ----------
         features_h3 = (
-            prata_h3.group_by("CODIGO_H3")
+            prata.group_by("CODIGO_H3")
             .agg(
                 [
                     pl.len().alias("CRIMES_REAIS"),
-                    pl.col("PESO_PENAL").sum().alias("CRIMES_PONDERADOS"),
+                    (pl.col("PESO_PENAL").sum()).alias("CRIMES_PONDERADOS"),
                     pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
                     pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
                     pl.col("LAT").std(ddof=1).fill_null(0.0).alias("LAT_STD"),
                     pl.col("LON").std(ddof=1).fill_null(0.0).alias("LON_STD"),
-                    (pl.col("PERIODO_DIA") == "NOITE").mean().alias("PROP_NOITE"),
-                    (pl.col("TIPO_CRIME") == "PATRIMONIO").mean().alias(
-                        "PROP_PATRIMONIO"
-                    ),
-                    (pl.col("PERFIL_VITIMA") == "MOTORISTA").mean().alias(
-                        "PROP_MOTORISTA"
-                    ),
-                    (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").mean().alias(
-                        "PROP_MOTO"
-                    ),
-                    pl.col("EH_FERIADO").mean().alias("PROP_FERIADO"),
-                    pl.col("SEMANA_PAGAMENTO").mean().alias("PROP_PAGAMENTO"),
+                    (pl.col("PERIODO_DETALHADO") == "MANHA").mean().alias("PROP_MANHA"),
+                    (pl.col("PERIODO_DETALHADO") == "TARDE").mean().alias("PROP_TARDE"),
+                    (pl.col("PERIODO_DETALHADO") == "NOITE").mean().alias("PROP_NOITE"),
+                    (pl.col("PERIODO_DETALHADO") == "MADRUGADA").mean().alias("PROP_MADRUGADA"),
+                    (pl.col("TIPO_CRIME") == "PATRIMONIO").mean().alias("PROP_PATRIMONIO"),
+                    (pl.col("PERFIL_VITIMA") == "MOTORISTA").mean().alias("PROP_MOTORISTA"),
+                    (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").mean().alias("PROP_MOTO"),
+                    (pl.col("EH_FERIADO") == 1).mean().alias("PROP_FERIADO"),
+                    (pl.col("SEMANA_PAGAMENTO") == 1).mean().alias("PROP_PAGAMENTO"),
                     pl.col("ANO").n_unique().alias("QTD_ANOS_OBSERVADOS"),
                 ]
             )
@@ -451,9 +408,7 @@ class SafeDriver:
                     (pl.col("PROP_NOITE") * pl.col("PROP_PATRIMONIO")).alias(
                         "RISCO_NOITE_PATRIMONIO"
                     ),
-                    (pl.col("PROP_MOTO") * pl.col("PROP_NOITE")).alias(
-                        "RISCO_MOTO_NOITE"
-                    ),
+                    (pl.col("PROP_MOTO") * pl.col("PROP_NOITE")).alias("RISCO_MOTO_NOITE"),
                     (pl.col("PROP_MOTORISTA") * pl.col("PROP_PAGAMENTO")).alias(
                         "RISCO_MOTORISTA_PAGTO"
                     ),
@@ -461,14 +416,16 @@ class SafeDriver:
             )
         )
 
-        # ---------- Matriz X comum ----------
         X = features_h3.select(
             [
                 "LATITUDE_MEDIA",
                 "LONGITUDE_MEDIA",
                 "LAT_STD",
                 "LON_STD",
+                "PROP_MANHA",
+                "PROP_TARDE",
                 "PROP_NOITE",
+                "PROP_MADRUGADA",
                 "PROP_PATRIMONIO",
                 "PROP_MOTORISTA",
                 "PROP_MOTO",
@@ -482,111 +439,55 @@ class SafeDriver:
             ]
         ).to_pandas()
 
-        # =======================
-        # Modelo 1 – Volume
-        # =======================
-        print("🧠 Treinando Modelo 1 (Volume de crimes)...", file=sys.stdout)
+        y_vol = features_h3["CRIMES_REAIS"].to_pandas()
+        y_pen = features_h3["CRIMES_PONDERADOS"].to_pandas()
 
-        crimes_volume = (
-            features_h3.select("CRIMES_REAIS").to_numpy().ravel().astype(float)
-        )
-        y_vol = np.sqrt(crimes_volume)
+        sample_weights_vol = np.ones(len(prata))
+        sample_weights_vol[prata["PERIODO_DETALHADO"].to_numpy() == "MADRUGADA"] *= 1.5
+        sample_weights_vol[prata["PERIODO_DETALHADO"].to_numpy() == "NOITE"] *= 1.2
 
-        pesos_vol = np.ones_like(crimes_volume, dtype=float)
-        pesos_vol[(crimes_volume >= 21) & (crimes_volume <= 50)] = 1.5
-        pesos_vol[(crimes_volume > 50) & (crimes_volume < 100)] = 2.0
-        pesos_vol[crimes_volume >= 100] = 3.0
-        pesos_vol = pesos_vol / pesos_vol.mean()
+        sample_weights_pen = np.ones(len(prata))
+        sample_weights_pen[prata["PERIODO_DETALHADO"].to_numpy() == "MADRUGADA"] *= 2.0
+        sample_weights_pen[prata["PERIODO_DETALHADO"].to_numpy() == "NOITE"] *= 1.5
+        sample_weights_pen[prata["PESO_PENAL"].to_numpy() >= 4] *= 1.5
+
+        print("🤖 Treinando modelos de Volume e Penal...", file=sys.stdout)
 
         cat_vol = CatBoostRegressor(
-            iterations=400,
+            iterations=100,
+            learning_rate=0.1,
             depth=6,
-            l2_leaf_reg=3.0,
-            learning_rate=0.05,
+            verbose=0,
+            random_seed=42,
             loss_function="RMSE",
-            silent=True,
         )
         lgbm_vol = LGBMRegressor(
-            n_estimators=600,
-            max_depth=-1,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=0.5,
-            objective="regression",
-            verbose=-1,
+            n_estimators=100, learning_rate=0.1, num_leaves=31, random_state=42
         )
-
-        cat_vol.fit(X, y_vol, sample_weight=pesos_vol)
-        lgbm_vol.fit(X, y_vol, sample_weight=pesos_vol)
-
-        ens_vol = VotingRegressor(
-            [
-                ("cv", cat_vol),
-                ("lv", lgbm_vol),
-            ]
-        ).fit(X, y_vol, sample_weight=pesos_vol)
-
-        preds_vol = ens_vol.predict(X)
-        y_hat_vol = np.square(preds_vol)
-        y_hat_vol = np.clip(y_hat_vol, 0, None)
-        risco_volume_medio = float(y_hat_vol.mean())
-
-        # =======================
-        # Modelo 2 – Penal
-        # =======================
-        print("🧠 Treinando Modelo 2 (Gravidade penal)...", file=sys.stdout)
-
-        crimes_penal = (
-            features_h3.select("CRIMES_PONDERADOS").to_numpy().ravel().astype(float)
+        ensemble_vol = VotingRegressor(
+            estimators=[("cat", cat_vol), ("lgbm", lgbm_vol)]
         )
-        y_pen = np.sqrt(crimes_penal)
-
-        # pesos_penal podem reforçar muito penal alto
-        pesos_pen = np.ones_like(crimes_penal, dtype=float)
-        q75_pen = np.nanpercentile(crimes_penal[crimes_penal > 0], 75)
-        pesos_pen[crimes_penal >= q75_pen] = 2.0
-        pesos_pen[crimes_penal == 0] = 0.5
-        pesos_pen = pesos_pen / pesos_pen.mean()
+        ensemble_vol.fit(X, y_vol, sample_weight=sample_weights_vol)
+        y_hat_vol = ensemble_vol.predict(X)
 
         cat_pen = CatBoostRegressor(
-            iterations=400,
+            iterations=100,
+            learning_rate=0.1,
             depth=6,
-            l2_leaf_reg=3.0,
-            learning_rate=0.05,
+            verbose=0,
+            random_seed=42,
             loss_function="RMSE",
-            silent=True,
         )
         lgbm_pen = LGBMRegressor(
-            n_estimators=600,
-            max_depth=-1,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_lambda=0.5,
-            objective="regression",
-            verbose=-1,
+            n_estimators=100, learning_rate=0.1, num_leaves=31, random_state=42
         )
-
-        cat_pen.fit(X, y_pen, sample_weight=pesos_pen)
-        lgbm_pen.fit(X, y_pen, sample_weight=pesos_pen)
-
-        ens_pen = VotingRegressor(
-            [
-                ("cp", cat_pen),
-                ("lp", lgbm_pen),
-            ]
-        ).fit(X, y_pen, sample_weight=pesos_pen)
-
-        preds_pen = ens_pen.predict(X)
-        y_hat_pen = np.square(preds_pen)
-        y_hat_pen = np.clip(y_hat_pen, 0, None)
-
-        # ---------- Camada Ouro ----------
-        print(
-            "💾 Gerando camada Ouro (ESCORE_VOLUME + ESCORE_PENAL por H3)...",
-            file=sys.stdout,
+        ensemble_pen = VotingRegressor(
+            estimators=[("cat", cat_pen), ("lgbm", lgbm_pen)]
         )
+        ensemble_pen.fit(X, y_pen, sample_weight=sample_weights_pen)
+        y_hat_pen = ensemble_pen.predict(X)
+
+        print("✅ Modelos treinados. Gerando previsões e artefatos...", file=sys.stdout)
 
         fato_ouro = features_h3.with_columns(
             [
@@ -595,7 +496,12 @@ class SafeDriver:
             ]
         )
 
-        # GEOMETRIA WKT opcional
+        fato_ouro = fato_ouro.with_columns(
+            pl.col("ESCORE_VOLUME").alias("ESCORE_RISCO")
+        )
+
+        risco_volume_medio = fato_ouro["ESCORE_RISCO"].mean()
+
         try:
             fato_ouro = fato_ouro.with_columns(
                 pl.col("CODIGO_H3")
@@ -611,17 +517,51 @@ class SafeDriver:
             if "GEOMETRIA_WKT" in fato_ouro.columns:
                 fato_ouro = fato_ouro.drop("GEOMETRIA_WKT")
 
-        ouro_path = self.pastas["ouro"] / "dashboard_final.parquet"
-        fato_ouro.write_parquet(ouro_path)
-
-        # ---------- Validação ----------
-        print("✅ Construindo tabela de validação (volume x penal)...", file=sys.stdout)
-
-        validacao = fato_ouro.select(
+        dashboard_final_df = fato_ouro.select(
             [
                 "CODIGO_H3",
                 "CRIMES_REAIS",
                 "CRIMES_PONDERADOS",
+                "ESCORE_RISCO",
+                "ESCORE_VOLUME",
+                "ESCORE_PENAL",
+                "LATITUDE_MEDIA",
+                "LONGITUDE_MEDIA",
+                "LAT_STD",
+                "LON_STD",
+                "PROP_MANHA",
+                "PROP_TARDE",
+                "PROP_NOITE",
+                "PROP_MADRUGADA",
+                "PROP_PATRIMONIO",
+                "PROP_MOTORISTA",
+                "PROP_MOTO",
+                "PROP_FERIADO",
+                "PROP_PAGAMENTO",
+                "CRIMES_POR_ANO",
+                "CRIMES_POND_POR_ANO",
+                "RISCO_NOITE_PATRIMONIO",
+                "RISCO_MOTO_NOITE",
+                "RISCO_MOTORISTA_PAGTO",
+                *(
+                    ["GEOMETRIA_WKT"]
+                    if "GEOMETRIA_WKT" in fato_ouro.columns
+                    else []
+                ),
+            ]
+        )
+
+        ouro_path = self.pastas["ouro"] / "dashboard_final.parquet"
+        dashboard_final_df.write_parquet(ouro_path)
+
+        print("✅ Construindo tabela de validação (validacao_modelo.parquet)...", file=sys.stdout)
+
+        validacao_modelo_df = fato_ouro.select(
+            [
+                "CODIGO_H3",
+                "CRIMES_REAIS",
+                "CRIMES_PONDERADOS",
+                "ESCORE_RISCO",
                 "ESCORE_VOLUME",
                 "ESCORE_PENAL",
                 "LATITUDE_MEDIA",
@@ -629,18 +569,19 @@ class SafeDriver:
             ]
         ).with_columns(
             [
-                # Erros em volume
-                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_VOLUME"))
+                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
+                .abs()
+                .alias("ERRO_ABS"),
+                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
                 .abs()
                 .alias("ERRO_ABS_VOLUME"),
                 (
-                    (pl.col("CRIMES_REAIS") - pl.col("ESCORE_VOLUME"))
+                    (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
                     .abs()
                     / pl.when(pl.col("CRIMES_REAIS") > 0)
                     .then(pl.col("CRIMES_REAIS"))
                     .otherwise(None)
                 ).alias("ERRO_PERC_VOLUME"),
-                # Erros em penal
                 (pl.col("CRIMES_PONDERADOS") - pl.col("ESCORE_PENAL"))
                 .abs()
                 .alias("ERRO_ABS_PENAL"),
@@ -655,48 +596,43 @@ class SafeDriver:
         )
 
         valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
-        validacao.write_parquet(valid_path)
+        validacao_modelo_df.write_parquet(valid_path)
 
-        # ---------- SHAP (volume) ----------
-        print("📊 Calculando SHAP (Modelo de Volume)...", file=sys.stdout)
+        print("📊 Calculando SHAP (Modelos Volume e Penal)...", file=sys.stdout)
 
-        sd_vol = (
-            pd.DataFrame(
-                shap.TreeExplainer(cat_vol).shap_values(X),
-                columns=X.columns,
-            )
-            .abs()
-            .mean()
-            .to_frame("GRAU_IMPORTANCIA_VOLUME")
-            .reset_index()
+        explainer_vol = shap.TreeExplainer(cat_vol)
+        shap_values_vol = explainer_vol.shap_values(X)
+        mean_abs_shap_vol = np.abs(shap_values_vol).mean(axis=0)
+        sd_vol = pl.DataFrame(
+            {
+                "VARIAVEL": X.columns.tolist(),
+                "GRAU_IMPORTANCIA_VOLUME": mean_abs_shap_vol,
+            }
         )
-        sd_vol.columns = ["VARIAVEL", "GRAU_IMPORTANCIA_VOLUME"]
 
-        # ---------- SHAP (penal) ----------
-        print("📊 Calculando SHAP (Modelo Penal)...", file=sys.stdout)
-
-        sd_pen = (
-            pd.DataFrame(
-                shap.TreeExplainer(cat_pen).shap_values(X),
-                columns=X.columns,
-            )
-            .abs()
-            .mean()
-            .to_frame("GRAU_IMPORTANCIA_PENAL")
-            .reset_index()
+        explainer_pen = shap.TreeExplainer(cat_pen)
+        shap_values_pen = explainer_pen.shap_values(X)
+        mean_abs_shap_pen = np.abs(shap_values_pen).mean(axis=0)
+        sd_pen = pl.DataFrame(
+            {
+                "VARIAVEL": X.columns.tolist(),
+                "GRAU_IMPORTANCIA_PENAL": mean_abs_shap_pen,
+            }
         )
-        sd_pen.columns = ["VARIAVEL", "GRAU_IMPORTANCIA_PENAL"]
 
-        shap_df = sd_vol.merge(sd_pen, on="VARIAVEL", how="outer")
+        shap_df = sd_vol.join(sd_pen, on="VARIAVEL", how="outer")
+        shap_df = shap_df.with_columns(
+            pl.col("GRAU_IMPORTANCIA_VOLUME").alias("GRAU_IMPORTANCIA")
+        )
+        shap_df = shap_df.sort("GRAU_IMPORTANCIA", descending=True)
+
         shap_path = self.pastas["ouro"] / "shap_audit.parquet"
-        pl.from_pandas(shap_df).write_parquet(shap_path)
+        shap_df.write_parquet(shap_path)
 
-        # ---------- BigQuery ----------
         status_bq = self.publicar_bigquery_a_partir_de_arquivos(
             bq_project, bq_dataset, bq_cred_json
         )
 
-        # ---------- Backup R2 ----------
         status_cloud = "❌ Desconectado"
         if self.s3:
             try:
@@ -718,11 +654,9 @@ class SafeDriver:
             status_bq,
         )
 
-    # ------------------- Orquestração -------------------
     def processar(self):
         print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
 
-        # Self-healing da Bronze
         for f in self.pastas["raw"].glob("*.parquet"):
             try:
                 if "D" not in pl.scan_parquet(f).columns:
@@ -742,7 +676,6 @@ class SafeDriver:
             }
         )
 
-        # ---------------- Bronze / Download ----------------
         ano_atual = datetime.now().year
         anos_todos = list(range(2022, ano_atual + 1))
 
@@ -886,12 +819,10 @@ class SafeDriver:
             self.discord.notificar_erro("SafeDriver Sync", msg)
             raise Exception(msg)
 
-        # BigQuery envs
         bq_project = os.environ.get("BQ_PROJECT_ID")
         bq_dataset = os.environ.get("BQ_DATASET_ID")
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
-        # --------------- PRATA ---------------
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
 
@@ -920,10 +851,14 @@ class SafeDriver:
                     .then(pl.lit("PATRIMONIO"))
                     .otherwise(pl.lit("PESSOA"))
                     .alias("TIPO_CRIME"),
-                    pl.when(pl.col("HORA_CRIME").is_between(6, 18))
-                    .then(pl.lit("DIA"))
-                    .otherwise(pl.lit("NOITE"))
-                    .alias("PERIODO_DIA"),
+                    pl.when(pl.col("HORA_CRIME").is_between(5, 11))
+                    .then(pl.lit("MANHA"))
+                    .when(pl.col("HORA_CRIME").is_between(12, 17))
+                    .then(pl.lit("TARDE"))
+                    .when(pl.col("HORA_CRIME").is_between(18, 23))
+                    .then(pl.lit("NOITE"))
+                    .otherwise(pl.lit("MADRUGADA"))
+                    .alias("PERIODO_DETALHADO"),
                     pl.col("DATA_FATO")
                     .dt.date()
                     .is_in(self.feriados)
@@ -961,7 +896,6 @@ class SafeDriver:
                     .then(pl.lit("MOTORISTA"))
                     .otherwise(pl.lit("GERAL"))
                     .alias("PERFIL_VITIMA"),
-                    # PESO_PENAL: gravidade jurídica aproximada
                     pl.when(
                         pl.col("N")
                         .str.to_uppercase()
@@ -999,7 +933,6 @@ class SafeDriver:
             self.pastas["prata"] / "camada_prata.parquet"
         )
 
-        # --------------- OURO  ---------------
         self.reconstruir_ouro_validacao_shap(bq_project, bq_dataset, bq_cred_json)
 
 
