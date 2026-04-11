@@ -16,6 +16,7 @@ from lightgbm import LGBMRegressor
 from sklearn.ensemble import VotingRegressor
 from google.cloud import bigquery
 from google.oauth2 import service_account
+import magic # Importar biblioteca para detecção de tipo de arquivo
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -180,36 +181,18 @@ class SafeDriver:
         self.meta = self.pastas["raw"] / "meta.json"
 
     def cdc_check(self, ano, url, sessao, path_parquet: Path):
+        # Este método agora é mais um "check_remote_status" para a SSP
+        # A lógica principal de CDC será no sincronizar_raw
         try:
             r = sessao.head(url, timeout=30, verify=False, allow_redirects=True)
             size = int(r.headers.get("Content-Length", 0))
-
-            if size <= 0 and path_parquet.exists():
-                return False, size
-
-            if self.meta.exists():
-                with open(self.meta, "r") as f:
-                    m = json.load(f).get(str(ano))
-
-                if (
-                    m
-                    and m.get("tamanho_bytes") == size
-                    and m.get("sha256") == self.calcular_sha256(str(path_parquet))
-                ):
-                    print(f"✅ CDC: Arquivo {ano} inalterado.", file=sys.stdout)
-                    return False, size
-            print(f"🔄 CDC: Arquivo {ano} alterado ou novo. Baixando...", file=sys.stdout)
-            return True, size
+            return True, size # Retorna que o remoto está acessível e seu tamanho
         except requests.exceptions.RequestException as e:
-            print(f"⚠️ CDC: Falha ao verificar {ano} (conexão ou 404): {e}", file=sys.stderr)
-            if path_parquet.exists():
-                print(f"✅ CDC: Usando cache local para {ano}.", file=sys.stdout)
-                return False, 0
-            print(f"❌ CDC: Sem cache local para {ano}. Requer download.", file=sys.stderr)
-            return True, 0
+            print(f"⚠️ CDC: Falha ao verificar SSP para {ano}: {e}", file=sys.stderr)
+            return False, 0 # Retorna que o remoto não está acessível
         except Exception as e:
-            print(f"❌ CDC: Erro inesperado ao verificar {ano}: {e}", file=sys.stderr)
-            return True, 0
+            print(f"❌ CDC: Erro inesperado ao verificar SSP para {ano}: {e}", file=sys.stderr)
+            return False, 0
 
     def calcular_sha256(self, caminho_arquivo):
         sha256_hash = hashlib.sha256()
@@ -232,181 +215,254 @@ class SafeDriver:
                 time.sleep(atraso_base * (2**tentativa))
         return False
 
+    def upload_para_r2(self, arquivo_local: Path, chave_r2: str):
+        if not self.s3:
+            print("⚠️ R2: Credenciais S3 não configuradas. Pulando upload.", file=sys.stderr)
+            return "PULADO"
+        try:
+            self.s3.upload_file(str(arquivo_local), self.bucket, chave_r2)
+            print(f"☁️ R2: Upload de {arquivo_local.name} para R2 como {chave_r2} concluído.", file=sys.stdout)
+            return "SUCESSO"
+        except Exception as e:
+            print(f"❌ R2: Falha no upload de {arquivo_local.name} para R2: {e}", file=sys.stderr)
+            return "FALHA"
+
+    def download_do_r2(self, chave_r2: str, arquivo_local: Path):
+        if not self.s3:
+            print("⚠️ R2: Credenciais S3 não configuradas. Pulando download do R2.", file=sys.stderr)
+            return False
+        try:
+            self.s3.download_file(self.bucket, chave_r2, str(arquivo_local))
+            print(f"☁️ R2: Download de {chave_r2} do R2 para {arquivo_local.name} concluído.", file=sys.stdout)
+            return True
+        except Exception as e:
+            print(f"❌ R2: Falha no download de {chave_r2} do R2: {e}", file=sys.stderr)
+            return False
+
     def sincronizar_raw(self):
+        anos = range(2022, datetime.now().year + 1)
         sessao = requests.Session()
-        retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-        sessao.mount("https://", HTTPAdapter(max_retries=retries))
+        retry = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        sessao.mount("https://", adapter)
+        sessao.mount("http://", adapter)
 
-        anos = range(2022, hora_brasilia().year + 1)
         for ano in anos:
-            url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-            path = self.pastas["raw"] / f"SPDadosCriminais_{ano}.parquet"
-            tmp = self.pastas["raw"] / f"SPDadosCriminais_{ano}.xlsx"
+            url_ssp = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+            tmp_xlsx = self.pastas["raw"] / f"SPDadosCriminais_{ano}.xlsx"
+            parquet_file = self.pastas["raw"] / f"SPDadosCriminais_{ano}.parquet"
+            r2_key = f"raw/SPDadosCriminais_{ano}.parquet"
 
-            baixar, size = self.cdc_check(ano, url, sessao, path)
+            print(f"\n--- Processando ano {ano} ---", file=sys.stdout)
 
-            if not baixar:
-                continue
+            # 1. Tentar baixar do R2 primeiro
+            if self.download_do_r2(r2_key, parquet_file):
+                print(f"✅ Sincronização: Usando arquivo {ano} do R2.", file=sys.stdout)
+                continue # Próximo ano, já temos o arquivo
 
-            try:
-                print(f"⬇️ Baixando dados de {ano}...", file=sys.stdout)
-                if self.baixar_robusto(url, tmp, sessao):
-                    print(f"✅ Download de {ano} concluído. Processando...", file=sys.stdout)
-                    abas = []
-                    excel_file = pl.read_excel(tmp, sheet_id=0, engine="calamine")
+            # 2. Se não está no R2, verificar SSP
+            print(f"🔄 Sincronização: Arquivo {ano} não encontrado no R2. Verificando SSP...", file=sys.stdout)
+            ssp_acessivel, ssp_size = self.cdc_check(ano, url_ssp, sessao, parquet_file)
 
-                    # Mapeamento flexível de colunas
-                    col_map = {
-                        "ANO_BO": "ANO_BO", "ANO BO": "ANO_BO",
-                        "NUM_BO": "NUM_BO", "NUM BO": "NUM_BO",
-                        "DELEGACIA": "DELEGACIA",
-                        "DATA_FATO": "D", "DATA FATO": "D",
-                        "HORA_FATO": "H", "HORA FATO": "H",
-                        "LATITUDE": "LAT",
-                        "LONGITUDE": "LON",
-                        "NATUREZA_CRIME": "N", "NATUREZA CRIME": "N",
-                    }
+            # 3. Se SSP acessível e arquivo local existe, verificar CDC com SSP
+            if ssp_acessivel and parquet_file.exists():
+                with open(self.meta, "r") as f:
+                    m = json.load(f)
+                meta_ano = m.get(str(ano), {})
 
-                    # Tenta encontrar as colunas em cada aba
-                    for sheet_name in excel_file.sheet_names:
-                        df = pl.read_excel(tmp, sheet_name=sheet_name, engine="calamine")
-                        f_cols = {}
-                        for original_col, target_col in col_map.items():
-                            if original_col in df.columns:
-                                f_cols[original_col] = target_col
-
-                        # Garante que as colunas essenciais para o processamento estejam presentes
-                        if all(col in f_cols.values() for col in ["D", "LAT", "LON", "H", "N"]):
-                            df_clean = (
-                                df.select(list(f_cols.keys()))
-                                .rename(f_cols)
-                                .with_columns(pl.all().cast(pl.String))
-                            )
-                            abas.append(df_clean)
-
-                    if abas:
-                        pl.concat(abas, how="diagonal").write_parquet(path)
-
-                        assinatura_sha256 = self.calcular_sha256(str(tmp))
-                        print(
-                            f"🔒 Assinatura SHA-256 ({ano}): {assinatura_sha256}",
-                            file=sys.stdout,
-                        )
-
-                        m_data = json.load(open(self.meta)) if self.meta.exists() else {}
-                        m_data[str(ano)] = {
-                            "tamanho_bytes": size, # Usar o size obtido do HEAD request
-                            "sha256": assinatura_sha256,
-                        }
-                        with open(self.meta, "w") as f:
-                            json.dump(m_data, f)
-                    else:
-                        print(f"⚠️ Nenhum dado criminal estruturado encontrado na planilha {ano}. Pulando.", file=sys.stderr)
-                        if os.path.exists(tmp):
-                            os.remove(tmp)
-                        continue
-
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
+                if (
+                    meta_ano
+                    and meta_ano.get("tamanho_bytes") == ssp_size
+                    and meta_ano.get("sha256") == self.calcular_sha256(str(parquet_file))
+                ):
+                    print(f"✅ Sincronização: Arquivo {ano} local inalterado e corresponde à SSP. Usando cache local.", file=sys.stdout)
+                    continue # Próximo ano, cache local está bom
                 else:
-                    raise Exception(f"Falha ao baixar arquivo {ano} apos multiplas tentativas.")
+                    print(f"⚠️ Sincronização: Arquivo {ano} local desatualizado ou meta.json inconsistente. Baixando da SSP.", file=sys.stdout)
+            elif not ssp_acessivel and parquet_file.exists():
+                print(f"⚠️ Sincronização: SSP inacessível para {ano}. Usando cache local.", file=sys.stdout)
+                continue # Próximo ano, SSP fora, usa local
+            elif not ssp_acessivel and not parquet_file.exists():
+                print(f"❌ Sincronização: SSP inacessível e sem cache local para {ano}.", file=sys.stderr)
+                self.discord.notificar_info(f"SafeDriver Sync {ano}", f"SSP inacessível e sem cache local para {ano}. Pulando.")
+                continue # Próximo ano, não há como obter o arquivo
 
-            except Exception as e:
-                print(f"❌ Erro Crítico ao processar {ano}: {e}", file=sys.stderr)
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                self.discord.notificar_info(
-                    f"SafeDriver Download SSP {ano}",
-                    f"Falha ao processar o ano {ano}:\n`{e}`",
-                )
+            # 4. Se chegamos aqui, precisamos baixar da SSP
+            print(f"⬇️ Sincronização: Baixando {ano} da SSP...", file=sys.stdout)
+            if not self.baixar_robusto(url_ssp, tmp_xlsx, sessao):
+                print(f"❌ Sincronização: Falha ao baixar {ano} da SSP após várias tentativas.", file=sys.stderr)
+                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano} da SSP.")
+                if tmp_xlsx.exists():
+                    os.remove(tmp_xlsx)
+                continue # Próximo ano
+
+            # 5. Verificar tipo de arquivo baixado
+            if not tmp_xlsx.exists():
+                print(f"❌ Sincronização: Arquivo {ano} não existe após download.", file=sys.stderr)
+                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Arquivo {ano} não existe após download da SSP.")
                 continue
 
-    def wkt(self, h3_id: str) -> str:
+            file_type = magic.from_file(str(tmp_xlsx), mime=True)
+            if file_type != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+                print(f"❌ Sincronização: Arquivo {ano} não é um XLSX válido. Tipo detectado: {file_type}", file=sys.stderr)
+                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Arquivo {ano} baixado da SSP não é um XLSX válido. Tipo: {file_type}")
+                os.remove(tmp_xlsx)
+                continue
+
+            # 6. Processar XLSX para Parquet
+            try:
+                print(f"⚙️ Sincronização: Processando {ano}.xlsx para parquet...", file=sys.stdout)
+                df_excel = pl.read_excel(
+                    tmp_xlsx,
+                    sheet_name=None,
+                    engine="openpyxl",
+                    read_options={"skip_rows": 1},
+                )
+                df_list = []
+                for sheet_name, df_sheet in df_excel.items():
+                    f_cols = [c for c in df_sheet.columns if c.startswith("F")]
+                    if len(f_cols) >= 5:
+                        df_list.append(df_sheet.select(["D", "H", "N", "LAT", "LON"]))
+                if df_list:
+                    m_data = pl.concat(df_list, how="vertical_relaxed")
+                    m_data.write_parquet(parquet_file)
+                    sha256_hash = self.calcular_sha256(str(parquet_file))
+
+                    with open(self.meta, "r+") as f:
+                        m = json.load(f)
+                        m[str(ano)] = {"tamanho_bytes": ssp_size, "sha256": sha256_hash}
+                        f.seek(0)
+                        json.dump(m, f, indent=4)
+                        f.truncate()
+                    print(f"✅ Sincronização: Arquivo {ano}.parquet criado e meta.json atualizado.", file=sys.stdout)
+                    self.upload_para_r2(parquet_file, r2_key) # Upload para R2 após processamento
+                else:
+                    print(f"⚠️ Sincronização: Nenhum dado criminal estruturado encontrado na planilha {ano}. Pulando.", file=sys.stderr)
+                    self.discord.notificar_info(f"SafeDriver Sync {ano}", f"Nenhum dado criminal estruturado encontrado na planilha {ano}.")
+                if tmp_xlsx.exists():
+                    os.remove(tmp_xlsx)
+            except Exception as e:
+                print(f"❌ Sincronização: Erro ao processar {ano}.xlsx: {e}", file=sys.stderr)
+                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Erro ao processar {ano}.xlsx: {e}")
+                if tmp_xlsx.exists():
+                    os.remove(tmp_xlsx)
+                continue
+
+        if not self.meta.exists():
+            with open(self.meta, "w") as f:
+                json.dump({}, f)
+
+    def wkt(self, h3_id):
         if not isinstance(h3_id, str):
             return None
-        try:
-            boundary = h3.h3_to_geo_boundary(h3_id, geo_json=True)
-            return f"POLYGON (({', '.join([f'{lon} {lat}' for lon, lat in boundary])}))"
-        except Exception:
-            return None
+        boundary = h3.h3_to_geo_boundary(h3_id)
+        # Formato WKT: POLYGON ((lon1 lat1, lon2 lat2, ..., lonN latN, lon1 lat1))
+        # h3.h3_to_geo_boundary retorna (lat, lon)
+        wkt_coords = ", ".join([f"{lon} {lat}" for lat, lon in boundary])
+        return f"POLYGON (({wkt_coords}, {boundary[0][1]} {boundary[0][0]}))"
 
     def publicar_bigquery_a_partir_de_arquivos(self, bq_project, bq_dataset, bq_cred_json):
-        status_bq = "✅ Sucesso"
+        print("\n🚀 Publicando Camada Ouro no BigQuery...", file=sys.stdout)
+        status_bq = "SUCESSO"
         try:
-            for pasta in ["ouro"]:
-                for arquivo in self.pastas[pasta].glob("*.parquet"):
-                    df = pl.read_parquet(arquivo)
-                    tabela_nome = arquivo.stem
-                    enviar_para_bigquery(df, tabela_nome, bq_project, bq_dataset, bq_cred_json)
-                    print(f"📡 Publicado {tabela_nome} no BigQuery.", file=sys.stdout)
+            enviar_para_bigquery(
+                pl.read_parquet(self.pastas["ouro"] / "dashboard_final.parquet"),
+                "sd_dashboard_final",
+                bq_project,
+                bq_dataset,
+                bq_cred_json,
+            )
+            enviar_para_bigquery(
+                pl.read_parquet(self.pastas["ouro"] / "validacao_modelo.parquet"),
+                "sd_validacao_modelo",
+                bq_project,
+                bq_dataset,
+                bq_cred_json,
+            )
+            enviar_para_bigquery(
+                pl.read_parquet(self.pastas["ouro"] / "shap_audit.parquet"),
+                "sd_shap_audit",
+                bq_project,
+                bq_dataset,
+                bq_cred_json,
+            )
+            print("✅ BigQuery: Publicação concluída.", file=sys.stdout)
         except Exception as e:
-            status_bq = f"❌ Falha: {e}"
-            print(f"❌ Erro ao publicar no BigQuery: {e}", file=sys.stderr)
+            print(f"❌ BigQuery: Falha na publicação: {e}", file=sys.stderr)
+            self.discord.notificar_erro("SafeDriver BigQuery", f"Falha na publicação no BigQuery: {e}")
+            status_bq = "FALHA"
         return status_bq
 
     def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
-        print("✨ Construindo Camada Ouro...", file=sys.stdout)
+        print("⚙️ Construindo Camada Ouro e Validando Modelos...", file=sys.stdout)
         prata = pl.read_parquet(self.pastas["prata"] / "camada_prata.parquet")
 
-        features_h3 = (
-            prata.group_by("CODIGO_H3")
+        crimes_por_h3 = (
+            prata.group_by(["CODIGO_H3", "ANO"])
             .agg(
+                pl.col("PESO_PENAL").sum().alias("CRIMES_POND_POR_ANO"),
+                pl.col("PESO_PENAL").count().alias("CRIMES_POR_ANO"),
                 pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
                 pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
-                pl.col("LAT").std().fill_null(0).alias("LAT_STD"),
-                pl.col("LON").std().fill_null(0).alias("LON_STD"),
-                pl.col("ID_ANONIMO").count().alias("CRIMES_REAIS"),
+                pl.col("LAT").std().alias("LAT_STD"),
+                pl.col("LON").std().alias("LON_STD"),
                 (pl.col("TIPO_CRIME") == "PATRIMONIO").sum().alias("PATRIMONIO_COUNT"),
                 (pl.col("PERFIL_VITIMA") == "MOTORISTA").sum().alias("MOTORISTA_COUNT"),
                 (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").sum().alias("MOTO_COUNT"),
-                (pl.col("PERFIL_VITIMA") == "PEDESTRE").sum().alias("PEDESTRE_COUNT"), # Adicionado
-                (pl.col("PERFIL_VITIMA") == "CICLISTA").sum().alias("CICLISTA_COUNT"), # Adicionado
+                (pl.col("PERFIL_VITIMA") == "PEDESTRE").sum().alias("PEDESTRE_COUNT"),
+                (pl.col("PERFIL_VITIMA") == "CICLISTA").sum().alias("CICLISTA_COUNT"),
                 (pl.col("EH_FERIADO") == 1).sum().alias("FERIADO_COUNT"),
                 (pl.col("SEMANA_PAGAMENTO") == 1).sum().alias("PAGAMENTO_COUNT"),
                 (pl.col("PERIODO_DETALHADO") == "MANHA").sum().alias("MANHA_COUNT"),
                 (pl.col("PERIODO_DETALHADO") == "TARDE").sum().alias("TARDE_COUNT"),
                 (pl.col("PERIODO_DETALHADO") == "NOITE").sum().alias("NOITE_COUNT"),
                 (pl.col("PERIODO_DETALHADO") == "MADRUGADA").sum().alias("MADRUGADA_COUNT"),
-                pl.col("PESO_PENAL").sum().alias("PESO_PENAL_TOTAL"),
-                pl.col("ANO").unique().count().alias("ANOS_COM_CRIMES"),
+                (
+                    (pl.col("PERIODO_DETALHADO") == "NOITE")
+                    & (pl.col("TIPO_CRIME") == "PATRIMONIO")
+                ).sum().alias("RISCO_NOITE_PATRIMONIO"),
+                (
+                    (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA")
+                    & (pl.col("PERIODO_DETALHADO") == "NOITE")
+                ).sum().alias("RISCO_MOTO_NOITE"),
+                (
+                    (pl.col("PERFIL_VITIMA") == "MOTORISTA")
+                    & (pl.col("SEMANA_PAGAMENTO") == 1)
+                ).sum().alias("RISCO_MOTORISTA_PAGTO"),
+            )
+            .sort(["CODIGO_H3", "ANO"])
+        )
+
+        features_h3 = (
+            crimes_por_h3.group_by("CODIGO_H3")
+            .agg(
+                pl.col("CRIMES_POR_ANO").sum().alias("CRIMES_REAIS"),
+                pl.col("CRIMES_POND_POR_ANO").sum().alias("CRIMES_POND_TOTAIS"),
+                pl.col("LATITUDE_MEDIA").mean().alias("LATITUDE_MEDIA"),
+                pl.col("LONGITUDE_MEDIA").mean().alias("LONGITUDE_MEDIA"),
+                pl.col("LAT_STD").mean().alias("LAT_STD"),
+                pl.col("LON_STD").mean().alias("LON_STD"),
+                (pl.col("PATRIMONIO_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_PATRIMONIO"),
+                (pl.col("MOTORISTA_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_MOTORISTA"),
+                (pl.col("MOTO_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_MOTO"),
+                (pl.col("PEDESTRE_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_PEDESTRE"),
+                (pl.col("CICLISTA_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_CICLISTA"),
+                (pl.col("FERIADO_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_FERIADO"),
+                (pl.col("PAGAMENTO_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_PAGAMENTO"),
+                (pl.col("MANHA_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_MANHA"),
+                (pl.col("TARDE_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_TARDE"),
+                (pl.col("NOITE_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_NOITE"),
+                (pl.col("MADRUGADA_COUNT").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("PROP_MADRUGADA"),
+                (pl.col("RISCO_NOITE_PATRIMONIO").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("RISCO_NOITE_PATRIMONIO"),
+                (pl.col("RISCO_MOTO_NOITE").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("RISCO_MOTO_NOITE"),
+                (pl.col("RISCO_MOTORISTA_PAGTO").sum() / pl.col("CRIMES_POR_ANO").sum()).alias("RISCO_MOTORISTA_PAGTO"),
+                pl.col("CRIMES_POR_ANO").count().alias("ANOS_COM_CRIMES"),
             )
             .with_columns(
-                (pl.col("PATRIMONIO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_PATRIMONIO"),
-                (pl.col("MOTORISTA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MOTORISTA"),
-                (pl.col("MOTO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MOTO"),
-                (pl.col("PEDESTRE_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_PEDESTRE"), # Adicionado
-                (pl.col("CICLISTA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_CICLISTA"), # Adicionado
-                (pl.col("FERIADO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_FERIADO"),
-                (pl.col("PAGAMENTO_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_PAGAMENTO"),
-                (pl.col("MANHA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MANHA"),
-                (pl.col("TARDE_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_TARDE"),
-                (pl.col("NOITE_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_NOITE"),
-                (pl.col("MADRUGADA_COUNT") / pl.col("CRIMES_REAIS")).alias("PROP_MADRUGADA"),
                 (pl.col("CRIMES_REAIS") / pl.col("ANOS_COM_CRIMES")).alias("CRIMES_POR_ANO"),
-                (pl.col("PESO_PENAL_TOTAL") / pl.col("ANOS_COM_CRIMES")).alias("CRIMES_POND_POR_ANO"),
+                (pl.col("CRIMES_POND_TOTAIS") / pl.col("ANOS_COM_CRIMES")).alias("CRIMES_POND_POR_ANO"),
             )
-            .with_columns(
-                (pl.col("PROP_NOITE") * pl.col("PROP_PATRIMONIO")).alias("RISCO_NOITE_PATRIMONIO"),
-                (pl.col("PROP_MOTO") * pl.col("PROP_NOITE")).alias("RISCO_MOTO_NOITE"),
-                (pl.col("PROP_MOTORISTA") * pl.col("PROP_PAGAMENTO")).alias("RISCO_MOTORISTA_PAGTO"),
-            )
-            .drop(
-                [
-                    "PATRIMONIO_COUNT",
-                    "MOTORISTA_COUNT",
-                    "MOTO_COUNT",
-                    "PEDESTRE_COUNT", # Adicionado
-                    "CICLISTA_COUNT", # Adicionado
-                    "FERIADO_COUNT",
-                    "PAGAMENTO_COUNT",
-                    "MANHA_COUNT",
-                    "TARDE_COUNT",
-                    "NOITE_COUNT",
-                    "MADRUGADA_COUNT",
-                    "PESO_PENAL_TOTAL",
-                    "ANOS_COM_CRIMES",
-                ]
-            )
+            .drop("ANOS_COM_CRIMES")
             .with_columns(
                 pl.col("CODIGO_H3")
                 .map_elements(self.wkt, return_dtype=pl.String)
@@ -417,14 +473,11 @@ class SafeDriver:
         features_modelo = [
             "LATITUDE_MEDIA",
             "LONGITUDE_MEDIA",
-            "LAT_STD",
-            "LON_STD",
-            "CRIMES_POR_ANO",
             "PROP_PATRIMONIO",
             "PROP_MOTORISTA",
             "PROP_MOTO",
-            "PROP_PEDESTRE", # Adicionado
-            "PROP_CICLISTA", # Adicionado
+            "PROP_PEDESTRE",
+            "PROP_CICLISTA",
             "PROP_FERIADO",
             "PROP_PAGAMENTO",
             "PROP_MANHA",
@@ -434,6 +487,10 @@ class SafeDriver:
             "RISCO_NOITE_PATRIMONIO",
             "RISCO_MOTO_NOITE",
             "RISCO_MOTORISTA_PAGTO",
+            "LAT_STD",
+            "LON_STD",
+            "CRIMES_POR_ANO",
+            "CRIMES_POND_POR_ANO",
         ]
         X = features_h3.select(features_modelo).to_pandas()
         y_volume = features_h3.select("CRIMES_REAIS").to_pandas().squeeze()
@@ -477,8 +534,8 @@ class SafeDriver:
                 "PROP_PATRIMONIO",
                 "PROP_MOTORISTA",
                 "PROP_MOTO",
-                "PROP_PEDESTRE", # Adicionado
-                "PROP_CICLISTA", # Adicionado
+                "PROP_PEDESTRE",
+                "PROP_CICLISTA",
                 "PROP_FERIADO",
                 "PROP_PAGAMENTO",
                 "PROP_MANHA",
