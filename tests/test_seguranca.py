@@ -1,19 +1,36 @@
+# tests/test_seguranca.py
 """
-tests/test_seguranca.py
-SafeDriver — Suite completa de testes de segurança, qualidade e LGPD
-Baseada nas instruções do documento SSP + CSV de validação BigQuery
+SafeDriver_Motor_V1.0.0 — Suite de Testes
+Cobre: LGPD, contratos de schema, escores, períodos e integração R2.
 """
-
-import pytest
-import pandas as pd
-import polars as pl
-import numpy as np
+import sys
 import os
 import json
 import hashlib
-from pathlib import Path
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+import pytest
+import pandas as pd
+import numpy as np
+import polars as pl
+
+# Garante que o módulo principal é encontrado
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from autobot.motor_analise_preditiva import (
+    calcular_escore,
+    classificar_periodo,
+    fator_periodo,
+    anonimizar_campo,
+    normalizar_texto,
+    renomear_sinonimos,
+    PESO_PENAL_BASE,
+    MULTIPLICADOR_PERFIL,
+    FATOR_PERIODO,
+    COLUNAS_CRITICAS,
+    SP_LAT_MIN, SP_LAT_MAX,
+    SP_LON_MIN, SP_LON_MAX,
+    NOME_SISTEMA,
+    VERSAO_PIPELINE,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -21,492 +38,416 @@ from unittest.mock import MagicMock, patch
 # ══════════════════════════════════════════════════════════════════════════════
 
 @pytest.fixture
-def df_prata_valido():
-    """DataFrame prata com dados válidos conforme documento SSP."""
-    np.random.seed(42)
-    n = 1000
-    return pl.DataFrame({
-        "NOME_DEPARTAMENTO":  ["DEINTER 1"] * n,
-        "NOME_SECCIONAL":     ["SECCIONAL CAPITAL"] * n,
-        "NOME_DELEGACIA":     ["1 DP"] * n,
-        "NOME_MUNICIPIO":     ["SAO PAULO"] * n,
-        "LOGRADOURO":         ["AV PAULISTA"] * n,
-        "NUMERO_LOGRADOURO":  [str(i) for i in range(n)],
-        "BAIRRO":             ["BELA VISTA"] * n,
-        "LATITUDE":           np.random.uniform(-23.8, -23.4, n).tolist(),
-        "LONGITUDE":          np.random.uniform(-46.8, -46.3, n).tolist(),
-        "DATA_OCORRENCIA_BO": [
-            (datetime(2024, 1, 1) + timedelta(days=i % 365)).strftime("%Y-%m-%d")
-            for i in range(n)
-        ],
-        "HORA_OCORRENCIA_BO": [f"{(i % 24):02d}:00" for i in range(n)],
-        "RUBRICA":            np.random.choice([
-            "ROUBO DE VEICULO", "FURTO DE VEICULO", "HOMICIDIO DOLOSO",
-            "ROUBO", "FURTO", "TRAFICO DE ENTORPECENTES"
-        ], n).tolist(),
-        "DESCR_CONDUTA":      ["SUBTRAIR COISA ALHEIA MOVEL"] * n,
-        "NATUREZA_APURADA":   ["ROUBO"] * n,
-        "DATA_REGISTRO":      [
-            (datetime(2024, 1, 2) + timedelta(days=i % 365)).strftime("%Y-%m-%d")
-            for i in range(n)
-        ],
-        "H3_R8":              [f"88a8a{i:06x}ff" for i in range(n)],
-        "ANO":                [2024] * n,
-        "MES":                [(i % 12) + 1 for i in range(n)],
-        "TURNO":              np.random.choice(["MANHA", "TARDE", "NOITE", "MADRUGADA"], n).tolist(),
-        "FERIADO":            [False] * n,
-        "FIM_DE_SEMANA":      [i % 7 >= 5 for i in range(n)],
-        "PESO_PENAL":         np.random.uniform(4.0, 10.0, n).tolist(),
-        "CRIME_VEICULO":      [True, False] * (n // 2),
-        "ATRASO_REGISTRO_DIAS": np.random.randint(0, 30, n).tolist(),
-    })
-
+def salt_teste():
+    return "salt_teste_unitario_safedriver"
 
 @pytest.fixture
-def df_com_coordenadas_invalidas():
-    """DataFrame com coordenadas zero — devem ser descartadas conforme documento SSP página 4."""
-    return pl.DataFrame({
-        "NOME_MUNICIPIO": ["SAO PAULO", "SAO PAULO", "SAO PAULO", "SAO PAULO"],
-        "LATITUDE":       [0.0,         -23.5,        0.0,          None],
-        "LONGITUDE":      [0.0,         -46.6,        -46.6,        None],
-        "RUBRICA":        ["ROUBO"] * 4,
-        "DATA_OCORRENCIA_BO": ["2024-01-01"] * 4,
+def df_prata_minimo():
+    """DataFrame mínimo válido para testar contratos."""
+    return pd.DataFrame({
+        "H3_INDEX":           ["8a2a100d2c37fff", "8a2a100d2c3ffff", "8a2a100d2c47fff"] * 200,
+        "ESCORE":             np.random.uniform(1.0, 10.0, 600),
+        "LATITUDE_F":         np.random.uniform(-23.6, -23.4, 600),
+        "LONGITUDE_F":        np.random.uniform(-46.7, -46.5, 600),
+        "RUBRICA":            ["ROUBO DE VEICULO", "FURTO", "HOMICIDIO DOLOSO"] * 200,
+        "PERIODO_DIA":        ["NOITE", "MANHA", "MADRUGADA"] * 200,
+        "IS_NOITE_MADRUGADA": [1, 0, 1] * 200,
+        "IS_PATRIMONIO":      [1, 1, 0] * 200,
+        "IS_VIOLENCIA_PESSOA":[0, 0, 1] * 200,
+        "NOME_MUNICIPIO":     ["SAO PAULO", "CAMPINAS", "GUARULHOS"] * 200,
+        "DATA_OCORRENCIA_BO": pd.date_range("2024-01-01", periods=600, freq="h"),
+        "ANO_MES":            ["2024-01"] * 600,
     })
 
-
 @pytest.fixture
-def xlsx_com_aba_metadados(tmp_path):
-    """Cria Excel com aba de metadados + aba de dados conforme estrutura SSP."""
-    caminho = tmp_path / "SPDadosCriminais_TEST.xlsx"
-    with pd.ExcelWriter(caminho, engine="openpyxl") as writer:
-        # Aba de metadados — deve ser IGNORADA
-        pd.DataFrame({
-            "Campo": ["LATITUDE", "LONGITUDE"],
-            "Descricao": ["Coordenada lat", "Coordenada lon"]
-        }).to_excel(writer, sheet_name="Campos da Tabela_SPDADOS", index=False)
-
-        # Aba de dados válida — deve ser PROCESSADA
-        pd.DataFrame({
-            "NOME_DEPARTAMENTO":  ["DEINTER 1"] * 5,
-            "NOME_MUNICIPIO":     ["SAO PAULO"] * 5,
-            "LOGRADOURO":         ["AV PAULISTA"] * 5,
-            "LATITUDE":           [-23.5] * 5,
-            "LONGITUDE":          [-46.6] * 5,
-            "DATA_OCORRENCIA_BO": ["2024-01-15"] * 5,
-            "RUBRICA":            ["ROUBO"] * 5,
-            "DATA_REGISTRO":      ["2024-01-16"] * 5,
-        }).to_excel(writer, sheet_name="JAN_2024", index=False)
-
-    return caminho
-
-
-@pytest.fixture
-def df_ouro_valido():
-    """Star schema fato mínimo para testes de qualidade."""
-    np.random.seed(42)
-    n = 500
-    perfis = ["MOTORISTA", "MOTOCICLISTA", "PEDESTRE", "CICLISTA"]
-    return pl.DataFrame({
-        "SK_FATO":        list(range(n)),
-        "SK_TEMPO":       [(i % 60) + 1 for i in range(n)],
-        "SK_LOCAL":       [(i % 200) + 1 for i in range(n)],
-        "SK_CRIME":       [(i % 20) + 1 for i in range(n)],
-        "SK_PERFIL":      [(i % 4) + 1 for i in range(n)],
-        "H3_R8":          [f"88a8a{i:06x}ff" for i in range(n)],
-        "ANO":            [2024] * n,
-        "MES":            [(i % 12) + 1 for i in range(n)],
-        "PERFIL":         [perfis[i % 4] for i in range(n)],
-        "QTD_CRIMES":     np.random.randint(1, 200, n).tolist(),
-        "ESCORE_RISCO":   np.random.uniform(0, 100, n).tolist(),
-        "RISCO_PREVISTO": np.random.uniform(0, 100, n).tolist(),
-        "MAE_MODELO":     [12.5] * n,
-        "R2_MODELO":      [0.88] * n,
-        "RUN_ID":         ["abc123def456"] * n,
-        "RUN_TS":         [datetime(2024, 6, 1).isoformat()] * n,
-        "VERSAO_PIPELINE":["3.0.0"] * n,
-        "VERSAO_FEATURES":["v3"] * n,
-    })
+def df_ouro_minimo(df_prata_minimo):
+    """Agregação mínima simulando saída do construir_ouro."""
+    agg = df_prata_minimo.groupby("H3_INDEX").agg(
+        QTD_CRIMES            =("ESCORE",             "count"),
+        ESCORE_TOTAL          =("ESCORE",             "sum"),
+        ESCORE_MEDIO          =("ESCORE",             "mean"),
+        ESCORE_GRAVIDADE_MAX  =("ESCORE",             "max"),
+        LATITUDE_MEDIA        =("LATITUDE_F",         "mean"),
+        LONGITUDE_MEDIA       =("LONGITUDE_F",        "mean"),
+        PROP_NOITE_MADRUGADA  =("IS_NOITE_MADRUGADA", "mean"),
+        PROP_PATRIMONIO       =("IS_PATRIMONIO",      "mean"),
+        PROP_VIOLENCIA_PESSOA =("IS_VIOLENCIA_PESSOA","mean"),
+    ).reset_index()
+    agg["ESCORE_LAG2"]    = agg["ESCORE_TOTAL"] * 0.9
+    agg["QTD_LAG2"]       = agg["QTD_CRIMES"]
+    agg["ESCORE_VIZ_1"]   = agg["ESCORE_MEDIO"] * 0.95
+    agg["ESCORE_VIZ_2"]   = agg["ESCORE_MEDIO"] * 0.85
+    agg["QTD_CRIMES_VIZ"] = agg["QTD_CRIMES"] * 0.9
+    agg["ESCORE_PREDITO"] = agg["ESCORE_TOTAL"] * 1.05
+    return agg
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 1 — LIMPEZA E VALIDAÇÃO GEOGRÁFICA (documento SSP)
+# 1. IDENTIDADE DO SISTEMA
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestLimpezaGeografica:
+class TestIdentidade:
+    def test_nome_sistema(self):
+        assert NOME_SISTEMA == "SafeDriver_Motor_V1.0.0", \
+            f"Nome incorreto: {NOME_SISTEMA}"
 
-    def test_coordenadas_zero_sao_descartadas(self, df_com_coordenadas_invalidas):
-        """Documento SSP página 4: lat=0 ou lon=0 devem ser tratados como inválidos."""
-        df = df_com_coordenadas_invalidas.to_pandas()
-        mask_invalido = (df["LATITUDE"] == 0) | (df["LONGITUDE"] == 0) | \
-                        df["LATITUDE"].isna() | df["LONGITUDE"].isna()
-        df_limpo = df[~mask_invalido]
-        assert len(df_limpo) == 1, "Apenas 1 registro tem coordenadas válidas"
-        assert df_limpo.iloc[0]["LATITUDE"] == -23.5
-
-    def test_coordenadas_nulas_sao_descartadas(self, df_com_coordenadas_invalidas):
-        """Coordenadas None/NaN devem ser descartadas sem tentativa de geocodificação."""
-        df = df_com_coordenadas_invalidas.to_pandas()
-        df_limpo = df.dropna(subset=["LATITUDE", "LONGITUDE"])
-        df_limpo = df_limpo[(df_limpo["LATITUDE"] != 0) & (df_limpo["LONGITUDE"] != 0)]
-        assert df_limpo["LATITUDE"].isna().sum() == 0
-        assert df_limpo["LONGITUDE"].isna().sum() == 0
-
-    def test_latitude_longitude_sao_float(self, df_prata_valido):
-        """Documento SSP página 2: LATITUDE e LONGITUDE devem ser float."""
-        df = df_prata_valido.to_pandas()
-        assert df["LATITUDE"].dtype in [np.float32, np.float64]
-        assert df["LONGITUDE"].dtype in [np.float32, np.float64]
-
-    def test_coordenadas_dentro_do_estado_de_sp(self, df_prata_valido):
-        """
-        São Paulo: lat entre -25.3 e -19.8, lon entre -53.1 e -44.1
-        Registros fora desse bbox são de outro estado e devem ser descartados.
-        """
-        df = df_prata_valido.to_pandas()
-        bbox_sp = (
-            df["LATITUDE"].between(-25.3, -19.8) &
-            df["LONGITUDE"].between(-53.1, -44.1)
-        )
-        assert bbox_sp.all(), "Todos os registros devem estar dentro do bbox do Estado de SP"
-
-    def test_municipio_normalizado_sem_acento(self, df_prata_valido):
-        """Documento SSP página 4: texto deve ser normalizado — maiúsculas, sem acentos."""
-        df = df_prata_valido.to_pandas()
-        for val in df["NOME_MUNICIPIO"].dropna():
-            assert val == val.upper(), f"Município não normalizado: {val}"
-            assert "Ã" not in val and "Ç" not in val and "Ó" not in val, \
-                f"Município com acento: {val}"
-
-    def test_sem_duplicatas_por_bo_e_data(self, df_prata_valido):
-        """Não deve haver duplicatas no par (H3_R8, DATA_OCORRENCIA_BO, RUBRICA)."""
-        df = df_prata_valido.to_pandas()
-        dupes = df.duplicated(subset=["H3_R8", "DATA_OCORRENCIA_BO", "RUBRICA"], keep=False)
-        # Aceita duplicatas naturais (mesmo crime, mesmo local, mesmo dia)
-        # mas verifica que o índice não tem duplicatas absolutas
-        assert df.index.duplicated().sum() == 0
+    def test_versao_pipeline(self):
+        assert VERSAO_PIPELINE == "5.0.0", \
+            f"Versão incorreta: {VERSAO_PIPELINE}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 2 — DETECÇÃO DE ABAS EXCEL (documento SSP)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestDeteccaoAbas:
-
-    COLUNAS_CRITICAS = [
-        "NOME_DEPARTAMENTO", "NOME_MUNICIPIO",
-        "LOGRADOURO", "LATITUDE", "LONGITUDE", "DATA_OCORRENCIA_BO"
-    ]
-
-    def test_aba_metadados_e_ignorada(self, xlsx_com_aba_metadados):
-        """Documento SSP página 3: aba 'Campos da Tabela_SPDADOS' deve ser ignorada."""
-        wb = __import__("openpyxl").load_workbook(xlsx_com_aba_metadados, read_only=True)
-        abas_ignoradas = [n for n in wb.sheetnames if "Campos da Tabela" in n]
-        assert len(abas_ignoradas) == 1
-        # Simula o que o pipeline faz
-        abas_dados = [n for n in wb.sheetnames if "Campos da Tabela" not in n]
-        assert "JAN_2024" in abas_dados
-
-    def test_aba_aceita_com_4_ou_mais_colunas_criticas(self, xlsx_com_aba_metadados):
-        """Documento SSP página 3: mínimo 4 colunas críticas para aceitar aba."""
-        df_aba = pd.read_excel(xlsx_com_aba_metadados, sheet_name="JAN_2024", nrows=5)
-        colunas_encontradas = [c for c in self.COLUNAS_CRITICAS if c in df_aba.columns]
-        assert len(colunas_encontradas) >= 4, \
-            f"Aba deveria ter >= 4 colunas críticas, encontrou {len(colunas_encontradas)}"
-
-    def test_multiplas_abas_sao_concatenadas(self, tmp_path):
-        """Documento SSP página 3: múltiplas abas de dados devem ser concatenadas."""
-        caminho = tmp_path / "multi_aba.xlsx"
-        linha_base = {
-            "NOME_DEPARTAMENTO": "DEINTER 1",
-            "NOME_MUNICIPIO":    "SAO PAULO",
-            "LOGRADOURO":        "RUA TESTE",
-            "LATITUDE":          -23.5,
-            "LONGITUDE":         -46.6,
-            "DATA_OCORRENCIA_BO":"2024-01-01",
-            "RUBRICA":           "ROUBO",
-        }
-        with pd.ExcelWriter(caminho, engine="openpyxl") as writer:
-            pd.DataFrame([linha_base] * 10).to_excel(writer, sheet_name="JAN_2024", index=False)
-            pd.DataFrame([linha_base] * 15).to_excel(writer, sheet_name="FEV_2024", index=False)
-
-        frames = []
-        wb = __import__("openpyxl").load_workbook(caminho, read_only=True)
-        for nome in wb.sheetnames:
-            df = pd.read_excel(caminho, sheet_name=nome)
-            colunas_ok = sum(1 for c in self.COLUNAS_CRITICAS if c in df.columns)
-            if colunas_ok >= 4:
-                frames.append(df)
-
-        df_master = pd.concat(frames, ignore_index=True)
-        assert len(df_master) == 25, "JAN(10) + FEV(15) = 25 registros concatenados"
-
-    def test_aba_sem_colunas_criticas_e_rejeitada(self, tmp_path):
-        """Aba sem colunas críticas suficientes deve ser ignorada pelo pipeline."""
-        caminho = tmp_path / "invalido.xlsx"
-        with pd.ExcelWriter(caminho, engine="openpyxl") as writer:
-            pd.DataFrame({"COL_A": [1], "COL_B": [2]}).to_excel(
-                writer, sheet_name="LIXO", index=False
-            )
-        df = pd.read_excel(caminho, sheet_name="LIXO")
-        colunas_ok = sum(1 for c in self.COLUNAS_CRITICAS if c in df.columns)
-        assert colunas_ok < 4, "Aba inválida não deve ser processada"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 3 — QUALIDADE DA CAMADA PRATA
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestQualidadePrata:
-
-    def test_sem_registros_fora_de_sp(self, df_prata_valido):
-        """Apenas registros do Estado de São Paulo devem existir na prata."""
-        df = df_prata_valido.to_pandas()
-        assert (df["NOME_MUNICIPIO"].str.upper().str.contains("SAO PAULO") |
-                df["NOME_DEPARTAMENTO"].str.upper().str.len() > 0).all()
-
-    def test_colunas_obrigatorias_presentes(self, df_prata_valido):
-        """Todas as colunas do documento SSP devem estar presentes na prata."""
-        obrigatorias = [
-            "NOME_DEPARTAMENTO", "NOME_SECCIONAL", "NOME_DELEGACIA",
-            "NOME_MUNICIPIO", "LOGRADOURO", "LATITUDE", "LONGITUDE",
-            "DATA_OCORRENCIA_BO", "HORA_OCORRENCIA_BO", "RUBRICA",
-            "DESCR_CONDUTA", "NATUREZA_APURADA", "DATA_REGISTRO",
-        ]
-        colunas_df = df_prata_valido.columns
-        faltando = [c for c in obrigatorias if c not in colunas_df]
-        assert len(faltando) == 0, f"Colunas obrigatórias ausentes: {faltando}"
-
-    def test_h3_gerado_para_todos_registros(self, df_prata_valido):
-        """Todo registro com coordenada válida deve ter H3 calculado."""
-        df = df_prata_valido.to_pandas()
-        assert df["H3_R8"].isna().sum() == 0
-        assert (df["H3_R8"].str.len() > 0).all()
-
-    def test_turno_derivado_corretamente(self, df_prata_valido):
-        """TURNO deve ser uma das quatro categorias válidas."""
-        df = df_prata_valido.to_pandas()
-        valores_validos = {"MANHA", "TARDE", "NOITE", "MADRUGADA"}
-        assert set(df["TURNO"].unique()).issubset(valores_validos)
-
-    def test_peso_penal_positivo(self, df_prata_valido):
-        """PESO_PENAL deve ser sempre positivo."""
-        df = df_prata_valido.to_pandas()
-        assert (df["PESO_PENAL"] > 0).all()
-
-    def test_atraso_registro_nao_negativo(self, df_prata_valido):
-        """Atraso de registro não pode ser negativo."""
-        df = df_prata_valido.to_pandas()
-        assert (df["ATRASO_REGISTRO_DIAS"] >= 0).all()
-
-    def test_volume_minimo_de_registros(self, df_prata_valido):
-        """Prata deve ter pelo menos 500 registros para ser considerada válida."""
-        assert len(df_prata_valido) >= 500
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 4 — QUALIDADE DO MODELO (baseado no CSV de validação BigQuery)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestQualidadeModelo:
-
-    # Thresholds baseados no CSV de validação — qualquer regressão abaixo disso é falha
-    MAE_MAX_GERAL        = 50.0   # CSV atual: 43.17 — tolerância de 15%
-    R2_MIN_GERAL         = 0.85   # CSV atual: 0.877
-    R2_MIN_FAIXA_BAIXA   = 0.85   # Faixa 1-5: CSV 0.900 — não pode regredir muito
-    MAE_MAX_FAIXA_MEDIA  = 20.0   # Faixa 21-50: CSV MAE 15.5 — ponto crítico
-    R2_MIN_FAIXA_MEDIA   = 0.40   # Faixa 21-50: CSV 0.468 — calcanhar de aquiles
-
-    def test_mae_geral_dentro_do_threshold(self, df_ouro_valido):
-        """MAE geral não pode ultrapassar threshold definido pelo CSV de validação."""
-        mae = df_ouro_valido["MAE_MODELO"][0]
-        assert mae <= self.MAE_MAX_GERAL, \
-            f"MAE {mae:.4f} acima do threshold {self.MAE_MAX_GERAL}"
-
-    def test_r2_geral_acima_do_minimo(self, df_ouro_valido):
-        """R² geral não pode cair abaixo do mínimo."""
-        r2 = df_ouro_valido["R2_MODELO"][0]
-        assert r2 >= self.R2_MIN_GERAL, \
-            f"R² {r2:.4f} abaixo do mínimo {self.R2_MIN_GERAL}"
-
-    def test_previsao_nao_negativa(self, df_ouro_valido):
-        """Risco previsto nunca pode ser negativo."""
-        df = df_ouro_valido.to_pandas()
-        assert (df["RISCO_PREVISTO"] >= 0).all()
-
-    def test_escore_entre_0_e_100(self, df_ouro_valido):
-        """ESCORE_RISCO deve estar na escala 0-100."""
-        df = df_ouro_valido.to_pandas()
-        assert df["ESCORE_RISCO"].between(0, 100).all(), \
-            "Escore fora do range 0-100"
-
-    def test_todos_os_perfis_presentes_na_fato(self, df_ouro_valido):
-        """Fato deve conter os 4 perfis: MOTORISTA, MOTOCICLISTA, PEDESTRE, CICLISTA."""
-        perfis_encontrados = set(df_ouro_valido["PERFIL"].to_list())
-        perfis_esperados   = {"MOTORISTA", "MOTOCICLISTA", "PEDESTRE", "CICLISTA"}
-        assert perfis_esperados.issubset(perfis_encontrados), \
-            f"Perfis ausentes: {perfis_esperados - perfis_encontrados}"
-
-    def test_hexagonos_unicos_por_perfil_mes(self, df_ouro_valido):
-        """Não deve haver duplicata de H3 + ANO + MES + PERFIL na fato."""
-        df = df_ouro_valido.to_pandas()
-        dupes = df.duplicated(subset=["H3_R8", "ANO", "MES", "PERFIL"])
-        # Com n=500 e 4 perfis + 12 meses, pode haver duplicatas na fixture
-        # O teste real valida que o pipeline não gera duplicatas
-        assert df[["SK_FATO"]].duplicated().sum() == 0, "SK_FATO deve ser único"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 5 — STAR SCHEMA (integridade para Looker)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestStarSchema:
-
-    def test_sk_fato_e_unico(self, df_ouro_valido):
-        """Chave substituta da fato deve ser única — requisito do Looker."""
-        df = df_ouro_valido.to_pandas()
-        assert not df["SK_FATO"].duplicated().any()
-
-    def test_sk_tempo_referencia_valida(self, df_ouro_valido):
-        """SK_TEMPO deve ser inteiro positivo."""
-        df = df_ouro_valido.to_pandas()
-        assert (df["SK_TEMPO"] > 0).all()
-        assert df["SK_TEMPO"].dtype in [np.int32, np.int64]
-
-    def test_sk_local_referencia_valida(self, df_ouro_valido):
-        """SK_LOCAL deve ser inteiro positivo."""
-        df = df_ouro_valido.to_pandas()
-        assert (df["SK_LOCAL"] > 0).all()
-
-    def test_sk_perfil_entre_1_e_4(self, df_ouro_valido):
-        """SK_PERFIL deve estar entre 1 e 4 — um por perfil."""
-        df = df_ouro_valido.to_pandas()
-        assert df["SK_PERFIL"].between(1, 4).all()
-
-    def test_versao_pipeline_presente(self, df_ouro_valido):
-        """VERSAO_PIPELINE deve estar preenchida para rastreabilidade."""
-        df = df_ouro_valido.to_pandas()
-        assert (df["VERSAO_PIPELINE"].str.len() > 0).all()
-
-    def test_run_id_presente_e_consistente(self, df_ouro_valido):
-        """RUN_ID deve ser o mesmo para todos os registros de uma execução."""
-        df = df_ouro_valido.to_pandas()
-        assert df["RUN_ID"].nunique() == 1, \
-            "Todos os registros de uma execução devem ter o mesmo RUN_ID"
-
-    def test_run_id_tem_12_caracteres(self, df_ouro_valido):
-        """RUN_ID deve ter exatamente 12 caracteres conforme pipeline."""
-        run_id = df_ouro_valido["RUN_ID"][0]
-        assert len(run_id) == 12
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 6 — LGPD
+# 2. LGPD — ANONIMIZAÇÃO
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestLGPD:
+    def test_anonimizar_retorna_sha256(self, salt_teste):
+        resultado = anonimizar_campo("Rua das Flores, 123", salt_teste)
+        assert len(resultado) == 64, "SHA-256 deve ter 64 caracteres hex"
+        assert all(c in "0123456789abcdef" for c in resultado)
 
-    CAMPOS_PROIBIDOS = [
-        "CPF", "RG", "NOME_VITIMA", "NOME_SUSPEITO", "NOME_AUTOR",
-        "NOME_INDICIADO", "TELEFONE", "EMAIL", "DATA_NASCIMENTO",
-        "ENDERECO_COMPLETO", "IP_ADDRESS", "DEVICE_ID",
+    def test_anonimizar_determinista(self, salt_teste):
+        r1 = anonimizar_campo("teste", salt_teste)
+        r2 = anonimizar_campo("teste", salt_teste)
+        assert r1 == r2, "Mesmo input deve gerar mesmo hash"
+
+    def test_anonimizar_salts_diferentes(self, salt_teste):
+        r1 = anonimizar_campo("teste", salt_teste)
+        r2 = anonimizar_campo("teste", "outro_salt")
+        assert r1 != r2, "Salts diferentes devem gerar hashes diferentes"
+
+    def test_anonimizar_valores_diferentes(self, salt_teste):
+        r1 = anonimizar_campo("Rua A", salt_teste)
+        r2 = anonimizar_campo("Rua B", salt_teste)
+        assert r1 != r2, "Valores diferentes devem gerar hashes diferentes"
+
+    def test_anonimizar_campo_vazio(self, salt_teste):
+        resultado = anonimizar_campo("", salt_teste)
+        assert len(resultado) == 64
+
+    def test_anonimizar_nao_expoe_original(self, salt_teste):
+        original  = "João da Silva"
+        resultado = anonimizar_campo(original, salt_teste)
+        assert "JOAO" not in resultado.upper()
+        assert "SILVA" not in resultado.upper()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. PERÍODO DO DIA
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPeriodoDia:
+    @pytest.mark.parametrize("hora,esperado", [
+        ("00:00", "MADRUGADA"),
+        ("03:30", "MADRUGADA"),
+        ("05:59", "MADRUGADA"),
+        ("06:00", "MANHA"),
+        ("11:59", "MANHA"),
+        ("12:00", "TARDE"),
+        ("17:59", "TARDE"),
+        ("18:00", "NOITE"),
+        ("23:59", "NOITE"),
+    ])
+    def test_classificar_periodo(self, hora, esperado):
+        assert classificar_periodo(hora) == esperado
+
+    def test_periodo_hora_invalida(self):
+        resultado = classificar_periodo("XX:YY")
+        assert resultado in ["MADRUGADA", "MANHA", "TARDE", "NOITE"]
+
+    @pytest.mark.parametrize("hora,esperado", [
+        ("02:00", 1.4),  # madrugada — agravante forte
+        ("08:00", 1.0),  # manhã — neutro
+        ("15:00", 1.0),  # tarde — neutro
+        ("20:00", 1.3),  # noite — agravante
+    ])
+    def test_fator_periodo(self, hora, esperado):
+        assert fator_periodo(hora) == esperado
+
+    def test_manha_tarde_nao_sao_agravantes(self):
+        assert fator_periodo("09:00") == 1.0, "Manhã deve ser neutro"
+        assert fator_periodo("14:00") == 1.0, "Tarde deve ser neutro"
+
+    def test_noite_madrugada_sao_agravantes(self):
+        assert fator_periodo("02:00") > 1.0, "Madrugada deve ser agravante"
+        assert fator_periodo("21:00") > 1.0, "Noite deve ser agravante"
+
+    def test_madrugada_mais_agravante_que_noite(self):
+        assert fator_periodo("03:00") > fator_periodo("21:00"), \
+            "Madrugada deve ter fator maior que noite"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. ESCORE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEscore:
+    def test_escore_positivo(self):
+        assert calcular_escore("ROUBO DE VEICULO", "08:00") > 0
+
+    def test_escore_noite_maior_que_manha(self):
+        escore_manha  = calcular_escore("ROUBO", "09:00", "MOTORISTA")
+        escore_noite  = calcular_escore("ROUBO", "21:00", "MOTORISTA")
+        assert escore_noite > escore_manha, \
+            "Crime à noite deve ter escore maior"
+
+    def test_escore_madrugada_maior_que_noite(self):
+        escore_noite     = calcular_escore("ROUBO", "20:00", "MOTORISTA")
+        escore_madrugada = calcular_escore("ROUBO", "02:00", "MOTORISTA")
+        assert escore_madrugada > escore_noite, \
+            "Madrugada deve ter escore maior que noite"
+
+    def test_escore_manha_igual_tarde(self):
+        escore_manha = calcular_escore("FURTO", "09:00", "MOTORISTA")
+        escore_tarde = calcular_escore("FURTO", "15:00", "MOTORISTA")
+        assert escore_manha == escore_tarde, \
+            "Manhã e tarde devem ter o mesmo escore (neutros)"
+
+    def test_escore_homicidio_maior_que_furto(self):
+        escore_hom  = calcular_escore("HOMICIDIO DOLOSO", "08:00")
+        escore_furt = calcular_escore("FURTO",            "08:00")
+        assert escore_hom > escore_furt
+
+    def test_escore_latrocinio_maximo(self):
+        escore = calcular_escore("LATROCINIO", "03:00", "MOTORISTA")
+        assert escore >= 10.0
+
+    def test_escore_crime_desconhecido(self):
+        escore = calcular_escore("CRIME_DESCONHECIDO_XYZ", "10:00")
+        assert escore > 0, "Crime desconhecido deve retornar escore base > 0"
+
+    def test_escore_perfil_motociclista(self):
+        escore_mot  = calcular_escore("ROUBO DE MOTOCICLETA", "21:00", "MOTOCICLISTA")
+        escore_ped  = calcular_escore("ROUBO DE MOTOCICLETA", "21:00", "PEDESTRE")
+        assert escore_mot > escore_ped, \
+            "Motociclista deve ter escore maior para roubo de moto"
+
+    def test_escore_retorna_float(self):
+        resultado = calcular_escore("ROUBO", "20:00")
+        assert isinstance(resultado, float)
+
+    def test_escore_arredondado_4_casas(self):
+        resultado = calcular_escore("ROUBO", "20:00")
+        assert resultado == round(resultado, 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. CONTRATOS DE SCHEMA — OURO
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestContratos:
+    COLUNAS_OBRIGATORIAS_OURO = [
+        "H3_INDEX",
+        "QTD_CRIMES",
+        "ESCORE_TOTAL",
+        "ESCORE_MEDIO",
+        "ESCORE_GRAVIDADE_MAX",
+        "LATITUDE_MEDIA",
+        "LONGITUDE_MEDIA",
+        "PROP_NOITE_MADRUGADA",
+        "PROP_PATRIMONIO",
+        "PROP_VIOLENCIA_PESSOA",
+        "ESCORE_LAG2",
+        "QTD_LAG2",
+        "ESCORE_VIZ_1",
+        "ESCORE_VIZ_2",
+        "QTD_CRIMES_VIZ",
+        "ESCORE_PREDITO",
     ]
 
-    def test_prata_sem_dados_pessoais(self, df_prata_valido):
-        """Camada prata não pode conter colunas com dados pessoais identificáveis."""
-        colunas = [c.upper() for c in df_prata_valido.columns]
-        violacoes = [c for c in self.CAMPOS_PROIBIDOS if c in colunas]
-        assert len(violacoes) == 0, f"Dados pessoais encontrados na prata: {violacoes}"
+    def test_colunas_obrigatorias_presentes(self, df_ouro_minimo):
+        faltando = [
+            c for c in self.COLUNAS_OBRIGATORIAS_OURO
+            if c not in df_ouro_minimo.columns
+        ]
+        assert not faltando, f"Colunas faltando no ouro: {faltando}"
 
-    def test_ouro_sem_dados_pessoais(self, df_ouro_valido):
-        """Camada ouro não pode conter colunas com dados pessoais identificáveis."""
-        colunas = [c.upper() for c in df_ouro_valido.columns]
-        violacoes = [c for c in self.CAMPOS_PROIBIDOS if c in colunas]
-        assert len(violacoes) == 0, f"Dados pessoais encontrados no ouro: {violacoes}"
+    def test_h3_index_nao_nulo(self, df_ouro_minimo):
+        assert df_ouro_minimo["H3_INDEX"].notna().all(), \
+            "H3_INDEX não pode ter nulos"
 
-    def test_h3_nao_permite_identificacao_individual(self, df_prata_valido):
-        """
-        H3 resolução 8 cobre ~0.74 km². Abaixo da resolução 10 (~0.015 km²)
-        o hexágono pode individualizar uma pessoa — não deve existir na camada prata.
-        """
-        df = df_prata_valido.to_pandas()
-        # Resolução H3 é o 3º caractere do índice: 88... = resolução 8
-        for h3_val in df["H3_R8"].dropna().head(10):
-            resolucao = int(h3_val[1], 16) if len(h3_val) > 1 else 0
-            assert resolucao <= 9, \
-                f"H3 com resolução muito alta (individualizante): {h3_val}"
+    def test_h3_index_unico(self, df_ouro_minimo):
+        assert df_ouro_minimo["H3_INDEX"].nunique() == len(df_ouro_minimo), \
+            "H3_INDEX deve ser único por linha no ouro"
 
-    def test_agregacao_minima_na_camada_ouro(self, df_ouro_valido):
-        """
-        Na camada ouro, QTD_CRIMES deve ser sempre >= 1 por hexágono-mês.
-        Hexágonos com 0 crimes não são transmitidos ao Looker.
-        """
-        df = df_ouro_valido.to_pandas()
-        assert (df["QTD_CRIMES"] >= 1).all(), \
-            "Ouro não deve conter hexágonos com 0 crimes — filtragem antes da transmissão"
+    def test_escore_total_positivo(self, df_ouro_minimo):
+        assert (df_ouro_minimo["ESCORE_TOTAL"] > 0).all(), \
+            "ESCORE_TOTAL deve ser positivo"
 
-    def test_dados_sao_publicos_e_anonimizados(self, df_prata_valido):
-        """
-        Verifica que a fonte dos dados é pública (SSP-SP) e já anonimizada.
-        Nenhum campo de identificação pessoal direta deve estar presente.
-        """
-        colunas = set(c.upper() for c in df_prata_valido.columns)
-        campos_identificadores = {
-            "BO_NUMERO", "NUM_BO",  # número do boletim pode ser pesquisável
-        }
-        # BO pode estar presente mas não é dado pessoal — apenas verifica que
-        # nenhum dado pessoal direto vazou
-        dados_pessoais_diretos = {"CPF", "NOME_VITIMA", "NOME_SUSPEITO"}
-        assert len(dados_pessoais_diretos & colunas) == 0
+    def test_qtd_crimes_positivo(self, df_ouro_minimo):
+        assert (df_ouro_minimo["QTD_CRIMES"] > 0).all(), \
+            "QTD_CRIMES deve ser positivo"
+
+    def test_prop_noite_madrugada_entre_0_1(self, df_ouro_minimo):
+        col = df_ouro_minimo["PROP_NOITE_MADRUGADA"]
+        assert (col >= 0).all() and (col <= 1).all(), \
+            "PROP_NOITE_MADRUGADA deve estar entre 0 e 1"
+
+    def test_prop_patrimonio_entre_0_1(self, df_ouro_minimo):
+        col = df_ouro_minimo["PROP_PATRIMONIO"]
+        assert (col >= 0).all() and (col <= 1).all()
+
+    def test_prop_violencia_entre_0_1(self, df_ouro_minimo):
+        col = df_ouro_minimo["PROP_VIOLENCIA_PESSOA"]
+        assert (col >= 0).all() and (col <= 1).all()
+
+    def test_latitude_dentro_sp(self, df_ouro_minimo):
+        lat = df_ouro_minimo["LATITUDE_MEDIA"]
+        assert (lat >= SP_LAT_MIN).all() and (lat <= SP_LAT_MAX).all(), \
+            f"Latitude fora do Estado de SP: {lat.min():.4f} – {lat.max():.4f}"
+
+    def test_longitude_dentro_sp(self, df_ouro_minimo):
+        lon = df_ouro_minimo["LONGITUDE_MEDIA"]
+        assert (lon >= SP_LON_MIN).all() and (lon <= SP_LON_MAX).all(), \
+            f"Longitude fora do Estado de SP: {lon.min():.4f} – {lon.max():.4f}"
+
+    def test_escore_gravidade_max_gte_medio(self, df_ouro_minimo):
+        assert (
+            df_ouro_minimo["ESCORE_GRAVIDADE_MAX"] >= df_ouro_minimo["ESCORE_MEDIO"]
+        ).all(), "ESCORE_GRAVIDADE_MAX deve ser >= ESCORE_MEDIO"
+
+    def test_escore_predito_nao_nulo(self, df_ouro_minimo):
+        assert df_ouro_minimo["ESCORE_PREDITO"].notna().all(), \
+            "ESCORE_PREDITO não pode ter NaN"
+
+    def test_sem_infinitos(self, df_ouro_minimo):
+        numericas = df_ouro_minimo.select_dtypes(include=[np.number])
+        assert not np.isinf(numericas.values).any(), \
+            "Ouro contém valores infinitos"
+
+    def test_escore_lag2_nao_negativo(self, df_ouro_minimo):
+        assert (df_ouro_minimo["ESCORE_LAG2"] >= 0).all(), \
+            "ESCORE_LAG2 não pode ser negativo"
+
+    def test_viz_1_nao_negativo(self, df_ouro_minimo):
+        assert (df_ouro_minimo["ESCORE_VIZ_1"] >= 0).all()
+
+    def test_viz_2_nao_negativo(self, df_ouro_minimo):
+        assert (df_ouro_minimo["ESCORE_VIZ_2"] >= 0).all()
+
+    def test_schema_polars_compativel(self, df_ouro_minimo):
+        """Garante que o ouro pode ser convertido para Polars sem erro."""
+        try:
+            ouro_pl = pl.from_pandas(df_ouro_minimo)
+            assert len(ouro_pl) == len(df_ouro_minimo)
+        except Exception as e:
+            pytest.fail(f"Conversão pandas→polars falhou: {e}")
+
+    def test_schema_serializavel_json(self, df_ouro_minimo):
+        """Garante que o schema pode ser serializado (BigQuery load)."""
+        schema = {col: str(dtype) for col, dtype in df_ouro_minimo.dtypes.items()}
+        try:
+            json.dumps(schema)
+        except Exception as e:
+            pytest.fail(f"Schema não serializável: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BLOCO 7 — INFRAESTRUTURA E VARIÁVEIS DE AMBIENTE
+# 6. NORMALIZAÇÃO E SINÔNIMOS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestInfraestrutura:
+class TestNormalizacao:
+    def test_normalizar_remove_acentos(self):
+        assert normalizar_texto("São Paulo") == "SAO PAULO"
 
+    def test_normalizar_maiusculas(self):
+        assert normalizar_texto("roubo de veículo") == "ROUBO DE VEICULO"
+
+    def test_normalizar_none(self):
+        assert normalizar_texto(None) == ""
+
+    def test_normalizar_numero(self):
+        resultado = normalizar_texto(123)
+        assert resultado == "123"
+
+    def test_renomear_sinonimos(self):
+        df = pl.DataFrame({"MUNICIPIO": ["SP"], "LAT": [1.0], "LON": [2.0]})
+        df_renomeado = renomear_sinonimos(df)
+        assert "NOME_MUNICIPIO" in df_renomeado.columns
+        assert "LATITUDE"       in df_renomeado.columns
+        assert "LONGITUDE"      in df_renomeado.columns
+
+    def test_renomear_sem_sinonimos_conhecidos(self):
+        df = pl.DataFrame({"COLUNA_ESTRANHA": ["x"]})
+        df_renomeado = renomear_sinonimos(df)
+        assert "COLUNA_ESTRANHA" in df_renomeado.columns
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. SECRETS DE AMBIENTE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSecrets:
     SECRETS_OBRIGATORIOS = [
         "R2_ENDPOINT_URL",
         "R2_ACCESS_KEY_ID",
         "R2_SECRET_ACCESS_KEY",
         "R2_BUCKET_NAME",
-    ]
-
-    SECRETS_OPCIONAIS = [
         "BQ_PROJECT_ID",
-        "BQ_DATASET",
-        "BQ_CREDENTIALS_JSON",
+        "BQ_DATASET_ID",
+        "BQ_SERVICE_ACCOUNT_JSON",
+        "LGPD_SALT",
         "DISCORD_SUCESSO",
         "DISCORD_ERRO",
     ]
 
-    def test_secrets_r2_presentes(self):
-        """Secrets do R2 Cloudflare são obrigatórios para o pipeline funcionar."""
-        ausentes = [s for s in self.SECRETS_OBRIGATORIOS if not os.environ.get(s)]
-        assert len(ausentes) == 0, \
-            f"Secrets obrigatórios ausentes: {ausentes}"
+    def test_secrets_presentes_no_ambiente(self):
+        faltando = [s for s in self.SECRETS_OBRIGATORIOS if not os.environ.get(s)]
+        if faltando:
+            pytest.skip(
+                f"Secrets não disponíveis em ambiente local (normal): {faltando}"
+            )
 
-    def test_secrets_opcionais_logados_se_ausentes(self):
-        """Secrets opcionais ausentes devem ser logados mas não devem quebrar o pipeline."""
-        ausentes = [s for s in self.SECRETS_OPCIONAIS if not os.environ.get(s)]
-        # Apenas loga — não falha
-        if ausentes:
-            print(f"\n⚠️  Secrets opcionais ausentes (pipeline continua): {ausentes}")
-        assert True
+    def test_lgpd_salt_nao_vazio_se_presente(self):
+        salt = os.environ.get("LGPD_SALT", "")
+        if salt:
+            assert len(salt.strip()) >= 16, \
+                "LGPD_SALT muito curto — mínimo 16 caracteres"
 
-    def test_run_id_e_deterministico_por_timestamp(self):
-        """RUN_ID deve ser gerado a partir de timestamp — diferente a cada execução."""
-        def gerar_run_id(ts: str) -> str:
-            return hashlib.sha256(ts.encode()).hexdigest()[:12]
+    def test_bq_project_nao_hardcoded(self):
+        """Garante que nenhum valor hardcoded de projeto existe no código fonte."""
+        caminho = os.path.join(
+            os.path.dirname(__file__), "..", "autobot", "motor_analise_preditiva.py"
+        )
+        if os.path.exists(caminho):
+            with open(caminho, "r", encoding="utf-8") as f:
+                conteudo = f.read()
+            assert "BQ_PROJECT_FIXO" not in conteudo, \
+                "BQ_PROJECT_FIXO hardcoded encontrado no código — usar só o secret"
 
-        ts1 = "2024-01-01T03:00:00"
-        ts2 = "2024-01-02T03:00:00"
-        assert gerar_run_id(ts1) != gerar_run_id(ts2)
-        assert len(gerar_run_id(ts1)) == 12
 
-    def test_versao_pipeline_formato_semver(self):
-        """VERSAO_PIPELINE deve seguir formato semver X.Y.Z."""
-        versao = "3.0.0"
-        partes = versao.split(".")
-        assert len(partes) == 3
-        assert all(p.isdigit() for p in partes)
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. PESOS E CONFIGURAÇÕES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPesos:
+    def test_todos_pesos_positivos(self):
+        for crime, peso in PESO_PENAL_BASE.items():
+            assert peso > 0, f"Peso negativo/zero para: {crime}"
+
+    def test_crimes_graves_peso_maximo(self):
+        assert PESO_PENAL_BASE["HOMICIDIO DOLOSO"] == 10.0
+        assert PESO_PENAL_BASE["LATROCINIO"]       == 10.0
+
+    def test_furto_menor_que_roubo(self):
+        assert PESO_PENAL_BASE["FURTO"] < PESO_PENAL_BASE["ROUBO"]
+
+    def test_todos_multiplicadores_positivos(self):
+        for perfil, crimes in MULTIPLICADOR_PERFIL.items():
+            for crime, mult in crimes.items():
+                assert mult > 0, \
+                    f"Multiplicador inválido para {perfil}/{crime}: {mult}"
+
+    def test_fator_madrugada_maior_que_noite(self):
+        assert FATOR_PERIODO["MADRUGADA"] > FATOR_PERIODO["NOITE"]
+
+    def test_manha_tarde_neutros(self):
+        assert FATOR_PERIODO["MANHA"]  == 1.0
+        assert FATOR_PERIODO["TARDE"]  == 1.0
+
+    def test_perfis_conhecidos(self):
+        perfis = set(MULTIPLICADOR_PERFIL.keys())
+        assert "MOTORISTA"    in perfis
+        assert "MOTOCICLISTA" in perfis
+        assert "PEDESTRE"     in perfis
+        assert "CICLISTA"     in perfis
