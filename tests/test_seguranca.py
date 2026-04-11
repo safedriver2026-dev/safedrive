@@ -29,16 +29,29 @@ def test_check_ouro_schema():
         "PROP_NOITE",
         "PROP_MADRUGADA",
         # Proporções de Perfil de Vítima
-        "PROP_CICLISTA",
-        "PROP_PEDESTRE",
-        "PROP_MOTOCICLISTA",
+        "PROP_PATRIMONIO", # Já existia, mas é um tipo de crime, não perfil de vítima. Mantido para compatibilidade.
         "PROP_MOTORISTA",
-        "PROP_GERAL",
+        "PROP_MOTO", # Corresponde a MOTOCICLISTA
+        "PROP_CICLISTA", # Nova proporção
+        "PROP_PEDESTRE", # Nova proporção
+        "PROP_GERAL_VITIMA", # Nova proporção para 'GERAL'
+        # Outras proporções
         "PROP_FERIADO",
         "PROP_PAGAMENTO",
+        # Novas features de risco combinadas
+        "RISCO_NOITE_PATRIMONIO",
+        "RISCO_MOTO_NOITE",
+        "RISCO_MOTORISTA_PAGTO",
+        # Outras features do H3
+        "LAT_STD",
+        "LON_STD",
+        "CRIMES_POR_ANO",
+        "CRIMES_POND_POR_ANO",
     ]
 
-    assert all(c in df.columns for c in colunas_obrigatorias)
+    # Verificando se todas as colunas obrigatórias estão presentes
+    assert all(c in df.columns for c in colunas_obrigatorias), \
+        f"Colunas ausentes na camada Ouro: {set(colunas_obrigatorias) - set(df.columns)}"
 
 
 def test_geometria_wkt_se_existir():
@@ -51,12 +64,9 @@ def test_geometria_wkt_se_existir():
         pytest.skip("Arquivo da camada Ouro ausente")
 
     df = pl.read_parquet(p)
-
-    if "GEOMETRIA_WKT" not in df.columns:
-        pytest.skip("GEOMETRIA_WKT ausente (uso opcional).")
-
-    non_null = df.select(pl.col("GEOMETRIA_WKT").is_not_null().sum())[0, 0]
-    assert non_null > 0, "Coluna GEOMETRIA_WKT presente, mas totalmente nula."
+    if "GEOMETRIA_WKT" in df.columns:
+        assert df["GEOMETRIA_WKT"].is_not_null().any(), \
+            "Coluna GEOMETRIA_WKT existe, mas está totalmente nula."
 
 
 def test_filtro_sp():
@@ -71,7 +81,8 @@ def test_filtro_sp():
     f = df.filter(
         (pl.col("LATITUDE_MEDIA") < -25.5) | (pl.col("LATITUDE_MEDIA") > -19.5)
     )
-    assert f.height == 0
+    assert f.height == 0, \
+        "Registros fora da faixa de latitude esperada para SP encontrados na camada Ouro."
 
 
 def test_lgpd():
@@ -84,8 +95,10 @@ def test_lgpd():
         pytest.skip("Arquivo da camada Prata ausente")
 
     df = pl.read_parquet(p)
-    assert not any("NUM" in c.upper() for c in df.columns)
-    assert "ID_ANONIMO" in df.columns
+    assert not any("NUM" in c.upper() for c in df.columns), \
+        "Coluna com 'NUM' (potencial dado sensível) encontrada na camada Prata."
+    assert "ID_ANONIMO" in df.columns, \
+        "Coluna ID_ANONIMO ausente na camada Prata."
 
 
 def test_auditoria_shap():
@@ -97,7 +110,8 @@ def test_auditoria_shap():
         pytest.skip("Arquivo shap_audit ausente")
 
     df = pl.read_parquet(p)
-    assert "VARIAVEL" in df.columns and "GRAU_IMPORTANCIA" in df.columns
+    assert "VARIAVEL" in df.columns and "GRAU_IMPORTANCIA" in df.columns, \
+        "Colunas VARIAVEL ou GRAU_IMPORTANCIA ausentes no shap_audit.parquet."
 
 
 def test_validacao_real_previsto():
@@ -114,4 +128,5 @@ def test_validacao_real_previsto():
 
     df = pl.read_parquet(p)
     colunas_obrigatorias = ["CRIMES_REAIS", "ESCORE_RISCO", "CODIGO_H3", "ERRO_ABS"]
-    assert all(c in df.columns for c in colunas_obrigatorias)
+    assert all(c in df.columns for c in colunas_obrigatorias), \
+        f"Colunas ausentes na validação do modelo: {set(colunas_obrigatorias) - set(df.columns)}"
