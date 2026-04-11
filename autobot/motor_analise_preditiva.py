@@ -178,18 +178,17 @@ class SafeDriver:
         self.feriados = list(
             holidays.Brazil(subdiv="SP", years=range(2022, 2027)).keys()
         )
-        self.meta = self.pastas["raw"] / "meta.json"
+        # O nome do arquivo meta.json no R2 é tracking_ssp.json
+        self.meta = self.pastas["raw"] / "tracking_ssp.json" 
 
-    def cdc_check(self, ano, url, sessao, path_parquet: Path):
-        # Este método agora é mais um "check_remote_status" para a SSP
-        # A lógica principal de CDC será no sincronizar_raw
+    def cdc_check(self, ano, url, sessao):
         try:
             r = sessao.head(url, timeout=30, verify=False, allow_redirects=True)
             size = int(r.headers.get("Content-Length", 0))
-            return True, size # Retorna que o remoto está acessível e seu tamanho
+            return True, size
         except requests.exceptions.RequestException as e:
             print(f"⚠️ CDC: Falha ao verificar SSP para {ano}: {e}", file=sys.stderr)
-            return False, 0 # Retorna que o remoto não está acessível
+            return False, 0
         except Exception as e:
             print(f"❌ CDC: Erro inesperado ao verificar SSP para {ano}: {e}", file=sys.stderr)
             return False, 0
@@ -229,7 +228,6 @@ class SafeDriver:
 
     def download_do_r2(self, chave_r2: str, arquivo_local: Path):
         if not self.s3:
-            print("⚠️ R2: Credenciais S3 não configuradas. Pulando download do R2.", file=sys.stderr)
             return False
         try:
             self.s3.download_file(self.bucket, chave_r2, str(arquivo_local))
@@ -237,6 +235,15 @@ class SafeDriver:
             return True
         except Exception as e:
             print(f"❌ R2: Falha no download de {chave_r2} do R2: {e}", file=sys.stderr)
+            return False
+
+    def r2_object_exists(self, chave_r2: str) -> bool:
+        if not self.s3:
+            return False
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=chave_r2)
+            return True
+        except Exception:
             return False
 
     def sincronizar_raw(self):
@@ -247,161 +254,157 @@ class SafeDriver:
         sessao.mount("https://", adapter)
         sessao.mount("http://", adapter)
 
+        # R2 Key para o arquivo de meta
+        r2_meta_key = "raw/tracking_ssp.json"
+
+        # Tenta baixar o meta.json do R2 primeiro
+        if self.download_do_r2(r2_meta_key, self.meta):
+            print("☁️ R2: tracking_ssp.json baixado do R2.", file=sys.stdout)
+        else:
+            print("⚠️ R2: tracking_ssp.json não encontrado no R2 ou falha no download. Criando novo ou usando local.", file=sys.stdout)
+
+        # Carrega meta.json, ou inicializa se não existir
+        if self.meta.exists():
+            with open(self.meta, "r") as f:
+                meta_info = json.load(f)
+        else:
+            meta_info = {}
+
+        arquivos_para_processar = []
+
         for ano in anos:
             url_ssp = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
             tmp_xlsx = self.pastas["raw"] / f"SPDadosCriminais_{ano}.xlsx"
-            parquet_file = self.pastas["raw"] / f"SPDadosCriminais_{ano}.parquet"
-            r2_key = f"raw/SPDadosCriminais_{ano}.parquet"
+            # CORREÇÃO AQUI: Usar o nome do arquivo como está no R2
+            parquet_file_name = f"ssp_{ano}.parquet" 
+            parquet_file = self.pastas["raw"] / parquet_file_name
+            r2_key = f"raw/{parquet_file_name}" # E a chave do R2 também
 
-            print(f"\n--- Processando ano {ano} ---", file=sys.stdout)
+            print(f"\n--- Sincronizando ano {ano} ---", file=sys.stdout)
 
-            # 1. Tentar baixar do R2 primeiro
-            if self.download_do_r2(r2_key, parquet_file):
-                print(f"✅ Sincronização: Usando arquivo {ano} do R2.", file=sys.stdout)
-                continue # Próximo ano, já temos o arquivo
+            # 1. Verificar se o arquivo .parquet já existe no R2
+            r2_tem_arquivo = self.r2_object_exists(r2_key)
 
-            # 2. Se não está no R2, verificar SSP
-            print(f"🔄 Sincronização: Arquivo {ano} não encontrado no R2. Verificando SSP...", file=sys.stdout)
-            ssp_acessivel, ssp_size = self.cdc_check(ano, url_ssp, sessao, parquet_file)
+            # 2. Lógica para o ano mais recente (ou se o arquivo não está no R2)
+            if ano == max(anos) or not r2_tem_arquivo:
+                print(f"🔄 Verificando SSP para o ano {ano} (último ano ou não no R2)...", file=sys.stdout)
+                ssp_acessivel, ssp_size = self.cdc_check(ano, url_ssp, sessao)
 
-            # 3. Se SSP acessível e arquivo local existe, verificar CDC com SSP
-            if ssp_acessivel and parquet_file.exists():
-                with open(self.meta, "r") as f:
-                    m = json.load(f)
-                meta_ano = m.get(str(ano), {})
+                if ssp_acessivel:
+                    meta_ano = meta_info.get(str(ano), {})
 
-                if (
-                    meta_ano
-                    and meta_ano.get("tamanho_bytes") == ssp_size
-                    and meta_ano.get("sha256") == self.calcular_sha256(str(parquet_file))
-                ):
-                    print(f"✅ Sincronização: Arquivo {ano} local inalterado e corresponde à SSP. Usando cache local.", file=sys.stdout)
-                    continue # Próximo ano, cache local está bom
+                    # Se o arquivo local (ou no R2) é diferente da SSP, ou não temos meta, ou não está no R2
+                    if (
+                        not meta_ano
+                        or meta_ano.get("tamanho_bytes") != ssp_size
+                        or not r2_tem_arquivo # Se não está no R2, consideramos que precisa ser baixado e processado
+                    ):
+                        print(f"⬇️ Baixando {ano} da SSP (arquivo novo/atualizado)...", file=sys.stdout)
+                        if not self.baixar_robusto(url_ssp, tmp_xlsx, sessao):
+                            print(f"❌ Falha ao baixar {ano} da SSP. Pulando este ano.", file=sys.stderr)
+                            self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano} da SSP.")
+                            continue
+
+                        file_type = magic.from_file(str(tmp_xlsx), mime=True)
+                        if file_type != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+                            print(f"❌ Erro Crítico ao processar {ano}: Arquivo baixado não é um XLSX válido ({file_type}). Removendo e pulando.", file=sys.stderr)
+                            tmp_xlsx.unlink(missing_ok=True)
+                            self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Arquivo {ano} da SSP não é XLSX válido.")
+                            continue
+
+                        print(f"⚙️ Processando {ano}.xlsx para {parquet_file_name}...", file=sys.stdout)
+                        try:
+                            df_excel = pl.read_excel(str(tmp_xlsx), sheet_name=None)
+                            aba_valida = None
+                            for sheet_name, df_sheet in df_excel.items():
+                                if len(df_sheet.columns) >= 5:
+                                    aba_valida = df_sheet
+                                    break
+
+                            if aba_valida is None:
+                                raise ValueError("Nenhuma aba válida encontrada com 5 ou mais colunas.")
+
+                            aba_valida.write_parquet(parquet_file)
+                            tmp_xlsx.unlink(missing_ok=True)
+
+                            # Atualiza meta.json
+                            meta_info[str(ano)] = {
+                                "tamanho_bytes": ssp_size,
+                                "sha256": self.calcular_sha256(str(parquet_file)),
+                                "data_sincronizacao": hora_brasilia().isoformat(),
+                            }
+
+                            self.upload_para_r2(parquet_file, r2_key)
+                            arquivos_para_processar.append(parquet_file)
+
+                        except Exception as e:
+                            print(f"❌ Erro ao processar {ano}.xlsx: {e}. Pulando este ano.", file=sys.stderr)
+                            self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Erro ao processar XLSX: {e}")
+                            tmp_xlsx.unlink(missing_ok=True)
+                            continue
+                    else:
+                        print(f"✅ Arquivo {ano} na SSP inalterado e já no R2/local. Baixando do R2 para processamento local...", file=sys.stdout)
+                        if self.download_do_r2(r2_key, parquet_file):
+                            arquivos_para_processar.append(parquet_file)
+                        else:
+                            print(f"❌ Falha ao baixar {ano}.parquet do R2 para processamento local. Pulando.", file=sys.stderr)
+                            self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano}.parquet do R2 para local.")
+                            continue
+                else: # SSP inacessível
+                    print(f"⚠️ SSP inacessível para {ano}.", file=sys.stdout)
+                    if r2_tem_arquivo:
+                        print(f"⬇️ Baixando {ano}.parquet do R2 para processamento local (SSP inacessível)...", file=sys.stdout)
+                        if self.download_do_r2(r2_key, parquet_file):
+                            arquivos_para_processar.append(parquet_file)
+                        else:
+                            print(f"❌ Falha ao baixar {ano}.parquet do R2 para processamento local. Pulando.", file=sys.stderr)
+                            self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano}.parquet do R2 para local.")
+                            continue
+                    else:
+                        print(f"❌ SSP inacessível e arquivo {ano} não encontrado no R2. Pulando este ano.", file=sys.stderr)
+                        self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"SSP inacessível e {ano} não no R2.")
+                        continue
+            else: # Ano não é o mais recente e o arquivo já está no R2
+                print(f"✅ Arquivo {ano} já no R2 e não é o ano mais recente. Baixando do R2 para processamento local...", file=sys.stdout)
+                if self.download_do_r2(r2_key, parquet_file):
+                    arquivos_para_processar.append(parquet_file)
                 else:
-                    print(f"⚠️ Sincronização: Arquivo {ano} local desatualizado ou meta.json inconsistente. Baixando da SSP.", file=sys.stdout)
-            elif not ssp_acessivel and parquet_file.exists():
-                print(f"⚠️ Sincronização: SSP inacessível para {ano}. Usando cache local.", file=sys.stdout)
-                continue # Próximo ano, SSP fora, usa local
-            elif not ssp_acessivel and not parquet_file.exists():
-                print(f"❌ Sincronização: SSP inacessível e sem cache local para {ano}.", file=sys.stderr)
-                self.discord.notificar_info(f"SafeDriver Sync {ano}", f"SSP inacessível e sem cache local para {ano}. Pulando.")
-                continue # Próximo ano, não há como obter o arquivo
+                    print(f"❌ Falha ao baixar {ano}.parquet do R2 para processamento local. Pulando.", file=sys.stderr)
+                    self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano}.parquet do R2 para local.")
+                    continue
 
-            # 4. Se chegamos aqui, precisamos baixar da SSP
-            print(f"⬇️ Sincronização: Baixando {ano} da SSP...", file=sys.stdout)
-            if not self.baixar_robusto(url_ssp, tmp_xlsx, sessao):
-                print(f"❌ Sincronização: Falha ao baixar {ano} da SSP após várias tentativas.", file=sys.stderr)
-                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano} da SSP.")
-                if tmp_xlsx.exists():
-                    os.remove(tmp_xlsx)
-                continue # Próximo ano
+        # Salva o meta.json atualizado no R2
+        with open(self.meta, "w") as f:
+            json.dump(meta_info, f, indent=4)
+        self.upload_para_r2(self.meta, r2_meta_key)
+        print("☁️ R2: tracking_ssp.json atualizado e enviado para R2.", file=sys.stdout)
 
-            # 5. Verificar tipo de arquivo baixado
-            if not tmp_xlsx.exists():
-                print(f"❌ Sincronização: Arquivo {ano} não existe após download.", file=sys.stderr)
-                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Arquivo {ano} não existe após download da SSP.")
-                continue
+        self.arquivos_raw_sincronizados = arquivos_para_processar
 
-            file_type = magic.from_file(str(tmp_xlsx), mime=True)
-            if file_type != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-                print(f"❌ Sincronização: Arquivo {ano} não é um XLSX válido. Tipo detectado: {file_type}", file=sys.stderr)
-                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Arquivo {ano} baixado da SSP não é um XLSX válido. Tipo: {file_type}")
-                os.remove(tmp_xlsx)
-                continue
-
-            # 6. Processar XLSX para Parquet
-            try:
-                print(f"⚙️ Sincronização: Processando {ano}.xlsx para parquet...", file=sys.stdout)
-                df_excel = pl.read_excel(
-                    tmp_xlsx,
-                    sheet_name=None,
-                    engine="openpyxl",
-                    read_options={"skip_rows": 1},
-                )
-                df_list = []
-                for sheet_name, df_sheet in df_excel.items():
-                    f_cols = [c for c in df_sheet.columns if c.startswith("F")]
-                    if len(f_cols) >= 5:
-                        df_list.append(df_sheet.select(["D", "H", "N", "LAT", "LON"]))
-                if df_list:
-                    m_data = pl.concat(df_list, how="vertical_relaxed")
-                    m_data.write_parquet(parquet_file)
-                    sha256_hash = self.calcular_sha256(str(parquet_file))
-
-                    with open(self.meta, "r+") as f:
-                        m = json.load(f)
-                        m[str(ano)] = {"tamanho_bytes": ssp_size, "sha256": sha256_hash}
-                        f.seek(0)
-                        json.dump(m, f, indent=4)
-                        f.truncate()
-                    print(f"✅ Sincronização: Arquivo {ano}.parquet criado e meta.json atualizado.", file=sys.stdout)
-                    self.upload_para_r2(parquet_file, r2_key) # Upload para R2 após processamento
-                else:
-                    print(f"⚠️ Sincronização: Nenhum dado criminal estruturado encontrado na planilha {ano}. Pulando.", file=sys.stderr)
-                    self.discord.notificar_info(f"SafeDriver Sync {ano}", f"Nenhum dado criminal estruturado encontrado na planilha {ano}.")
-                if tmp_xlsx.exists():
-                    os.remove(tmp_xlsx)
-            except Exception as e:
-                print(f"❌ Sincronização: Erro ao processar {ano}.xlsx: {e}", file=sys.stderr)
-                self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Erro ao processar {ano}.xlsx: {e}")
-                if tmp_xlsx.exists():
-                    os.remove(tmp_xlsx)
-                continue
-
-        if not self.meta.exists():
-            with open(self.meta, "w") as f:
-                json.dump({}, f)
-
-    def wkt(self, h3_id):
-        if not isinstance(h3_id, str):
-            return None
-        boundary = h3.h3_to_geo_boundary(h3_id)
-        # Formato WKT: POLYGON ((lon1 lat1, lon2 lat2, ..., lonN latN, lon1 lat1))
-        # h3.h3_to_geo_boundary retorna (lat, lon)
-        wkt_coords = ", ".join([f"{lon} {lat}" for lat, lon in boundary])
-        return f"POLYGON (({wkt_coords}, {boundary[0][1]} {boundary[0][0]}))"
 
     def publicar_bigquery_a_partir_de_arquivos(self, bq_project, bq_dataset, bq_cred_json):
-        print("\n🚀 Publicando Camada Ouro no BigQuery...", file=sys.stdout)
-        status_bq = "SUCESSO"
-        try:
-            enviar_para_bigquery(
-                pl.read_parquet(self.pastas["ouro"] / "dashboard_final.parquet"),
-                "sd_dashboard_final",
-                bq_project,
-                bq_dataset,
-                bq_cred_json,
-            )
-            enviar_para_bigquery(
-                pl.read_parquet(self.pastas["ouro"] / "validacao_modelo.parquet"),
-                "sd_validacao_modelo",
-                bq_project,
-                bq_dataset,
-                bq_cred_json,
-            )
-            enviar_para_bigquery(
-                pl.read_parquet(self.pastas["ouro"] / "shap_audit.parquet"),
-                "sd_shap_audit",
-                bq_project,
-                bq_dataset,
-                bq_cred_json,
-            )
-            print("✅ BigQuery: Publicação concluída.", file=sys.stdout)
-        except Exception as e:
-            print(f"❌ BigQuery: Falha na publicação: {e}", file=sys.stderr)
-            self.discord.notificar_erro("SafeDriver BigQuery", f"Falha na publicação no BigQuery: {e}")
-            status_bq = "FALHA"
-        return status_bq
+        df_dashboard = pl.read_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
+        enviar_para_bigquery(df_dashboard, "sd_dashboard_final", bq_project, bq_dataset, bq_cred_json)
+        print("📊 Publicado sd_dashboard_final no BigQuery.", file=sys.stdout)
+
+        df_validacao = pl.read_parquet(self.pastas["ouro"] / "validacao_modelo.parquet")
+        enviar_para_bigquery(df_validacao, "sd_validacao_modelo", bq_project, bq_dataset, bq_cred_json)
+        print("✅ Publicado sd_validacao_modelo no BigQuery.", file=sys.stdout)
+
+        df_shap = pl.read_parquet(self.pastas["ouro"] / "shap_audit.parquet")
+        enviar_para_bigquery(df_shap, "sd_shap_audit", bq_project, bq_dataset, bq_cred_json)
+        print("🔍 Publicado sd_shap_audit no BigQuery.", file=sys.stdout)
 
     def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
-        print("⚙️ Construindo Camada Ouro e Validando Modelos...", file=sys.stdout)
-        prata = pl.read_parquet(self.pastas["prata"] / "camada_prata.parquet")
+        print("✨ Construindo Camada Ouro e Modelos...", file=sys.stdout)
 
-        crimes_por_h3 = (
-            prata.group_by(["CODIGO_H3", "ANO"])
+        df_prata = pl.read_parquet(self.pastas["prata"] / "camada_prata.parquet")
+
+        crimes_por_h3_ano = (
+            df_prata.group_by(["CODIGO_H3", "ANO"])
             .agg(
+                pl.count().alias("CRIMES_POR_ANO"),
                 pl.col("PESO_PENAL").sum().alias("CRIMES_POND_POR_ANO"),
-                pl.col("PESO_PENAL").count().alias("CRIMES_POR_ANO"),
                 pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
                 pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
                 pl.col("LAT").std().alias("LAT_STD"),
@@ -434,7 +437,7 @@ class SafeDriver:
         )
 
         features_h3 = (
-            crimes_por_h3.group_by("CODIGO_H3")
+            crimes_por_h3_ano.group_by("CODIGO_H3")
             .agg(
                 pl.col("CRIMES_POR_ANO").sum().alias("CRIMES_REAIS"),
                 pl.col("CRIMES_POND_POR_ANO").sum().alias("CRIMES_POND_TOTAIS"),
@@ -574,13 +577,14 @@ class SafeDriver:
         self.publicar_bigquery_a_partir_de_arquivos(bq_project, bq_dataset, bq_cred_json)
 
     def processar(self):
+        print("Iniciando Verificação de Integridade (Self-Healing)...", file=sys.stdout)
         self.sincronizar_raw()
 
         bq_project = os.environ.get("BQ_PROJECT_ID")
         bq_dataset = os.environ.get("BQ_DATASET_ID")
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
-        arquivos_limpos = list(self.pastas["raw"].glob("*.parquet"))
+        arquivos_limpos = self.arquivos_raw_sincronizados
         if not arquivos_limpos:
             msg = "Nenhum arquivo RAW válido encontrado após sincronização."
             self.discord.notificar_erro("SafeDriver Sync", msg)
