@@ -34,22 +34,6 @@ jobs:
           pip install --no-cache-dir polars pandas numpy catboost lightgbm scikit-learn holidays boto3 shap google-cloud-bigquery google-auth-oauthlib fastexcel python-magic
           conda install -c conda-forge h3-py -y # Instala h3-py via conda-forge
 
-      - name: Cache Datalake Raw e Meta
-        uses: actions/cache@v4
-        with:
-          path: datalake/raw # Caminho para a pasta raw
-          key: ${{ runner.os }}-datalake-raw-${{ hashFiles('datalake/raw/**') }} # Chave baseada no conteúdo
-          restore-keys: |
-            ${{ runner.os }}-datalake-raw- # Fallback para qualquer cache raw
-
-      - name: Cache Meta.json
-        uses: actions/cache@v4
-        with:
-          path: datalake/raw/meta.json # Caminho para o arquivo meta.json
-          key: ${{ runner.os }}-meta-json-${{ hashFiles('datalake/raw/meta.json') }} # Chave baseada no conteúdo
-          restore-keys: |
-            ${{ runner.os }}-meta-json- # Fallback para qualquer cache meta
-
       - name: Executar Pipeline SafeDriver
         shell: bash -l {0}
         env:
