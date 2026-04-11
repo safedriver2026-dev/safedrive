@@ -1,871 +1,512 @@
-# autobot/motor_analise_preditiva.py
-"""
-SafeDriver_Motor_V1.0.0
-Pipeline preditivo de segurança urbana — Estado de São Paulo
-Estratégia: R2 → fallback download SSP-SP → salva no R2.
-Escore por perfil: MOTORISTA, MOTOCICLISTA, PEDESTRE, CICLISTA.
-"""
-import sys, os, traceback, hashlib, warnings, time, json, unicodedata
-from datetime import datetime, timedelta
-from io import BytesIO
-import urllib3
-import polars as pl
+import sys, os, json, hashlib
+import pytest
 import pandas as pd
 import numpy as np
-import h3
-import holidays
-import boto3
-from botocore.exceptions import ClientError
-import joblib
-from google.cloud import bigquery
-from google.oauth2 import service_account
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error, r2_score
-from lightgbm import LGBMRegressor
-from catboost import CatBoostRegressor
-from sklearn.ensemble import VotingRegressor
-import shap
+import polars as pl
+from unittest.mock import patch, MagicMock
 import requests
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from autobot.motor_analise_preditiva import (
+    NOME_SISTEMA,
+    PERFIS,
+    PESO_PENAL_BASE,
+    MULTIPLICADOR_PERFIL,
+    FATOR_PERIODO,
+    COLUNAS_CRITICAS,
+    SINONIMOS,
+    SP_LAT_MIN, SP_LAT_MAX,
+    SP_LON_MIN, SP_LON_MAX,
+    SSP_URL_TEMPLATE,
+    SSP_MAX_TENTATIVAS,
+    calcular_escore,
+    calcular_escores_todos_perfis,
+    classificar_periodo,
+    fator_periodo,
+    anonimizar_campo,
+    normalizar_texto,
+    renomear_sinonimos,
+    baixar_ssp,
+    TrackingSSP,
+    SafeDriver,
+)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# IDENTIDADE
-# ══════════════════════════════════════════════════════════════════════════════
+@pytest.fixture
+def salt_teste():
+    return "salt_unitario_safedriver_2024"
 
-NOME_SISTEMA     = "SafeDriver_Motor_V1.0.0"
-VERSAO_PIPELINE  = "5.5.0"
-VERSAO_FEATURES  = "v5"
-H3_RESOLUCAO     = 8
-MIN_REGISTROS    = 500
-ANO_ATUAL        = datetime.utcnow().year
-ANOS_DISPONIVEIS = list(range(2022, ANO_ATUAL + 1))
-FUSO_BRASILIA    = timedelta(hours=3)
-PERFIS           = ["MOTORISTA", "MOTOCICLISTA", "PEDESTRE", "CICLISTA"]
+@pytest.fixture
+def df_prata_valido():
+    n = 100
+    return pl.DataFrame({
+        "H3_INDEX":              [f"8a2a100d{i:04x}fff" for i in range(n)],
+        "LATITUDE_F":            np.random.uniform(SP_LAT_MIN, SP_LAT_MAX, n),
+        "LONGITUDE_F":           np.random.uniform(SP_LON_MIN, SP_LON_MAX, n),
+        "RUBRICA":               np.random.choice(["ROUBO", "FURTO", "HOMICIDIO DOLOSO"], n),
+        "PERIODO_DIA":           np.random.choice(["MANHA", "TARDE", "NOITE", "MADRUGADA"], n),
+        "IS_NOITE_MADRUGADA":    np.random.randint(0, 2, n),
+        "IS_PATRIMONIO":         np.random.randint(0, 2, n),
+        "IS_VIOLENCIA_PESSOA":   np.random.randint(0, 2, n),
+        "NOME_MUNICIPIO":        np.random.choice(["SAO PAULO", "CAMPINAS"], n),
+        "DATA_OCORRENCIA_BO":    pd.to_datetime(pd.date_range("2023-01-01", periods=n, freq="D")),
+        "ANO":                   np.random.randint(2022, 2025, n),
+        "ESCORE_MOTORISTA":      np.random.uniform(1.0, 15.0, n),
+        "ESCORE_MOTOCICLISTA":   np.random.uniform(1.0, 15.0, n),
+        "ESCORE_PEDESTRE":       np.random.uniform(1.0, 15.0, n),
+        "ESCORE_CICLISTA":       np.random.uniform(1.0, 15.0, n),
+        "LOGRADOURO_HASH":       [hashlib.sha256(f"RUA {i}-salt".encode()).hexdigest() for i in range(n)],
+        "NUMERO_LOGRADOURO_HASH":[hashlib.sha256(f"{i}-salt".encode()).hexdigest() for i in range(n)],
+        "BAIRRO_HASH":           [hashlib.sha256(f"BAIRRO {i}-salt".encode()).hexdigest() for i in range(n)],
+    })
 
-# Prefixo fixo confirmado pelas imagens do Cloudflare R2
-R2_PREFIXO_RAW    = "safedriver/safedriver/datalake/raw/"
-R2_PREFIXO_PRATA  = "safedriver/safedriver/datalake/prata/"
-R2_PREFIXO_OURO   = "safedriver/safedriver/datalake/ouro/"
-R2_PREFIXO_MODELO = "safedriver/safedriver/datalake/modelos/"
-R2_TRACKING       = "safedriver/safedriver/datalake/raw/tracking_ssp.json"
+@pytest.fixture
+def df_ouro_valido():
+    n = 300
+    return pd.DataFrame({
+        "H3_INDEX":                [f"8a2a100d{i:04x}fff" for i in range(n)],
+        "QTD_CRIMES":              np.random.randint(1, 200, n),
+        "ESCORE_TOTAL":            np.random.uniform(10.0, 500.0, n),
+        "ESCORE_MEDIO":            np.random.uniform(1.0, 10.0, n),
+        "ESCORE_GRAVIDADE_MAX":    np.random.uniform(5.0, 15.0, n),
+        "ESCORE_MOTORISTA":        np.random.uniform(1.0, 15.0, n),
+        "ESCORE_MOTOCICLISTA":     np.random.uniform(1.0, 15.0, n),
+        "ESCORE_PEDESTRE":         np.random.uniform(1.0, 15.0, n),
+        "ESCORE_CICLISTA":         np.random.uniform(1.0, 15.0, n),
+        "LATITUDE_MEDIA":          np.random.uniform(SP_LAT_MIN, SP_LAT_MAX, n),
+        "LONGITUDE_MEDIA":         np.random.uniform(SP_LON_MIN, SP_LON_MAX, n),
+        "PROP_NOITE_MADRUGADA":    np.random.uniform(0.0, 1.0, n),
+        "PROP_PATRIMONIO":         np.random.uniform(0.0, 1.0, n),
+        "PROP_VIOLENCIA_PESSOA":   np.random.uniform(0.0, 1.0, n),
+        "ESCORE_LAG2":             np.random.uniform(5.0, 400.0, n),
+        "QTD_LAG2":                np.random.randint(1, 150, n),
+        "ESCORE_VIZ_1":            np.random.uniform(5.0, 400.0, n),
+        "QTD_CRIMES_VIZ":          np.random.randint(1, 150, n),
+        "ESCORE_PREDITO":          np.random.uniform(10.0, 500.0, n),
+        "MUNICIPIO_DOMINANTE":     np.random.choice(["SAO PAULO", "CAMPINAS"], n),
+        "IS_FERIADO":              np.random.randint(0, 2, n),
+        "ANO":                     np.random.randint(2022, 2025, n),
+        "DATA_REFERENCIA":         pd.to_datetime(pd.date_range("2023-01-01", periods=n, freq="D")),
+        "DIA_SEMANA":              np.random.randint(0, 7, n),
+        "MES":                     np.random.randint(1, 13, n),
+        "DIA_MES":                 np.random.randint(1, 32, n),
+    })
 
-# URL base da SSP-SP — só o ano muda
-SSP_URL_TEMPLATE  = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-SSP_TIMEOUT       = 300   # segundos — arquivo pode ter 100+ MB
-SSP_MAX_TENTATIVAS = 3
+class TestIdentidade:
+    def test_nome_sistema(self):
+        assert NOME_SISTEMA == "SafeDriver_Motor"
 
+    def test_perfis_completos(self):
+        assert set(PERFIS) == {"MOTORISTA", "MOTOCICLISTA", "PEDESTRE", "CICLISTA"}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PESOS E MULTIPLICADORES
-# ══════════════════════════════════════════════════════════════════════════════
+    def test_anos_disponiveis(self):
+        assert 2022 in ANOS_DISPONIVEIS
+        assert min(ANOS_DISPONIVEIS) == 2022
 
-PESO_PENAL_BASE = {
-    "HOMICIDIO DOLOSO":            10.0,
-    "LATROCINIO":                  10.0,
-    "EXTORSAO MEDIANTE SEQUESTRO": 10.0,
-    "ROUBO DE VEICULO":            10.0,
-    "ROUBO DE MOTOCICLETA":        10.0,
-    "ROUBO DE CARGA":              10.0,
-    "ATROPELAMENTO":                9.0,
-    "ESTUPRO":                      9.0,
-    "FURTO DE VEICULO":             8.0,
-    "FURTO DE MOTOCICLETA":         8.0,
-    "ROUBO":                        7.0,
-    "ACIDENTE COM MOTOCICLETA":     7.0,
-    "LESAO CORPORAL DOLOSA":        6.0,
-    "PORTE ILEGAL DE ARMA":         6.0,
-    "TRAFICO DE ENTORPECENTES":     5.0,
-    "ACIDENTE DE TRANSITO":         5.0,
-    "FURTO":                        4.0,
-}
+    def test_ssp_url_template(self):
+        url = SSP_URL_TEMPLATE.format(ano=2024)
+        assert "2024" in url
+        assert url.startswith("https://www.ssp.sp.gov.br")
+        assert url.endswith(".xlsx")
 
-MULTIPLICADOR_PERFIL = {
-    "MOTORISTA":    {"ROUBO DE VEICULO": 1.5, "FURTO DE VEICULO": 1.5, "ROUBO DE CARGA": 1.4, "LATROCINIO": 1.3},
-    "MOTOCICLISTA": {"ROUBO DE MOTOCICLETA": 1.5, "FURTO DE MOTOCICLETA": 1.5, "ACIDENTE COM MOTOCICLETA": 1.5},
-    "PEDESTRE":     {"ROUBO": 1.4, "LESAO CORPORAL DOLOSA": 1.4, "ATROPELAMENTO": 1.5, "ESTUPRO": 1.5},
-    "CICLISTA":     {"ROUBO": 1.3, "ATROPELAMENTO": 1.8, "ACIDENTE DE TRANSITO": 1.5},
-}
+class TestLGPD:
+    def test_anonimizar_retorna_sha256(self, salt_teste):
+        resultado = anonimizar_campo("Rua das Flores, 123", salt_teste)
+        assert len(resultado) == 64
+        assert all(c in "0123456789abcdef" for c in resultado)
 
-FATOR_PERIODO = {
-    "MADRUGADA": 1.4,
-    "MANHA":     1.0,
-    "TARDE":     1.0,
-    "NOITE":     1.3,
-}
+    def test_anonimizar_determinista(self, salt_teste):
+        r1 = anonimizar_campo("Av Paulista", salt_teste)
+        r2 = anonimizar_campo("Av Paulista", salt_teste)
+        assert r1 == r2
 
-SP_LAT_MIN, SP_LAT_MAX = -25.3, -19.8
-SP_LON_MIN, SP_LON_MAX = -53.2, -44.0
+    def test_anonimizar_salts_diferentes(self, salt_teste):
+        r1 = anonimizar_campo("Rua A", salt_teste)
+        r2 = anonimizar_campo("Rua A", "outro_salt")
+        assert r1 != r2
 
-SINONIMOS = {
-    "NOME_DEPARTAMENTO":  ["DEPARTAMENTO", "DEPTO"],
-    "NOME_SECCIONAL":     ["SECCIONAL"],
-    "NOME_DELEGACIA":     ["DELEGACIA"],
-    "NOME_MUNICIPIO":     ["MUNICIPIO", "MUN", "CIDADE"],
-    "LOGRADOURO":         ["RUA", "ENDERECO"],
-    "NUMERO_LOGRADOURO":  ["NUMERO", "NUM_LOGRADOURO"],
-    "BAIRRO":             ["NOME_BAIRRO"],
-    "LATITUDE":           ["LAT", "COORD_LAT", "LATITUDE_BO"],
-    "LONGITUDE":          ["LON", "LNG", "COORD_LON", "LONGITUDE_BO"],
-    "DATA_OCORRENCIA_BO": ["DATA_OCORRENCIA", "DT_OCORRENCIA"],
-    "HORA_OCORRENCIA_BO": ["HORA_OCORRENCIA", "HR_OCORRENCIA"],
-    "RUBRICA":            ["TIPO_CRIME", "NATUREZA_CRIMINAL"],
-    "DESCR_CONDUTA":      ["CONDUTA", "DESCRICAO_CONDUTA"],
-    "NATUREZA_APURADA":   ["NATUREZA", "NAT_APURADA"],
-    "DATA_REGISTRO":      ["DT_REGISTRO", "DATA_BO"],
-}
+    def test_anonimizar_valores_diferentes(self, salt_teste):
+        r1 = anonimizar_campo("Rua A", salt_teste)
+        r2 = anonimizar_campo("Rua B", salt_teste)
+        assert r1 != r2
 
-COLUNAS_CRITICAS = [
-    "NOME_DEPARTAMENTO", "NOME_MUNICIPIO",
-    "LOGRADOURO", "LATITUDE", "LONGITUDE", "DATA_OCORRENCIA_BO"
-]
+    def test_anonimizar_campo_vazio(self, salt_teste):
+        resultado = anonimizar_campo("", salt_teste)
+        assert len(resultado) == 64
 
+    def test_anonimizar_nao_expoe_original(self, salt_teste):
+        original  = "Rua Coronel Melo de Oliveira"
+        resultado = anonimizar_campo(original, salt_teste)
+        assert original.upper() not in resultado
+        assert "RUA" not in resultado
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UTILITÁRIOS
-# ══════════════════════════════════════════════════════════════════════════════
+class TestPeriodoDia:
+    @pytest.mark.parametrize("hora,esperado", [
+        ("00:00", "MADRUGADA"), ("03:30", "MADRUGADA"), ("05:59", "MADRUGADA"),
+        ("06:00", "MANHA"),     ("11:59", "MANHA"),
+        ("12:00", "TARDE"),     ("17:59", "TARDE"),
+        ("18:00", "NOITE"),     ("23:59", "NOITE"),
+    ])
+    def test_classificar_periodo(self, hora, esperado):
+        assert classificar_periodo(hora) == esperado
 
-def hora_brasilia() -> datetime:
-    return datetime.utcnow() - FUSO_BRASILIA
+    def test_periodo_hora_invalida(self):
+        assert classificar_periodo("XX:YY") == "MANHA"
 
-def sanitizar_secret(valor: str) -> str:
-    if not valor:
-        return ""
-    return "".join(c for c in valor if c.isprintable()).strip()
+    @pytest.mark.parametrize("hora,fator", [
+        ("02:00", 1.4), ("08:00", 1.0), ("15:00", 1.0), ("20:00", 1.3),
+    ])
+    def test_fator_periodo(self, hora, fator):
+        assert fator_periodo(hora) == fator
 
-def normalizar_texto(texto) -> str:
-    if not isinstance(texto, str):
-        return str(texto) if texto is not None else ""
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
-    return texto.upper().strip()
+    def test_manha_tarde_nao_sao_agravantes(self):
+        assert fator_periodo("09:00") == 1.0
+        assert fator_periodo("14:00") == 1.0
 
-def run_id_curto() -> str:
-    return hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
+    def test_noite_madrugada_sao_agravantes(self):
+        assert fator_periodo("20:00") > 1.0
+        assert fator_periodo("03:00") > 1.0
 
-def classificar_periodo(hora_str) -> str:
-    try:
-        h = int(str(hora_str).split(":")[0])
-    except Exception:
-        return "MANHA"
-    if 0 <= h < 6:
-        return "MADRUGADA"
-    elif 6 <= h < 12:
-        return "MANHA"
-    elif 12 <= h < 18:
-        return "TARDE"
-    else:
-        return "NOITE"
+    def test_madrugada_mais_agravante_que_noite(self):
+        assert fator_periodo("03:00") > fator_periodo("20:00")
 
-def fator_periodo(hora_str) -> float:
-    return FATOR_PERIODO[classificar_periodo(hora_str)]
+class TestEscore:
+    def test_escore_positivo(self):
+        assert calcular_escore("ROUBO", "20:00", "PEDESTRE") > 0
 
-def anonimizar_campo(valor: str, salt: str) -> str:
-    raw = f"{salt}:{normalizar_texto(str(valor))}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    def test_escore_noite_maior_que_manha(self):
+        assert calcular_escore("ROUBO", "20:00", "PEDESTRE") > \
+               calcular_escore("ROUBO", "09:00", "PEDESTRE")
 
-def calcular_escore(rubrica: str, hora_str: str, perfil: str = "MOTORISTA") -> float:
-    rubrica = normalizar_texto(rubrica)
-    peso    = PESO_PENAL_BASE.get(rubrica, 1.0)
-    mult    = MULTIPLICADOR_PERFIL.get(perfil, {}).get(rubrica, 1.0)
-    fator   = fator_periodo(hora_str)
-    return round(peso * mult * fator, 4)
+    def test_escore_madrugada_maior_que_noite(self):
+        assert calcular_escore("FURTO", "03:00", "MOTORISTA") > \
+               calcular_escore("FURTO", "20:00", "MOTORISTA")
 
-def calcular_escores_todos_perfis(rubrica: str, hora_str: str) -> dict:
-    return {perfil: calcular_escore(rubrica, hora_str, perfil) for perfil in PERFIS}
+    def test_escore_manha_igual_tarde(self):
+        assert calcular_escore("ROUBO", "09:00", "PEDESTRE") == \
+               calcular_escore("ROUBO", "14:00", "PEDESTRE")
 
-def renomear_sinonimos(df: pl.DataFrame) -> pl.DataFrame:
-    mapa = {}
-    colunas_atuais = set(df.columns)
-    for nome_canonico, sinonimos in SINONIMOS.items():
-        if nome_canonico not in colunas_atuais:
-            for sin in sinonimos:
-                if sin in colunas_atuais:
-                    mapa[sin] = nome_canonico
-                    break
-    return df.rename(mapa) if mapa else df
+    def test_escore_homicidio_maior_que_furto(self):
+        assert calcular_escore("HOMICIDIO DOLOSO", "12:00", "PEDESTRE") > \
+               calcular_escore("FURTO", "12:00", "PEDESTRE")
 
+    def test_escore_latrocinio_maximo(self):
+        e = calcular_escore("LATROCINIO", "12:00", "MOTORISTA")
+        assert e >= 10.0
 
-# ══════════════════════════════════════════════════════════════════════════════
-# DOWNLOAD SSP-SP
-# ══════════════════════════════════════════════════════════════════════════════
+    def test_escore_crime_desconhecido(self):
+        assert calcular_escore("CRIME_INEXISTENTE", "12:00", "MOTORISTA") > 0
 
-def baixar_ssp(ano: int) -> pd.DataFrame | None:
-    """
-    Baixa o Excel da SSP-SP para o ano informado.
-    Tenta SSP_MAX_TENTATIVAS vezes com backoff.
-    Retorna DataFrame pandas ou None se o ano não existir.
-    """
-    url = SSP_URL_TEMPLATE.format(ano=ano)
-    print(f"[SSP] Baixando {ano} → {url}")
+    def test_escore_perfil_motociclista(self):
+        assert calcular_escore("ROUBO DE MOTOCICLETA", "20:00", "MOTOCICLISTA") > \
+               calcular_escore("ROUBO DE MOTOCICLETA", "20:00", "PEDESTRE")
 
-    for tentativa in range(1, SSP_MAX_TENTATIVAS + 1):
+    def test_escore_retorna_float(self):
+        assert isinstance(calcular_escore("FURTO", "10:00", "CICLISTA"), float)
+
+    def test_escore_arredondado_4_casas(self):
+        e = calcular_escore("ROUBO", "20:00", "MOTORISTA")
+        assert round(e, 4) == e
+
+    def test_escore_todos_perfis_retorna_dict(self):
+        resultado = calcular_escores_todos_perfis("ROUBO DE VEICULO", "20:00")
+        assert set(resultado.keys()) == {f"ESCORE_{p.upper()}" for p in PERFIS}
+        assert all(v > 0 for v in resultado.values())
+
+    def test_escore_motorista_maior_roubo_veiculo(self):
+        r = calcular_escores_todos_perfis("ROUBO DE VEICULO", "20:00")
+        assert r["ESCORE_MOTORISTA"] >= r["ESCORE_PEDESTRE"]
+
+    def test_escore_motociclista_maior_roubo_moto(self):
+        r = calcular_escores_todos_perfis("ROUBO DE MOTOCICLETA", "12:00")
+        assert r["ESCORE_MOTOCICLISTA"] >= r["ESCORE_MOTORISTA"]
+
+    def test_escore_ciclista_maior_atropelamento(self):
+        r = calcular_escores_todos_perfis("ATROPELAMENTO", "12:00")
+        assert r["ESCORE_CICLISTA"] >= r["ESCORE_PEDESTRE"]
+
+class TestContratosPrata:
+    COLUNAS_OBRIGATORIAS = [
+        "H3_INDEX", "LATITUDE_F", "LONGITUDE_F", "RUBRICA", "PERIODO_DIA",
+        "IS_NOITE_MADRUGADA", "IS_PATRIMONIO", "IS_VIOLENCIA_PESSOA",
+        "NOME_MUNICIPIO", "DATA_OCORRENCIA_BO", "ANO",
+        "ESCORE_MOTORISTA", "ESCORE_MOTOCICLISTA", "ESCORE_PEDESTRE", "ESCORE_CICLISTA",
+        "LOGRADOURO_HASH", "NUMERO_LOGRADOURO_HASH", "BAIRRO_HASH"
+    ]
+
+    def test_colunas_presentes(self, df_prata_valido):
+        for col in self.COLUNAS_OBRIGATORIAS:
+            assert col in df_prata_valido.columns, f"Coluna ausente na prata: {col}"
+
+    def test_escores_perfil_positivos(self, df_prata_valido):
+        for col in ["ESCORE_MOTORISTA", "ESCORE_MOTOCICLISTA",
+                    "ESCORE_PEDESTRE", "ESCORE_CICLISTA"]:
+            assert (df_prata_valido[col] > 0).all(), f"{col} tem valores negativos/zero"
+
+    def test_h3_nao_nulo(self, df_prata_valido):
+        assert df_prata_valido["H3_INDEX"].is_not_null().all()
+
+    def test_periodo_valores_validos(self, df_prata_valido):
+        validos = {"MANHA", "TARDE", "NOITE", "MADRUGADA"}
+        assert set(df_prata_valido["PERIODO_DIA"].unique()).issubset(validos)
+
+    def test_coordenadas_sp(self, df_prata_valido):
+        assert df_prata_valido["LATITUDE_F"].is_between(SP_LAT_MIN, SP_LAT_MAX).all()
+        assert df_prata_valido["LONGITUDE_F"].is_between(SP_LON_MIN, SP_LON_MAX).all()
+
+    def test_is_noite_madrugada_binario(self, df_prata_valido):
+        assert set(df_prata_valido["IS_NOITE_MADRUGADA"].unique()).issubset({0, 1})
+
+class TestContratosOuro:
+    COLUNAS_OBRIGATORIAS = [
+        "H3_INDEX", "QTD_CRIMES", "ESCORE_TOTAL", "ESCORE_MEDIO",
+        "ESCORE_GRAVIDADE_MAX", "ESCORE_MOTORISTA", "ESCORE_MOTOCICLISTA",
+        "ESCORE_PEDESTRE", "ESCORE_CICLISTA", "LATITUDE_MEDIA", "LONGITUDE_MEDIA",
+        "PROP_NOITE_MADRUGADA", "PROP_PATRIMONIO", "PROP_VIOLENCIA_PESSOA",
+        "ESCORE_LAG2", "QTD_LAG2", "ESCORE_VIZ_1", "QTD_CRIMES_VIZ",
+        "ESCORE_PREDITO", "MUNICIPIO_DOMINANTE", "IS_FERIADO",
+    ]
+
+    def test_colunas_presentes(self, df_ouro_valido):
+        for col in self.COLUNAS_OBRIGATORIAS:
+            assert col in df_ouro_valido.columns, f"Coluna ausente no ouro: {col}"
+
+    def test_escores_perfil_positivos(self, df_ouro_valido):
+        for col in ["ESCORE_MOTORISTA", "ESCORE_MOTOCICLISTA",
+                    "ESCORE_PEDESTRE", "ESCORE_CICLISTA", "ESCORE_TOTAL", "ESCORE_PREDITO"]:
+            assert (df_ouro_valido[col] > 0).all(), f"{col} tem valores negativos/zero"
+
+    def test_h3_nao_nulo(self, df_ouro_valido):
+        assert df_ouro_valido["H3_INDEX"].notna().all()
+
+    def test_latitude_longitude_media_validas(self, df_ouro_valido):
+        assert df_ouro_valido["LATITUDE_MEDIA"].between(SP_LAT_MIN, SP_LAT_MAX).all()
+        assert df_ouro_valido["LONGITUDE_MEDIA"].between(SP_LON_MIN, SP_LON_MAX).all()
+
+    def test_proporcoes_entre_0_e_1(self, df_ouro_valido):
+        for col in ["PROP_NOITE_MADRUGADA", "PROP_PATRIMONIO", "PROP_VIOLENCIA_PESSOA", "IS_FERIADO"]:
+            assert df_ouro_valido[col].between(0, 1).all(), f"{col} fora do range [0, 1]"
+
+    def test_schema_polars_compativel(self, df_ouro_valido):
         try:
-            resp = requests.get(
-                url,
-                timeout=SSP_TIMEOUT,
-                verify=False,
-                headers={"User-Agent": "SafeDriver-Pipeline/5.5.0"},
-                stream=True,
-            )
-            if resp.status_code == 404:
-                print(f"[SSP] {ano} não disponível ainda (404) — pulando.")
-                return None
-            if resp.status_code != 200:
-                raise RuntimeError(f"HTTP {resp.status_code}")
-
-            # Lê em memória — evita arquivo temporário no runner
-            buf = BytesIO()
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                buf.write(chunk)
-            buf.seek(0)
-            tamanho_mb = buf.getbuffer().nbytes / (1024 * 1024)
-            print(f"[SSP] {ano} baixado — {tamanho_mb:.1f} MB")
-
-            # Tenta as duas engines disponíveis no ambiente
-            for engine in ("openpyxl", "xlrd"):
-                try:
-                    buf.seek(0)
-                    df = pd.read_excel(buf, engine=engine, dtype=str)
-                    print(f"[SSP] {ano} lido com engine={engine} — {len(df):,} linhas")
-                    return df
-                except Exception as e_eng:
-                    print(f"[SSP] engine {engine} falhou: {e_eng}")
-
-            print(f"[SSP] {ano} — nenhuma engine conseguiu ler o arquivo.")
-            return None
-
+            pl.from_pandas(df_ouro_valido)
         except Exception as e:
-            print(f"[SSP] tentativa {tentativa}/{SSP_MAX_TENTATIVAS} falhou: {e}")
-            if tentativa < SSP_MAX_TENTATIVAS:
-                time.sleep(10 * tentativa)
+            pytest.fail(f"Erro de compatibilidade Polars: {e}")
 
-    print(f"[SSP] {ano} — todas as tentativas esgotadas.")
-    return None
+class TestNormalizacaoSinonimos:
+    def test_normalizar_texto_maiusculas_sem_acentos(self):
+        assert normalizar_texto("São Paulo") == "SAO PAULO"
+        assert normalizar_texto("Rua Cândido Portinari") == "RUA CANDIDO PORTINARI"
 
+    def test_normalizar_texto_numeros_e_caracteres_especiais(self):
+        assert normalizar_texto("Rua 123-B") == "RUA 123-B"
 
-def converter_e_salvar_r2(df_raw: pd.DataFrame, ano: int, s3, bucket: str) -> int:
-    """Converte DataFrame pandas → parquet e salva no R2. Retorna tamanho em bytes."""
-    df_pl  = pl.from_pandas(df_raw.astype(str))
-    buf    = BytesIO()
-    df_pl.write_parquet(buf)
-    buf.seek(0)
-    dados  = buf.read()
-    chave  = f"{R2_PREFIXO_RAW}ssp_{ano}.parquet"
-    s3.put_object(Bucket=bucket, Key=chave, Body=dados)
-    print(f"[R2] ssp_{ano}.parquet salvo — {len(dados) / (1024*1024):.1f} MB")
-    return len(dados)
+    def test_normalizar_texto_vazio(self):
+        assert normalizar_texto("") == ""
 
+    def test_renomear_sinonimos_funciona(self):
+        df = pl.DataFrame({"DATA_OCORRENCIA": ["01/01/2023"]})
+        df_r = renomear_sinonimos(df)
+        assert "DATA_OCORRENCIA_BO" in df_r.columns
+        assert "DATA_OCORRENCIA" not in df_r.columns
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TRACKING
-# ══════════════════════════════════════════════════════════════════════════════
+    def test_renomear_sinonimos_multiplos(self):
+        df = pl.DataFrame({"MUN": ["SP"], "DT_OCORRENCIA": ["01/01/2023"]})
+        df_r = renomear_sinonimos(df)
+        assert "NOME_MUNICIPIO" in df_r.columns
+        assert "DATA_OCORRENCIA_BO" in df_r.columns
 
-class TrackingSSP:
-    def __init__(self, s3, bucket: str):
-        self.s3     = s3
-        self.bucket = bucket
-        self.dados  = {}
-        self._carregar()
+    def test_renomear_sem_sinonimos_conhecidos(self):
+        df = pl.DataFrame({"COLUNA_ESTRANHA": [1, 2, 3]})
+        df_r = renomear_sinonimos(df)
+        assert "COLUNA_ESTRANHA" in df_r.columns
 
-    def _carregar(self):
-        try:
-            obj  = self.s3.get_object(Bucket=self.bucket, Key=R2_TRACKING)
-            raw  = json.loads(obj["Body"].read().decode("utf-8"))
-            # Migração defensiva: garante que cada valor é dict
-            for ano, val in raw.items():
-                if isinstance(val, dict):
-                    self.dados[str(ano)] = val
-                elif isinstance(val, (int, float)):
-                    self.dados[str(ano)] = {"tamanho_bytes": int(val), "linhas": 0}
-                else:
-                    self.dados[str(ano)] = {"tamanho_bytes": 0, "linhas": 0}
-            print(f"[Tracking] Carregado — anos: {list(self.dados.keys())}")
-        except self.s3.exceptions.NoSuchKey:
-            print("[Tracking] tracking_ssp.json não encontrado — iniciando do zero.")
-        except Exception as e:
-            print(f"[Tracking] Erro ao carregar — iniciando do zero: {e}")
+class TestSecrets:
+    SECRETS_OBRIGATORIOS = [
+        "R2_ENDPOINT_URL",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_BUCKET_NAME",
+        "BQ_PROJECT_ID",
+        "BQ_DATASET_ID",
+        "BQ_SERVICE_ACCOUNT_JSON",
+        "LGPD_SALT",
+        "DISCORD_SUCESSO",
+        "DISCORD_ERRO",
+    ]
 
-    def salvar(self):
-        payload = json.dumps(self.dados, ensure_ascii=False, indent=2).encode("utf-8")
-        self.s3.put_object(Bucket=self.bucket, Key=R2_TRACKING, Body=payload)
+    def test_secrets_presentes_no_ambiente(self):
+        faltando = [s for s in self.SECRETS_OBRIGATORIOS if not os.environ.get(s)]
+        if faltando:
+            pytest.skip(f"Secrets não disponíveis localmente (normal): {faltando}")
 
-    def precisa_processar(self, ano: int, tamanho_atual: int) -> bool:
-        entrada = self.dados.get(str(ano), {})
-        if not isinstance(entrada, dict):
-            return True
-        return entrada.get("tamanho_bytes", 0) != tamanho_atual
+    def test_lgpd_salt_nao_vazio_se_presente(self):
+        salt = os.environ.get("LGPD_SALT", "")
+        if salt:
+            assert len(salt.strip()) >= 16, "LGPD_SALT muito curto — mínimo 16 caracteres"
 
-    def registrar(self, ano: int, tamanho_bytes: int, linhas: int):
-        self.dados[str(ano)] = {
-            "tamanho_bytes": tamanho_bytes,
-            "linhas":        linhas,
-            "atualizado_em": hora_brasilia().isoformat(),
+    def test_bq_project_nao_hardcoded(self):
+        caminho = os.path.join(
+            os.path.dirname(__file__), "..", "autobot", "motor_analise_preditiva.py"
+        )
+        if os.path.exists(caminho):
+            with open(caminho, "r", encoding="utf-8") as f:
+                conteudo = f.read()
+            assert "BQ_PROJECT_FIXO" not in conteudo, \
+                "BQ_PROJECT_FIXO hardcoded encontrado — usar só o secret"
+            assert "safe-driver-fc3a9" not in conteudo, \
+                "Project ID hardcoded no código — usar só o secret"
+
+class TestIntegracaoR2SSP:
+    @patch("requests.get")
+    @patch("boto3.client")
+    def test_baixar_ssp_sucesso(self, mock_boto_client, mock_requests_get):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        df_dummy = pd.DataFrame({"col1": [1, 2], "col2": ["A", "B"]})
+        excel_buffer = BytesIO()
+        df_dummy.to_excel(excel_buffer, index=False, engine="openpyxl")
+        excel_buffer.seek(0)
+        mock_response.content = excel_buffer.getvalue()
+        mock_requests_get.return_value = mock_response
+
+        df_baixado = baixar_ssp(2022)
+        assert df_baixado is not None
+        assert not df_baixado.empty
+        assert len(df_baixado) == 2
+        mock_requests_get.assert_called_once()
+
+    @patch("requests.get")
+    @patch("boto3.client")
+    def test_baixar_ssp_404(self, mock_boto_client, mock_requests_get):
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mock_requests_get.return_value = mock_response
+
+        df_baixado = baixar_ssp(2027)
+        assert df_baixado is None
+        mock_requests_get.assert_called_once()
+
+    @patch("requests.get")
+    @patch("boto3.client")
+    def test_baixar_ssp_falha_apos_retries(self, mock_boto_client, mock_requests_get):
+        mock_requests_get.side_effect = requests.exceptions.Timeout("Mock Timeout")
+
+        df_baixado = baixar_ssp(2022)
+        assert df_baixado is None
+        assert mock_requests_get.call_count == SSP_MAX_TENTATIVAS
+
+    @patch("boto3.client")
+    def test_tracking_ssp_init_migracao_int_para_dict(self, mock_boto_client):
+        mock_s3_obj = MagicMock()
+        mock_s3_obj.get_object.return_value = {
+            "Body": MagicMock(read=lambda: json.dumps({"2022": 12345}).encode("utf-8"))
         }
+        mock_boto_client.return_value = mock_s3_obj
 
+        tracking = TrackingSSP(mock_boto_client, "test-bucket", "test-tracking.json")
+        assert tracking.dados["2022"] == {"tamanho_bytes": 12345, "hash_sha256": "legacy_hash"}
+        assert not tracking.precisa_processar(2022, "legacy_hash", 12345)
+        assert tracking.precisa_processar(2022, "new_hash", 12345)
+        assert tracking.precisa_processar(2022, "legacy_hash", 54321)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MEMÓRIA DE DESEMPENHO
-# ══════════════════════════════════════════════════════════════════════════════
+    @patch("boto3.client")
+    def test_tracking_ssp_atualizar_e_salvar(self, mock_boto_client):
+        mock_s3_obj = MagicMock()
+        mock_s3_obj.get_object.side_effect = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        mock_boto_client.return_value = mock_s3_obj
 
-class MemoriaDesempenho:
-    CHAVE = "safedriver/safedriver/datalake/raw/memoria_desempenho.json"
+        tracking = TrackingSSP(mock_boto_client, "test-bucket", "test-tracking.json")
+        tracking.atualizar_tracking({"2023": {"tamanho_bytes": 500, "hash_sha256": "abc"}})
+        tracking.salvar_tracking()
 
-    def __init__(self, s3, bucket: str):
-        self.s3     = s3
-        self.bucket = bucket
-        self._dados = {}
-        self._carregar()
+        mock_s3_obj.put_object.assert_called_once()
+        args, kwargs = mock_s3_obj.put_object.call_args
+        assert kwargs["Key"] == "test-tracking.json"
+        salvo = json.loads(kwargs["Body"].decode("utf-8"))
+        assert salvo["2023"]["hash_sha256"] == "abc"
 
-    def _carregar(self):
-        try:
-            obj = self.s3.get_object(Bucket=self.bucket, Key=self.CHAVE)
-            self._dados = json.loads(obj["Body"].read().decode("utf-8"))
-            print(f"[Memória] Histórico carregado — runs: {len(self._dados)}")
-        except Exception:
-            print("[Memória] Sem histórico — primeira execução.")
+    @patch("autobot.motor_analise_preditiva.baixar_ssp")
+    @patch("boto3.client")
+    def test_sincronizar_raw_fallback_ssp(self, mock_boto_client, mock_baixar_ssp):
+        mock_s3_instance = MagicMock()
+        mock_s3_instance.get_object.side_effect = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        mock_boto_client.return_value = mock_s3_instance
 
-    def salvar(self):
-        payload = json.dumps(self._dados, ensure_ascii=False, indent=2).encode("utf-8")
-        self.s3.put_object(Bucket=self.bucket, Key=self.CHAVE, Body=payload)
+        df_ssp_mock = pd.DataFrame({"DATA_OCORRENCIA_BO": ["01/01/2022"], "LATITUDE": [-23.5], "LONGITUDE": [-46.6], "RUBRICA": ["FURTO"]})
+        mock_baixar_ssp.return_value = df_ssp_mock
 
-    def mae_anterior(self) -> float:
-        if not self._dados:
-            return float("inf")
-        ultimo = sorted(self._dados.keys())[-1]
-        return self._dados[ultimo].get("mae", float("inf"))
+        mock_tracking = MagicMock(spec=TrackingSSP)
+        mock_tracking.dados = {}
+        mock_tracking.precisa_processar.return_value = True
 
-    def registrar(self, mae: float, r2: float, n_hexagonos: int):
-        chave = hora_brasilia().strftime("%Y-%m-%dT%H:%M:%S")
-        self._dados[chave] = {"mae": mae, "r2": r2, "hexagonos": n_hexagonos}
+        with patch.dict(os.environ, {"R2_BUCKET_NAME": "test-bucket", "LGPD_SALT": "a"*16, "R2_ENDPOINT_URL": "http://mock", "R2_ACCESS_KEY_ID": "mock", "R2_SECRET_ACCESS_KEY": "mock"}):
+            app = SafeDriver()
+            app.s3 = mock_s3_instance
+            app.tracking = mock_tracking
+            app.ANOS_DISPONIVEIS = [2022]
 
+            app.sincronizar_raw()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# DISCORD
-# ══════════════════════════════════════════════════════════════════════════════
+            mock_baixar_ssp.assert_called_once_with(2022)
+            mock_s3_instance.put_object.assert_called_once()
+            assert not app.df_raw.is_empty()
+            assert len(app.df_raw) == 1
+            mock_tracking.atualizar_tracking.assert_called_once()
+            mock_tracking.salvar_tracking.assert_called_once()
 
-class DiscordNotifier:
-    def __init__(self, webhook_sucesso: str, webhook_erro: str):
-        self.ws = webhook_sucesso
-        self.we = webhook_erro
-
-    def _post(self, webhook: str, payload: dict):
-        if not webhook:
-            return
-        try:
-            requests.post(webhook, json=payload, timeout=15, verify=False)
-        except Exception as e:
-            print(f"[Discord] Falha ao enviar: {e}")
-
-    def relatorio_executivo(self, run_id, tempo, n_hex, mae, r2, melhoria, top_mun, top_feat):
-        emoji = "📈" if melhoria > 0 else "📉"
-        msg   = (
-            f"**SafeDriver | Run `{run_id}`**\n"
-            f"✅ Pipeline concluído em {tempo:.1f}s\n"
-            f"🔷 Hexágonos: {n_hex:,} | MAE: {mae:.4f} | R²: {r2:.4f}\n"
-            f"{emoji} Melhoria MAE: {melhoria:+.2f}%\n"
-            f"📍 Município crítico: **{top_mun}**\n"
-            f"🧠 Feature SHAP #1: `{top_feat}`"
-        )
-        self._post(self.ws, {"content": msg})
-
-    def relatorio_operacional(self, run_id, n_raw, n_prata, n_ouro,
-                               mae, r2, mae_ant, anos, status_bq, shap_top3, prefixo_raw):
-        shap_str = " | ".join([f"`{f}` {v:.4f}" for f, v in shap_top3]) if shap_top3 else "N/A"
-        msg = (
-            f"**[OPS] Run `{run_id}`**\n"
-            f"📦 Raw: {n_raw:,} | Prata: {n_prata:,} | Ouro: {n_ouro:,}\n"
-            f"📅 Anos: {anos}\n"
-            f"📊 MAE ant: {mae_ant:.4f} → atual: {mae:.4f} | R²: {r2:.4f}\n"
-            f"🗄️ BigQuery: {status_bq}\n"
-            f"🧠 SHAP top3: {shap_str}\n"
-            f"🗂️ Prefixo R2: `{prefixo_raw}`"
-        )
-        self._post(self.ws, {"content": msg})
-
-    def sem_novidades(self, run_id, tempo):
-        self._post(self.ws, {"content": f"**SafeDriver | Run `{run_id}`** — Sem dados novos ({tempo:.1f}s)"})
-
-    def alerta_erro(self, run_id, titulo, detalhe):
-        msg = f"🚨 **ERRO [{titulo}] | Run `{run_id}`**\n```{detalhe[:1800]}```"
-        self._post(self.we, {"content": msg})
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PIPELINE PRINCIPAL
-# ══════════════════════════════════════════════════════════════════════════════
-
-class SafeDriver:
-
-    def __init__(self):
-        self.t_inicio = time.time()
-        self.run_id   = run_id_curto()
-
-        # Secrets
-        endpoint  = sanitizar_secret(os.environ.get("R2_ENDPOINT_URL", ""))
-        key_id    = sanitizar_secret(os.environ.get("R2_ACCESS_KEY_ID", ""))
-        secret    = sanitizar_secret(os.environ.get("R2_SECRET_ACCESS_KEY", ""))
-        self.bucket = sanitizar_secret(os.environ.get("R2_BUCKET_NAME", ""))
-        self.salt   = sanitizar_secret(os.environ.get("LGPD_SALT", ""))
-
-        if not self.salt:
-            raise RuntimeError("LGPD_SALT não definido — abortando por segurança LGPD.")
-
-        print(f"[{NOME_SISTEMA}] Iniciando run {self.run_id}")
-        print(f"[R2] Bucket   : {self.bucket}")
-        print(f"[R2] Endpoint : {endpoint[:40]}...")
-
-        self.s3 = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            aws_access_key_id=key_id,
-            aws_secret_access_key=secret,
-            region_name="auto",
-        )
-
-        self.tracking        = TrackingSSP(self.s3, self.bucket)
-        self.memoria         = MemoriaDesempenho(self.s3, self.bucket)
-        self.anos_processados = []
-        self.df_raw          = pd.DataFrame()
-
-        ws = sanitizar_secret(os.environ.get("DISCORD_SUCESSO", ""))
-        we = sanitizar_secret(os.environ.get("DISCORD_ERRO", ""))
-        self.discord = DiscordNotifier(ws, we)
-
-    def _log(self, evento: str, dados: dict):
-        ts  = hora_brasilia().strftime("%H:%M:%S")
-        msg = json.dumps(dados, ensure_ascii=False)
-        print(f"  [{self.run_id}] {evento}: ***{msg}*** [{ts}]")
-
-    # ── SINCRONIZAR RAW ──────────────────────────────────────────────────────
-
-    def sincronizar_raw(self):
-        self._log("sincronizar_raw_inicio", {})
-        frames = []
-
-        for ano in ANOS_DISPONIVEIS:
-            chave = f"{R2_PREFIXO_RAW}ssp_{ano}.parquet"
-            tamanho_r2 = 0
-
-            # 1) Verifica se já existe no R2
-            try:
-                head = self.s3.head_object(Bucket=self.bucket, Key=chave)
-                tamanho_r2 = head["ContentLength"]
-                print(f"[R2] ssp_{ano}.parquet encontrado — {tamanho_r2 / (1024*1024):.1f} MB")
-            except ClientError as e:
-                if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
-                    print(f"[R2] ssp_{ano}.parquet não existe — tentando SSP-SP...")
-                else:
-                    print(f"[R2] Erro ao checar ssp_{ano}.parquet: {e}")
-
-            # 2) Se não existe no R2, baixa da SSP-SP e salva
-            if tamanho_r2 == 0:
-                df_ssp = baixar_ssp(ano)
-                if df_ssp is None or df_ssp.empty:
-                    print(f"[SSP] {ano} — sem dados disponíveis, pulando.")
-                    continue
-                tamanho_r2 = converter_e_salvar_r2(df_ssp, ano, self.s3, self.bucket)
-                self.tracking.registrar(ano, tamanho_r2, len(df_ssp))
-                self.tracking.salvar()
-
-            # 3) Verifica se precisa reprocessar
-            if not self.tracking.precisa_processar(ano, tamanho_r2):
-                print(f"[R2] ssp_{ano}.parquet inalterado — carregando do cache.")
-
-            # 4) Carrega o parquet do R2
-            try:
-                obj = self.s3.get_object(Bucket=self.bucket, Key=chave)
-                df  = pl.read_parquet(BytesIO(obj["Body"].read())).to_pandas()
-                frames.append(df)
-                self.anos_processados.append(str(ano))
-                self.tracking.registrar(ano, tamanho_r2, len(df))
-                print(f"[R2] ssp_{ano}.parquet carregado — {len(df):,} linhas")
-            except Exception as e:
-                print(f"[R2] Erro ao ler ssp_{ano}.parquet: {e}")
-
-        self.tracking.salvar()
-
-        if frames:
-            self.df_raw = pd.concat(frames, ignore_index=True)
-            print(f"[Raw] Total consolidado: {len(self.df_raw):,} registros | anos: {self.anos_processados}")
-            self._log("sincronizar_raw_fim", {
-                "total_registros": len(self.df_raw),
-                "anos": self.anos_processados
-            })
-        else:
-            print("[Raw] Nenhum dado disponível — pipeline encerrado.")
-            self._log("sincronizar_raw_sem_dados", {})
-
-    # ── CONSTRUIR PRATA ──────────────────────────────────────────────────────
-
-    def construir_prata(self) -> pd.DataFrame:
-        if self.df_raw.empty:
-            print("[Prata] df_raw vazio — nada a processar.")
-            return pd.DataFrame()
-
-        self._log("prata_inicio", {"registros_raw": len(self.df_raw)})
-
-        df = pl.from_pandas(self.df_raw.astype(str))
-        df = renomear_sinonimos(df)
-        df = df.with_columns([pl.col(c).map_elements(normalizar_texto, return_dtype=pl.Utf8)
-                               for c in df.columns if df[c].dtype == pl.Utf8])
-
-        # Filtro SP
-        for col_lat in ["LATITUDE", "LATITUDE_BO"]:
-            if col_lat in df.columns:
-                df = df.rename({col_lat: "LATITUDE"}) if col_lat != "LATITUDE" else df
-                break
-        for col_lon in ["LONGITUDE", "LONGITUDE_BO"]:
-            if col_lon in df.columns:
-                df = df.rename({col_lon: "LONGITUDE"}) if col_lon != "LONGITUDE" else df
-                break
-
-        df = df.to_pandas()
-
-        # Converter coordenadas
-        for col in ["LATITUDE", "LONGITUDE"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(
-                    df[col].str.replace(",", ".").str.strip(), errors="coerce"
-                )
-
-        if "LATITUDE" in df.columns and "LONGITUDE" in df.columns:
-            df = df[
-                df["LATITUDE"].between(SP_LAT_MIN, SP_LAT_MAX) &
-                df["LONGITUDE"].between(SP_LON_MIN, SP_LON_MAX)
-            ].copy()
-
-        if df.empty or len(df) < MIN_REGISTROS:
-            print(f"[Prata] Registros insuficientes após filtro SP: {len(df)}")
-            return pd.DataFrame()
-
-        # H3
-        df["H3_INDEX"] = df.apply(
-            lambda r: h3.latlng_to_cell(r["LATITUDE"], r["LONGITUDE"], H3_RESOLUCAO)
-            if pd.notna(r.get("LATITUDE")) and pd.notna(r.get("LONGITUDE")) else None,
-            axis=1
-        )
-        df = df.dropna(subset=["H3_INDEX"])
-
-        # Período do dia
-        hora_col = "HORA_OCORRENCIA_BO" if "HORA_OCORRENCIA_BO" in df.columns else None
-        if hora_col:
-            df["PERIODO_DIA"]        = df[hora_col].apply(classificar_periodo)
-            df["IS_NOITE_MADRUGADA"] = df["PERIODO_DIA"].isin(["NOITE", "MADRUGADA"]).astype(int)
-        else:
-            df["PERIODO_DIA"]        = "MANHA"
-            df["IS_NOITE_MADRUGADA"] = 0
-
-        # Escores por perfil
-        if "RUBRICA" in df.columns and hora_col:
-            for perfil in PERFIS:
-                df[f"ESCORE_{perfil}"] = df.apply(
-                    lambda r: calcular_escore(r.get("RUBRICA", ""), r.get(hora_col, "00:00"), perfil),
-                    axis=1
-                )
-            df["ESCORE"] = df[f"ESCORE_{PERFIS[0]}"]  # MOTORISTA como base
-        else:
-            for perfil in PERFIS:
-                df[f"ESCORE_{perfil}"] = 1.0
-            df["ESCORE"] = 1.0
-
-        # Flags de categoria
-        crimes_patrimonio = {
-            "ROUBO DE VEICULO","FURTO DE VEICULO","ROUBO DE MOTOCICLETA",
-            "FURTO DE MOTOCICLETA","ROUBO DE CARGA","FURTO","ROUBO"
+    @patch("autobot.motor_analise_preditiva.baixar_ssp")
+    @patch("boto3.client")
+    def test_sincronizar_raw_r2_existente_e_nao_alterado(self, mock_boto_client, mock_baixar_ssp):
+        mock_s3_instance = MagicMock()
+        parquet_data = pl.DataFrame({"DATA_OCORRENCIA_BO": ["01/01/2022"], "LATITUDE": [-23.5], "LONGITUDE": [-46.6], "RUBRICA": ["FURTO"]}).write_parquet(BytesIO()).getvalue()
+        mock_s3_instance.get_object.return_value = {
+            "Body": MagicMock(read=lambda: parquet_data),
+            "ContentLength": len(parquet_data)
         }
-        crimes_violencia = {
-            "HOMICIDIO DOLOSO","LATROCINIO","LESAO CORPORAL DOLOSA",
-            "ESTUPRO","ATROPELAMENTO"
-        }
-        if "RUBRICA" in df.columns:
-            df["IS_PATRIMONIO"]       = df["RUBRICA"].isin(crimes_patrimonio).astype(int)
-            df["IS_VIOLENCIA_PESSOA"] = df["RUBRICA"].isin(crimes_violencia).astype(int)
-        else:
-            df["IS_PATRIMONIO"]       = 0
-            df["IS_VIOLENCIA_PESSOA"] = 0
+        mock_boto_client.return_value = mock_s3_instance
 
-        # LGPD — anonimizar campos sensíveis
-        campos_sensiveis = [c for c in ["LOGRADOURO", "NUMERO_LOGRADOURO", "BAIRRO"] if c in df.columns]
-        for campo in campos_sensiveis:
-            df[campo] = df[campo].apply(lambda v: anonimizar_campo(str(v), self.salt))
+        mock_tracking = MagicMock(spec=TrackingSSP)
+        mock_tracking.dados = {"2022": {"tamanho_bytes": len(parquet_data), "hash_sha256": hashlib.sha256(parquet_data).hexdigest()}}
+        mock_tracking.precisa_processar.return_value = False
 
-        # Data
-        if "DATA_OCORRENCIA_BO" in df.columns:
-            df["DATA_OCORRENCIA_BO"] = pd.to_datetime(df["DATA_OCORRENCIA_BO"], errors="coerce")
+        with patch.dict(os.environ, {"R2_BUCKET_NAME": "test-bucket", "LGPD_SALT": "a"*16, "R2_ENDPOINT_URL": "http://mock", "R2_ACCESS_KEY_ID": "mock", "R2_SECRET_ACCESS_KEY": "mock"}):
+            app = SafeDriver()
+            app.s3 = mock_s3_instance
+            app.tracking = mock_tracking
+            app.ANOS_DISPONIVEIS = [2022]
 
-        # Salvar prata
-        prata_pl = pl.from_pandas(df)
-        buf      = BytesIO()
-        prata_pl.write_parquet(buf)
-        buf.seek(0)
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=f"{R2_PREFIXO_PRATA}prata_atual.parquet",
-            Body=buf.read(),
-        )
+            app.sincronizar_raw()
 
-        print(f"[Prata] {len(df):,} registros processados e salvos.")
-        self._log("prata_fim", {"registros": len(df)})
-        return df
+            mock_baixar_ssp.assert_not_called()
+            mock_s3_instance.put_object.assert_not_called()
+            assert app.df_raw.is_empty()
+            mock_tracking.atualizar_tracking.assert_not_called()
+            mock_tracking.salvar_tracking.assert_not_called()
 
-    # ── CONSTRUIR OURO ───────────────────────────────────────────────────────
+class TestPesos:
+    def test_todos_pesos_positivos(self):
+        for crime, peso in PESO_PENAL_BASE.items():
+            assert peso > 0, f"Peso inválido para: {crime}"
 
-    def construir_ouro(self, df_prata: pd.DataFrame,
-                       bq_project: str, bq_dataset: str, bq_cred: str):
-        if df_prata.empty:
-            print("[Ouro] prata vazia — abortando.")
-            return None
+    def test_crimes_graves_peso_maximo(self):
+        assert PESO_PENAL_BASE["HOMICIDIO DOLOSO"] == 10.0
+        assert PESO_PENAL_BASE["LATROCINIO"]       == 10.0
 
-        self._log("ouro_inicio", {"registros_prata": len(df_prata)})
+    def test_furto_menor_que_roubo(self):
+        assert PESO_PENAL_BASE["FURTO"] < PESO_PENAL_BASE["ROUBO"]
 
-        feriados_sp = holidays.Brazil(state="SP", years=ANOS_DISPONIVEIS)
+    def test_todos_multiplicadores_positivos(self):
+        for perfil, crimes in MULTIPLICADOR_PERFIL.items():
+            for crime, mult in crimes.items():
+                assert mult > 0, f"Multiplicador inválido: {perfil}/{crime}"
 
-        # Agregação por hexágono
-        agg_base = {
-            "QTD_CRIMES":   ("H3_INDEX", "count"),
-            "ESCORE_TOTAL": ("ESCORE",   "sum"),
-            "ESCORE_MEDIO": ("ESCORE",   "mean"),
-        }
-        if "LATITUDE" in df_prata.columns:
-            agg_base["LATITUDE_MEDIA"]  = ("LATITUDE",  "mean")
-            agg_base["LONGITUDE_MEDIA"] = ("LONGITUDE", "mean")
+    def test_fator_madrugada_maior_que_noite(self):
+        assert FATOR_PERIODO["MADRUGADA"] > FATOR_PERIODO["NOITE"]
 
-        agg = df_prata.groupby("H3_INDEX").agg(**agg_base).reset_index()
+    def test_manha_tarde_neutros(self):
+        assert FATOR_PERIODO["MANHA"] == 1.0
+        assert FATOR_PERIODO["TARDE"] == 1.0
 
-        # Escores por perfil agregados
-        for perfil in PERFIS:
-            col = f"ESCORE_{perfil}"
-            if col in df_prata.columns:
-                agg_perfil = df_prata.groupby("H3_INDEX")[col].mean().reset_index()
-                agg_perfil.columns = ["H3_INDEX", col]
-                agg = agg.merge(agg_perfil, on="H3_INDEX", how="left")
-
-        # Gravidade máxima
-        agg["ESCORE_GRAVIDADE_MAX"] = df_prata.groupby("H3_INDEX")["ESCORE"].max().values \
-            if len(agg) == len(df_prata.groupby("H3_INDEX")) \
-            else agg["ESCORE_MEDIO"] * 1.2
-
-        # Proporções
-        for flag, col_prop in [("IS_NOITE_MADRUGADA","PROP_NOITE_MADRUGADA"),
-                                ("IS_PATRIMONIO",     "PROP_PATRIMONIO"),
-                                ("IS_VIOLENCIA_PESSOA","PROP_VIOLENCIA_PESSOA")]:
-            if flag in df_prata.columns:
-                prop = df_prata.groupby("H3_INDEX")[flag].mean().reset_index()
-                prop.columns = ["H3_INDEX", col_prop]
-                agg = agg.merge(prop, on="H3_INDEX", how="left")
-            else:
-                agg[col_prop] = 0.0
-
-        # Município dominante
-        if "NOME_MUNICIPIO" in df_prata.columns:
-            mun = (df_prata.groupby("H3_INDEX")["NOME_MUNICIPIO"]
-                   .agg(lambda x: x.mode()[0] if not x.empty else "N/A")
-                   .reset_index())
-            mun.columns = ["H3_INDEX", "MUNICIPIO_DOMINANTE"]
-            agg = agg.merge(mun, on="H3_INDEX", how="left")
-
-        # Features temporais
-        if "DATA_OCORRENCIA_BO" in df_prata.columns:
-            df_prata["IS_FERIADO"] = df_prata["DATA_OCORRENCIA_BO"].apply(
-                lambda d: 1 if pd.notna(d) and d.date() in feriados_sp else 0
-            )
-            fer = df_prata.groupby("H3_INDEX")["IS_FERIADO"].mean().reset_index()
-            fer.columns = ["H3_INDEX", "IS_FERIADO"]
-            agg = agg.merge(fer, on="H3_INDEX", how="left")
-        else:
-            agg["IS_FERIADO"] = 0.0
-
-        # Lag e vizinhança
-        escore_map = agg.set_index("H3_INDEX")["ESCORE_TOTAL"].to_dict()
-        agg["ESCORE_LAG2"]    = agg["ESCORE_TOTAL"] * 0.9
-        agg["QTD_LAG2"]       = agg["QTD_CRIMES"]   * 0.9
-        agg["ESCORE_VIZ_1"]   = agg["H3_INDEX"].apply(
-            lambda h: np.mean([escore_map.get(v, 0) for v in h3.grid_disk(h, 1) if v != h]) or 0
-        )
-        agg["ESCORE_VIZ_2"]   = agg["H3_INDEX"].apply(
-            lambda h: np.mean([escore_map.get(v, 0) for v in h3.grid_disk(h, 2) if v != h]) or 0
-        )
-        agg["QTD_CRIMES_VIZ"] = agg["ESCORE_VIZ_1"]
-
-        # Modelo
-        features = [
-            "QTD_CRIMES", "ESCORE_MEDIO", "ESCORE_GRAVIDADE_MAX",
-            "PROP_NOITE_MADRUGADA", "PROP_PATRIMONIO", "PROP_VIOLENCIA_PESSOA",
-            "ESCORE_LAG2", "QTD_LAG2", "ESCORE_VIZ_1", "ESCORE_VIZ_2",
-            "QTD_CRIMES_VIZ", "IS_FERIADO",
-        ]
-        features = [f for f in features if f in agg.columns]
-        X = agg[features].fillna(0)
-        y = agg["ESCORE_TOTAL"]
-
-        tscv = TimeSeriesSplit(n_splits=5)
-        maes, r2s = [], []
-
-        lgbm = LGBMRegressor(n_estimators=400, learning_rate=0.05,
-                              num_leaves=63, random_state=42, verbose=-1)
-        cat  = CatBoostRegressor(iterations=400, learning_rate=0.05,
-                                  depth=6, random_seed=42, verbose=0,
-                                  loss_function="RMSE")
-        modelo = VotingRegressor([("lgbm", lgbm), ("cat", cat)])
-
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            modelo.fit(X_tr, y_tr)
-            pred     = modelo.predict(X_val)
-            fold_mae = mean_absolute_error(y_val, pred)
-            fold_r2  = r2_score(y_val, pred)
-            maes.append(fold_mae)
-            r2s.append(fold_r2)
-            print(f"[Ouro] Fold {fold+1}/5 — MAE={fold_mae:.4f} R²={fold_r2:.4f}")
-
-        mae = float(np.mean(maes))
-        r2  = float(np.mean(r2s))
-        print(f"[Ouro] Final — MAE={mae:.4f}  R²={r2:.4f}")
-
-        modelo.fit(X, y)
-        agg["ESCORE_PREDITO"] = modelo.predict(X)
-
-        # SHAP
-        shap_top3, shap_col_names, top_shap_feature = [], [], "N/A"
-        try:
-            explainer    = shap.TreeExplainer(modelo.estimators_[0])
-            shap_values  = explainer.shap_values(X)
-            importancias = sorted(
-                zip(features, np.abs(shap_values).mean(axis=0)),
-                key=lambda x: -x[1]
-            )
-            shap_top3        = importancias[:3]
-            top_shap_feature = shap_top3[0][0]
-            print(f"[Ouro] SHAP top3: {shap_top3}")
-            for i, feat in enumerate(features):
-                agg[f"SHAP_{feat}"] = shap_values[:, i]
-                shap_col_names.append(f"SHAP_{feat}")
-        except Exception as e:
-            print(f"[Ouro] SHAP não crítico: {e}")
-
-        # Município crítico
-        top_municipio = "N/A"
-        if "MUNICIPIO_DOMINANTE" in agg.columns:
-            try:
-                top_municipio = (
-                    agg.groupby("MUNICIPIO_DOMINANTE")["ESCORE_TOTAL"]
-                    .sum().sort_values(ascending=False).index[0]
-                )
-            except Exception:
-                pass
-
-        mae_ant  = self.memoria.mae_anterior()
-        melhoria = ((mae_ant - mae) / mae_ant * 100) if mae_ant != float("inf") else 0.0
-        self.memoria.registrar(mae, r2, len(agg))
-        self.memoria.salvar()
-
-        # Salvar modelo
-        buf_modelo = BytesIO()
-        joblib.dump(modelo, buf_modelo)
-        buf_modelo.seek(0)
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=f"{R2_PREFIXO_MODELO}modelo_{NOME_SISTEMA}.pkl",
-            Body=buf_modelo.read(),
-        )
-
-        # Salvar ouro
-        ouro_pl  = pl.from_pandas(agg)
-        buf_ouro = BytesIO()
-        ouro_pl.write_parquet(buf_ouro)
-        buf_ouro.seek(0)
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=f"{R2_PREFIXO_OURO}ouro_atual.parquet",
-            Body=buf_ouro.read(),
-        )
-        print(f"[Ouro] {len(agg):,} hexágonos | perfis: {PERFIS} | SHAP: {len(shap_col_names)} colunas")
-
-        # BigQuery
-        status_bq = "skipped"
-        if bq_project and bq_dataset and bq_cred:
-            try:
-                cred_info = json.loads(bq_cred)
-                creds     = service_account.Credentials.from_service_account_info(
-                    cred_info, scopes=["https://www.googleapis.com/auth/bigquery"]
-                )
-                client  = bigquery.Client(project=bq_project, credentials=creds)
-                tabela  = f"{bq_project}.{bq_dataset}.ouro_h3"
-                job_cfg = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-                job     = client.load_table_from_dataframe(agg, tabela, job_config=job_cfg)
-                job.result()
-                status_bq = f"ok — {len(agg):,} linhas → {tabela}"
-                print(f"[BigQuery] {status_bq}")
-            except Exception as e:
-                status_bq = f"erro: {str(e)[:300]}"
-                print(f"[BigQuery] {status_bq}")
-
-        self._log("ouro_fim", {
-            "hexagonos": len(agg), "mae": round(mae, 4),
-            "r2": round(r2, 4), "shap_top1": top_shap_feature,
-            "top_municipio": top_municipio, "perfis": PERFIS,
-        })
-
-        return (ouro_pl, mae, r2, mae_ant, melhoria, status_bq,
-                len(self.df_raw), len(df_prata), top_municipio,
-                top_shap_feature, shap_top3)
-
-    # ── PROCESSAR ────────────────────────────────────────────────────────────
-
-    def processar(self):
-        self._log("pipeline_iniciado", {
-            "sistema": NOME_SISTEMA, "versao": VERSAO_PIPELINE, "features": VERSAO_FEATURES
-        })
-
-        bq_project = sanitizar_secret(os.environ.get("BQ_PROJECT_ID", ""))
-        bq_dataset = sanitizar_secret(os.environ.get("BQ_DATASET_ID", ""))
-        bq_cred    = sanitizar_secret(os.environ.get("BQ_SERVICE_ACCOUNT_JSON", ""))
-
-        self.sincronizar_raw()
-        df_prata  = self.construir_prata()
-        resultado = self.construir_ouro(df_prata, bq_project, bq_dataset, bq_cred)
-
-        tempo = time.time() - self.t_inicio
-
-        if resultado:
-            (df_ouro, mae, r2, mae_ant, melhoria, status_bq,
-             n_raw, n_prata, top_municipio, top_shap_feature, shap_top3) = resultado
-
-            self.discord.relatorio_executivo(
-                self.run_id, tempo, len(df_ouro), mae, r2,
-                melhoria, top_municipio, top_shap_feature
-            )
-            self.discord.relatorio_operacional(
-                self.run_id, n_raw, n_prata, len(df_ouro),
-                mae, r2, mae_ant, self.anos_processados,
-                status_bq, shap_top3, R2_PREFIXO_RAW
-            )
-        else:
-            self.discord.sem_novidades(self.run_id, tempo)
-
-        self._log("pipeline_fim", {"tempo_segundos": round(tempo, 1)})
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRYPOINT
-# ══════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    app = SafeDriver()
-    try:
-        app.processar()
-    except Exception:
-        err = traceback.format_exc()
-        print("\n" + "=" * 60, file=sys.stderr)
-        print("ERRO FATAL", file=sys.stderr)
-        print("=" * 60, file=sys.stderr)
-        print(err, file=sys.stderr)
-        try:
-            app.discord.alerta_erro(app.run_id, "Falha Sistêmica", err)
-        except Exception:
-            pass
-        sys.exit(1)
+    def test_perfis_com_multiplicadores(self):
+        assert set(MULTIPLICADOR_PERFIL.keys()) == set(PERFIS)
