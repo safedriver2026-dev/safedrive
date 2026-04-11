@@ -20,7 +20,6 @@ from google.oauth2 import service_account
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
-
 # --------------------------------------------------------------------
 # Utilitários de data/hora e BigQuery
 # --------------------------------------------------------------------
@@ -339,7 +338,7 @@ class SafeDriver:
             bq_project, bq_dataset, "sd_shap_audit", bq_cred_json
         )
 
-        if dashboard_ok and validacao_ok && shap_ok:
+        if dashboard_ok and validacao_ok and shap_ok:
             return "✅ Tabelas já existem no BigQuery e estão disponíveis para o BI."
 
         try:
@@ -397,9 +396,14 @@ class SafeDriver:
 
         prata_path = self.pastas["prata"] / "camada_prata.parquet"
         if not prata_path.exists():
-            raise Exception("Camada Prata não encontrada. Não é possível reconstruir Ouro/Validação.")
+            raise Exception(
+                "Camada Prata não encontrada. Não é possível reconstruir Ouro/Validação."
+            )
 
-        print("♻️ Recalculando Camada Ouro, Validação e SHAP a partir da Prata (H3+ melhorado)...", file=sys.stdout)
+        print(
+            "♻️ Recalculando Camada Ouro, Validação e SHAP a partir da Prata (H3+ melhorado)...",
+            file=sys.stdout,
+        )
 
         # ---------- Carrega camada Prata ----------
         prata = pl.read_parquet(prata_path)
@@ -413,8 +417,7 @@ class SafeDriver:
 
         # ---------- Features por H3 ----------
         features_h3 = (
-            prata_h3
-            .group_by("CODIGO_H3")
+            prata_h3.group_by("CODIGO_H3")
             .agg(
                 [
                     pl.len().alias("CRIMES_REAIS"),
@@ -423,9 +426,15 @@ class SafeDriver:
                     pl.col("LAT").std(ddof=1).fill_null(0.0).alias("LAT_STD"),
                     pl.col("LON").std(ddof=1).fill_null(0.0).alias("LON_STD"),
                     (pl.col("PERIODO_DIA") == "NOITE").mean().alias("PROP_NOITE"),
-                    (pl.col("TIPO_CRIME") == "PATRIMONIO").mean().alias("PROP_PATRIMONIO"),
-                    (pl.col("PERFIL_VITIMA") == "MOTORISTA").mean().alias("PROP_MOTORISTA"),
-                    (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").mean().alias("PROP_MOTO"),
+                    (pl.col("TIPO_CRIME") == "PATRIMONIO").mean().alias(
+                        "PROP_PATRIMONIO"
+                    ),
+                    (pl.col("PERFIL_VITIMA") == "MOTORISTA").mean().alias(
+                        "PROP_MOTORISTA"
+                    ),
+                    (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").mean().alias(
+                        "PROP_MOTO"
+                    ),
                     pl.col("EH_FERIADO").mean().alias("PROP_FERIADO"),
                     pl.col("SEMANA_PAGAMENTO").mean().alias("PROP_PAGAMENTO"),
                     pl.col("ANO").n_unique().alias("QTD_ANOS_OBSERVADOS"),
@@ -445,15 +454,24 @@ class SafeDriver:
             )
             .with_columns(
                 [
-                    (pl.col("PROP_NOITE") * pl.col("PROP_PATRIMONIO")).alias("RISCO_NOITE_PATRIMONIO"),
-                    (pl.col("PROP_MOTO") * pl.col("PROP_NOITE")).alias("RISCO_MOTO_NOITE"),
-                    (pl.col("PROP_MOTORISTA") * pl.col("PROP_PAGAMENTO")).alias("RISCO_MOTORISTA_PAGTO"),
+                    (pl.col("PROP_NOITE") * pl.col("PROP_PATRIMONIO")).alias(
+                        "RISCO_NOITE_PATRIMONIO"
+                    ),
+                    (pl.col("PROP_MOTO") * pl.col("PROP_NOITE")).alias(
+                        "RISCO_MOTO_NOITE"
+                    ),
+                    (pl.col("PROP_MOTORISTA") * pl.col("PROP_PAGAMENTO")).alias(
+                        "RISCO_MOTORISTA_PAGTO"
+                    ),
                 ]
             )
         )
 
         # ---------- Treino do modelo ----------
-        print("🧠 Re-treinando modelo preditivo (H3+, alvo sqrt, pesos por faixa)...", file=sys.stdout)
+        print(
+            "🧠 Re-treinando modelo preditivo (H3+, alvo sqrt, pesos por faixa)...",
+            file=sys.stdout,
+        )
 
         X = features_h3.select(
             [
@@ -474,7 +492,9 @@ class SafeDriver:
             ]
         ).to_pandas()
 
-        crimes_np = features_h3.select("CRIMES_REAIS").to_numpy().ravel().astype(float)
+        crimes_np = (
+            features_h3.select("CRIMES_REAIS").to_numpy().ravel().astype(float)
+        )
         y = np.sqrt(crimes_np)
 
         # pesos por faixa de crime
@@ -520,22 +540,26 @@ class SafeDriver:
         risco_avg = float(y_hat.mean())
 
         # ---------- Camada Ouro ----------
-        print("💾 Gerando camada Ouro (dashboard_final H3+ melhorado)...", file=sys.stdout)
+        print(
+            "💾 Gerando camada Ouro (dashboard_final H3+ melhorado)...",
+            file=sys.stdout,
+        )
 
         fato_ouro = features_h3.with_columns(
-            [
-                pl.Series("ESCORE_RISCO", np.round(y_hat, 2)),
-            ]
+            [pl.Series("ESCORE_RISCO", np.round(y_hat, 2))]
         )
 
         # GEOMETRIA WKT opcional
         try:
             fato_ouro = fato_ouro.with_columns(
                 pl.col("CODIGO_H3")
-                .map_elements(self.wkt, return_dtype=pl.String)
-                .alias("GEOMETRIA_WKT")
+                    .map_elements(self.wkt, return_dtype=pl.String)
+                    .alias("GEOMETRIA_WKT")
             )
-            if fato_ouro.select(pl.col("GEOMETRIA_WKT").is_not_null().sum())[0, 0] == 0:
+            if (
+                fato_ouro.select(pl.col("GEOMETRIA_WKT").is_not_null().sum())[0, 0]
+                == 0
+            ):
                 fato_ouro = fato_ouro.drop("GEOMETRIA_WKT")
         except Exception:
             if "GEOMETRIA_WKT" in fato_ouro.columns:
@@ -557,7 +581,9 @@ class SafeDriver:
             ]
         ).with_columns(
             [
-                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO")).abs().alias("ERRO_ABS")
+                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
+                .abs()
+                .alias("ERRO_ABS")
             ]
         )
 
@@ -567,10 +593,16 @@ class SafeDriver:
         # ---------- SHAP ----------
         print("📊 Calculando SHAP (CatBoost)...", file=sys.stdout)
 
-        sd = pd.DataFrame(
-            shap.TreeExplainer(cat_model).shap_values(X),
-            columns=X.columns,
-        ).abs().mean().to_frame("GRAU_IMPORTANCIA").reset_index()
+        sd = (
+            pd.DataFrame(
+                shap.TreeExplainer(cat_model).shap_values(X),
+                columns=X.columns,
+            )
+            .abs()
+            .mean()
+            .to_frame("GRAU_IMPORTANCIA")
+            .reset_index()
+        )
         sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
         shap_path = self.pastas["ouro"] / "shap_audit.parquet"
         pl.from_pandas(sd).write_parquet(shap_path)
@@ -585,7 +617,9 @@ class SafeDriver:
         if self.s3:
             try:
                 for f in self.pastas["ouro"].glob("*.parquet"):
-                    self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
+                    self.s3.upload_file(
+                        str(f), self.bucket, f"ouro/{f.name}"
+                    )
                 status_cloud = "✅ Upload Realizado"
             except Exception:
                 status_cloud = "⚠️ Falha no Backup R2"
@@ -778,9 +812,9 @@ class SafeDriver:
 
         # ---------------- Decisão de rebuild ----------------
         # Nesta versão, sempre reconstruímos Ouro/Validação/SHAP
-        # para garantir que qualquer mudança no modelo/feature
+        # para garantir que qualquer mudança de modelo/feature
         # reflita na camada Ouro.
-        precisa_reconstruir = True
+        precisa_reconstruir = True  # mantido para clareza, mas sempre True
 
         # --------------- PRATA ---------------
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
