@@ -283,10 +283,15 @@ class SafeDriver:
         return False
 
     def wkt(self, h3_id):
+        """
+        Gera WKT do hexágono H3.
+        Não é crítica para o pipeline; se falhar, retornamos None.
+        """
         try:
-            b = h3.h3_to_geo_boundary(h3_id, geo_json=True)
-            pts = ", ".join([f"{ln} {lt}" for ln, lt in b])
-            return f"POLYGON(({pts}, {b[0][0]} {b[0][1]}))"
+            boundary = h3.h3_to_geo_boundary(h3_id, geo_json=True)  # [(lat, lon), ...]
+            coords = [f"{lon} {lat}" for lat, lon in boundary]
+            coords.append(coords[0])
+            return f"POLYGON(({', '.join(coords)}))"
         except Exception:
             return None
 
@@ -384,6 +389,165 @@ class SafeDriver:
             )
 
         return status_bq
+
+    # ------------------- Reconstrução Ouro / Validação / SHAP -------------------
+    def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
+        """
+        Reconstroi a camada Ouro (dashboard_final), a validação (validacao_modelo)
+        e o SHAP (shap_audit) usando a camada Prata já existente.
+
+        - Melhor granularidade: nível H3.
+        - Melhor uso da camada Prata: agrega variáveis comportamentais por H3.
+        - Modelo prevê diretamente CRIMES_REAIS por H3.
+        - Tenta gerar GEOMETRIA_WKT; se ficar toda nula, não mantém a coluna.
+        """
+
+        prata_path = self.pastas["prata"] / "camada_prata.parquet"
+        if not prata_path.exists():
+            raise Exception("Camada Prata não encontrada. Não é possível reconstruir Ouro/Validação.")
+
+        print("♻️ Recalculando Camada Ouro, Validação e SHAP a partir da Prata...", file=sys.stdout)
+
+        # ---------- Carrega camada Prata ----------
+        prata = pl.read_parquet(prata_path)
+
+        # ---------- Calcula H3 ----------
+        c = prata.select(["LAT", "LON"]).unique().to_pandas()
+        c["CODIGO_H3"] = c.apply(
+            lambda r: h3.latlng_to_cell(r["LAT"], r["LON"], 8), axis=1
+        )
+        prata_h3 = prata.join(pl.from_pandas(c), on=["LAT", "LON"])
+
+        # ---------- FEATURES por H3 ----------
+        features_h3 = (
+            prata_h3
+            .group_by("CODIGO_H3")
+            .agg(
+                [
+                    pl.len().alias("CRIMES_REAIS"),
+                    pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
+                    pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
+                    (pl.col("PERIODO_DIA") == "NOITE").mean().alias("PROP_NOITE"),
+                    (pl.col("TIPO_CRIME") == "PATRIMONIO").mean().alias("PROP_PATRIMONIO"),
+                    (pl.col("PERFIL_VITIMA") == "MOTORISTA").mean().alias("PROP_MOTORISTA"),
+                    (pl.col("PERFIL_VITIMA") == "MOTOCICLISTA").mean().alias("PROP_MOTO"),
+                    pl.col("EH_FERIADO").mean().alias("PROP_FERIADO"),
+                    pl.col("SEMANA_PAGAMENTO").mean().alias("PROP_PAGAMENTO"),
+                ]
+            )
+        )
+
+        # ---------- Treino do modelo ----------
+        print("🧠 Re-treinando modelo preditivo (nível H3)...", file=sys.stdout)
+
+        X = features_h3.select(
+            [
+                "LATITUDE_MEDIA",
+                "LONGITUDE_MEDIA",
+                "PROP_NOITE",
+                "PROP_PATRIMONIO",
+                "PROP_MOTORISTA",
+                "PROP_MOTO",
+                "PROP_FERIADO",
+                "PROP_PAGAMENTO",
+            ]
+        ).to_pandas()
+
+        y = np.log1p(features_h3.select("CRIMES_REAIS").to_numpy().ravel())
+
+        ens = VotingRegressor(
+            [
+                ("c", CatBoostRegressor(iterations=300, silent=True)),
+                ("l", LGBMRegressor(n_estimators=400, verbose=-1)),
+            ]
+        ).fit(X, y)
+
+        preds = ens.predict(X)
+        y_hat = np.expm1(preds)
+        risco_avg = float(y_hat.mean())
+
+        # ---------- Camada Ouro ----------
+        print("💾 Gerando camada Ouro (dashboard_final)...", file=sys.stdout)
+
+        fato_ouro = features_h3.with_columns(
+            [
+                pl.Series("ESCORE_RISCO", np.round(y_hat, 2)),
+            ]
+        )
+
+        # tentar gerar GEOMETRIA_WKT; se tudo None, descartamos a coluna
+        try:
+            fato_ouro = fato_ouro.with_columns(
+                pl.col("CODIGO_H3")
+                .map_elements(self.wkt, return_dtype=pl.String)
+                .alias("GEOMETRIA_WKT")
+            )
+            # verifica se há pelo menos um valor não nulo
+            if fato_ouro.select(pl.col("GEOMETRIA_WKT").is_not_null().sum())[0, 0] == 0:
+                fato_ouro = fato_ouro.drop("GEOMETRIA_WKT")
+        except Exception:
+            # se der qualquer erro, garante que não deixa a coluna quebrada
+            if "GEOMETRIA_WKT" in fato_ouro.columns:
+                fato_ouro = fato_ouro.drop("GEOMETRIA_WKT")
+
+        ouro_path = self.pastas["ouro"] / "dashboard_final.parquet"
+        fato_ouro.write_parquet(ouro_path)
+
+        # ---------- Validação ----------
+        print("✅ Construindo tabela de validação...", file=sys.stdout)
+
+        validacao = fato_ouro.select(
+            [
+                "CODIGO_H3",
+                "CRIMES_REAIS",
+                "ESCORE_RISCO",
+                "LATITUDE_MEDIA",
+                "LONGITUDE_MEDIA",
+            ]
+        ).with_columns(
+            [
+                (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO")).abs().alias("ERRO_ABS")
+            ]
+        )
+
+        valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
+        validacao.write_parquet(valid_path)
+
+        # ---------- SHAP ----------
+        print("📊 Calculando SHAP...", file=sys.stdout)
+
+        sd = pd.DataFrame(
+            shap.TreeExplainer(ens.estimators_[0]).shap_values(X),
+            columns=X.columns,
+        ).abs().mean().to_frame("GRAU_IMPORTANCIA").reset_index()
+        sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
+        shap_path = self.pastas["ouro"] / "shap_audit.parquet"
+        pl.from_pandas(sd).write_parquet(shap_path)
+
+        # ---------- BigQuery ----------
+        status_bq = self.publicar_bigquery_a_partir_de_arquivos(
+            bq_project, bq_dataset, bq_cred_json
+        )
+
+        # ---------- Backup R2 ----------
+        status_cloud = "❌ Desconectado"
+        if self.s3:
+            try:
+                for f in self.pastas["ouro"].glob("*.parquet"):
+                    self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
+                status_cloud = "✅ Upload Realizado"
+            except Exception:
+                status_cloud = "⚠️ Falha no Backup R2"
+
+        tempo_total = time.time() - self.t_inicio
+        self.discord.notificar_sucesso(
+            "Reconstrução da Camada Ouro/Validação (SafeDriver H3+)",
+            tempo_total,
+            features_h3.height,
+            risco_avg,
+            status_cloud,
+            status_bq,
+        )
 
     # ------------------- Orquestração -------------------
     def processar(self):
@@ -571,16 +735,18 @@ class SafeDriver:
         if ouro_path.exists() and valid_path.exists():
             try:
                 df_ouro = pl.read_parquet(ouro_path)
-                colunas_ok = all(
+                # Novo formato esperado: H3 + crimes + score + lat/long
+                colunas_basicas = all(
                     c in df_ouro.columns
                     for c in [
+                        "CRIMES_REAIS",
                         "ESCORE_RISCO",
-                        "GEOMETRIA_WKT",
                         "CODIGO_H3",
-                        "PERFIL_VITIMA",
+                        "LATITUDE_MEDIA",
+                        "LONGITUDE_MEDIA",
                     ]
                 )
-                if colunas_ok and not novo:
+                if colunas_basicas and not novo:
                     precisa_reconstruir = False
             except Exception:
                 precisa_reconstruir = True
@@ -713,104 +879,8 @@ class SafeDriver:
             self.pastas["prata"] / "camada_prata.parquet"
         )
 
-        # --------------- OURO / Modelo ---------------
-        print("🧠 Treinando IA Preditiva...", file=sys.stdout)
-        c = prata.select(["LAT", "LON"]).unique().to_pandas()
-        c["CODIGO_H3"] = c.apply(
-            lambda r: h3.latlng_to_cell(r["LAT"], r["LON"], 8), axis=1
-        )
-
-        fato = (
-            prata.join(pl.from_pandas(c), on=["LAT", "LON"])
-            .group_by(
-                [
-                    "CODIGO_H3",
-                    "PERIODO_DIA",
-                    "TIPO_CRIME",
-                    "PERFIL_VITIMA",
-                    "EH_FERIADO",
-                    "SEMANA_PAGAMENTO",
-                ]
-            )
-            .agg(
-                [
-                    pl.len().alias("TOTAL_OCORRENCIAS"),
-                    pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
-                    pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
-                ]
-            )
-        )
-
-        X = fato.select(
-            ["LATITUDE_MEDIA", "LONGITUDE_MEDIA", "EH_FERIADO", "SEMANA_PAGAMENTO"]
-        ).to_pandas()
-        y = np.log1p(fato.select("TOTAL_OCORRENCIAS").to_numpy().ravel())
-
-        ens = VotingRegressor(
-            [
-                ("c", CatBoostRegressor(iterations=100, silent=True)),
-                ("l", LGBMRegressor(n_estimators=100, verbose=-1)),
-            ]
-        ).fit(X, y)
-        preds = ens.predict(X)
-        risco_avg = np.mean(np.expm1(preds))
-
-        fato_ouro = fato.with_columns(
-            [
-                pl.Series("ESCORE_RISCO", np.round(np.expm1(preds), 2)),
-                pl.col("CODIGO_H3")
-                .map_elements(self.wkt, return_dtype=pl.String)
-                .alias("GEOMETRIA_WKT"),
-            ]
-        )
-
-        fato_ouro.write_parquet(self.pastas["ouro"] / "dashboard_final.parquet")
-
-        # --------------- Validação ---------------
-        prata_h3 = prata.join(pl.from_pandas(c), on=["LAT", "LON"])
-        crimes_reais = (
-            prata_h3.group_by("CODIGO_H3")
-            .agg(pl.len().alias("CRIMES_REAIS"))
-        )
-        escore_medio = (
-            fato_ouro.group_by("CODIGO_H3")
-            .agg(pl.col("ESCORE_RISCO").mean().alias("ESCORE_RISCO"))
-        )
-        validacao = crimes_reais.join(escore_medio, on="CODIGO_H3", how="inner")
-        validacao.write_parquet(self.pastas["ouro"] / "validacao_modelo.parquet")
-
-        # --------------- SHAP ---------------
-        sd = pd.DataFrame(
-            shap.TreeExplainer(ens.estimators_[0]).shap_values(X),
-            columns=X.columns,
-        ).abs().mean().to_frame("GRAU_IMPORTANCIA").reset_index()
-        sd.columns = ["VARIAVEL", "GRAU_IMPORTANCIA"]
-        pl.from_pandas(sd).write_parquet(self.pastas["ouro"] / "shap_audit.parquet")
-
-        # --------------- BigQuery ---------------
-        status_bq = self.publicar_bigquery_a_partir_de_arquivos(
-            bq_project, bq_dataset, bq_cred_json
-        )
-
-        # --------------- Backup R2 ---------------
-        status_cloud = "❌ Desconectado"
-        if self.s3:
-            try:
-                for f in self.pastas["ouro"].glob("*.parquet"):
-                    self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
-                status_cloud = "✅ Upload Realizado"
-            except Exception:
-                status_cloud = "⚠️ Falha no Backup R2"
-
-        tempo_total = time.time() - self.t_inicio
-        self.discord.notificar_sucesso(
-            "Execução Concluída",
-            tempo_total,
-            prata.height,
-            risco_avg,
-            status_cloud,
-            status_bq,
-        )
+        # --------------- OURO  ---------------
+        self.reconstruir_ouro_validacao_shap(bq_project, bq_dataset, bq_cred_json)
 
 
 if __name__ == "__main__":
