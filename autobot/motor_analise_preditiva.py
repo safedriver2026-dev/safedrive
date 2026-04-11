@@ -339,7 +339,7 @@ class SafeDriver:
             bq_project, bq_dataset, "sd_shap_audit", bq_cred_json
         )
 
-        if dashboard_ok and validacao_ok and shap_ok:
+        if dashboard_ok and validacao_ok && shap_ok:
             return "✅ Tabelas já existem no BigQuery e estão disponíveis para o BI."
 
         try:
@@ -433,7 +433,6 @@ class SafeDriver:
             )
             .with_columns(
                 [
-                    # crimes por ano observado (aprox intensidade temporal)
                     (
                         pl.col("CRIMES_REAIS")
                         / pl.when(pl.col("QTD_ANOS_OBSERVADOS") > 0)
@@ -778,78 +777,10 @@ class SafeDriver:
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
         # ---------------- Decisão de rebuild ----------------
-        ouro_path = self.pastas["ouro"] / "dashboard_final.parquet"
-        valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
+        # Nesta versão, sempre reconstruímos Ouro/Validação/SHAP
+        # para garantir que qualquer mudança no modelo/feature
+        # reflita na camada Ouro.
         precisa_reconstruir = True
-
-        if ouro_path.exists() and valid_path.exists():
-            try:
-                df_ouro = pl.read_parquet(ouro_path)
-                colunas_basicas = all(
-                    c in df_ouro.columns
-                    for c in [
-                        "CRIMES_REAIS",
-                        "ESCORE_RISCO",
-                        "CODIGO_H3",
-                        "LATITUDE_MEDIA",
-                        "LONGITUDE_MEDIA",
-                    ]
-                )
-                if colunas_basicas and not novo:
-                    precisa_reconstruir = False
-            except Exception:
-                precisa_reconstruir = True
-
-        # --------------- Caso NÃO precise rebuild ---------------
-        if not precisa_reconstruir:
-            print(
-                "Nenhuma atualização pendente. Camada Ouro já aderente às novas regras.",
-                file=sys.stdout,
-            )
-
-            status_bq = self.publicar_bigquery_a_partir_de_arquivos(
-                bq_project, bq_dataset, bq_cred_json
-            )
-
-            registros = 0
-            media_risco = 0.0
-
-            prata_path = self.pastas["prata"] / "camada_prata.parquet"
-
-            try:
-                if prata_path.exists():
-                    df_prata = pl.read_parquet(prata_path)
-                    registros = df_prata.height
-
-                if valid_path.exists():
-                    df_valid = pl.read_parquet(valid_path)
-                    if "ESCORE_RISCO" in df_valid.columns and df_valid.height > 0:
-                        media_risco = float(df_valid["ESCORE_RISCO"].mean())
-            except Exception as e:
-                print(
-                    f"⚠️ Falha ao calcular métricas de resumo (sem rebuild): {e}",
-                    file=sys.stderr,
-                )
-
-            status_cloud = "❌ Desconectado"
-            if self.s3:
-                try:
-                    for f in self.pastas["ouro"].glob("*.parquet"):
-                        self.s3.upload_file(str(f), self.bucket, f"ouro/{f.name}")
-                    status_cloud = "✅ Upload Realizado"
-                except Exception:
-                    status_cloud = "⚠️ Falha no Backup R2"
-
-            tempo_total = time.time() - self.t_inicio
-            self.discord.notificar_sucesso(
-                "Execução Concluída (Sem Rebuild de Modelo)",
-                tempo_total,
-                registros=registros,
-                media_risco=media_risco,
-                status_s3=status_cloud,
-                status_bq=status_bq,
-            )
-            return
 
         # --------------- PRATA ---------------
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
