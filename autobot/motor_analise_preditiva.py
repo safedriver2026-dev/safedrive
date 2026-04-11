@@ -327,20 +327,6 @@ class SafeDriver:
         if not (bq_project and bq_dataset and bq_cred_json):
             return status_bq
 
-        # Verifica existência das tabelas no BQ
-        dashboard_ok = tabela_existe_bigquery(
-            bq_project, bq_dataset, "sd_dashboard_final", bq_cred_json
-        )
-        validacao_ok = tabela_existe_bigquery(
-            bq_project, bq_dataset, "sd_validacao_modelo", bq_cred_json
-        )
-        shap_ok = tabela_existe_bigquery(
-            bq_project, bq_dataset, "sd_shap_audit", bq_cred_json
-        )
-
-        if dashboard_ok and validacao_ok and shap_ok:
-            return "✅ Tabelas já existem no BigQuery e estão disponíveis para o BI."
-
         try:
             dash_path = self.pastas["ouro"] / "dashboard_final.parquet"
             valid_path = self.pastas["ouro"] / "validacao_modelo.parquet"
@@ -388,9 +374,10 @@ class SafeDriver:
         Reconstroi a camada Ouro (dashboard_final), a validação (validacao_modelo)
         e o SHAP (shap_audit) usando a camada Prata existente.
 
-        Melhorias:
+        Melhorias conceituais:
         - Previsão a nível H3 com alvo sqrt(CRIMES_REAIS)
         - Pesos por faixa de crime (mais peso em áreas críticas)
+        - Inclusão de CRIMES_PONDERADOS (peso penal) como feature
         - Novas features comportamentais e geográficas
         """
 
@@ -421,6 +408,7 @@ class SafeDriver:
             .agg(
                 [
                     pl.len().alias("CRIMES_REAIS"),
+                    pl.col("PESO_PENAL").sum().alias("CRIMES_PONDERADOS"),
                     pl.col("LAT").mean().alias("LATITUDE_MEDIA"),
                     pl.col("LON").mean().alias("LONGITUDE_MEDIA"),
                     pl.col("LAT").std(ddof=1).fill_null(0.0).alias("LAT_STD"),
@@ -450,6 +438,14 @@ class SafeDriver:
                     )
                     .cast(pl.Float64)
                     .alias("CRIMES_POR_ANO"),
+                    (
+                        pl.col("CRIMES_PONDERADOS")
+                        / pl.when(pl.col("QTD_ANOS_OBSERVADOS") > 0)
+                        .then(pl.col("QTD_ANOS_OBSERVADOS"))
+                        .otherwise(1)
+                    )
+                    .cast(pl.Float64)
+                    .alias("CRIMES_POND_POR_ANO"),
                 ]
             )
             .with_columns(
@@ -469,7 +465,7 @@ class SafeDriver:
 
         # ---------- Treino do modelo ----------
         print(
-            "🧠 Re-treinando modelo preditivo (H3+, alvo sqrt, pesos por faixa)...",
+            "🧠 Re-treinando modelo preditivo (H3+, alvo sqrt, pesos por faixa + input penal)...",
             file=sys.stdout,
         )
 
@@ -486,6 +482,7 @@ class SafeDriver:
                 "PROP_FERIADO",
                 "PROP_PAGAMENTO",
                 "CRIMES_POR_ANO",
+                "CRIMES_POND_POR_ANO",
                 "RISCO_NOITE_PATRIMONIO",
                 "RISCO_MOTO_NOITE",
                 "RISCO_MOTORISTA_PAGTO",
@@ -497,7 +494,7 @@ class SafeDriver:
         )
         y = np.sqrt(crimes_np)
 
-        # pesos por faixa de crime
+        # pesos por faixa de crime (mantém teste compatível com CSV)
         pesos = np.ones_like(crimes_np, dtype=float)
         pesos[(crimes_np >= 21) & (crimes_np <= 50)] = 1.5
         pesos[(crimes_np > 50) & (crimes_np < 100)] = 2.0
@@ -553,8 +550,8 @@ class SafeDriver:
         try:
             fato_ouro = fato_ouro.with_columns(
                 pl.col("CODIGO_H3")
-                    .map_elements(self.wkt, return_dtype=pl.String)
-                    .alias("GEOMETRIA_WKT")
+                .map_elements(self.wkt, return_dtype=pl.String)
+                .alias("GEOMETRIA_WKT")
             )
             if (
                 fato_ouro.select(pl.col("GEOMETRIA_WKT").is_not_null().sum())[0, 0]
@@ -575,6 +572,7 @@ class SafeDriver:
             [
                 "CODIGO_H3",
                 "CRIMES_REAIS",
+                "CRIMES_PONDERADOS",
                 "ESCORE_RISCO",
                 "LATITUDE_MEDIA",
                 "LONGITUDE_MEDIA",
@@ -583,7 +581,14 @@ class SafeDriver:
             [
                 (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
                 .abs()
-                .alias("ERRO_ABS")
+                .alias("ERRO_ABS"),
+                (
+                    (pl.col("CRIMES_REAIS") - pl.col("ESCORE_RISCO"))
+                    .abs()
+                    / pl.when(pl.col("CRIMES_REAIS") > 0)
+                    .then(pl.col("CRIMES_REAIS"))
+                    .otherwise(None)
+                ).alias("ERRO_PERC_ABS"),
             ]
         )
 
@@ -626,7 +631,7 @@ class SafeDriver:
 
         tempo_total = time.time() - self.t_inicio
         self.discord.notificar_sucesso(
-            "Reconstrução da Camada Ouro/Validação (SafeDriver H3+ Melhorado)",
+            "Reconstrução da Camada Ouro/Validação (SafeDriver H3+ Penal)",
             tempo_total,
             features_h3.height,
             risco_avg,
@@ -657,8 +662,6 @@ class SafeDriver:
                 "Accept": "*/*",
             }
         )
-
-        novo = False
 
         # ---------------- Bronze / Download ----------------
         ano_atual = datetime.now().year
@@ -698,7 +701,6 @@ class SafeDriver:
                 sucesso_download = self.baixar_robusto(url, str(tmp), s)
 
                 if sucesso_download:
-                    novo = True
                     print(
                         f"✅ Download {ano} concluído! Inspecionando abas...",
                         file=sys.stdout,
@@ -810,12 +812,6 @@ class SafeDriver:
         bq_dataset = os.environ.get("BQ_DATASET_ID")
         bq_cred_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
-        # ---------------- Decisão de rebuild ----------------
-        # Nesta versão, sempre reconstruímos Ouro/Validação/SHAP
-        # para garantir que qualquer mudança de modelo/feature
-        # reflita na camada Ouro.
-        precisa_reconstruir = True  # mantido para clareza, mas sempre True
-
         # --------------- PRATA ---------------
         print("⚙️ Construindo Camada Prata...", file=sys.stdout)
         lf = pl.concat([pl.scan_parquet(f) for f in arquivos_limpos], how="diagonal")
@@ -860,28 +856,60 @@ class SafeDriver:
                     )
                     .cast(pl.Int8)
                     .alias("SEMANA_PAGAMENTO"),
+                    # PERFIL_VITIMA mais robusto (ciclista / pedestre / moto / motorista)
                     pl.when(
                         pl.col("N")
                         .str.to_uppercase()
-                        .str.contains("VEICULO|AUTO|CARGA")
+                        .str.contains("CICLISTA|BICICLETA")
                     )
-                    .then(pl.lit("MOTORISTA"))
+                    .then(pl.lit("CICLISTA"))
                     .when(
                         pl.col("N")
                         .str.to_uppercase()
                         .str.contains("TRANSEUNTE|PEDESTRE")
                     )
                     .then(pl.lit("PEDESTRE"))
-                    .when(pl.col("N").str.to_uppercase().str.contains("MOTO"))
+                    .when(
+                        pl.col("N")
+                        .str.to_uppercase()
+                        .str.contains("MOTO|MOTOCICLETA|MOTOCICLISTA")
+                    )
                     .then(pl.lit("MOTOCICLISTA"))
                     .when(
                         pl.col("N")
                         .str.to_uppercase()
-                        .str.contains("BICICLETA")
+                        .str.contains("VEICULO|AUTO|CARRO|CARGA|CAMINHAO")
                     )
-                    .then(pl.lit("CICLISTA"))
+                    .then(pl.lit("MOTORISTA"))
                     .otherwise(pl.lit("GERAL"))
                     .alias("PERFIL_VITIMA"),
+                    # PESO_PENAL baseado em gravidade (pode ser refinado por artigo)
+                    pl.when(
+                        pl.col("N")
+                        .str.to_uppercase()
+                        .str.contains("LATROCINIO|HOMICIDIO|SEQUESTRO|CARCERE")
+                    )
+                    .then(pl.lit(5))
+                    .when(
+                        pl.col("N")
+                        .str.to_uppercase()
+                        .str.contains("ROUBO|EXTORCAO|EXTORSÃO|ESTUPRO")
+                    )
+                    .then(pl.lit(4))
+                    .when(
+                        pl.col("N")
+                        .str.to_uppercase()
+                        .str.contains("FURTO QUALIFICADO|RECEPTACAO|RECEPTAÇÃO|ARMA DE FOGO")
+                    )
+                    .then(pl.lit(3))
+                    .when(
+                        pl.col("N")
+                        .str.to_uppercase()
+                        .str.contains("FURTO|DANO|AMEACA|AMEAÇA|DESACATO")
+                    )
+                    .then(pl.lit(2))
+                    .otherwise(pl.lit(1))
+                    .alias("PESO_PENAL"),
                 ]
             )
             .collect()
@@ -901,7 +929,7 @@ if __name__ == "__main__":
     app = SafeDriver()
     try:
         app.processar()
-    except Exception as e:
+    except Exception:
         err = traceback.format_exc()
         print("\n" + "=" * 50, file=sys.stderr)
         print("🚨 ERRO FATAL NO PIPELINE 🚨", file=sys.stderr)
