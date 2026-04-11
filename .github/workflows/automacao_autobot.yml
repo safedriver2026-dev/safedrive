@@ -28,7 +28,12 @@ jobs:
       - name: Instalar Dependências
         run: |
           python -m pip install --upgrade pip
-          pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest pyarrow google-cloud-bigquery pandas-gbq
+          # Fixando a versão do h3-py para garantir que geo_to_h3_cell esteja disponível
+          pip install polars pandas numpy "h3-py==3.7.6" holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest pyarrow google-cloud-bigquery pandas-gbq
+
+      - name: Verificar Versão do H3 (Debug)
+        run: |
+          python -c "import h3; print(f'Versão do h3-py instalada: {h3.__version__}')"
 
       - name: Executar Motor Analítico Preditivo
         env:
