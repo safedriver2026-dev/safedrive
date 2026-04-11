@@ -1,49 +1,47 @@
-import pytest, polars as pl
-from pathlib import Path
+name: SafeDriver Execução Diaria
 
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
-def test_check_ouro():
-    p = Path("datalake/ouro/dashboard_final.parquet")
-    if not p.exists():
-        pytest.skip("Arquivo ausente")
-    df = pl.read_parquet(p)
-    assert all(
-        c in df.columns
-        for c in ["ESCORE_RISCO", "GEOMETRIA_WKT", "CODIGO_H3", "PERFIL_VITIMA"]
-    )
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do Repositório
+        uses: actions/checkout@v3
 
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
 
-def test_filtro_sp():
-    p = Path("datalake/ouro/dashboard_final.parquet")
-    if not p.exists():
-        pytest.skip("Arquivo ausente")
-    df = pl.read_parquet(p)
-    f = df.filter(
-        (pl.col("LATITUDE_MEDIA") < -25.5) | (pl.col("LATITUDE_MEDIA") > -19.5)
-    )
-    assert f.height == 0
+      - name: Restaurar Cache do Datalake
+        uses: actions/cache@v3
+        with:
+          path: datalake/
+          key: raw-data-${{ hashFiles('autobot/motor_analise_preditiva.py') }}-${{ github.run_id }}
+          restore-keys: |
+            raw-data-
 
+      - name: Instalar Dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars pandas numpy h3 holidays boto3 catboost lightgbm scikit-learn shap requests fastexcel python-calamine pytest pyarrow google-cloud-bigquery pandas-gbq
 
-def test_lgpd():
-    p = Path("datalake/prata/camada_prata.parquet")
-    if not p.exists():
-        pytest.skip("Arquivo ausente")
-    df = pl.read_parquet(p)
-    assert not any("NUM" in c.upper() for c in df.columns)
-    assert "ID_ANONIMO" in df.columns
+      - name: Executar Motor Analítico Preditivo
+        env:
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
+        run: python -u autobot/motor_analise_preditiva.py
 
-
-def test_auditoria_shap():
-    p = Path("datalake/ouro/shap_audit.parquet")
-    if not p.exists():
-        pytest.skip("Arquivo ausente")
-    df = pl.read_parquet(p)
-    assert "VARIAVEL" in df.columns and "GRAU_IMPORTANCIA" in df.columns
-
-
-def test_validacao_real_previsto():
-    p = Path("datalake/ouro/validacao_modelo.parquet")
-    if not p.exists():
-        pytest.skip("Arquivo de validação ausente")
-    df = pl.read_parquet(p)
-    assert all(c in df.columns for c in ["CRIMES_REAIS", "ESCORE_RISCO", "CODIGO_H3"])
+      - name: Rodar Testes de Segurança e Qualidade
+        run: pytest tests/test_seguranca.py -v
