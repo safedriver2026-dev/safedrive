@@ -1,0 +1,29 @@
+name: safedriver_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - polars
+    - pandas
+    - openpyxl
+    - pyarrow
+    - numpy
+    - boto3
+    - requests
+    - urllib3
+    - google-cloud-bigquery
+    - google-cloud-bigquery-storage
+    - google-auth
+    - db-dtypes
+    - catboost
+    - lightgbm
+    - scikit-learn
+    - shap
+    - h3
+    - holidays
+    - python-magic
+    - joblib
+    - pytest
