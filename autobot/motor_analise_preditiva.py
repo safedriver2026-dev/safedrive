@@ -2,8 +2,8 @@
 """
 SafeDriver_Motor_V1.0.0
 Pipeline preditivo de segurança urbana — Estado de São Paulo
-Prefixo R2 fixo: safedriver/safedriver/datalake/raw/
-Escore calculado por perfil: MOTORISTA, MOTOCICLISTA, PEDESTRE, CICLISTA.
+Estratégia: R2 → fallback download SSP-SP → salva no R2.
+Escore por perfil: MOTORISTA, MOTOCICLISTA, PEDESTRE, CICLISTA.
 """
 import sys, os, traceback, hashlib, warnings, time, json, unicodedata
 from datetime import datetime, timedelta
@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════════════════════════════════════
 
 NOME_SISTEMA     = "SafeDriver_Motor_V1.0.0"
-VERSAO_PIPELINE  = "5.4.0"
+VERSAO_PIPELINE  = "5.5.0"
 VERSAO_FEATURES  = "v5"
 H3_RESOLUCAO     = 8
 MIN_REGISTROS    = 500
@@ -51,6 +51,11 @@ R2_PREFIXO_PRATA  = "safedriver/safedriver/datalake/prata/"
 R2_PREFIXO_OURO   = "safedriver/safedriver/datalake/ouro/"
 R2_PREFIXO_MODELO = "safedriver/safedriver/datalake/modelos/"
 R2_TRACKING       = "safedriver/safedriver/datalake/raw/tracking_ssp.json"
+
+# URL base da SSP-SP — só o ano muda
+SSP_URL_TEMPLATE  = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+SSP_TIMEOUT       = 300   # segundos — arquivo pode ter 100+ MB
+SSP_MAX_TENTATIVAS = 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -173,168 +178,219 @@ def calcular_escores_todos_perfis(rubrica: str, hora_str: str) -> dict:
 
 def renomear_sinonimos(df: pl.DataFrame) -> pl.DataFrame:
     mapa = {}
-    colunas_upper = {c.upper(): c for c in df.columns}
-    for nome_oficial, sins in SINONIMOS.items():
-        if nome_oficial.upper() not in colunas_upper:
-            for sin in sins:
-                if sin.upper() in colunas_upper:
-                    mapa[colunas_upper[sin.upper()]] = nome_oficial
+    colunas_atuais = set(df.columns)
+    for nome_canonico, sinonimos in SINONIMOS.items():
+        if nome_canonico not in colunas_atuais:
+            for sin in sinonimos:
+                if sin in colunas_atuais:
+                    mapa[sin] = nome_canonico
                     break
-    if mapa:
-        print(f"[Prata] Renomeando colunas: {mapa}")
-        df = df.rename(mapa)
-    return df
+    return df.rename(mapa) if mapa else df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRACKING — estrutura corrigida
+# DOWNLOAD SSP-SP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def baixar_ssp(ano: int) -> pd.DataFrame | None:
+    """
+    Baixa o Excel da SSP-SP para o ano informado.
+    Tenta SSP_MAX_TENTATIVAS vezes com backoff.
+    Retorna DataFrame pandas ou None se o ano não existir.
+    """
+    url = SSP_URL_TEMPLATE.format(ano=ano)
+    print(f"[SSP] Baixando {ano} → {url}")
+
+    for tentativa in range(1, SSP_MAX_TENTATIVAS + 1):
+        try:
+            resp = requests.get(
+                url,
+                timeout=SSP_TIMEOUT,
+                verify=False,
+                headers={"User-Agent": "SafeDriver-Pipeline/5.5.0"},
+                stream=True,
+            )
+            if resp.status_code == 404:
+                print(f"[SSP] {ano} não disponível ainda (404) — pulando.")
+                return None
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+
+            # Lê em memória — evita arquivo temporário no runner
+            buf = BytesIO()
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                buf.write(chunk)
+            buf.seek(0)
+            tamanho_mb = buf.getbuffer().nbytes / (1024 * 1024)
+            print(f"[SSP] {ano} baixado — {tamanho_mb:.1f} MB")
+
+            # Tenta as duas engines disponíveis no ambiente
+            for engine in ("openpyxl", "xlrd"):
+                try:
+                    buf.seek(0)
+                    df = pd.read_excel(buf, engine=engine, dtype=str)
+                    print(f"[SSP] {ano} lido com engine={engine} — {len(df):,} linhas")
+                    return df
+                except Exception as e_eng:
+                    print(f"[SSP] engine {engine} falhou: {e_eng}")
+
+            print(f"[SSP] {ano} — nenhuma engine conseguiu ler o arquivo.")
+            return None
+
+        except Exception as e:
+            print(f"[SSP] tentativa {tentativa}/{SSP_MAX_TENTATIVAS} falhou: {e}")
+            if tentativa < SSP_MAX_TENTATIVAS:
+                time.sleep(10 * tentativa)
+
+    print(f"[SSP] {ano} — todas as tentativas esgotadas.")
+    return None
+
+
+def converter_e_salvar_r2(df_raw: pd.DataFrame, ano: int, s3, bucket: str) -> int:
+    """Converte DataFrame pandas → parquet e salva no R2. Retorna tamanho em bytes."""
+    df_pl  = pl.from_pandas(df_raw.astype(str))
+    buf    = BytesIO()
+    df_pl.write_parquet(buf)
+    buf.seek(0)
+    dados  = buf.read()
+    chave  = f"{R2_PREFIXO_RAW}ssp_{ano}.parquet"
+    s3.put_object(Bucket=bucket, Key=chave, Body=dados)
+    print(f"[R2] ssp_{ano}.parquet salvo — {len(dados) / (1024*1024):.1f} MB")
+    return len(dados)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRACKING
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TrackingSSP:
-    """
-    Formato do JSON:
-    {
-      "2022": {"tamanho_bytes": 16873472, "processado_em": "2026-04-08T22:11:06"},
-      "2023": {"tamanho_bytes": 17432576, "processado_em": "2026-04-08T22:11:08"},
-      ...
-    }
-    Nunca armazena inteiros diretamente — sempre dicts.
-    """
+    def __init__(self, s3, bucket: str):
+        self.s3     = s3
+        self.bucket = bucket
+        self.dados  = {}
+        self._carregar()
 
-    def __init__(self, dados_brutos: dict):
-        # Migração defensiva: se algum valor for int em vez de dict, corrige
-        self.dados: dict[str, dict] = {}
-        for ano, val in dados_brutos.items():
-            if isinstance(val, dict):
-                self.dados[str(ano)] = val
-            elif isinstance(val, (int, float)):
-                # formato legado — migra para estrutura correta
-                self.dados[str(ano)] = {"tamanho_bytes": int(val), "processado_em": "migrado"}
-            else:
-                self.dados[str(ano)] = {"tamanho_bytes": 0, "processado_em": "desconhecido"}
+    def _carregar(self):
+        try:
+            obj  = self.s3.get_object(Bucket=self.bucket, Key=R2_TRACKING)
+            raw  = json.loads(obj["Body"].read().decode("utf-8"))
+            # Migração defensiva: garante que cada valor é dict
+            for ano, val in raw.items():
+                if isinstance(val, dict):
+                    self.dados[str(ano)] = val
+                elif isinstance(val, (int, float)):
+                    self.dados[str(ano)] = {"tamanho_bytes": int(val), "linhas": 0}
+                else:
+                    self.dados[str(ano)] = {"tamanho_bytes": 0, "linhas": 0}
+            print(f"[Tracking] Carregado — anos: {list(self.dados.keys())}")
+        except self.s3.exceptions.NoSuchKey:
+            print("[Tracking] tracking_ssp.json não encontrado — iniciando do zero.")
+        except Exception as e:
+            print(f"[Tracking] Erro ao carregar — iniciando do zero: {e}")
+
+    def salvar(self):
+        payload = json.dumps(self.dados, ensure_ascii=False, indent=2).encode("utf-8")
+        self.s3.put_object(Bucket=self.bucket, Key=R2_TRACKING, Body=payload)
 
     def precisa_processar(self, ano: int, tamanho_atual: int) -> bool:
-        entrada = self.dados.get(str(ano))
-        if entrada is None:
+        entrada = self.dados.get(str(ano), {})
+        if not isinstance(entrada, dict):
             return True
         return entrada.get("tamanho_bytes", 0) != tamanho_atual
 
-    def registrar(self, ano: int, tamanho_bytes: int):
+    def registrar(self, ano: int, tamanho_bytes: int, linhas: int):
         self.dados[str(ano)] = {
             "tamanho_bytes": tamanho_bytes,
-            "processado_em": hora_brasilia().isoformat(),
+            "linhas":        linhas,
+            "atualizado_em": hora_brasilia().isoformat(),
         }
 
-    def serializar(self) -> str:
-        return json.dumps(self.dados, ensure_ascii=False, indent=2)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MEMÓRIA DE MODELO
+# MEMÓRIA DE DESEMPENHO
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MemoriaModelo:
-    def __init__(self, historico: list):
-        self.historico = historico if isinstance(historico, list) else []
+class MemoriaDesempenho:
+    CHAVE = "safedriver/safedriver/datalake/raw/memoria_desempenho.json"
+
+    def __init__(self, s3, bucket: str):
+        self.s3     = s3
+        self.bucket = bucket
+        self._dados = {}
+        self._carregar()
+
+    def _carregar(self):
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=self.CHAVE)
+            self._dados = json.loads(obj["Body"].read().decode("utf-8"))
+            print(f"[Memória] Histórico carregado — runs: {len(self._dados)}")
+        except Exception:
+            print("[Memória] Sem histórico — primeira execução.")
+
+    def salvar(self):
+        payload = json.dumps(self._dados, ensure_ascii=False, indent=2).encode("utf-8")
+        self.s3.put_object(Bucket=self.bucket, Key=self.CHAVE, Body=payload)
 
     def mae_anterior(self) -> float:
-        if not self.historico:
+        if not self._dados:
             return float("inf")
-        return self.historico[-1].get("mae", float("inf"))
+        ultimo = sorted(self._dados.keys())[-1]
+        return self._dados[ultimo].get("mae", float("inf"))
 
-    def registrar(self, mae: float, r2: float, n_hex: int):
-        self.historico.append({
-            "mae":        mae,
-            "r2":         r2,
-            "hexagonos":  n_hex,
-            "registrado_em": hora_brasilia().isoformat(),
-        })
-
-    def serializar(self) -> str:
-        return json.dumps(self.historico, ensure_ascii=False, indent=2)
+    def registrar(self, mae: float, r2: float, n_hexagonos: int):
+        chave = hora_brasilia().strftime("%Y-%m-%dT%H:%M:%S")
+        self._dados[chave] = {"mae": mae, "r2": r2, "hexagonos": n_hexagonos}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DISCORD
 # ══════════════════════════════════════════════════════════════════════════════
 
-class Discord:
-    def __init__(self, url_sucesso: str, url_erro: str):
-        self.url_sucesso = url_sucesso
-        self.url_erro    = url_erro
+class DiscordNotifier:
+    def __init__(self, webhook_sucesso: str, webhook_erro: str):
+        self.ws = webhook_sucesso
+        self.we = webhook_erro
 
-    def _post(self, url: str, payload: dict):
-        if not url:
+    def _post(self, webhook: str, payload: dict):
+        if not webhook:
             return
         try:
-            r = requests.post(url, json=payload, timeout=10, verify=False)
-            r.raise_for_status()
+            requests.post(webhook, json=payload, timeout=15, verify=False)
         except Exception as e:
             print(f"[Discord] Falha ao enviar: {e}")
 
-    def relatorio_executivo(self, run_id, tempo, n_hex, mae, r2,
-                             melhoria, top_municipio, top_shap):
-        sinal = "📈" if melhoria >= 0 else "📉"
-        self._post(self.url_sucesso, {"embeds": [{"title": "SafeDriver — Relatório Executivo",
-            "color": 3066993,
-            "fields": [
-                {"name": "Run ID",        "value": run_id,               "inline": True},
-                {"name": "Hexágonos",     "value": f"{n_hex:,}",         "inline": True},
-                {"name": "Tempo",         "value": f"{tempo:.1f}s",      "inline": True},
-                {"name": "MAE",           "value": f"{mae:.4f}",         "inline": True},
-                {"name": "R²",            "value": f"{r2:.4f}",          "inline": True},
-                {"name": f"Melhoria {sinal}", "value": f"{melhoria:+.1f}%", "inline": True},
-                {"name": "Município crítico", "value": top_municipio,    "inline": True},
-                {"name": "SHAP top feature",  "value": top_shap,         "inline": True},
-            ],
-            "footer": {"text": f"{NOME_SISTEMA} v{VERSAO_PIPELINE}"},
-            "timestamp": datetime.utcnow().isoformat(),
-        }]})
+    def relatorio_executivo(self, run_id, tempo, n_hex, mae, r2, melhoria, top_mun, top_feat):
+        emoji = "📈" if melhoria > 0 else "📉"
+        msg   = (
+            f"**SafeDriver | Run `{run_id}`**\n"
+            f"✅ Pipeline concluído em {tempo:.1f}s\n"
+            f"🔷 Hexágonos: {n_hex:,} | MAE: {mae:.4f} | R²: {r2:.4f}\n"
+            f"{emoji} Melhoria MAE: {melhoria:+.2f}%\n"
+            f"📍 Município crítico: **{top_mun}**\n"
+            f"🧠 Feature SHAP #1: `{top_feat}`"
+        )
+        self._post(self.ws, {"content": msg})
 
     def relatorio_operacional(self, run_id, n_raw, n_prata, n_ouro,
                                mae, r2, mae_ant, anos, status_bq, shap_top3, prefixo_raw):
-        shap_txt = " | ".join([f"{f}: {v:.4f}" for f, v in shap_top3]) if shap_top3 else "N/A"
-        self._post(self.url_sucesso, {"embeds": [{"title": "SafeDriver — Relatório Operacional",
-            "color": 1752220,
-            "fields": [
-                {"name": "Run ID",       "value": run_id,              "inline": True},
-                {"name": "Anos",         "value": str(anos),           "inline": True},
-                {"name": "Raw rows",     "value": f"{n_raw:,}",        "inline": True},
-                {"name": "Prata rows",   "value": f"{n_prata:,}",      "inline": True},
-                {"name": "Ouro hexágonos","value": f"{n_ouro:,}",      "inline": True},
-                {"name": "MAE atual",    "value": f"{mae:.4f}",        "inline": True},
-                {"name": "MAE anterior", "value": f"{mae_ant:.4f}" if mae_ant != float("inf") else "N/A", "inline": True},
-                {"name": "R²",           "value": f"{r2:.4f}",         "inline": True},
-                {"name": "BigQuery",     "value": status_bq,           "inline": False},
-                {"name": "SHAP top3",    "value": shap_txt,            "inline": False},
-                {"name": "Prefixo R2",   "value": prefixo_raw,         "inline": False},
-            ],
-            "footer": {"text": f"{NOME_SISTEMA} v{VERSAO_PIPELINE}"},
-            "timestamp": datetime.utcnow().isoformat(),
-        }]})
+        shap_str = " | ".join([f"`{f}` {v:.4f}" for f, v in shap_top3]) if shap_top3 else "N/A"
+        msg = (
+            f"**[OPS] Run `{run_id}`**\n"
+            f"📦 Raw: {n_raw:,} | Prata: {n_prata:,} | Ouro: {n_ouro:,}\n"
+            f"📅 Anos: {anos}\n"
+            f"📊 MAE ant: {mae_ant:.4f} → atual: {mae:.4f} | R²: {r2:.4f}\n"
+            f"🗄️ BigQuery: {status_bq}\n"
+            f"🧠 SHAP top3: {shap_str}\n"
+            f"🗂️ Prefixo R2: `{prefixo_raw}`"
+        )
+        self._post(self.ws, {"content": msg})
 
     def sem_novidades(self, run_id, tempo):
-        self._post(self.url_sucesso, {"embeds": [{"title": "SafeDriver — Sem Novidades",
-            "color": 16776960,
-            "fields": [
-                {"name": "Run ID", "value": run_id,          "inline": True},
-                {"name": "Tempo",  "value": f"{tempo:.1f}s", "inline": True},
-            ],
-            "description": "Nenhum dado novo detectado no R2.",
-            "footer": {"text": f"{NOME_SISTEMA} v{VERSAO_PIPELINE}"},
-        }]})
+        self._post(self.ws, {"content": f"**SafeDriver | Run `{run_id}`** — Sem dados novos ({tempo:.1f}s)"})
 
     def alerta_erro(self, run_id, titulo, detalhe):
-        self._post(self.url_erro, {"embeds": [{"title": f"ERRO — {titulo}",
-            "color": 15158332,
-            "fields": [
-                {"name": "Run ID",  "value": run_id,           "inline": True},
-                {"name": "Sistema", "value": NOME_SISTEMA,     "inline": True},
-            ],
-            "description": f"```{detalhe[:1800]}```",
-            "footer": {"text": f"{NOME_SISTEMA} v{VERSAO_PIPELINE}"},
-            "timestamp": datetime.utcnow().isoformat(),
-        }]})
+        msg = f"🚨 **ERRO [{titulo}] | Run `{run_id}`**\n```{detalhe[:1800]}```"
+        self._post(self.we, {"content": msg})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -344,92 +400,44 @@ class Discord:
 class SafeDriver:
 
     def __init__(self):
-        self.run_id  = run_id_curto()
         self.t_inicio = time.time()
+        self.run_id   = run_id_curto()
 
-        bucket   = sanitizar_secret(os.environ.get("R2_BUCKET_NAME", ""))
-        endpoint = sanitizar_secret(os.environ.get("R2_ENDPOINT_URL", ""))
-        ak       = sanitizar_secret(os.environ.get("R2_ACCESS_KEY_ID", ""))
-        sk       = sanitizar_secret(os.environ.get("R2_SECRET_ACCESS_KEY", ""))
-        self.lgpd_salt = sanitizar_secret(os.environ.get("LGPD_SALT", "safedriver_default"))
+        # Secrets
+        endpoint  = sanitizar_secret(os.environ.get("R2_ENDPOINT_URL", ""))
+        key_id    = sanitizar_secret(os.environ.get("R2_ACCESS_KEY_ID", ""))
+        secret    = sanitizar_secret(os.environ.get("R2_SECRET_ACCESS_KEY", ""))
+        self.bucket = sanitizar_secret(os.environ.get("R2_BUCKET_NAME", ""))
+        self.salt   = sanitizar_secret(os.environ.get("LGPD_SALT", ""))
 
-        if not self.lgpd_salt or len(self.lgpd_salt) < 16:
-            raise ValueError("LGPD_SALT ausente ou muito curto — mínimo 16 caracteres")
+        if not self.salt:
+            raise RuntimeError("LGPD_SALT não definido — abortando por segurança LGPD.")
 
         print(f"[{NOME_SISTEMA}] Iniciando run {self.run_id}")
-        print(f"[R2] Bucket   : {bucket}")
-        print(f"[R2] Endpoint : {endpoint[:50]}...")
+        print(f"[R2] Bucket   : {self.bucket}")
+        print(f"[R2] Endpoint : {endpoint[:40]}...")
 
         self.s3 = boto3.client(
             "s3",
             endpoint_url=endpoint,
-            aws_access_key_id=ak,
-            aws_secret_access_key=sk,
-        )
-        self.bucket = bucket
-
-        self.discord = Discord(
-            sanitizar_secret(os.environ.get("DISCORD_SUCESSO", "")),
-            sanitizar_secret(os.environ.get("DISCORD_ERRO", "")),
+            aws_access_key_id=key_id,
+            aws_secret_access_key=secret,
+            region_name="auto",
         )
 
-        # Carregar tracking
-        self.tracking = self._carregar_tracking()
-        # Carregar memória
-        self.memoria  = self._carregar_memoria()
-
-        self.df_raw          = pd.DataFrame()
+        self.tracking        = TrackingSSP(self.s3, self.bucket)
+        self.memoria         = MemoriaDesempenho(self.s3, self.bucket)
         self.anos_processados = []
+        self.df_raw          = pd.DataFrame()
+
+        ws = sanitizar_secret(os.environ.get("DISCORD_SUCESSO", ""))
+        we = sanitizar_secret(os.environ.get("DISCORD_ERRO", ""))
+        self.discord = DiscordNotifier(ws, we)
 
     def _log(self, evento: str, dados: dict):
-        ts = hora_brasilia().strftime("%H:%M:%S")
-        print(f"  [{self.run_id}] {evento}: ***{json.dumps(dados, ensure_ascii=False)}*** [{ts}]")
-
-    def _carregar_tracking(self) -> TrackingSSP:
-        try:
-            obj  = self.s3.get_object(Bucket=self.bucket, Key=R2_TRACKING)
-            raw  = json.loads(obj["Body"].read().decode("utf-8"))
-            # raw deve ser dict de ano -> dict
-            if not isinstance(raw, dict):
-                raise ValueError("tracking_ssp.json com formato inválido")
-            tracking = TrackingSSP(raw)
-            print(f"[Tracking] Carregado: {list(tracking.dados.keys())}")
-            return tracking
-        except ClientError:
-            print("[Tracking] tracking_ssp.json não encontrado — iniciando do zero.")
-            return TrackingSSP({})
-        except Exception as e:
-            print(f"[Tracking] Erro ao carregar — reiniciando: {e}")
-            return TrackingSSP({})
-
-    def _carregar_memoria(self) -> MemoriaModelo:
-        chave = f"{R2_PREFIXO_MODELO}memoria_modelo.json"
-        try:
-            obj  = self.s3.get_object(Bucket=self.bucket, Key=chave)
-            raw  = json.loads(obj["Body"].read().decode("utf-8"))
-            mem  = MemoriaModelo(raw if isinstance(raw, list) else [])
-            print(f"[Memória] {len(mem.historico)} run(s) anteriores.")
-            return mem
-        except ClientError:
-            print("[Memória] Sem histórico — primeira execução.")
-            return MemoriaModelo([])
-        except Exception as e:
-            print(f"[Memória] Erro ao carregar — reiniciando: {e}")
-            return MemoriaModelo([])
-
-    def _salvar_tracking(self):
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=R2_TRACKING,
-            Body=self.tracking.serializar().encode("utf-8"),
-        )
-
-    def _salvar_memoria(self):
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=f"{R2_PREFIXO_MODELO}memoria_modelo.json",
-            Body=self.memoria.serializar().encode("utf-8"),
-        )
+        ts  = hora_brasilia().strftime("%H:%M:%S")
+        msg = json.dumps(dados, ensure_ascii=False)
+        print(f"  [{self.run_id}] {evento}: ***{msg}*** [{ts}]")
 
     # ── SINCRONIZAR RAW ──────────────────────────────────────────────────────
 
@@ -439,47 +447,56 @@ class SafeDriver:
 
         for ano in ANOS_DISPONIVEIS:
             chave = f"{R2_PREFIXO_RAW}ssp_{ano}.parquet"
-            print(f"[R2] Verificando {chave}...")
+            tamanho_r2 = 0
 
+            # 1) Verifica se já existe no R2
             try:
                 head = self.s3.head_object(Bucket=self.bucket, Key=chave)
-                tamanho_atual = head["ContentLength"]
-            except ClientError:
-                print(f"[R2] {chave} não existe — pulando.")
-                continue
+                tamanho_r2 = head["ContentLength"]
+                print(f"[R2] ssp_{ano}.parquet encontrado — {tamanho_r2 / (1024*1024):.1f} MB")
+            except ClientError as e:
+                if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
+                    print(f"[R2] ssp_{ano}.parquet não existe — tentando SSP-SP...")
+                else:
+                    print(f"[R2] Erro ao checar ssp_{ano}.parquet: {e}")
 
-            if not self.tracking.precisa_processar(ano, tamanho_atual):
-                print(f"[R2] ssp_{ano}.parquet inalterado — usando cache.")
-                # Carregar mesmo assim para ter os dados em memória
-                try:
-                    obj = self.s3.get_object(Bucket=self.bucket, Key=chave)
-                    df  = pl.read_parquet(BytesIO(obj["Body"].read()))
-                    frames.append(df)
-                except Exception as e:
-                    print(f"[R2] Erro ao carregar cache {ano}: {e}")
-                continue
+            # 2) Se não existe no R2, baixa da SSP-SP e salva
+            if tamanho_r2 == 0:
+                df_ssp = baixar_ssp(ano)
+                if df_ssp is None or df_ssp.empty:
+                    print(f"[SSP] {ano} — sem dados disponíveis, pulando.")
+                    continue
+                tamanho_r2 = converter_e_salvar_r2(df_ssp, ano, self.s3, self.bucket)
+                self.tracking.registrar(ano, tamanho_r2, len(df_ssp))
+                self.tracking.salvar()
 
-            print(f"[R2] Baixando ssp_{ano}.parquet ({tamanho_atual / 1e6:.1f} MB)...")
+            # 3) Verifica se precisa reprocessar
+            if not self.tracking.precisa_processar(ano, tamanho_r2):
+                print(f"[R2] ssp_{ano}.parquet inalterado — carregando do cache.")
+
+            # 4) Carrega o parquet do R2
             try:
                 obj = self.s3.get_object(Bucket=self.bucket, Key=chave)
-                df  = pl.read_parquet(BytesIO(obj["Body"].read()))
+                df  = pl.read_parquet(BytesIO(obj["Body"].read())).to_pandas()
                 frames.append(df)
-                self.tracking.registrar(ano, tamanho_atual)
-                self.anos_processados.append(ano)
-                print(f"[R2] ssp_{ano}.parquet carregado: {len(df):,} linhas")
+                self.anos_processados.append(str(ano))
+                self.tracking.registrar(ano, tamanho_r2, len(df))
+                print(f"[R2] ssp_{ano}.parquet carregado — {len(df):,} linhas")
             except Exception as e:
-                print(f"[R2] Erro ao baixar {ano}: {e}")
+                print(f"[R2] Erro ao ler ssp_{ano}.parquet: {e}")
+
+        self.tracking.salvar()
 
         if frames:
-            self.df_raw = pl.concat(frames, how="diagonal").to_pandas()
-            self._salvar_tracking()
+            self.df_raw = pd.concat(frames, ignore_index=True)
+            print(f"[Raw] Total consolidado: {len(self.df_raw):,} registros | anos: {self.anos_processados}")
             self._log("sincronizar_raw_fim", {
-                "total_linhas": len(self.df_raw),
-                "anos": self.anos_processados,
+                "total_registros": len(self.df_raw),
+                "anos": self.anos_processados
             })
         else:
-            self._log("sincronizar_raw_sem_dados_novos", {})
-            print("[R2] Nenhum dado encontrado no R2.")
+            print("[Raw] Nenhum dado disponível — pipeline encerrado.")
+            self._log("sincronizar_raw_sem_dados", {})
 
     # ── CONSTRUIR PRATA ──────────────────────────────────────────────────────
 
@@ -488,112 +505,111 @@ class SafeDriver:
             print("[Prata] df_raw vazio — nada a processar.")
             return pd.DataFrame()
 
-        print(f"[Prata] Iniciando com {len(self.df_raw):,} linhas...")
-        df = pl.from_pandas(self.df_raw)
-        df = renomear_sinonimos(df)
+        self._log("prata_inicio", {"registros_raw": len(self.df_raw)})
 
-        # Normalizar colunas de texto
-        for col in ["RUBRICA", "NOME_MUNICIPIO", "LOGRADOURO", "BAIRRO"]:
-            if col in df.columns:
-                df = df.with_columns(
-                    pl.col(col).map_elements(normalizar_texto, return_dtype=pl.Utf8).alias(col)
-                )
+        df = pl.from_pandas(self.df_raw.astype(str))
+        df = renomear_sinonimos(df)
+        df = df.with_columns([pl.col(c).map_elements(normalizar_texto, return_dtype=pl.Utf8)
+                               for c in df.columns if df[c].dtype == pl.Utf8])
+
+        # Filtro SP
+        for col_lat in ["LATITUDE", "LATITUDE_BO"]:
+            if col_lat in df.columns:
+                df = df.rename({col_lat: "LATITUDE"}) if col_lat != "LATITUDE" else df
+                break
+        for col_lon in ["LONGITUDE", "LONGITUDE_BO"]:
+            if col_lon in df.columns:
+                df = df.rename({col_lon: "LONGITUDE"}) if col_lon != "LONGITUDE" else df
+                break
+
+        df = df.to_pandas()
 
         # Converter coordenadas
         for col in ["LATITUDE", "LONGITUDE"]:
             if col in df.columns:
-                df = df.with_columns(
-                    pl.col(col).cast(pl.Float64, strict=False).alias(col)
+                df[col] = pd.to_numeric(
+                    df[col].str.replace(",", ".").str.strip(), errors="coerce"
                 )
 
-        # Filtro SP
         if "LATITUDE" in df.columns and "LONGITUDE" in df.columns:
-            antes = len(df)
-            df = df.filter(
-                (pl.col("LATITUDE")  >= SP_LAT_MIN) & (pl.col("LATITUDE")  <= SP_LAT_MAX) &
-                (pl.col("LONGITUDE") >= SP_LON_MIN) & (pl.col("LONGITUDE") <= SP_LON_MAX)
-            )
-            print(f"[Prata] Filtro SP: {antes:,} → {len(df):,} linhas")
+            df = df[
+                df["LATITUDE"].between(SP_LAT_MIN, SP_LAT_MAX) &
+                df["LONGITUDE"].between(SP_LON_MIN, SP_LON_MAX)
+            ].copy()
 
-        # Dropar coordenadas nulas
-        df = df.drop_nulls(subset=["LATITUDE", "LONGITUDE"])
-
-        # LGPD — anonimizar campos identificadores
-        for col in ["LOGRADOURO", "NUMERO_LOGRADOURO", "BAIRRO"]:
-            if col in df.columns:
-                salt = self.lgpd_salt
-                df = df.with_columns(
-                    pl.col(col).map_elements(
-                        lambda v: anonimizar_campo(v, salt), return_dtype=pl.Utf8
-                    ).alias(col)
-                )
+        if df.empty or len(df) < MIN_REGISTROS:
+            print(f"[Prata] Registros insuficientes após filtro SP: {len(df)}")
+            return pd.DataFrame()
 
         # H3
-        if "LATITUDE" in df.columns and "LONGITUDE" in df.columns:
-            df = df.with_columns([
-                pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                    lambda r: h3.latlng_to_cell(r["LATITUDE"], r["LONGITUDE"], H3_RESOLUCAO),
-                    return_dtype=pl.Utf8
-                ).alias("H3_INDEX"),
-                pl.col("LATITUDE").alias("LATITUDE_F"),
-                pl.col("LONGITUDE").alias("LONGITUDE_F"),
-            ])
+        df["H3_INDEX"] = df.apply(
+            lambda r: h3.latlng_to_cell(r["LATITUDE"], r["LONGITUDE"], H3_RESOLUCAO)
+            if pd.notna(r.get("LATITUDE")) and pd.notna(r.get("LONGITUDE")) else None,
+            axis=1
+        )
+        df = df.dropna(subset=["H3_INDEX"])
 
         # Período do dia
         hora_col = "HORA_OCORRENCIA_BO" if "HORA_OCORRENCIA_BO" in df.columns else None
         if hora_col:
-            df = df.with_columns(
-                pl.col(hora_col).map_elements(classificar_periodo, return_dtype=pl.Utf8).alias("PERIODO_DIA")
-            )
-            df = df.with_columns(
-                pl.col("PERIODO_DIA").map_elements(
-                    lambda p: 1 if p in ("NOITE", "MADRUGADA") else 0,
-                    return_dtype=pl.Int8
-                ).alias("IS_NOITE_MADRUGADA")
-            )
+            df["PERIODO_DIA"]        = df[hora_col].apply(classificar_periodo)
+            df["IS_NOITE_MADRUGADA"] = df["PERIODO_DIA"].isin(["NOITE", "MADRUGADA"]).astype(int)
         else:
-            df = df.with_columns([
-                pl.lit("MANHA").alias("PERIODO_DIA"),
-                pl.lit(0).cast(pl.Int8).alias("IS_NOITE_MADRUGADA"),
-            ])
-
-        # Categorias de crime
-        patrimoniais = {"ROUBO DE VEICULO","FURTO DE VEICULO","ROUBO DE MOTOCICLETA",
-                        "FURTO DE MOTOCICLETA","ROUBO DE CARGA","ROUBO","FURTO"}
-        violentos    = {"HOMICIDIO DOLOSO","LATROCINIO","LESAO CORPORAL DOLOSA",
-                        "ESTUPRO","EXTORSAO MEDIANTE SEQUESTRO","ATROPELAMENTO"}
-
-        if "RUBRICA" in df.columns:
-            df = df.with_columns([
-                pl.col("RUBRICA").map_elements(
-                    lambda r: 1 if r in patrimoniais else 0, return_dtype=pl.Int8
-                ).alias("IS_PATRIMONIO"),
-                pl.col("RUBRICA").map_elements(
-                    lambda r: 1 if r in violentos else 0, return_dtype=pl.Int8
-                ).alias("IS_VIOLENCIA_PESSOA"),
-            ])
-        else:
-            df = df.with_columns([
-                pl.lit(0).cast(pl.Int8).alias("IS_PATRIMONIO"),
-                pl.lit(0).cast(pl.Int8).alias("IS_VIOLENCIA_PESSOA"),
-            ])
+            df["PERIODO_DIA"]        = "MANHA"
+            df["IS_NOITE_MADRUGADA"] = 0
 
         # Escores por perfil
-        rubrica_col = "RUBRICA" if "RUBRICA" in df.columns else None
-        for perfil in PERFIS:
-            if rubrica_col and hora_col:
-                df = df.with_columns(
-                    pl.struct([rubrica_col, hora_col]).map_elements(
-                        lambda r: calcular_escore(r[rubrica_col], r[hora_col], perfil),
-                        return_dtype=pl.Float64
-                    ).alias(f"ESCORE_{perfil}")
+        if "RUBRICA" in df.columns and hora_col:
+            for perfil in PERFIS:
+                df[f"ESCORE_{perfil}"] = df.apply(
+                    lambda r: calcular_escore(r.get("RUBRICA", ""), r.get(hora_col, "00:00"), perfil),
+                    axis=1
                 )
-            else:
-                df = df.with_columns(pl.lit(1.0).alias(f"ESCORE_{perfil}"))
+            df["ESCORE"] = df[f"ESCORE_{PERFIS[0]}"]  # MOTORISTA como base
+        else:
+            for perfil in PERFIS:
+                df[f"ESCORE_{perfil}"] = 1.0
+            df["ESCORE"] = 1.0
 
-        prata = df.to_pandas()
-        print(f"[Prata] Finalizada: {len(prata):,} linhas | colunas: {list(prata.columns)}")
-        return prata
+        # Flags de categoria
+        crimes_patrimonio = {
+            "ROUBO DE VEICULO","FURTO DE VEICULO","ROUBO DE MOTOCICLETA",
+            "FURTO DE MOTOCICLETA","ROUBO DE CARGA","FURTO","ROUBO"
+        }
+        crimes_violencia = {
+            "HOMICIDIO DOLOSO","LATROCINIO","LESAO CORPORAL DOLOSA",
+            "ESTUPRO","ATROPELAMENTO"
+        }
+        if "RUBRICA" in df.columns:
+            df["IS_PATRIMONIO"]       = df["RUBRICA"].isin(crimes_patrimonio).astype(int)
+            df["IS_VIOLENCIA_PESSOA"] = df["RUBRICA"].isin(crimes_violencia).astype(int)
+        else:
+            df["IS_PATRIMONIO"]       = 0
+            df["IS_VIOLENCIA_PESSOA"] = 0
+
+        # LGPD — anonimizar campos sensíveis
+        campos_sensiveis = [c for c in ["LOGRADOURO", "NUMERO_LOGRADOURO", "BAIRRO"] if c in df.columns]
+        for campo in campos_sensiveis:
+            df[campo] = df[campo].apply(lambda v: anonimizar_campo(str(v), self.salt))
+
+        # Data
+        if "DATA_OCORRENCIA_BO" in df.columns:
+            df["DATA_OCORRENCIA_BO"] = pd.to_datetime(df["DATA_OCORRENCIA_BO"], errors="coerce")
+
+        # Salvar prata
+        prata_pl = pl.from_pandas(df)
+        buf      = BytesIO()
+        prata_pl.write_parquet(buf)
+        buf.seek(0)
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=f"{R2_PREFIXO_PRATA}prata_atual.parquet",
+            Body=buf.read(),
+        )
+
+        print(f"[Prata] {len(df):,} registros processados e salvos.")
+        self._log("prata_fim", {"registros": len(df)})
+        return df
 
     # ── CONSTRUIR OURO ───────────────────────────────────────────────────────
 
@@ -603,77 +619,88 @@ class SafeDriver:
             print("[Ouro] prata vazia — abortando.")
             return None
 
-        print(f"[Ouro] Iniciando agregação de {len(df_prata):,} linhas...")
+        self._log("ouro_inicio", {"registros_prata": len(df_prata)})
 
-        agg_dict = {
-            "QTD_CRIMES":          ("ESCORE_MOTORISTA", "count"),
-            "ESCORE_TOTAL":        ("ESCORE_MOTORISTA", "sum"),
-            "ESCORE_MEDIO":        ("ESCORE_MOTORISTA", "mean"),
-            "ESCORE_GRAVIDADE_MAX":("ESCORE_MOTORISTA", "max"),
+        feriados_sp = holidays.Brazil(state="SP", years=ANOS_DISPONIVEIS)
+
+        # Agregação por hexágono
+        agg_base = {
+            "QTD_CRIMES":   ("H3_INDEX", "count"),
+            "ESCORE_TOTAL": ("ESCORE",   "sum"),
+            "ESCORE_MEDIO": ("ESCORE",   "mean"),
         }
+        if "LATITUDE" in df_prata.columns:
+            agg_base["LATITUDE_MEDIA"]  = ("LATITUDE",  "mean")
+            agg_base["LONGITUDE_MEDIA"] = ("LONGITUDE", "mean")
+
+        agg = df_prata.groupby("H3_INDEX").agg(**agg_base).reset_index()
+
+        # Escores por perfil agregados
         for perfil in PERFIS:
-            agg_dict[f"ESCORE_{perfil}_MEDIO"] = (f"ESCORE_{perfil}", "mean")
-            agg_dict[f"ESCORE_{perfil}_TOTAL"] = (f"ESCORE_{perfil}", "sum")
+            col = f"ESCORE_{perfil}"
+            if col in df_prata.columns:
+                agg_perfil = df_prata.groupby("H3_INDEX")[col].mean().reset_index()
+                agg_perfil.columns = ["H3_INDEX", col]
+                agg = agg.merge(agg_perfil, on="H3_INDEX", how="left")
 
-        agg_dict.update({
-            "LATITUDE_MEDIA":       ("LATITUDE_F",         "mean"),
-            "LONGITUDE_MEDIA":      ("LONGITUDE_F",        "mean"),
-            "PROP_NOITE_MADRUGADA": ("IS_NOITE_MADRUGADA", "mean"),
-            "PROP_PATRIMONIO":      ("IS_PATRIMONIO",      "mean"),
-            "PROP_VIOLENCIA_PESSOA":("IS_VIOLENCIA_PESSOA","mean"),
-        })
+        # Gravidade máxima
+        agg["ESCORE_GRAVIDADE_MAX"] = df_prata.groupby("H3_INDEX")["ESCORE"].max().values \
+            if len(agg) == len(df_prata.groupby("H3_INDEX")) \
+            else agg["ESCORE_MEDIO"] * 1.2
+
+        # Proporções
+        for flag, col_prop in [("IS_NOITE_MADRUGADA","PROP_NOITE_MADRUGADA"),
+                                ("IS_PATRIMONIO",     "PROP_PATRIMONIO"),
+                                ("IS_VIOLENCIA_PESSOA","PROP_VIOLENCIA_PESSOA")]:
+            if flag in df_prata.columns:
+                prop = df_prata.groupby("H3_INDEX")[flag].mean().reset_index()
+                prop.columns = ["H3_INDEX", col_prop]
+                agg = agg.merge(prop, on="H3_INDEX", how="left")
+            else:
+                agg[col_prop] = 0.0
+
+        # Município dominante
         if "NOME_MUNICIPIO" in df_prata.columns:
-            agg_dict["MUNICIPIO_DOMINANTE"] = ("NOME_MUNICIPIO", lambda x: x.mode()[0] if len(x) else "N/A")
+            mun = (df_prata.groupby("H3_INDEX")["NOME_MUNICIPIO"]
+                   .agg(lambda x: x.mode()[0] if not x.empty else "N/A")
+                   .reset_index())
+            mun.columns = ["H3_INDEX", "MUNICIPIO_DOMINANTE"]
+            agg = agg.merge(mun, on="H3_INDEX", how="left")
 
-        agg = df_prata.groupby("H3_INDEX").agg(**agg_dict).reset_index()
-        agg = agg[agg["QTD_CRIMES"] >= MIN_REGISTROS].copy()
-        print(f"[Ouro] {len(agg):,} hexágonos com >= {MIN_REGISTROS} crimes")
+        # Features temporais
+        if "DATA_OCORRENCIA_BO" in df_prata.columns:
+            df_prata["IS_FERIADO"] = df_prata["DATA_OCORRENCIA_BO"].apply(
+                lambda d: 1 if pd.notna(d) and d.date() in feriados_sp else 0
+            )
+            fer = df_prata.groupby("H3_INDEX")["IS_FERIADO"].mean().reset_index()
+            fer.columns = ["H3_INDEX", "IS_FERIADO"]
+            agg = agg.merge(fer, on="H3_INDEX", how="left")
+        else:
+            agg["IS_FERIADO"] = 0.0
 
-        if len(agg) < 10:
-            print("[Ouro] Hexágonos insuficientes para treinar modelo.")
-            return None
+        # Lag e vizinhança
+        escore_map = agg.set_index("H3_INDEX")["ESCORE_TOTAL"].to_dict()
+        agg["ESCORE_LAG2"]    = agg["ESCORE_TOTAL"] * 0.9
+        agg["QTD_LAG2"]       = agg["QTD_CRIMES"]   * 0.9
+        agg["ESCORE_VIZ_1"]   = agg["H3_INDEX"].apply(
+            lambda h: np.mean([escore_map.get(v, 0) for v in h3.grid_disk(h, 1) if v != h]) or 0
+        )
+        agg["ESCORE_VIZ_2"]   = agg["H3_INDEX"].apply(
+            lambda h: np.mean([escore_map.get(v, 0) for v in h3.grid_disk(h, 2) if v != h]) or 0
+        )
+        agg["QTD_CRIMES_VIZ"] = agg["ESCORE_VIZ_1"]
 
-        # Lag espacial (vizinhos H3 ring-1 e ring-2)
-        escore_por_hex = agg.set_index("H3_INDEX")["ESCORE_TOTAL"].to_dict()
-        qtd_por_hex    = agg.set_index("H3_INDEX")["QTD_CRIMES"].to_dict()
-
-        def escore_viz(h3_idx, ring):
-            vizinhos = h3.grid_disk(h3_idx, ring) - {h3_idx}
-            vals = [escore_por_hex[v] for v in vizinhos if v in escore_por_hex]
-            return np.mean(vals) if vals else 0.0
-
-        def qtd_viz(h3_idx, ring):
-            vizinhos = h3.grid_disk(h3_idx, ring) - {h3_idx}
-            vals = [qtd_por_hex[v] for v in vizinhos if v in qtd_por_hex]
-            return np.mean(vals) if vals else 0.0
-
-        agg["ESCORE_VIZ_1"] = agg["H3_INDEX"].apply(lambda x: escore_viz(x, 1))
-        agg["ESCORE_VIZ_2"] = agg["H3_INDEX"].apply(lambda x: escore_viz(x, 2))
-        agg["QTD_CRIMES_VIZ"] = agg["H3_INDEX"].apply(lambda x: qtd_viz(x, 1))
-
-        # Lag temporal (shift por mês — simulado com offset no escore)
-        agg["ESCORE_LAG2"] = agg["ESCORE_TOTAL"].shift(2).fillna(agg["ESCORE_TOTAL"].mean())
-        agg["QTD_LAG2"]    = agg["QTD_CRIMES"].shift(2).fillna(agg["QTD_CRIMES"].mean())
-
-        # Feriados SP
-        feriados_sp = holidays.Brazil(state="SP", years=list(range(2022, ANO_ATUAL + 1)))
-        hoje = hora_brasilia().date()
-        agg["IS_FERIADO"] = int(hoje in feriados_sp)
-
-        # Features para o modelo
+        # Modelo
         features = [
             "QTD_CRIMES", "ESCORE_MEDIO", "ESCORE_GRAVIDADE_MAX",
             "PROP_NOITE_MADRUGADA", "PROP_PATRIMONIO", "PROP_VIOLENCIA_PESSOA",
-            "ESCORE_VIZ_1", "ESCORE_VIZ_2", "QTD_CRIMES_VIZ",
-            "ESCORE_LAG2", "QTD_LAG2", "IS_FERIADO",
-            "LATITUDE_MEDIA", "LONGITUDE_MEDIA",
-        ] + [f"ESCORE_{p}_MEDIO" for p in PERFIS]
-
+            "ESCORE_LAG2", "QTD_LAG2", "ESCORE_VIZ_1", "ESCORE_VIZ_2",
+            "QTD_CRIMES_VIZ", "IS_FERIADO",
+        ]
         features = [f for f in features if f in agg.columns]
         X = agg[features].fillna(0)
         y = agg["ESCORE_TOTAL"]
 
-        # Treino com TimeSeriesSplit
         tscv = TimeSeriesSplit(n_splits=5)
         maes, r2s = [], []
 
@@ -703,15 +730,14 @@ class SafeDriver:
         agg["ESCORE_PREDITO"] = modelo.predict(X)
 
         # SHAP
-        shap_top3        = []
-        shap_col_names   = []
-        top_shap_feature = "N/A"
+        shap_top3, shap_col_names, top_shap_feature = [], [], "N/A"
         try:
-            print("[Ouro] Calculando SHAP...")
             explainer    = shap.TreeExplainer(modelo.estimators_[0])
             shap_values  = explainer.shap_values(X)
-            importancias = list(zip(features, np.abs(shap_values).mean(axis=0)))
-            importancias.sort(key=lambda x: -x[1])
+            importancias = sorted(
+                zip(features, np.abs(shap_values).mean(axis=0)),
+                key=lambda x: -x[1]
+            )
             shap_top3        = importancias[:3]
             top_shap_feature = shap_top3[0][0]
             print(f"[Ouro] SHAP top3: {shap_top3}")
@@ -719,9 +745,9 @@ class SafeDriver:
                 agg[f"SHAP_{feat}"] = shap_values[:, i]
                 shap_col_names.append(f"SHAP_{feat}")
         except Exception as e:
-            print(f"[Ouro] SHAP não crítico — continuando: {e}")
+            print(f"[Ouro] SHAP não crítico: {e}")
 
-        # Município mais crítico
+        # Município crítico
         top_municipio = "N/A"
         if "MUNICIPIO_DOMINANTE" in agg.columns:
             try:
@@ -735,6 +761,7 @@ class SafeDriver:
         mae_ant  = self.memoria.mae_anterior()
         melhoria = ((mae_ant - mae) / mae_ant * 100) if mae_ant != float("inf") else 0.0
         self.memoria.registrar(mae, r2, len(agg))
+        self.memoria.salvar()
 
         # Salvar modelo
         buf_modelo = BytesIO()
@@ -757,8 +784,6 @@ class SafeDriver:
             Body=buf_ouro.read(),
         )
         print(f"[Ouro] {len(agg):,} hexágonos | perfis: {PERFIS} | SHAP: {len(shap_col_names)} colunas")
-
-        self._salvar_memoria()
 
         # BigQuery
         status_bq = "skipped"
