@@ -28,9 +28,8 @@ jobs:
         uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: safedriver_env
-          environment-file: environment.yml
-          auto-activate-base: false
           python-version: "3.10"
+          auto-activate-base: false
 
       - name: Instalar Dependências
         shell: bash -l {0}
@@ -57,7 +56,8 @@ jobs:
             h3 \
             holidays \
             python-magic \
-            joblib
+            joblib \
+            pytest
 
       - name: Executar Pipeline
         shell: bash -l {0}
