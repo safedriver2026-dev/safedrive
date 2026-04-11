@@ -12,10 +12,10 @@ jobs:
       - name: Checkout do Repositório
         uses: actions/checkout@v3
 
-      - name: Configurar Python
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v4
         with:
-          python-version: '3.12'
+          python-version: '3.11' # ALTERADO AQUI: De '3.12' para '3.11'
 
       - name: Restaurar Cache do Datalake
         uses: actions/cache@v3
@@ -27,11 +27,10 @@ jobs:
 
       - name: Instalar Dependências
         run: |
-          # Atualizar pip para a versão mais recente
           python -m pip install --upgrade pip
-          # Instalar ferramentas de build que podem ser necessárias para h3-py
+          # setuptools e wheel já foram instalados no passo anterior, mas não custa garantir
           pip install setuptools wheel
-          # Instalar as bibliotecas, forçando a não usar cache para h3-py
+          # Instalar as bibliotecas, agora com h3-py==4.0.0 para Python 3.11
           pip install --no-cache-dir polars pandas numpy h3-py==4.0.0 catboost lightgbm scikit-learn h3 holidays boto3 shap google-cloud-bigquery google-auth-oauthlib fastexcel
 
       - name: Verificar Versão do H3 (Debug)
