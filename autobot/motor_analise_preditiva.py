@@ -347,26 +347,7 @@ class SafeDriver:
                         if self.download_do_r2(r2_key, parquet_file):
                             arquivos_para_processar.append(parquet_file)
                         else:
-                            print(f"❌ Falha ao baixar {ano}.parquet do R2 para processamento local. Pulando.", file=sys.stderr)
-                            self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano}.parquet do R2 para local.")
-                            continue
-                else: # SSP inacessível
-                    print(f"⚠️ SSP inacessível para {ano}.", file=sys.stdout)
-                    if r2_tem_arquivo:
-                        print(f"⬇️ Baixando {ano}.parquet do R2 para processamento local (SSP inacessível)...", file=sys.stdout)
-                        if self.download_do_r2(r2_key, parquet_file):
-                            arquivos_para_processar.append(parquet_file)
-                        else:
-                            print(f"❌ Falha ao baixar {ano}.parquet do R2 para processamento local. Pulando.", file=sys.stderr)
-                            self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"Falha ao baixar {ano}.parquet do R2 para local.")
-                            continue
-                    else:
-                        print(f"❌ SSP inacessível e arquivo {ano} não encontrado no R2. Pulando este ano.", file=sys.stderr)
-                        self.discord.notificar_erro(f"SafeDriver Sync {ano}", f"SSP inacessível e {ano} não no R2.")
-                        continue
-            else: # Ano não é o mais recente e o arquivo já está no R2
-                print(f"✅ Arquivo {ano} já no R2 e não é o ano mais recente. Baixando do R2 para processamento local...", file=sys.stdout)
-                if self.download_do_r2(r2_key, parquet_file):
+                            print(f"❌ F..file):
                     arquivos_para_processar.append(parquet_file)
                 else:
                     print(f"❌ Falha ao baixar {ano}.parquet do R2 para processamento local. Pulando.", file=sys.stderr)
