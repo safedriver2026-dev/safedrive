@@ -178,7 +178,6 @@ class SafeDriver:
         self.feriados = list(
             holidays.Brazil(subdiv="SP", years=range(2022, 2027)).keys()
         )
-        # O nome do arquivo meta.json no R2 é tracking_ssp.json
         self.meta = self.pastas["raw"] / "tracking_ssp.json" 
 
     def cdc_check(self, ano, url, sessao):
@@ -246,6 +245,52 @@ class SafeDriver:
         except Exception:
             return False
 
+    def _processar_e_salvar_raw(self, ano, tmp_xlsx: Path, parquet_file: Path, r2_key: str, meta_info: dict):
+        print(f"⚙️ Processando XLSX para Parquet para o ano {ano}...", file=sys.stdout)
+
+        # Verificar o tipo MIME do arquivo
+        file_type = magic.from_file(str(tmp_xlsx), mime=True)
+        if file_type != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+            print(f"❌ Erro: O arquivo {tmp_xlsx.name} não é um XLSX válido (tipo: {file_type}).", file=sys.stderr)
+            tmp_xlsx.unlink(missing_ok=True) # Remover arquivo inválido
+            raise ValueError(f"Arquivo {tmp_xlsx.name} não é um XLSX válido.")
+
+        df_ssp = pl.read_excel(tmp_xlsx, engine="fastexcel")
+
+        # Lógica para lidar com arquivos Excel de uma ou múltiplas abas
+        if isinstance(df_ssp, dict):
+            # Se for um dicionário (múltiplas abas), concatena todas
+            print(f"ℹ️ XLSX de {ano} possui múltiplas abas. Concatenando...", file=sys.stdout)
+            df_final = pl.concat([df_sheet.lazy() for df_sheet in df_ssp.values()]).collect()
+        else:
+            # Se for um DataFrame (uma única aba), usa diretamente
+            print(f"ℹ️ XLSX de {ano} possui uma única aba.", file=sys.stdout)
+            df_final = df_ssp.collect() # Já é um DataFrame, mas coletar garante consistência
+
+        # Limpeza de colunas e salvamento
+        f_cols = [c for c in df_final.columns if c.strip() in ["D", "H", "LAT", "LON", "N"]]
+        if len(f_cols) >= 5:
+            df_final = df_final.select(f_cols).rename({c: c.strip() for c in f_cols})
+            df_final.write_parquet(parquet_file)
+            print(f"✅ Parquet para {ano} salvo em {parquet_file.name}.", file=sys.stdout)
+
+            # Atualizar meta_info
+            sha256 = self.calcular_sha256(parquet_file)
+            size = parquet_file.stat().st_size
+            meta_info[str(ano)] = {
+                "tamanho_bytes": size,
+                "sha256": sha256,
+                "data_sincronizacao": hora_brasilia().isoformat(),
+            }
+
+            # Upload para R2
+            self.upload_para_r2(parquet_file, r2_key)
+        else:
+            print(f"❌ Erro: O arquivo XLSX de {ano} não contém as colunas esperadas (D, H, LAT, LON, N).", file=sys.stderr)
+            raise ValueError(f"Colunas esperadas não encontradas no XLSX de {ano}.")
+
+        tmp_xlsx.unlink(missing_ok=True) # Remover arquivo XLSX temporário
+
     def sincronizar_raw(self):
         anos = range(2022, datetime.now().year + 1)
         sessao = requests.Session()
@@ -270,7 +315,7 @@ class SafeDriver:
         else:
             meta_info = {}
 
-        arquivos_para_processar = []
+        self.arquivos_raw_sincronizados = [] # Reinicializa a lista para cada execução
 
         for ano in anos:
             url_ssp = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
@@ -291,34 +336,33 @@ class SafeDriver:
                 print(f"🔄 Verificando SSP para o ano {ano} (último ano ou não no R2)...", file=sys.stdout)
                 ssp_acessivel, ssp_size = self.cdc_check(ano, url_ssp, sessao)
 
-                # Se SSP acessível, verificar se o arquivo mudou
                 if ssp_acessivel:
+                    meta_ano = meta_info.get(str(ano), {})
+
                     # Verificar se o arquivo no R2 (se existir) está atualizado com a SSP
                     # ou se o arquivo local (se existir) está atualizado com a SSP
-                    r2_sha256 = meta_info.get(str(ano), {}).get("sha256")
-                    r2_size = meta_info.get(str(ano), {}).get("tamanho_bytes")
+                    r2_sha256 = meta_ano.get("sha256")
+                    r2_stored_size = meta_ano.get("tamanho_bytes")
 
-                    if r2_tem_arquivo and r2_size == ssp_size:
-                        # Se o R2 tem o arquivo e o tamanho é o mesmo da SSP,
-                        # assumimos que está atualizado. Baixamos do R2 para local.
+                    # Se o R2 tem o arquivo e o tamanho/SHA256 são os mesmos da SSP,
+                    # assumimos que está atualizado. Baixamos do R2 para local.
+                    if r2_tem_arquivo and r2_stored_size == ssp_size and r2_sha256: # Adicionado r2_sha256 para garantir que a meta está completa
                         print(f"✅ R2: Arquivo {ano} no R2 está atualizado com a SSP. Baixando do R2...", file=sys.stdout)
                         if self.download_do_r2(r2_key, parquet_file):
-                            arquivos_para_processar.append(parquet_file)
+                            self.arquivos_raw_sincronizados.append(parquet_file)
                         else:
                             print(f"❌ R2: Falha ao baixar {r2_key} do R2, mesmo existindo. Tentando SSP...", file=sys.stderr)
                             if self.baixar_robusto(url_ssp, tmp_xlsx, sessao):
-                                print(f"✅ SSP: Download de {ano} concluído. Processando...", file=sys.stdout)
                                 self._processar_e_salvar_raw(ano, tmp_xlsx, parquet_file, r2_key, meta_info)
-                                arquivos_para_processar.append(parquet_file)
+                                self.arquivos_raw_sincronizados.append(parquet_file)
                             else:
-                                print(f"❌ SSP: Falha crítica ao baixar {ano} da SSP.", file=sys.stderr)
+                                print(f"❌ SSP: Falha crítica ao baixar {ano} da SSP.", file=sys.sys.stderr)
                     else:
                         # Arquivo no R2 não existe ou está desatualizado. Baixar da SSP.
                         print(f"⬇️ SSP: Baixando {ano} da SSP (novo ou atualizado)...", file=sys.stdout)
                         if self.baixar_robusto(url_ssp, tmp_xlsx, sessao):
-                            print(f"✅ SSP: Download de {ano} concluído. Processando...", file=sys.stdout)
                             self._processar_e_salvar_raw(ano, tmp_xlsx, parquet_file, r2_key, meta_info)
-                            arquivos_para_processar.append(parquet_file)
+                            self.arquivos_raw_sincronizados.append(parquet_file)
                         else:
                             print(f"❌ SSP: Falha crítica ao baixar {ano} da SSP.", file=sys.stderr)
                 else:
@@ -327,74 +371,75 @@ class SafeDriver:
                     if r2_tem_arquivo:
                         if self.download_do_r2(r2_key, parquet_file):
                             print(f"✅ R2: Usando arquivo {ano} do R2 como fallback.", file=sys.stdout)
-                            arquivos_para_processar.append(parquet_file)
+                            self.arquivos_raw_sincronizados.append(parquet_file)
                         else:
-                            print(f"❌ R2: Falha ao baixar {r2_key} do R2. Não foi possível obter dados para {ano}.", file=sys.stderr)
+                            print(f"❌ R2: Falha ao baixar {r2_key} do R2 como fallback. Pulando ano {ano}.", file=sys.stderr)
                     else:
-                        print(f"❌ R2: Arquivo {ano} não encontrado no R2. Não foi possível obter dados para {ano}.", file=sys.stderr)
+                        print(f"❌ Nenhum arquivo disponível para o ano {ano} (SSP inacessível e não no R2). Pulando.", file=sys.stderr)
             else:
-                # Não é o ano mais recente E o arquivo já está no R2. Baixar do R2.
-                print(f"☁️ R2: Arquivo {ano} já existe no R2. Baixando para processamento local...", file=sys.stdout)
+                # Não é o ano mais recente e o arquivo já está no R2. Baixar do R2.
+                print(f"✅ R2: Usando arquivo {ano} do R2 (não é o ano mais recente e já está no R2).", file=sys.stdout)
                 if self.download_do_r2(r2_key, parquet_file):
-                    arquivos_para_processar.append(parquet_file)
+                    self.arquivos_raw_sincronizados.append(parquet_file)
                 else:
-                    print(f"❌ R2: Falha ao baixar {r2_key} do R2. Não foi possível obter dados para {ano}.", file=sys.stderr)
+                    print(f"❌ R2: Falha ao baixar {r2_key} do R2. Pulando ano {ano}.", file=sys.stderr)
 
-            # Limpar arquivo temporário .xlsx se existir
-            if tmp_xlsx.exists():
-                tmp_xlsx.unlink()
-
-        # Salvar o meta_info atualizado no R2
+        # Salvar meta_info atualizado no local e fazer upload para R2
         with open(self.meta, "w") as f:
             json.dump(meta_info, f, indent=4)
         self.upload_para_r2(self.meta, r2_meta_key)
 
-        self.arquivos_raw_sincronizados = arquivos_para_processar
+        print("\n--- Sincronização RAW concluída ---", file=sys.stdout)
+        if not self.arquivos_raw_sincronizados:
+            print("⚠️ Nenhum arquivo RAW foi sincronizado com sucesso.", file=sys.stderr)
+        else:
+            print(f"✅ {len(self.arquivos_raw_sincronizados)} arquivos RAW sincronizados e prontos para processamento.", file=sys.stdout)
 
-    def _processar_e_salvar_raw(self, ano, tmp_xlsx: Path, parquet_file: Path, r2_key: str, meta_info: dict):
-        """Processa o XLSX baixado, salva como Parquet e faz upload para R2."""
+
+    def wkt(self, h3_code):
+        if h3_code is None:
+            return None
         try:
-            print(f"⚙️ Processando XLSX para Parquet para o ano {ano}...", file=sys.stdout)
-            df_ssp = pl.read_excel(str(tmp_xlsx), sheet_name=None)
-
-            # Encontrar a aba com o maior número de colunas (provavelmente a principal)
-            main_sheet_name = None
-            max_cols = 0
-            for sheet_name, df_sheet in df_ssp.items():
-                if df_sheet.width > max_cols:
-                    max_cols = df_sheet.width
-                    main_sheet_name = sheet_name
-
-            if not main_sheet_name:
-                raise ValueError(f"Nenhuma aba válida encontrada no XLSX para o ano {ano}.")
-
-            df_ssp_main = df_ssp[main_sheet_name]
-
-            # Filtrar colunas que começam com 'D', 'H', 'N', 'LAT', 'LON'
-            f_cols = [col for col in df_ssp_main.columns if col.startswith(('D', 'H', 'N', 'LAT', 'LON'))]
-
-            if len(f_cols) < 5: # Ajustado para ser mais tolerante
-                raise ValueError(f"Colunas essenciais (D, H, N, LAT, LON) não encontradas no XLSX para o ano {ano}.")
-
-            df_ssp_main.select(f_cols).write_parquet(parquet_file)
-
-            # Atualizar meta_info com o SHA256 e tamanho do novo arquivo Parquet
-            meta_info[str(ano)] = {
-                "tamanho_bytes": parquet_file.stat().st_size,
-                "sha256": self.calcular_sha256(parquet_file),
-                "data_sincronizacao": hora_brasilia().isoformat()
-            }
-
-            # Fazer upload do novo arquivo Parquet para o R2
-            self.upload_para_r2(parquet_file, r2_key)
-
+            boundary = h3.h3_to_geo_boundary(h3_code, geo_json=True)
+            # Formato WKT para Polígono: POLYGON ((lon1 lat1, lon2 lat2, ..., lon1 lat1))
+            # h3_to_geo_boundary retorna [lat, lon], precisamos [lon, lat]
+            coords = ", ".join([f"{lon} {lat}" for lat, lon in boundary])
+            return f"POLYGON (({coords}))"
         except Exception as e:
-            print(f"❌ Erro ao processar e salvar RAW para o ano {ano}: {e}", file=sys.stderr)
-            self.discord.notificar_erro(f"Falha Processamento RAW {ano}", str(e))
-            # Se falhar, garantir que o arquivo não seja adicionado à lista de processamento
-            if parquet_file.exists():
-                parquet_file.unlink() # Remover arquivo parcial/corrompido
-            raise # Re-lançar a exceção para interromper o pipeline se for crítico
+            print(f"❌ Erro ao converter H3 {h3_code} para WKT: {e}", file=sys.stderr)
+            return None
+
+    def publicar_bigquery_a_partir_de_arquivos(self, bq_project, bq_dataset, bq_cred_json):
+        print("📡 Publicando camadas Ouro para BigQuery...", file=sys.stdout)
+
+        # Publicar dashboard_final
+        dashboard_final_path = self.pastas["ouro"] / "dashboard_final.parquet"
+        if dashboard_final_path.exists():
+            df_dashboard = pl.read_parquet(dashboard_final_path)
+            enviar_para_bigquery(df_dashboard, "dashboard_final", bq_project, bq_dataset, bq_cred_json)
+            print("✅ dashboard_final publicado no BigQuery.", file=sys.stdout)
+        else:
+            print("⚠️ dashboard_final.parquet não encontrado. Pulando publicação.", file=sys.stderr)
+
+        # Publicar validacao_modelo
+        validacao_modelo_path = self.pastas["ouro"] / "validacao_modelo.parquet"
+        if validacao_modelo_path.exists():
+            df_validacao = pl.read_parquet(validacao_modelo_path)
+            enviar_para_bigquery(df_validacao, "validacao_modelo", bq_project, bq_dataset, bq_cred_json)
+            print("✅ validacao_modelo publicado no BigQuery.", file=sys.stdout)
+        else:
+            print("⚠️ validacao_modelo.parquet não encontrado. Pulando publicação.", file=sys.stderr)
+
+        # Publicar shap_audit
+        shap_audit_path = self.pastas["ouro"] / "shap_audit.parquet"
+        if shap_audit_path.exists():
+            df_shap = pl.read_parquet(shap_audit_path)
+            enviar_para_bigquery(df_shap, "shap_audit", bq_project, bq_dataset, bq_cred_json)
+            print("✅ shap_audit publicado no BigQuery.", file=sys.stdout)
+        else:
+            print("⚠️ shap_audit.parquet não encontrado. Pulando publicação.", file=sys.stderr)
+
+        print("📡 Publicação BigQuery concluída.", file=sys.stdout)
 
 
     def reconstruir_ouro_validacao_shap(self, bq_project, bq_dataset, bq_cred_json):
