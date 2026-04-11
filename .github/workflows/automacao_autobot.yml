@@ -36,10 +36,10 @@ jobs:
       - name: Sanitizar Secrets
         shell: bash -l {0}
         run: |
-          echo "R2_ACCESS_KEY_ID=$(echo "$R2_ACCESS_KEY_ID" | tr -d '\n\r ')" >> $GITHUB_ENV
+          echo "R2_ACCESS_KEY_ID=$(echo "$R2_ACCESS_KEY_ID" | tr -d '\n\r ')"       >> $GITHUB_ENV
           echo "R2_SECRET_ACCESS_KEY=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d '\n\r ')" >> $GITHUB_ENV
-          echo "R2_ENDPOINT_URL=$(echo "$R2_ENDPOINT_URL" | tr -d '\n\r ')" >> $GITHUB_ENV
-          echo "R2_BUCKET_NAME=$(echo "$R2_BUCKET_NAME" | tr -d '\n\r ')" >> $GITHUB_ENV
+          echo "R2_ENDPOINT_URL=$(echo "$R2_ENDPOINT_URL" | tr -d '\n\r ')"           >> $GITHUB_ENV
+          echo "R2_BUCKET_NAME=$(echo "$R2_BUCKET_NAME" | tr -d '\n\r ')"             >> $GITHUB_ENV
 
       - name: Instalar Dependências
         shell: bash -l {0}
@@ -49,7 +49,6 @@ jobs:
           pip install \
             polars \
             pandas \
-            openpyxl \
             pyarrow \
             numpy \
             boto3 \
