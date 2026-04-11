@@ -45,25 +45,10 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install \
-            polars \
-            pandas \
-            pyarrow \
-            numpy \
-            boto3 \
-            requests \
-            urllib3 \
-            google-cloud-bigquery \
-            google-cloud-bigquery-storage \
-            google-auth \
-            db-dtypes \
-            catboost \
-            lightgbm \
-            scikit-learn \
-            shap \
-            h3 \
-            holidays \
-            joblib \
-            pytest
+            polars pandas pyarrow numpy boto3 requests urllib3 \
+            google-cloud-bigquery google-cloud-bigquery-storage \
+            google-auth db-dtypes catboost lightgbm scikit-learn \
+            shap h3 holidays joblib pytest
 
       - name: Executar Pipeline
         run: python autobot/motor_analise_preditiva.py
