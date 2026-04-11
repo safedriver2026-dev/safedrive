@@ -12,30 +12,46 @@ jobs:
       - name: Checkout do Repositório
         uses: actions/checkout@v4
 
-      - name: Configurar Python 3.9
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-
-      - name: Instalar Miniconda
+      - name: Configurar Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
-          python-version: 3.9
-          auto-update-conda: true
-          auto-activate-base: false # Não ativar o ambiente base automaticamente
-          activate-environment: safedriver_env # Nome do ambiente conda
+          python-version: '3.9'
+          channels: conda-forge
+          activate-environment: safedriver_env
+          auto-activate-base: false
 
-      - name: Instalar Dependências com Conda e Pip
-        shell: bash -l {0} # Usar bash -l para ativar o ambiente conda
+      - name: Instalar Dependências do Sistema (para compilação)
+        shell: bash -l {0}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3-dev
+
+      - name: Instalar Bibliotecas Python
+        shell: bash -l {0}
         run: |
           conda activate safedriver_env
-          # Instalar h3-py via conda-forge, que geralmente tem builds mais robustos
-          conda install -c conda-forge h3-py -y
-          # Instalar o restante via pip, no ambiente conda
-          pip install --no-cache-dir polars pandas numpy catboost lightgbm scikit-learn holidays boto3 shap google-cloud-bigquery google-auth-oauthlib fastexcel
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir polars pandas numpy catboost lightgbm scikit-learn holidays boto3 shap google-cloud-bigquery google-auth-oauthlib fastexcel python-magic
+          conda install -c conda-forge h3-py -y # Instala h3-py via conda-forge
+
+      - name: Cache Datalake Raw e Meta
+        uses: actions/cache@v4
+        with:
+          path: datalake/raw # Caminho para a pasta raw
+          key: ${{ runner.os }}-datalake-raw-${{ hashFiles('datalake/raw/**') }} # Chave baseada no conteúdo
+          restore-keys: |
+            ${{ runner.os }}-datalake-raw- # Fallback para qualquer cache raw
+
+      - name: Cache Meta.json
+        uses: actions/cache@v4
+        with:
+          path: datalake/raw/meta.json # Caminho para o arquivo meta.json
+          key: ${{ runner.os }}-meta-json-${{ hashFiles('datalake/raw/meta.json') }} # Chave baseada no conteúdo
+          restore-keys: |
+            ${{ runner.os }}-meta-json- # Fallback para qualquer cache meta
 
       - name: Executar Pipeline SafeDriver
-        shell: bash -l {0} # Usar bash -l para ativar o ambiente conda
+        shell: bash -l {0}
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -51,7 +67,7 @@ jobs:
           python -u autobot/motor_analise_preditiva.py
 
       - name: Rodar Testes de Segurança e Qualidade
-        shell: bash -l {0} # Usar bash -l para ativar o ambiente conda
+        shell: bash -l {0}
         run: |
           conda activate safedriver_env
           pytest tests/test_seguranca.py -v
