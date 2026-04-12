@@ -1,15 +1,16 @@
-name: SafeDriver_Motor
+name: SafeDriver Autobot Pipeline
 
 on:
   schedule:
-    - cron: '0 3 * * *'
-  workflow_dispatch:
+    - cron: '0 3 * * *' # Roda todo dia às 03:00 AM
+  workflow_dispatch: # Permite rodar manualmente pelo GitHub
 
 jobs:
-  run-pipeline:
+  executar-inteligencia:
     runs-on: ubuntu-latest
 
     env:
+      # Configurações de Nuvem (Secrets)
       R2_ENDPOINT_URL:         ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID:        ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY:    ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -22,35 +23,24 @@ jobs:
       LGPD_SALT:               ${{ secrets.LGPD_SALT }}
 
     steps:
-      - name: Checkout
+      - name: Clonando Repositório
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Configurando Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip' # Acelera as próximas execuções
 
-      - name: Sanitizar Secrets
-        run: |
-          echo "R2_ACCESS_KEY_ID=$(echo "$R2_ACCESS_KEY_ID" | tr -d '\n\r ')"             >> $GITHUB_ENV
-          echo "R2_SECRET_ACCESS_KEY=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d '\n\r ')"     >> $GITHUB_ENV
-          echo "R2_ENDPOINT_URL=$(echo "$R2_ENDPOINT_URL" | tr -d '\n\r ')"               >> $GITHUB_ENV
-          echo "R2_BUCKET_NAME=$(echo "$R2_BUCKET_NAME" | tr -d '\n\r ')"                 >> $GITHUB_ENV
-          echo "BQ_PROJECT_ID=$(echo "$BQ_PROJECT_ID" | tr -d '\n\r ')"                   >> $GITHUB_ENV
-          echo "BQ_DATASET_ID=$(echo "$BQ_DATASET_ID" | tr -d '\n\r ')"                   >> $GITHUB_ENV
-          echo "LGPD_SALT=$(echo "$LGPD_SALT" | tr -d '\n\r ')"                           >> $GITHUB_ENV
-
-      - name: Instalar Dependências
+      - name: Instalando Dependências de Alta Performance
         run: |
           pip install --upgrade pip
-          pip install \
-            polars pandas pyarrow openpyxl numpy boto3 requests urllib3 \
-            google-cloud-bigquery google-cloud-bigquery-storage \
-            google-auth db-dtypes catboost lightgbm scikit-learn \
-            shap h3 holidays joblib pytest
+          pip install polars pandas pyarrow openpyxl numpy boto3 requests \
+                      google-cloud-bigquery google-auth scikit-learn \
+                      catboost lightgbm h3 holidays joblib pytest
 
-      - name: Executar Pipeline
+      - name: Executando SafeDriver Autobot
         run: python autobot/motor_analise_preditiva.py
 
-      - name: Testes
-        run: pytest tests/test_seguranca.py -v
+      - name: Validando Contratos e Segurança LGPD
+        run: pytest tests/test_contratos.py -v
