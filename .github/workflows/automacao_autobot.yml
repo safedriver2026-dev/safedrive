@@ -1,9 +1,9 @@
-name: SafeDriver Autobot Pipeline
+name: SafeDriver_Autobot_Pipeline
 
 on:
   schedule:
-    - cron: '0 3 * * *' # Roda todo dia às 03:00 AM
-  workflow_dispatch: # Permite rodar manualmente pelo GitHub
+    - cron: '0 3 * * *' 
+  workflow_dispatch: 
 
 jobs:
   executar-inteligencia:
@@ -20,27 +20,27 @@ jobs:
       BQ_PROJECT_ID:           ${{ secrets.BQ_PROJECT_ID }}
       BQ_DATASET_ID:           ${{ secrets.BQ_DATASET_ID }}
       BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-      LGPD_SALT:               ${{ secrets.LGPD_SALT }}
+      LGPD_SALT:               ${{ secrets.LGPD_SALT }} 
 
     steps:
-      - name: Clonando Repositório
+      - name:  Clonando Repositório
         uses: actions/checkout@v4
 
-      - name: Configurando Python 3.11
+      - name:  Configurando Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip' # Acelera as próximas execuções
+          cache: 'pip' 
 
-      - name: Instalando Dependências de Alta Performance
+      - name:  Instalando Dependências de Alta Performance
         run: |
           pip install --upgrade pip
           pip install polars pandas pyarrow openpyxl numpy boto3 requests \
                       google-cloud-bigquery google-auth scikit-learn \
                       catboost lightgbm h3 holidays joblib pytest
 
-      - name: Executando SafeDriver Autobot
+      - name:  Executando SafeDriver Autobot
         run: python autobot/motor_analise_preditiva.py
 
-      - name: Validando Contratos e Segurança LGPD
+      - name:  Validando Contratos e Segurança LGPD
         run: pytest tests/test_contratos.py -v
