@@ -64,4 +64,4 @@ def executar_ingestao(robo: RoboComunicador):
                                     "Tamanho Fonte": f"{tamanho_ssp} bytes",
                                     "Camada": "Bronze (Raw)"})
     except Exception:
-        robo.enviar_alerta_tecnico("Ingestão Raw (Bronze)", traceback.format_exc())
+        robo.enviar_alerta_tecnico("Ingestão Raw Bronze", traceback.format_exc())
