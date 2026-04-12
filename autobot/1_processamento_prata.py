@@ -85,4 +85,4 @@ def executar_silver(robo: RoboComunicador):
                                     "Camada": "Silver (Prata)"})
 
     except Exception:
-        robo.enviar_alerta_tecnico("Processamento Prata (Silver)", traceback.format_exc())
+        robo.enviar_alerta_tecnico("Processamento Prata", traceback.format_exc())
