@@ -1,70 +1,56 @@
 import pytest
-import polars as pl
+import pandas as pd
 import os
-import sys
-from datetime import datetime
+import hashlib
 
-# Adiciona a pasta raiz ao path para importar o motor
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+CAMINHO_PRATA = "camada_prata.parquet"
 
-# Importa as funções e variáveis do motor
-from autobot.motor_analise_preditiva import normalizar, get_periodo, PESO_PENAL_BASE, anonimizar
+def test_camada_prata_foi_gerada():
+    assert os.path.exists(CAMINHO_PRATA), "Falha Crítica: O ficheiro camada_prata.parquet não foi gerado pelo módulo Silver."
 
-# --- TESTES DE NORMALIZAÇÃO E SCHEMA ---
-def test_normalizacao_texto():
-    """Garante que o SchemaBrain não se perca com acentos ou espaços."""
-    assert normalizar("São Paulo ") == "SAO PAULO"
-    assert normalizar(None) == ""
-    assert normalizar("123-ABC") == "123-ABC"
+def test_fusao_geografica_master():
+    if os.path.exists(CAMINHO_PRATA):
+        df = pd.read_parquet(CAMINHO_PRATA)
 
-def test_classificacao_periodo():
-    """Garante que o robô entende o perigo da madrugada."""
-    assert get_periodo("02:30:00") == "MADRUGADA"
-    assert get_periodo("14:00") == "TARDE"
-    assert get_periodo("invalid") == "MANHA" # Fallback de segurança
+        features_urbanas = [
+            'DENSIDADE_LOGRADOUROS', 
+            'PROPORCAO_RESIDENCIAL_H3', 
+            'TOTAL_EDIFICACOES_H3'
+        ]
 
-# --- TESTES DE REGRA DE NEGÓCIO (GRAVIDADE VS VOLUME) ---
-def test_inteligencia_de_pesos():
-    """Garante que crimes graves pesam mais que crimes leves no escore."""
-    peso_homicidio = PESO_PENAL_BASE.get("HOMICIDIO DOLOSO")
-    peso_furto = PESO_PENAL_BASE.get("FURTO")
+        for col in features_urbanas:
+            assert col in df.columns, f"Falha na integração: A feature urbana '{col}' está ausente."
 
-    assert peso_homicidio > peso_furto, "ERRO: A inteligência de risco está invertida!"
-    assert peso_homicidio == 10.0
-    assert peso_furto == 4.0
+def test_seguranca_anonimizacao_lgpd():
+    if os.path.exists(CAMINHO_PRATA):
+        df = pd.read_parquet(CAMINHO_PRATA)
 
-# --- TESTE DE CONTRATO DE DADOS (OURO) ---
-def test_contrato_camada_ouro():
-    """Valida se as colunas essenciais para o Looker estão presentes."""
-    colunas_obrigatorias = [
-        "H3_INDEX", "ANO", "ESCORE_TOTAL", "VOL_CRIMES", 
-        "MUNICIPIO", "DENSIDADE_URBANA", "ESCORE_PREDITO"
-    ]
+        assert 'ID_ANONIMO' in df.columns, "Falha de Conformidade: Coluna de anonimização 'ID_ANONIMO' ausente."
 
-    # Simula um DataFrame Polars de saída com algumas colunas
-    # Na prática, você leria um sample do seu output real ou um mock mais complexo
-    df_saida_simulado = pl.DataFrame({
-        "H3_INDEX": ["8829a1a0bffffff", "8829a1a0bffffff"],
-        "ANO": [2023, 2023],
-        "ESCORE_TOTAL": [100.0, 120.0],
-        "VOL_CRIMES": [5, 7],
-        "MUNICIPIO": ["SAO PAULO", "CAMPINAS"],
-        "DENSIDADE_URBANA": [1500.0, 800.0],
-        "ESCORE_PREDITO": [0.8, 0.9],
-        "COLUNA_EXTRA": ["A", "B"] # Coluna extra para garantir que não falhe por ter mais
-    })
+        SALT = os.environ.get("LGPD_SALT", "default_salt_seguranca_test") 
 
-    for col in colunas_obrigatorias:
-        assert col in df_saida_simulado.columns, f"ERRO: Coluna '{col}' ausente na camada Ouro!"
+        if not df.empty:
+            primeiro_bo_original = str(df['NUM_BO'].iloc[0])
+            primeiro_bo_hash_calculado = hashlib.sha256(f"{primeiro_bo_original}{SALT}".encode()).hexdigest()[:12]
+            primeiro_bo_hash_existente = str(df['ID_ANONIMO'].iloc[0])
 
-def test_anonimizacao_lgpd():
-    """Garante que não existem dados sensíveis em texto claro no código."""
-    salt = os.environ.get("LGPD_SALT", "salt_padrao_para_teste") # Usa a variável de ambiente ou um padrão
+            assert primeiro_bo_hash_existente == primeiro_bo_hash_calculado, "Alerta Crítico: Hash de anonimização incorreto ou BO Original exposto!"
+            assert primeiro_bo_hash_existente != primeiro_bo_original, "Alerta Crítico: BO Original exposto! Quebra de conformidade LGPD detetada."
+        else:
+            pytest.skip("DataFrame vazio, impossível testar anonimização.")
 
-    hash_1 = anonimizar("RUA TESTE", salt)
-    hash_2 = anonimizar("RUA TESTE", salt)
-    hash_3 = anonimizar("RUA DIFERENTE", salt)
+def test_formato_para_motor_ia():
+    if os.path.exists(CAMINHO_PRATA):
+        df = pd.read_parquet(CAMINHO_PRATA)
 
-    assert hash_1 == hash_2, "ERRO: Anonimização inconsistente para o mesmo valor!"
-    assert hash_1 != hash_3, "ERRO: Anonimização gerou o mesmo hash para valores diferentes!"
-    assert "RUA TESTE" not in hash_1, "ALERTA: Falha na anonimização LGPD! Dado sensível em texto claro."
+        colunas_vitais = [
+            'INDICE_H3', 
+            'EH_FERIADO', 
+            'DIA_PAGAMENTO', 
+            'PESO_CRIME'
+        ]
+
+        for col in colunas_vitais:
+            assert col in df.columns, f"A coluna vital '{col}' desapareceu, o modelo de IA (Ouro) vai falhar."
+
+        assert pd.api.types.is_integer_dtype(df['PESO_CRIME']), "Erro de Tipo: PESO_CRIME deve ser numérico inteiro."
