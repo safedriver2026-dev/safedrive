@@ -1,6 +1,8 @@
 import sys
 import os
 import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 import logging
 import argparse
 from datetime import datetime
@@ -26,36 +28,43 @@ class SafeDriverMaestro:
 
     def _dados_essenciais_ausentes(self):
         """
-        Verifica a integridade do Datalake. 
+        Verifica a integridade do Datalake no Cloudflare R2. 
         Retorna True se os dados do ano atual ou os modelos de produção estiverem ausentes.
         """
         ano_atual = datetime.now().year
+        
+        # Caminhos absolutos conforme a estrutura física do bucket
         path_prata = f"safedriver/datalake/prata/ssp_consolidada_{ano_atual}.parquet"
-        path_modelo = "modelos_ml/latest_cat_motorista.pkl"
+        path_modelo = "safedriver/modelos_ml/latest_cat_motorista.pkl"
 
         try:
+            # Conexão blindada para R2
             s3 = boto3.client(
                 's3',
                 endpoint_url=os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/'),
                 aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
-                aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+                aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
+                config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
             )
             bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
-            # Tenta acessar os metadados dos arquivos críticos
+            # head_object: Valida metadados sem fazer download (operação de O(1) em custo de rede)
             s3.head_object(Bucket=bucket, Key=path_prata)
             s3.head_object(Bucket=bucket, Key=path_modelo)
-            return False  # Os dados essenciais existem
+            return False  # Ambos os ficheiros críticos existem
             
-        except Exception as e:
-            logger.warning("Verificação de integridade: Dados ou modelos essenciais não localizados no storage.")
-            return True   # Faltam dados, a execução é obrigatória
+        except ClientError as e:
+            if 'NoSuchKey' in str(e) or '404' in str(e):
+                logger.warning("Verificação de integridade: Dados ou modelos essenciais não localizados no storage.")
+                return True   # Faltam dados, a execução é obrigatória
+            else:
+                logger.error(f"Erro de permissão ou rede ao validar Datalake: {e}")
+                # Em caso de erro de rede, forçamos a execução para garantir a continuidade
+                return True 
 
     def run(self, force=False):
         """
         Orquestra a execução do pipeline de dados e inferência de Machine Learning.
-        Parâmetros:
-            force (bool): Ignora validações de calendário e força o processamento.
         """
         try:
             logger.info("SafeDriver Maestro: Iniciando rotina de verificação e orquestração.")
@@ -67,13 +76,13 @@ class SafeDriverMaestro:
             deve_executar = deve_executar_calendario or dados_ausentes
 
             if not deve_executar and not force:
-                logger.info("Operação suspensa: Fora do ciclo estratégico e Datalake atualizado.")
+                logger.info("Operação suspensa: Fora do ciclo estratégico e Datalake perfeitamente atualizado.")
                 return
 
             if dados_ausentes:
-                logger.info("Gatilho acionado: Execução mandatória para recuperação de dados faltantes.")
+                logger.info("Gatilho acionado: Execução mandatória para recuperação de dados em falta.")
             else:
-                logger.info("Gatilho acionado: Ciclo estratégico identificado via calendário.")
+                logger.info("Gatilho acionado: Ciclo estratégico identificado via calendário de risco.")
 
             # 2. Execução da Camada Prata
             logger.info("Etapa 1/3: Iniciando consolidação e cálculo de Deltas (Camada Prata).")
@@ -84,7 +93,7 @@ class SafeDriverMaestro:
             logger.info("Etapa 2/3: Iniciando ciclo de treinamento e versionamento de IA.")
             treinador = TreinadorEvolutivo()
             if not treinador.treinar_modelo_mestre():
-                raise RuntimeError("Falha no Treinamento da IA. Pipeline interrompido.")
+                raise RuntimeError("Falha no Treinamento da IA. A base de dados pode estar vazia. Pipeline interrompido.")
 
             # 4. Execução da Camada Ouro (Inferência)
             logger.info("Etapa 3/3: Processando inferência dinâmica e sincronização com BigQuery.")
@@ -92,9 +101,10 @@ class SafeDriverMaestro:
             if not ouro.executar_predicao_atual():
                 raise RuntimeError("Falha na geração da Predição de Risco na Camada Ouro.")
 
-            # 5. Conclusão e Registro
+            # 5. Conclusão e Registo
             tempo_total = str(datetime.now() - self.inicio).split(".")[0]
-            logger.info(f"Processo finalizado com êxito. Tempo de execução: {tempo_total}. BigQuery atualizado.")
+            msg_final = f"Processo finalizado com êxito em {tempo_total}. BigQuery sincronizado."
+            logger.info(msg_final)
             
             self.comunicador.relatar_sucesso(
                 datetime.now().year, 
@@ -103,14 +113,14 @@ class SafeDriverMaestro:
             )
 
         except Exception as e:
-            err_msg = f"Erro sistêmico no Orquestrador: {str(e)}"
+            err_msg = f"Erro sistémico no Orquestrador: {str(e)}"
             logger.error(err_msg)
             self.comunicador.relatar_erro("SafeDriver Maestro", err_msg)
             sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SafeDriver - Orquestrador de Pipeline de Dados e ML")
-    parser.add_argument('--force', action='store_true', help="Força a execução do pipeline ignorando verificações.")
+    parser.add_argument('--force', action='store_true', help="Força a execução do pipeline ignorando validações.")
     args = parser.parse_args()
 
     maestro = SafeDriverMaestro()
