@@ -1,57 +1,62 @@
-name: Pipeline Integrado SafeDriver
+name: SafeDriver Autobot - MLOps Pipeline
 
 on:
   schedule:
-    - cron: "0 0 * * 0" # Ciclo Semanal: Bronze e Prata
-    - cron: "0 2 * * *" # Ciclo Diário: Treino e Ouro
+    # Ciclo Semanal: Toda madrugada de domingo às 00:00 (Carga SSP)
+    - cron: "0 0 * * 0"
+    # Ciclo Diário: Todo dia às 02:00 da manhã (Treino IA e BigQuery)
+    - cron: "0 2 * * *"
+  # Permite que você rode manualmente pelo botão "Run workflow" no GitHub
   workflow_dispatch:
 
 jobs:
   ingestao_semanal:
+    # Só roda no domingo ou se você clicar no botão manual
     if: github.event.schedule == '0 0 * * 0' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout Código
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Instalar Dependências
         run: pip install -r requirements.txt
 
-      - name: Executar Ciclo Semanal (Bronze e Prata)
+      - name: Executar Engenharia (Bronze e Prata)
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          # Mapeamento para o Comunicador
+          # Webhooks do Discord conforme sua correção
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python main.py --weekly
 
   inteligencia_diaria:
+    # Roda sempre (diário ou manual) e aguarda o job semanal se ambos dispararem juntos
     if: always()
     needs: [ingestao_semanal]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout Código
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Configurar Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Instalar Dependências
         run: pip install -r requirements.txt
 
-      - name: Executar Ciclo Diário (Treino IA e Camada Ouro)
+      - name: Executar MLOps (Treino e Ouro BigQuery)
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -59,9 +64,9 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-          # Mapeamento do JSON da Service Account
+          # Mapeamento do Secret para a variável de memória do Python
           GCP_SA_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-          # Mapeamento para o Comunicador
+          # Webhooks do Discord
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python main.py --daily
