@@ -18,9 +18,17 @@ def executar_ingestao(robo: RoboComunicador):
     path_raw = f"safedriver/datalake/raw/ssp_{ano}_incremental.parquet"
 
     try:
+        # 1. Obter tamanho do arquivo na fonte SSP
         res_head = requests.head(url, timeout=15)
         tamanho_ssp_fonte = int(res_head.headers.get('Content-Length', 0))
 
+        if tamanho_ssp_fonte == 0:
+            print(f"⚠️ Camada Bronze: Fonte SSP ({url}) retornou tamanho 0. Não há dados para ingestão.")
+            robo.enviar_relatorio_operacional("Camada Bronze: Fonte SSP retornou tamanho 0. Ingestão pulada.", 
+                                       {"URL Fonte": url, "Camada": "Bronze (Raw)"})
+            return False
+
+        # 2. Verificar se o arquivo existe no R2 e obter seu tamanho
         base_existente_no_r2 = False
         tamanho_ssp_r2 = 0
         try:
@@ -29,61 +37,72 @@ def executar_ingestao(robo: RoboComunicador):
             base_existente_no_r2 = True
         except s3.exceptions.ClientError as e:
             if e.response['Error']['Code'] == 'NotFound':
-                base_existente_no_r2 = False
+                base_existente_no_r2 = False # Explicitamente False se não encontrado
             else:
-                raise
+                raise # Re-lança outros erros do S3
 
-        if base_existente_no_r2 and tamanho_ssp_fonte == tamanho_ssp_r2 and tamanho_ssp_fonte > 0:
+        # 3. Lógica de pular ingestão se a fonte não foi atualizada E o arquivo existe no R2
+        if base_existente_no_r2 and tamanho_ssp_fonte == tamanho_ssp_r2:
             print(f"✅ Camada Bronze: Fonte SSP não atualizada. Tamanho {tamanho_ssp_fonte} bytes. Pulando ingestão.")
             robo.enviar_relatorio_operacional("Camada Bronze: Fonte SSP não atualizada. Ingestão pulada.", 
                                        {"Tamanho Fonte": f"{tamanho_ssp_fonte} bytes",
                                         "Camada": "Bronze (Raw)"})
             return False
 
+        # Se chegamos aqui, ou o arquivo não existe no R2, ou a fonte foi atualizada.
         print(f"📥 A extrair dados da SSP: {url}")
         res_data = requests.get(url, timeout=120)
 
-        if ano == 2026:
+        df_novo = pd.DataFrame()
+        if ano == 2026: # Lógica específica para 2026 com múltiplas abas
             xls = pd.ExcelFile(res_data.content)
-            df_novo = pd.DataFrame()
             for sheet_name in xls.sheet_names:
                 try:
                     df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
                     if not df_sheet.empty:
                         df_novo = pd.concat([df_novo, df_sheet], ignore_index=True)
-                except Exception:
-                    pass
+                except Exception as sheet_e:
+                    print(f"Aviso: Falha ao ler a aba '{sheet_name}': {sheet_e}")
             if df_novo.empty:
                 raise ValueError("Nenhum dado válido encontrado nas abas do arquivo SSP.")
-        else:
+        else: # Lógica para outros anos (arquivo único)
             df_novo = pd.read_excel(res_data.content)
+
+        # Lógica para concatenação incremental ou primeira ingestão
+        df_final = df_novo
+        novos_registros = len(df_novo)
 
         if base_existente_no_r2:
             try:
                 s3.download_file(bucket, path_raw, "raw_local.parquet")
                 df_atual = pd.read_parquet("raw_local.parquet")
 
+                # Concatena e remove duplicatas para garantir incrementalidade
                 df_final = pd.concat([df_atual, df_novo]).drop_duplicates(
                     subset=['NUM_BO', 'ANO_BO', 'NOME_DELEGACIA'], keep='first'
                 )
-                novos_registos = len(df_final) - len(df_atual)
-            except Exception:
-                df_final = df_novo
-                novos_registos = len(df_final)
+                novos_registros = len(df_final) - len(df_atual)
+                print(f"Adicionados {novos_registros} novos registros à base existente.")
+            except Exception as concat_e:
+                print(f"Aviso: Falha ao carregar base existente do R2 para concatenação: {concat_e}. Prosseguindo com apenas os novos dados.")
+                # Se falhar ao carregar a base existente, usa apenas os novos dados.
+                # novos_registros já está com len(df_novo)
         else:
-            df_final = df_novo
-            novos_registos = len(df_final)
+            print("Primeira ingestão da camada Bronze. Criando arquivo no R2.")
+            # novos_registros já está com len(df_novo)
 
+        # Salvar o DataFrame final no R2
         df_final.to_parquet("raw_final.parquet", index=False)
         s3.upload_file("raw_final.parquet", bucket, path_raw)
 
+        # Limpeza de arquivos temporários
         if os.path.exists("raw_local.parquet"):
             os.remove("raw_local.parquet")
         if os.path.exists("raw_final.parquet"):
             os.remove("raw_final.parquet")
 
         robo.enviar_relatorio_operacional("Sincronização com a SSP concluída.", 
-                                   {"Novos Registos": novos_registos, 
+                                   {"Novos Registros": novos_registros, 
                                     "Tamanho Fonte": f"{tamanho_ssp_fonte} bytes",
                                     "Camada": "Bronze (Raw)"})
         return True
