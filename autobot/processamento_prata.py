@@ -27,8 +27,8 @@ class ProcessamentoPrata:
         self.colunas_lgpd = [
             "NUM_BO", "LOGRADOURO", "NUMERO_LOGRADOURO", 
             "NOME_DELEGACIA", "NOME_DEPARTAMENTO", "NOME_SECCIONAL",
-            "NOME_DELEGACIA_CIRCUNSCRIÇÃO", "NOME_DEPARTAMENTO_CIRCUNSCRIÇÃO",
-            "NOME_SECCIONAL_CIRCUNSCRIÇÃO"
+            "NOME_DELEGACIA_CIRCUNSCRICAO", "NOME_DEPARTAMENTO_CIRCUNSCRICAO",
+            "NOME_SECCIONAL_CIRCUNSCRICAO", "NOME_MUNICIPIO_CIRCUNSCRICAO"
         ]
 
     def executar_prata(self, ano):
@@ -44,10 +44,11 @@ class ProcessamentoPrata:
             except:
                 pass
 
-            logger.info(f"PRATA: Lendo dados brutos e base geografica...")
-            
+            logger.info(f"PRATA: Lendo dados brutos de {ano}...")
             resp_ssp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
-            lf_ssp = pl.read_excel(io.BytesIO(resp_ssp['Body'].read()))
+            conteudo_excel = resp_ssp['Body'].read()
+
+            lf_ssp = self._ler_aba_correta(conteudo_excel, ano)
 
             resp_geo = self.s3.get_object(Bucket=self.bucket, Key=path_geo)
             lf_geo = pl.read_parquet(io.BytesIO(resp_geo['Body'].read()))
@@ -55,12 +56,12 @@ class ProcessamentoPrata:
             lf_ssp = lf_ssp.filter(
                 (pl.col("LATITUDE").is_not_null()) & 
                 (pl.col("LONGITUDE").is_not_null()) &
-                (pl.col("LATITUDE") < -20) & (pl.col("LATITUDE") > -26)
+                (pl.col("LATITUDE") != 0)
             )
 
             df_pandas = lf_ssp.to_pandas()
             df_pandas['H3_INDEX'] = df_pandas.apply(
-                lambda row: h3.latlng_to_cell(row['LATITUDE'], row['LONGITUDE'], self.h3_resolution), 
+                lambda row: h3.latlng_to_cell(float(row['LATITUDE']), float(row['LONGITUDE']), self.h3_resolution), 
                 axis=1
             )
             lf_ssp = pl.from_pandas(df_pandas)
@@ -90,17 +91,30 @@ class ProcessamentoPrata:
             logger.error(f"Erro na Camada Prata ({ano}): {e}")
             raise e
 
+    def _ler_aba_correta(self, conteudo, ano):
+        for aba_id in [2, 1, 3]:
+            try:
+                df = pl.read_excel(io.BytesIO(conteudo), sheet_id=aba_id)
+                if "LATITUDE" in df.columns or "Latitude" in df.columns:
+                    if "Latitude" in df.columns:
+                        df = df.rename({"Latitude": "LATITUDE", "Longitude": "LONGITUDE"})
+                    logger.info(f"PRATA: Dados encontrados na aba {aba_id} do arquivo de {ano}.")
+                    return df
+            except:
+                continue
+        raise ValueError(f"Nao foi possivel encontrar a coluna LATITUDE no Excel de {ano}")
+
     def _agregar_crimes(self, lf):
         return lf.group_by("H3_INDEX").agg([
-            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Veículo|Automóvel")).count().alias("TOTAL_CRIMES_MOTORISTA"),
-            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Celular|Transeunte")).count().alias("TOTAL_CRIMES_PEDESTRE"),
-            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Motocicleta")).count().alias("TOTAL_CRIMES_MOTOCICLISTA")
+            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("(?i)Veículo|Automóvel|Carro")).count().alias("TOTAL_CRIMES_MOTORISTA"),
+            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("(?i)Celular|Transeunte|Transeunte")).count().alias("TOTAL_CRIMES_PEDESTRE"),
+            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("(?i)Motocicleta|Moto")).count().alias("TOTAL_CRIMES_MOTOCICLISTA")
         ])
 
     def _processar_indicadores(self, lf, ano):
         return lf.with_columns([
             pl.lit(ano).alias("ANO_REFERENCIA"),
-            pl.col("TOTAL_NAO_RESIDENCIAIS_H3").alias("TOTAL_NAO_RESIDENCIAL"),
+            pl.col("TOTAL_NAO_RESIDENCIAIS_H3").alias("TOTAL_NAO_RES_H3"),
             pl.col("PROPORCAO_RESIDENCIAL_H3").alias("INDICE_RESIDENCIAL"),
             pl.col("DENSIDADE_LOGRADOUROS").alias("DENSIDADE_ENDERECOS")
         ]).fill_null(0)
