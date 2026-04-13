@@ -1,11 +1,18 @@
-name: SafeDriver Pipeline
+name: 🚀 SafeDriver Pipeline (Produção)
 
+# Acionamento do Robô
 on:
   schedule:
+    # Todo domingo às 03:00 (Horário de Brasília / 06:00 UTC)
     - cron: '0 6 * * 0'
+  
   workflow_dispatch:
+    # Permite rodar manualmente clicando no botão "Run workflow" no GitHub
 
 jobs:
+  # ==========================================
+  # JOB 1: AUDITORIA DE SEGURANÇA
+  # ==========================================
   auditoria_seguranca:
     name: 🛡️ Auditoria de Segurança e LGPD
     runs-on: ubuntu-latest
@@ -19,18 +26,22 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: 📦 Instalar Dependências
+      - name: 📦 Instalar Dependências de Teste
         run: pip install pytest polars
 
-      - name: 🧪 Executar Testes
+      - name: 🧪 Executar Testes de Segurança
         env:
+          # Garante que o pytest encontre a pasta 'autobot'
           PYTHONPATH: ${{ github.workspace }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: pytest tests/test_seguranca.py -v
 
+  # ==========================================
+  # JOB 2: MOTOR DE PROCESSAMENTO (MLOps)
+  # ==========================================
   motor_dados:
     name: ⚙️ Processamento e Inteligência (SafeDriver)
-    needs: auditoria_seguranca
+    needs: auditoria_seguranca # Só roda se os testes passarem
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -44,28 +55,34 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: 📦 Instalar Dependências
+      - name: 📦 Instalar Dependências do Projeto
         run: pip install -r requirements.txt
 
-      - name: 🔍 Debug: Listar Estrutura de Pastas
-        # Este comando vai nos mostrar se o nome da pasta está correto (ex: autobot vs Autobot)
-        run: ls -R
-
-      - name: 🔑 Autenticação Google Cloud
+      - name: 🔑 Autenticação Google Cloud (BigQuery)
         uses: google-github-actions/auth@v2
         with:
+          # Usando o nome exato do seu Secret: BQ_SERVICE_ACCOUNT_JSON
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
-      - name: 🚀 Executar Orquestrador Principal
+      - name: 🚀 Executar Orquestrador Principal (main.py)
         env:
+          # --- SOLUÇÃO PARA O ERRO DE IMPORTAÇÃO ---
           PYTHONPATH: ${{ github.workspace }}
+          
+          # Injeção de todos os seus Secrets conforme seu print
+          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
-        run: python main.py
+          
+        run: |
+          # Executa o orquestrador que agora consegue importar 'autobot'
+          python main.py
