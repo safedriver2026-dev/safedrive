@@ -1,16 +1,11 @@
-name:  SafeDriver Pipeline
-
+name: 🚀 SafeDriver Pipeline (Produção)
 
 on:
   schedule:
- 
     - cron: '0 6 * * 0'
-  
   workflow_dispatch:
- 
 
 jobs:
-
   auditoria_seguranca:
     name: 🛡️ Auditoria de Segurança e LGPD
     runs-on: ubuntu-latest
@@ -28,15 +23,16 @@ jobs:
         run: pip install pytest polars
 
       - name: Executar Testes de Segurança (pytest)
-       
+        # Injetando o LGPD_SALT que está nos seus Secrets para os testes usarem
+        env:
+          LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: pytest tests/test_seguranca.py -v
-
 
   motor_dados:
     name: ⚙️ Processamento e Inteligência (SafeDriver)
-    needs: auditoria_seguranca 
+    needs: auditoria_seguranca
     runs-on: ubuntu-latest
-    timeout-minutes: 60 
+    timeout-minutes: 60
 
     steps:
       - name: Checkout do Código
@@ -54,11 +50,11 @@ jobs:
       - name: 🔑 Autenticação Google Cloud (BigQuery)
         uses: google-github-actions/auth@v2
         with:
-       
-          credentials_json: '${{ secrets.GCP_CREDENTIALS_JSON }}'
+          # --- CORREÇÃO AQUI: Usando o nome exato do seu Secret ---
+          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
       - name: 🚀 Executar Orquestrador Principal (main.py)
-       
+        # Passando exatamente os mesmos nomes que estão no seu print
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -66,5 +62,7 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
         run: |
           python main.py
