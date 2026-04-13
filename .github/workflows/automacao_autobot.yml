@@ -2,61 +2,80 @@ name: SafeDriver Autobot
 
 on:
   schedule:
- 
+    # Execução diária às 04:00 AM (Horário de Brasília aprox. 01:00 AM)
     - cron: "0 4 * * *"
   
   workflow_dispatch:
-
     inputs:
       force_execution:
-        description: 'Forçar execução? (Ignora CDC, Calendário e Integridade)'
+        description: 'Forçar execução total? (Ignora CDC e Check de Integridade)'
         required: true
         type: boolean
         default: false
 
+# Permissões necessárias para o deploy automático no GitHub Pages
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
 jobs:
   pipeline_producao:
-    name: Executar Pipeline
+    name: Executar Pipeline e Atualizar Mapa
     runs-on: ubuntu-latest
     
     steps:
       - name: Checkout do Repositório
         uses: actions/checkout@v4
 
-      - name: Configuração do Ambiente Python
+      - name:  Configuração do Ambiente Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip' 
 
-      - name: Instalação de Dependências
+      - name:  Instalação de Dependências
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # Garantia de resiliência caso pacotes críticos sejam removidos do requirements por engano
-          pip install requests boto3 holidays h3 polars catboost lightgbm scikit-learn google-cloud-bigquery
+          # Pacotes adicionais para a Camada Ouro e Gerador de Mapas
+          pip install folium branca pandas-gbq google-cloud-bigquery-storage
 
-      - name: Acionar Motor SafeDriver 
+      - name: Acionar Motor SafeDriver
         env:
-          # Credenciais Cloudflare
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          
-          # Credenciais Google BigQuery
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-          
-          # Webhooks de Monitorização Discord e Segurança
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
           if [ "${{ github.event.inputs.force_execution }}" == "true" ]; then
-            echo "Aviso: Execução forçada ativada via interface do GitHub."
+            echo "Cold Start: Execução mandatória iniciada."
             python main.py --force
           else
             python main.py
           fi
+
+      - name: Gerar Mapa de Calor Estático 
+        if: success() # Só gera o mapa se a IA e o BigQuery terminarem sem erros
+        env:
+          # O gerador de mapa pode ler do R2 para ser mais rápido que o BigQuery
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: python autobot/gerador_mapa.py
+
+      - name: Deploy do Dashboard Geográfico
+        if: success()
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs # Pasta onde o gerador_mapa.py salva o index.html
+          publish_branch: gh-pages
+          force_orphan: true
