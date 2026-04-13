@@ -38,14 +38,14 @@ class ProcessamentoPrata:
         self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
 
     def executar_todos_os_anos(self):
-        logger.info("PRATA: Iniciando consolidação Multi-Aba e Tipagem Estrita...")
+        logger.info("PRATA: Iniciando consolidação com estratégia String-First...")
         ano_atual = datetime.now().year
         estado_atual = self._carregar_tracker()
 
         for ano in range(2022, ano_atual + 1):
             if self.processar_ano_com_delta(ano, estado_atual):
                 self._salvar_tracker(estado_atual)
-                logger.info(f"PRATA: Ciclo {ano} finalizado.")
+                logger.info(f"PRATA: Ciclo {ano} finalizado com sucesso.")
 
     def processar_ano_com_delta(self, ano, estado):
         path_bronze = f"safedriver/datalake/bronze/ssp_raw_{ano}.xlsx"
@@ -66,40 +66,52 @@ class ProcessamentoPrata:
             excel_data = resp['Body'].read()
             dfs_abas = []
 
-            # VARREDURA DE TODAS AS ABAS POSSÍVEIS (Não para na primeira)
             for sheet_idx in range(1, 6):
                 try:
+                    # Lemos a aba ignorando tipos automáticos (tudo vira String)
                     temp_df = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine")
+                    
+                    # --- ESTRATÉGIA STRING-FIRST ---
+                    # Transformamos TODAS as colunas em String imediatamente para evitar conflitos de vstack
+                    temp_df = temp_df.with_columns(pl.all().cast(pl.String))
+                    
                     cols = [str(c).upper().replace("Ç", "C").replace("Ã", "A").strip() for c in temp_df.columns]
                     
-                    if all(k in cols for k in ["LATITUDE", "LONGITUDE", "RUBRICA"]):
-                        # Normaliza a aba encontrada
+                    if any(k in cols for k in ["LATITUDE", "LONGITUDE", "RUBRICA"]):
+                        # Normaliza nomes e limpa textos
                         temp_df = temp_df.rename({c: str(c).upper().replace("Ç", "C").replace("Ã", "A").strip() for c in temp_df.columns})
-                        temp_df = temp_df.with_columns(pl.col(pl.Utf8).str.strip_chars().str.to_uppercase())
+                        temp_df = temp_df.with_columns(pl.col(pl.String).str.strip_chars().str.to_uppercase())
                         dfs_abas.append(temp_df)
-                        logger.info(f"PRATA: [{ano}] Aba {sheet_idx} validada e incluída.")
+                        logger.info(f"PRATA: [{ano}] Aba {sheet_idx} carregada como String.")
                 except: continue
 
-            if not dfs_abas:
-                logger.error(f"PRATA: [{ano}] Nenhuma aba de dados válida.")
-                return False
+            if not dfs_abas: return False
 
-            # Une todas as abas do mesmo ano antes de processar
+            # Concatena as abas do ano (agora todas são String, sem erro de tipo)
             df = pl.concat(dfs_abas, how="diagonal")
 
-            # Mapeamento e Limpeza
+            # Mapeamento de colunas inconsistentes
             col_local = "DESCR_SUBTIPOLOCAL" if "DESCR_SUBTIPOLOCAL" in df.columns else "DESCR_TIPOLOCAL"
-            df = df.rename({col_local: "LOCAL_TIPO"}).rename({"CIDADE": "MUNICIPIO", "NOME_MUNICIPIO": "MUNICIPIO"}).rename({"DESCR_PERIODO": "PERIODO", "DESC_PERIODO": "PERIODO"})
+            df = df.rename({
+                col_local: "LOCAL_TIPO", 
+                "CIDADE": "MUNICIPIO", "NOME_MUNICIPIO": "MUNICIPIO",
+                "DESCR_PERIODO": "PERIODO", "DESC_PERIODO": "PERIODO"
+            })
 
+            # --- CONVERSÃO CONTROLADA ---
+            # Só agora transformamos as coordenadas em número para o cálculo H3
             df = df.with_columns([
                 pl.col("LATITUDE").cast(pl.Float64, strict=False),
                 pl.col("LONGITUDE").cast(pl.Float64, strict=False)
             ]).filter(pl.col("LATITUDE").is_not_null() & (pl.col("LATITUDE") != 0))
 
+            if df.is_empty(): return False
+
+            # Geração do Índice Geográfico
             h3_list = [h3.latlng_to_cell(lat, lon, 8) for lat, lon in zip(df["LATITUDE"], df["LONGITUDE"])]
             df = df.with_columns(pl.Series("H3_INDEX", h3_list))
 
-            # Agregação com Int32 Forçado
+            # Agregação Final com casting para Int32 (Padrão IA)
             df_atual = df.group_by(["H3_INDEX"]).agg([
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO|VEICULO|CARGA")).count().cast(pl.Int32).alias("TOTAL_CRIMES_MOTORISTA"),
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("CELULAR|TRANSEUNTE|PESSOA")).count().cast(pl.Int32).alias("TOTAL_CRIMES_PEDESTRE"),
@@ -109,8 +121,10 @@ class ProcessamentoPrata:
                 pl.col("LOGRADOURO").n_unique().cast(pl.Int32).alias("DENSIDADE_ENDERECOS")
             ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
 
+            # Cálculo de Tendências (Deltas)
             df_final = self._injetar_deltas(df_atual, path_prata_anterior)
             
+            # Persistência em Parquet
             buffer = io.BytesIO()
             df_final.write_parquet(buffer)
             self.s3.put_object(Bucket=self.bucket, Key=path_prata_atual, Body=buffer.getvalue())
@@ -118,7 +132,7 @@ class ProcessamentoPrata:
             estado[str(ano)] = tamanho_atual
             return True
         except Exception as e:
-            logger.error(f"PRATA: Erro no ano {ano}: {e}")
+            logger.error(f"PRATA: Erro crítico no ano {ano}: {e}")
             return False
 
     def _injetar_deltas(self, df_atual, path_anterior):
@@ -135,4 +149,11 @@ class ProcessamentoPrata:
                 (pl.col("TOTAL_CRIMES_MOTOCICLISTA") - pl.col("TOTAL_CRIMES_MOTOCICLISTA_PASSADO")).cast(pl.Int32).alias("DELTA_MOTOCICLISTA")
             ]).drop([c for c in df_join.columns if "_PASSADO" in c])
         except:
-            return df_atual.with_columns([pl.lit(0).cast(pl.Int32).alias("DELTA_MOTORISTA"), pl.lit(0).cast(pl.Int32).alias("DELTA_PEDESTRE"), pl.lit(0).cast(pl.Int32).alias("DELTA_MOTOCICLISTA")])
+            return df_atual.with_columns([
+                pl.lit(0).cast(pl.Int32).alias("DELTA_MOTORISTA"),
+                pl.lit(0).cast(pl.Int32).alias("DELTA_PEDESTRE"),
+                pl.lit(0).cast(pl.Int32).alias("DELTA_MOTOCICLISTA")
+            ])
+
+if __name__ == "__main__":
+    ProcessamentoPrata().executar_todos_os_anos()
