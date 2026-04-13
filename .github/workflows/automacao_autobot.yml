@@ -20,7 +20,7 @@ jobs:
     - name: Configurar Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' # Mantendo Python 3.10 para melhor compatibilidade
+        python-version: '3.10'
 
     - name: Atualizar pip
       run: |
@@ -28,13 +28,7 @@ jobs:
 
     - name: Instalar dependências
       run: |
-        pip install pandas openpyxl requests boto3 h3 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest # ALTERADO: h3-py para h3
-
-    - name: Executar testes de segurança
-      env:
-        LGPD_SALT: ${{ secrets.LGPD_SALT }}
-      run: |
-        pytest tests/test_seguranca.py
+        pip install pandas openpyxl requests boto3 h3 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
 
     - name: Executar Pipeline Bronze e Prata
       env:
@@ -47,6 +41,17 @@ jobs:
         LGPD_SALT: ${{ secrets.LGPD_SALT }}
       run: |
         python autobot/motor_analise_preditiva.py executar_pipeline_bronze_prata
+
+    - name: Executar testes de segurança (APÓS A GERAÇÃO DA PRATA)
+      env:
+        LGPD_SALT: ${{ secrets.LGPD_SALT }}
+        # GARANTIR QUE AS VARIÁVEIS DO R2 SÃO PASSADAS PARA O AMBIENTE DE TESTES
+        R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      run: |
+        pytest tests/test_seguranca.py
 
   pipeline-ouro:
     name: Processamento Camada Ouro
@@ -63,7 +68,7 @@ jobs:
     - name: Configurar Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' # Mantendo Python 3.10 para melhor compatibilidade
+        python-version: '3.10'
 
     - name: Atualizar pip
       run: |
@@ -71,7 +76,7 @@ jobs:
 
     - name: Instalar dependências
       run: |
-        pip install pandas openpyxl requests boto3 h3 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest # ALTERADO: h3-py para h3
+        pip install pandas openpyxl requests boto3 h3 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
 
     - name: Executar Pipeline Ouro
       env:
