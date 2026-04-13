@@ -10,76 +10,125 @@ import logging
 from datetime import datetime
 from autobot.comunicador import ComunicadorSafeDriver
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# Configuração de Logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class TreinadorEvolutivo:
     def __init__(self):
-        self.s3 = boto3.client('s3',
-                                endpoint_url=os.getenv("R2_ENDPOINT_URL"),
-                                aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
-                                aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"))
-        self.bucket = os.getenv("R2_BUCKET_NAME")
+        # 🛡️ SANITIZAÇÃO: .strip() evita erros de conexão nos segredos do GitHub
+        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip()
+        self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+        self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+        self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
+
+        self.s3 = boto3.client(
+            's3',
+            endpoint_url=self.endpoint,
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.secret_key
+        )
+        
         self.comunicador = ComunicadorSafeDriver()
-        self.features = ['DENSIDADE_TOTAL_ENDERECOS', 'TAXA_RESIDENCIAL']
+        
+        # Engenharia de Atributos: Features geradas na Camada Prata
+        self.features = [
+            'INDICE_RESIDENCIAL', 
+            'TOTAL_NAO_RESIDENCIAL', 
+            'DENSIDADE_ENDERECOS'
+        ]
 
     def treinar_modelo_mestre(self):
-        logger.info("🧠 Iniciando Treinamento Evolutivo (Base 2022+)...")
+        """
+        Carrega o histórico completo da Prata (2022+), treina a IA 
+        e valida a acurácia antes de salvar os modelos no R2.
+        """
+        logger.info("🧠 [IA] Iniciando ciclo de treinamento evolutivo...")
         
         try:
-            # 1. Carregar todos os anos disponíveis na Prata (Escalabilidade)
+            # 1. Carregamento Escalável de Dados
             dfs_prata = []
-            anos_disponiveis = [2022, 2023, 2024, 2025] # O loop detecta o que existe no R2
+            ano_atual = datetime.now().year
             
-            for ano in anos_disponiveis:
+            for ano in range(2022, ano_atual + 1):
+                path = f"datalake/prata/ssp_consolidada_{ano}.parquet"
                 try:
-                    path = f"datalake/prata/ssp_consolidada_{ano}.parquet"
                     resp = self.s3.get_object(Bucket=self.bucket, Key=path)
                     dfs_prata.append(pl.read_parquet(io.BytesIO(resp['Body'].read())))
-                    logger.info(f"✅ Ano {ano} incorporado ao treino.")
+                    logger.info(f"✅ Dados de {ano} carregados para treino.")
                 except:
-                    continue
+                    logger.warning(f"⚠️ Ano {ano} ainda não disponível na Prata. Pulando.")
 
-            # Consolida a base histórica total
+            if not dfs_prata:
+                logger.error("❌ Erro fatal: Nenhuma base de dados encontrada para treinamento.")
+                return False
+
+            # Consolidação da base histórica
             df_total = pl.concat(dfs_prata).to_pandas()
 
-            # 2. Validação "Out-of-Time" (Inteligência de Equipe)
-            # Treinamos com o passado e testamos com o "futuro" (ano mais recente)
+            # 2. Validação Out-of-Time (Inteligência de Produção)
+            # Treinamos com o passado e validamos com o ano mais recente disponível
             ano_max = df_total['ANO_REFERENCIA'].max()
             train = df_total[df_total['ANO_REFERENCIA'] < ano_max]
             test = df_total[df_total['ANO_REFERENCIA'] == ano_max]
+            
+            # Se só tivermos um ano, fazemos split 80/20 padrão
+            if train.empty:
+                logger.info("ℹ️ Base histórica curta. Usando split aleatório 80/20.")
+                from sklearn.model_selection import train_test_split
+                train, test = train_test_split(df_total, test_size=0.2, random_state=42)
 
-            logger.info(f"📊 Treinando com dados até {ano_max-1} e validando em {ano_max}")
-
+            # 3. Loop de Treinamento por Persona
+            # O SafeDriver personaliza o risco para quem dirige, quem caminha e quem pilota
             for persona in ["MOTORISTA", "PEDESTRE", "MOTOCICLISTA"]:
-                # Filtro por Persona
-                df_train_p = train[train['PERFIL_PERSONA'] == persona]
-                df_test_p = test[test['PERFIL_PERSONA'] == persona]
-
-                modelo = CatBoostRegressor(iterations=1000, learning_rate=0.05, depth=6, verbose=0)
+                logger.info(f"🚀 Treinando cérebro da persona: {persona}")
                 
-                modelo.fit(df_train_p[self.features], df_train_p['TOTAL_CRIMES'])
-
-                # Avaliação de Performance
-                preds = modelo.predict(df_test_p[self.features])
-                mae = mean_absolute_error(df_test_p['TOTAL_CRIMES'], preds)
+                # O target é o total de crimes que afetam aquela persona específica
+                # (Coluna gerada conforme a lógica de filtragem da Prata)
+                target = f'TOTAL_CRIMES_{persona}'
                 
-                logger.info(f"📈 Persona {persona} - MAE: {mae:.4f}")
+                model = CatBoostRegressor(
+                    iterations=1000,
+                    learning_rate=0.03,
+                    depth=6,
+                    l2_leaf_reg=3,
+                    loss_function='MAE', # Foco em minimizar o erro absoluto de ocorrências
+                    verbose=False
+                )
 
-                # 3. Persistência do Modelo (.pkl)
-                self._salvar_modelo_r2(modelo, persona.lower())
+                model.fit(train[self.features], train[target], eval_set=(test[self.features], test[target]))
+                
+                # Métrica de Performance (MAE)
+                # $$MAE = \frac{1}{n} \sum_{i=1}^{n} |y_i - \hat{y}_i|$$
+                preds = model.predict(test[self.features])
+                mae = mean_absolute_error(test[target], preds)
+                
+                logger.info(f"📊 Acurácia {persona}: MAE de {mae:.4f} crimes por hexágono.")
 
-            self.comunicador.relatar_sucesso("Treinamento IA", "10 min", "Modelo Mestre Atualizado")
+                # 4. Persistência no R2
+                self._salvar_modelo_r2(model, persona.lower())
+
+            logger.info("✨ Todos os modelos foram atualizados e sincronizados no Data Lake.")
+            return True
 
         except Exception as e:
-            logger.error(f"❌ Erro no treinamento: {e}")
-            self.comunicador.relatar_erro("Treinador IA", e)
+            logger.error(f"❌ Falha no ciclo de IA: {e}")
+            self.comunicador.relatar_erro("Treinador IA", str(e))
+            return False
 
-    def _salvar_modelo_r2(self, modelo, nome):
+    def _salvar_modelo_r2(self, model, nome):
+        """Salva o arquivo .pkl diretamente no Cloudflare R2"""
         buffer = io.BytesIO()
-        joblib.dump(modelo, buffer)
+        joblib.dump(model, buffer)
         buffer.seek(0)
-        self.s3.put_object(Bucket=self.bucket, Key=f"modelos_ml/catboost_{nome}.pkl", Body=buffer.getvalue())
+        
+        path_modelo = f"modelos_ml/catboost_{nome}.pkl"
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=path_modelo,
+            Body=buffer.getvalue()
+        )
+        logger.info(f"💾 Modelo {nome} exportado para {path_modelo}")
 
 if __name__ == "__main__":
     TreinadorEvolutivo().treinar_modelo_mestre()
