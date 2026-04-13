@@ -67,16 +67,20 @@ class CamadaOuroSafeDriver:
 
     def _gerar_scores_ensemble(self, lf, modelos):
         df = lf.to_pandas()
+        
+        # As features exatas que saem da Camada Prata apos o Join com o IBGE
         features = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
 
         for p, mods in modelos.items():
             col = f"SCORE_RISCO_{p.upper()}"
             preds_final = []
             
-            if mods["catboost"]:
-                preds_final.append(mods["catboost"].predict(df[features]))
-            if mods["lightgbm"]:
-                preds_final.append(mods["lightgbm"].predict(df[features]))
+            # Valida se as features estao no dataframe antes de prever
+            if all(f in df.columns for f in features):
+                if mods["catboost"]:
+                    preds_final.append(mods["catboost"].predict(df[features]))
+                if mods["lightgbm"]:
+                    preds_final.append(mods["lightgbm"].predict(df[features]))
 
             if preds_final:
                 avg_preds = pd.DataFrame(preds_final).mean().values
@@ -96,7 +100,7 @@ class CamadaOuroSafeDriver:
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
 
-        # 2. Executa o MERGE (Lógica Delta/Upsert)
+        # 2. Executa o MERGE (Upsert)
         sql_merge = f"""
         MERGE `{tabela_final}` T
         USING `{tabela_stg}` S
@@ -112,7 +116,7 @@ class CamadaOuroSafeDriver:
           VALUES (S.H3_INDEX, S.ANO_REFERENCIA, S.SCORE_RISCO_MOTORISTA, S.SCORE_RISCO_PEDESTRE, S.SCORE_RISCO_MOTOCICLISTA, S.ULTIMA_ATUALIZACAO, S.INDICE_RESIDENCIAL, S.TOTAL_NAO_RES_H3, S.DENSIDADE_ENDERECOS)
         """
         self.bq_client.query(sql_merge).result()
-        logger.info(f"Sincronizacao Delta concluida para {tabela_final}")
+        logger.info(f"OURO: Sincronizacao Delta concluida para {tabela_final}")
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver()
