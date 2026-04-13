@@ -31,7 +31,7 @@ class TreinadorEvolutivo:
         self.comunicador = ComunicadorSafeDriver()
         self.features = [
             'INDICE_RESIDENCIAL', 
-            'TOTAL_NAO_RESIDENCIAL', 
+            'TOTAL_NAO_RES_H3', 
             'DENSIDADE_ENDERECOS'
         ]
 
@@ -47,8 +47,8 @@ class TreinadorEvolutivo:
                 try:
                     resp = self.s3.get_object(Bucket=self.bucket, Key=path)
                     dfs_prata.append(pl.read_parquet(io.BytesIO(resp['Body'].read())))
-                    logger.info(f"Dados de {ano} carregados.")
-                except:
+                    logger.info(f"Dados de {ano} carregados para treino.")
+                except Exception:
                     continue
 
             if not dfs_prata:
@@ -56,10 +56,14 @@ class TreinadorEvolutivo:
                 return False
 
             df_total = pl.concat(dfs_prata).to_pandas()
+            
+            if not all(f in df_total.columns for f in self.features):
+                raise ValueError(f"Features ausentes na Prata. Verifique as colunas geradas.")
+
             ano_max = df_total['ANO_REFERENCIA'].max()
             
-            train = df_total[df_total['ANO_REFERENCIA'] < ano_max]
-            test = df_total[df_total['ANO_REFERENCIA'] == ano_max]
+            train = df_total[df_total['ANO_REFERENCIA'] < ano_max].copy()
+            test = df_total[df_total['ANO_REFERENCIA'] == ano_max].copy()
             
             if train.empty:
                 from sklearn.model_selection import train_test_split
@@ -68,6 +72,9 @@ class TreinadorEvolutivo:
             for persona in ["MOTORISTA", "PEDESTRE", "MOTOCICLISTA"]:
                 logger.info(f"Treinando ensemble para: {persona}")
                 target = f'TOTAL_CRIMES_{persona}'
+                
+                train[target] = train[target].fillna(0)
+                test[target] = test[target].fillna(0)
                 
                 model_cat = CatBoostRegressor(
                     iterations=1000,
@@ -84,7 +91,8 @@ class TreinadorEvolutivo:
                     learning_rate=0.03,
                     num_leaves=31,
                     importance_type='gain',
-                    objective='regression_l1'
+                    objective='regression_l1',
+                    verbose=-1
                 )
                 model_lgb.fit(train[self.features], train[target], eval_set=[(test[self.features], test[target])])
 
@@ -104,7 +112,7 @@ class TreinadorEvolutivo:
         except Exception as e:
             logger.error(f"Falha no treinamento ensemble: {e}")
             self.comunicador.relatar_erro("Treinador IA", str(e))
-            return False
+            raise e
 
     def _salvar_modelo_r2(self, model, nome):
         buffer = io.BytesIO()
