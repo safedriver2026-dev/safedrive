@@ -36,22 +36,20 @@ class CamadaOuroSafeDriver:
         path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
         
         try:
-            logger.info(f"OURO: Iniciando sincronizacao ensemble do ano {ano}...")
+            logger.info(f"OURO: Iniciando processamento incremental para o ano {ano}...")
             
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read()))
 
             modelos = self._carregar_modelos_ensemble()
-            
             df_final = self._gerar_scores_ensemble(lf, modelos)
 
-            self._sincronizar_bigquery(df_final)
+            self._sincronizar_bigquery_delta(df_final)
 
             return True
 
         except Exception as e:
             logger.error(f"Falha na Camada Ouro para o ano {ano}: {e}")
-            self.comunicador.relatar_erro(f"Ouro Sync - {ano}", str(e))
             raise e
 
     def _carregar_modelos_ensemble(self):
@@ -63,15 +61,13 @@ class CamadaOuroSafeDriver:
                 try:
                     obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                     modelos[p][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-                    logger.info(f"Modelo {alg} {p} carregado.")
-                except ClientError:
-                    logger.warning(f"Modelo {alg} {p} ausente.")
+                except:
                     modelos[p][alg] = None
         return modelos
 
     def _gerar_scores_ensemble(self, lf, modelos):
         df = lf.to_pandas()
-        features = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RESIDENCIAL', 'DENSIDADE_ENDERECOS']
+        features = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
 
         for p, mods in modelos.items():
             col = f"SCORE_RISCO_{p.upper()}"
@@ -79,37 +75,45 @@ class CamadaOuroSafeDriver:
             
             if mods["catboost"]:
                 preds_final.append(mods["catboost"].predict(df[features]))
-            
             if mods["lightgbm"]:
                 preds_final.append(mods["lightgbm"].predict(df[features]))
 
             if preds_final:
                 avg_preds = pd.DataFrame(preds_final).mean().values
-                df[col] = (avg_preds / avg_preds.max() * 100).clip(0, 100)
+                max_val = avg_preds.max() if avg_preds.max() > 0 else 1
+                df[col] = (avg_preds / max_val * 100).clip(0, 100)
             else:
-                df[col] = 50.0
+                df[col] = 0.0
 
         df['ULTIMA_ATUALIZACAO'] = pd.Timestamp.now()
         return df
 
-    def _sincronizar_bigquery(self, df):
-        tabela = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
-        
-        job_config = bigquery.LoadJobConfig(
-            write_disposition="WRITE_APPEND",
-            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
-            source_format=bigquery.SourceFormat.PARQUET,
-        )
+    def _sincronizar_bigquery_delta(self, df):
+        tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
+        tabela_stg = f"{tabela_final}_stg"
 
-        logger.info(f"Enviando dados para o BigQuery: {tabela}")
-        job = self.bq_client.load_table_from_dataframe(df, tabela, job_config=job_config)
-        job.result()
-        logger.info("Sincronizacao BigQuery concluida.")
+        # 1. Carrega para tabela de Staging (Sobrescreve sempre a STG)
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+        self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
+
+        # 2. Executa o MERGE (Lógica Delta/Upsert)
+        sql_merge = f"""
+        MERGE `{tabela_final}` T
+        USING `{tabela_stg}` S
+        ON T.H3_INDEX = S.H3_INDEX AND T.ANO_REFERENCIA = S.ANO_REFERENCIA
+        WHEN MATCHED THEN
+          UPDATE SET 
+            T.SCORE_RISCO_MOTORISTA = S.SCORE_RISCO_MOTORISTA,
+            T.SCORE_RISCO_PEDESTRE = S.SCORE_RISCO_PEDESTRE,
+            T.SCORE_RISCO_MOTOCICLISTA = S.SCORE_RISCO_MOTOCICLISTA,
+            T.ULTIMA_ATUALIZACAO = S.ULTIMA_ATUALIZACAO
+        WHEN NOT MATCHED THEN
+          INSERT (H3_INDEX, ANO_REFERENCIA, SCORE_RISCO_MOTORISTA, SCORE_RISCO_PEDESTRE, SCORE_RISCO_MOTOCICLISTA, ULTIMA_ATUALIZACAO, INDICE_RESIDENCIAL, TOTAL_NAO_RES_H3, DENSIDADE_ENDERECOS)
+          VALUES (S.H3_INDEX, S.ANO_REFERENCIA, S.SCORE_RISCO_MOTORISTA, S.SCORE_RISCO_PEDESTRE, S.SCORE_RISCO_MOTOCICLISTA, S.ULTIMA_ATUALIZACAO, S.INDICE_RESIDENCIAL, S.TOTAL_NAO_RES_H3, S.DENSIDADE_ENDERECOS)
+        """
+        self.bq_client.query(sql_merge).result()
+        logger.info(f"Sincronizacao Delta concluida para {tabela_final}")
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver()
-    ano_inicio = 2022
-    ano_fim = datetime.now().year
-    
-    for a in range(ano_inicio, ano_fim + 1):
-        ouro.processar_ouro(a)
+    ouro.processar_ouro(datetime.now().year)
