@@ -43,6 +43,7 @@ def executar_silver(robo: RoboComunicador):
 
         caminho_raw = f"safedriver/datalake/raw/ssp_{ano}_incremental.parquet"
         caminho_master = "safedriver/datalake/base_geografica/safedriver_geo_base_sp_h3_8.parquet"
+        caminho_silver_r2 = f"safedriver/datalake/silver/prata_{ano}.parquet"
 
         s3.download_file(bucket, caminho_raw, "raw.parquet")
         s3.download_file(bucket, caminho_master, "master.parquet")
@@ -68,16 +69,17 @@ def executar_silver(robo: RoboComunicador):
 
         df_silver['PESO_CRIME'] = df_silver['RUBRICA'].apply(
             lambda x: 10 if any(c in str(x).upper() for c in ["ROUBO", "LATROCINIO", "ESTUPRO", "HOMICIDIO"]) else 4
-        ).astype(int) # Preferência por valores numéricos como inteiros
+        ).astype(int)
 
-        df_silver.to_parquet("camada_prata.parquet", index=False)
-
-        s3.upload_file("camada_prata.parquet", bucket, f"safedriver/datalake/silver/prata_{ano}.parquet")
+        df_silver.to_parquet("camada_prata_temp.parquet", index=False)
+        s3.upload_file("camada_prata_temp.parquet", bucket, caminho_silver_r2)
 
         if os.path.exists("raw.parquet"):
             os.remove("raw.parquet")
         if os.path.exists("master.parquet"):
             os.remove("master.parquet")
+        if os.path.exists("camada_prata_temp.parquet"):
+            os.remove("camada_prata_temp.parquet")
 
         robo.enviar_relatorio_operacional("Camada Prata processada com sucesso.", 
                                    {"Registos Fundidos": len(df_silver), 
@@ -85,4 +87,4 @@ def executar_silver(robo: RoboComunicador):
                                     "Camada": "Silver (Prata)"})
 
     except Exception:
-        robo.enviar_alerta_tecnico("Processamento Prata", traceback.format_exc())
+        robo.enviar_alerta_tecnico("Processamento Prata (Silver)", traceback.format_exc())
