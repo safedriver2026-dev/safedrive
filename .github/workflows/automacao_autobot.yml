@@ -2,15 +2,14 @@ name: Pipeline SafeDriver Autobot
 
 on:
   schedule:
-    - cron: '0 3 * * 1' # Bronze/Prata: Toda segunda-feira às 03:00 UTC
-    - cron: '0 4 * * *' # Ouro: Todos os dias às 04:00 UTC
-  workflow_dispatch: # Permite acionamento manual
+    - cron: '0 3 * * 1'
+    - cron: '0 4 * * *'
+  workflow_dispatch:
 
 jobs:
   pipeline-bronze-prata:
     name: Processamento Camada Bronze e Prata
     runs-on: ubuntu-latest
-    # Executa apenas se for acionado manualmente ou na segunda-feira às 03:00 UTC
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 3 * * 1'
 
     steps:
@@ -45,7 +44,6 @@ jobs:
     - name: Executar testes de segurança (APÓS A GERAÇÃO DA PRATA)
       env:
         LGPD_SALT: ${{ secrets.LGPD_SALT }}
-        # GARANTIR QUE AS VARIÁVEIS DO R2 SÃO PASSADAS PARA O AMBIENTE DE TESTES
         R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -56,9 +54,7 @@ jobs:
   pipeline-ouro:
     name: Processamento Camada Ouro
     runs-on: ubuntu-latest
-    # Executa todos os dias às 04:00 UTC ou quando acionado manualmente
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 4 * * *'
-    # Garante que este job só comece após o pipeline de bronze/prata ter terminado com sucesso (se ambos estiverem agendados para o mesmo dia)
     needs: pipeline-bronze-prata
 
     steps:
