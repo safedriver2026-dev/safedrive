@@ -1,38 +1,42 @@
-name: SafeDriver Autobot Pipeline
+name: Pipeline SafeDriver Autobot
 
 on:
   schedule:
     - cron: '0 3 * * 1' # Bronze/Prata: Toda segunda-feira às 03:00 UTC
     - cron: '0 4 * * *' # Ouro: Todos os dias às 04:00 UTC
-  workflow_dispatch:
+  workflow_dispatch: # Permite acionamento manual
 
 jobs:
-  bronze-silver-pipeline:
-    name: Bronze and Silver Layer Processing
+  pipeline-bronze-prata:
+    name: Processamento Camada Bronze e Prata
     runs-on: ubuntu-latest
+    # Executa apenas se for acionado manualmente ou na segunda-feira às 03:00 UTC
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 3 * * 1'
 
     steps:
-    - name: Checkout repository
+    - name: Clonar repositório
       uses: actions/checkout@v4
 
-    - name: Set up Python
+    - name: Configurar Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.9'
 
-    - name: Install dependencies
+    - name: Atualizar pip
       run: |
         python -m pip install --upgrade pip
-        pip install pandas openpyxl requests boto3 h3-py holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
 
-    - name: Run tests
+    - name: Instalar dependências
+      run: |
+        pip install pandas openpyxl requests boto3 h3-py==3.7.6 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
+
+    - name: Executar testes de segurança
       env:
         LGPD_SALT: ${{ secrets.LGPD_SALT }}
       run: |
         pytest tests/test_seguranca.py
 
-    - name: Run Bronze and Silver Pipeline
+    - name: Executar Pipeline Bronze e Prata
       env:
         R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -44,33 +48,39 @@ jobs:
       run: |
         python autobot/motor_analise_preditiva.py executar_pipeline_bronze_prata
 
-  gold-pipeline:
-    name: Gold Layer Daily Update
+  pipeline-ouro:
+    name: Atualização Diária Camada Ouro
     runs-on: ubuntu-latest
+    # Executa apenas se for acionado manualmente ou todos os dias às 04:00 UTC
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 4 * * *'
+    # Garante que o pipeline de ouro só comece após o pipeline de bronze/prata ter terminado com sucesso (se ambos estiverem agendados para o mesmo dia)
+    needs: pipeline-bronze-prata
 
     steps:
-    - name: Checkout repository
+    - name: Clonar repositório
       uses: actions/checkout@v4
 
-    - name: Set up Python
+    - name: Configurar Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.9'
 
-    - name: Install dependencies
+    - name: Atualizar pip
       run: |
         python -m pip install --upgrade pip
-        pip install pandas openpyxl requests boto3 h3-py holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
 
-    - name: Run Gold Pipeline
+    - name: Instalar dependências
+      run: |
+        pip install pandas openpyxl requests boto3 h3-py==3.7.6 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
+
+    - name: Executar Pipeline Ouro
       env:
         R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
         R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-        DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+        DISCORD_ERRO: ${{ secrets.R2_ENDPOINT_URL }}
         LGPD_SALT: ${{ secrets.LGPD_SALT }}
         BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
         BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
