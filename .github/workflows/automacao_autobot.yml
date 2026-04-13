@@ -1,90 +1,36 @@
-name: Pipeline SafeDriver Autobot
+name: Automacao SafeDriver
 
 on:
   schedule:
-    - cron: '0 3 * * 1'
-    - cron: '0 4 * * *'
+    - cron: '0 0 1 * *'
   workflow_dispatch:
 
 jobs:
-  pipeline-bronze-prata:
-    name: Processamento Camada Bronze e Prata
+  execucao_pipeline:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 3 * * 1'
 
     steps:
-    - name: Clonar repositório
-      uses: actions/checkout@v4
+      - name: Checkout do repositorio
+        uses: actions/checkout@v3
 
-    - name: Configurar Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Instalacao do Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Atualizar pip
-      run: |
-        python -m pip install --upgrade pip
+      - name: Instalacao de Dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas pyarrow numpy lightgbm catboost scikit-learn joblib h3 boto3 google-cloud-bigquery requests openpyxl
 
-    - name: Instalar dependências
-      run: |
-        pip install pandas openpyxl requests boto3 h3 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
-
-    - name: Executar Pipeline Bronze e Prata
-      env:
-        R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-        DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        LGPD_SALT: ${{ secrets.LGPD_SALT }}
-      run: |
-        python -m autobot.motor_analise_preditiva executar_pipeline_bronze_prata
-
-    - name: Executar testes de segurança (APÓS A GERAÇÃO DA PRATA)
-      env:
-        LGPD_SALT: ${{ secrets.LGPD_SALT }}
-        R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      run: |
-        pytest tests/test_seguranca.py
-
-  pipeline-ouro:
-    name: Processamento Camada Ouro
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 4 * * *'
-    needs: pipeline-bronze-prata
-
-    steps:
-    - name: Clonar repositório
-      uses: actions/checkout@v4
-
-    - name: Configurar Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
-
-    - name: Atualizar pip
-      run: |
-        python -m pip install --upgrade pip
-
-    - name: Instalar dependências
-      run: |
-        pip install pandas openpyxl requests boto3 h3 holidays scikit-learn lightgbm catboost shap google-cloud-bigquery google-auth-oauthlib service_identity pytest
-
-    - name: Executar Pipeline Ouro
-      env:
-        R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-        DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        LGPD_SALT: ${{ secrets.LGPD_SALT }}
-        BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-        BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-        BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-      run: |
-        python -m autobot.motor_analise_preditiva executar_pipeline_ouro
+      - name: Execucao do Motor SafeDriver
+        env:
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
+          LGPD_SALT: ${{ secrets.LGPD_SALT }}
+        run: python -m autobot.motor_analise_preditiva
