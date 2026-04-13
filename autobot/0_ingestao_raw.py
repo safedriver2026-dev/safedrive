@@ -19,7 +19,26 @@ def executar_ingestao(robo: RoboComunicador):
 
     try:
         res_head = requests.head(url, timeout=15)
-        tamanho_ssp = int(res_head.headers.get('Content-Length', 0))
+        tamanho_ssp_fonte = int(res_head.headers.get('Content-Length', 0))
+
+        base_existente_no_r2 = False
+        tamanho_ssp_r2 = 0
+        try:
+            obj_info = s3.head_object(Bucket=bucket, Key=path_raw)
+            tamanho_ssp_r2 = obj_info['ContentLength']
+            base_existente_no_r2 = True
+        except s3.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'NotFound':
+                base_existente_no_r2 = False
+            else:
+                raise
+
+        if base_existente_no_r2 and tamanho_ssp_fonte == tamanho_ssp_r2 and tamanho_ssp_fonte > 0:
+            print(f"✅ Camada Bronze: Fonte SSP não atualizada. Tamanho {tamanho_ssp_fonte} bytes. Pulando ingestão.")
+            robo.enviar_relatorio_operacional("Camada Bronze: Fonte SSP não atualizada. Ingestão pulada.", 
+                                       {"Tamanho Fonte": f"{tamanho_ssp_fonte} bytes",
+                                        "Camada": "Bronze (Raw)"})
+            return False
 
         print(f"📥 A extrair dados da SSP: {url}")
         res_data = requests.get(url, timeout=120)
@@ -39,15 +58,19 @@ def executar_ingestao(robo: RoboComunicador):
         else:
             df_novo = pd.read_excel(res_data.content)
 
-        try:
-            s3.download_file(bucket, path_raw, "raw_local.parquet")
-            df_atual = pd.read_parquet("raw_local.parquet")
+        if base_existente_no_r2:
+            try:
+                s3.download_file(bucket, path_raw, "raw_local.parquet")
+                df_atual = pd.read_parquet("raw_local.parquet")
 
-            df_final = pd.concat([df_atual, df_novo]).drop_duplicates(
-                subset=['NUM_BO', 'ANO_BO', 'NOME_DELEGACIA'], keep='first'
-            )
-            novos_registos = len(df_final) - len(df_atual)
-        except Exception:
+                df_final = pd.concat([df_atual, df_novo]).drop_duplicates(
+                    subset=['NUM_BO', 'ANO_BO', 'NOME_DELEGACIA'], keep='first'
+                )
+                novos_registos = len(df_final) - len(df_atual)
+            except Exception:
+                df_final = df_novo
+                novos_registos = len(df_final)
+        else:
             df_final = df_novo
             novos_registos = len(df_final)
 
@@ -61,7 +84,9 @@ def executar_ingestao(robo: RoboComunicador):
 
         robo.enviar_relatorio_operacional("Sincronização com a SSP concluída.", 
                                    {"Novos Registos": novos_registos, 
-                                    "Tamanho Fonte": f"{tamanho_ssp} bytes",
+                                    "Tamanho Fonte": f"{tamanho_ssp_fonte} bytes",
                                     "Camada": "Bronze (Raw)"})
+        return True
     except Exception:
-        robo.enviar_alerta_tecnico("Ingestão Raw Bronze", traceback.format_exc())
+        robo.enviar_alerta_tecnico("Ingestão Raw (Bronze)", traceback.format_exc())
+        return False
