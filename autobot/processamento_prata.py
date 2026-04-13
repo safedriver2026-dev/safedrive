@@ -38,14 +38,14 @@ class ProcessamentoPrata:
         self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
 
     def executar_todos_os_anos(self):
-        logger.info("PRATA: Iniciando consolidação com estratégia String-First...")
+        logger.info("PRATA: Iniciando consolidação com Dicionário de Sinônimos Resiliente...")
         ano_atual = datetime.now().year
         estado_atual = self._carregar_tracker()
 
         for ano in range(2022, ano_atual + 1):
             if self.processar_ano_com_delta(ano, estado_atual):
                 self._salvar_tracker(estado_atual)
-                logger.info(f"PRATA: Ciclo {ano} finalizado com sucesso.")
+                logger.info(f"PRATA: Ciclo {ano} consolidado com sucesso.")
 
     def processar_ano_com_delta(self, ano, estado):
         path_bronze = f"safedriver/datalake/bronze/ssp_raw_{ano}.xlsx"
@@ -68,38 +68,48 @@ class ProcessamentoPrata:
 
             for sheet_idx in range(1, 6):
                 try:
-                    # Lemos a aba ignorando tipos automáticos (tudo vira String)
+                    # Estratégia String-First: Evita conflitos de tipos entre anos/abas
                     temp_df = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine")
-                    
-                    # --- ESTRATÉGIA STRING-FIRST ---
-                    # Transformamos TODAS as colunas em String imediatamente para evitar conflitos de vstack
                     temp_df = temp_df.with_columns(pl.all().cast(pl.String))
                     
-                    cols = [str(c).upper().replace("Ç", "C").replace("Ã", "A").strip() for c in temp_df.columns]
+                    # Normalização de nomes: Remove acentos, espaços e força Upper
+                    temp_df = temp_df.rename({
+                        c: str(c).upper().replace("Ç", "C").replace("Ã", "A").strip() 
+                        for c in temp_df.columns
+                    })
                     
-                    if any(k in cols for k in ["LATITUDE", "LONGITUDE", "RUBRICA"]):
-                        # Normaliza nomes e limpa textos
-                        temp_df = temp_df.rename({c: str(c).upper().replace("Ç", "C").replace("Ã", "A").strip() for c in temp_df.columns})
-                        temp_df = temp_df.with_columns(pl.col(pl.String).str.strip_chars().str.to_uppercase())
+                    if any(k in temp_df.columns for k in ["LATITUDE", "RUBRICA"]):
                         dfs_abas.append(temp_df)
-                        logger.info(f"PRATA: [{ano}] Aba {sheet_idx} carregada como String.")
                 except: continue
 
             if not dfs_abas: return False
 
-            # Concatena as abas do ano (agora todas são String, sem erro de tipo)
+            # Concatena abas do mesmo ano (diagonal permite colunas extras como CMD/BTL)
             df = pl.concat(dfs_abas, how="diagonal")
 
-            # Mapeamento de colunas inconsistentes
-            col_local = "DESCR_SUBTIPOLOCAL" if "DESCR_SUBTIPOLOCAL" in df.columns else "DESCR_TIPOLOCAL"
-            df = df.rename({
-                col_local: "LOCAL_TIPO", 
-                "CIDADE": "MUNICIPIO", "NOME_MUNICIPIO": "MUNICIPIO",
-                "DESCR_PERIODO": "PERIODO", "DESC_PERIODO": "PERIODO"
-            })
+            # --- DICIONÁRIO DE SINÔNIMOS CANÔNICO ---
+            # Resolve as variações que você mapeou de 2022 a 2026
+            sinonimos = {
+                "MUNICIPIO": ["NOME_MUNICIPIO", "CIDADE"],
+                "LOCAL_TIPO": ["DESCR_SUBTIPOLOCAL", "DESCR_TIPOLOCAL"],
+                "PERIODO": ["DESC_PERIODO", "DESCR_PERIODO"],
+                "SEC_CIRC": ["NOME_SECCIONAL_CIRCUNSCRICAO", "NOME_SECCIONAL_CIRCUNSCRIÇÃO"],
+                "DEP_CIRC": ["NOME_DEPARTAMENTO_CIRCUNSCRICAO", "NOME_DEPARTAMENTO_CIRCUNSCRIÇÃO"],
+                "MUN_CIRC": ["NOME_MUNICIPIO_CIRCUNSCRICAO", "NOME_MUNICIPIO_CIRCUNSCRIÇÃO"]
+            }
 
-            # --- CONVERSÃO CONTROLADA ---
-            # Só agora transformamos as coordenadas em número para o cálculo H3
+            for alvo, origens in sinonimos.items():
+                col_encontrada = next((o for o in origens if o in df.columns), None)
+                if col_encontrada:
+                    df = df.rename({col_encontrada: alvo})
+                    # Limpeza de duplicidade: se houver outros sinônimos, apaga-os
+                    outros = [o for o in origens if o in df.columns and o != alvo]
+                    if outros: df = df.drop(outros)
+
+            # Sanitização dos dados (Strings limpas)
+            df = df.with_columns(pl.col(pl.String).str.strip_chars().str.to_uppercase())
+
+            # Conversão numérica para cálculo geográfico
             df = df.with_columns([
                 pl.col("LATITUDE").cast(pl.Float64, strict=False),
                 pl.col("LONGITUDE").cast(pl.Float64, strict=False)
@@ -107,11 +117,11 @@ class ProcessamentoPrata:
 
             if df.is_empty(): return False
 
-            # Geração do Índice Geográfico
+            # Geração do H3
             h3_list = [h3.latlng_to_cell(lat, lon, 8) for lat, lon in zip(df["LATITUDE"], df["LONGITUDE"])]
             df = df.with_columns(pl.Series("H3_INDEX", h3_list))
 
-            # Agregação Final com casting para Int32 (Padrão IA)
+            # Agregação com Casting Int32 (Essencial para o Treinador IA)
             df_atual = df.group_by(["H3_INDEX"]).agg([
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO|VEICULO|CARGA")).count().cast(pl.Int32).alias("TOTAL_CRIMES_MOTORISTA"),
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("CELULAR|TRANSEUNTE|PESSOA")).count().cast(pl.Int32).alias("TOTAL_CRIMES_PEDESTRE"),
@@ -121,10 +131,9 @@ class ProcessamentoPrata:
                 pl.col("LOGRADOURO").n_unique().cast(pl.Int32).alias("DENSIDADE_ENDERECOS")
             ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
 
-            # Cálculo de Tendências (Deltas)
+            # Cálculo de Deltas
             df_final = self._injetar_deltas(df_atual, path_prata_anterior)
             
-            # Persistência em Parquet
             buffer = io.BytesIO()
             df_final.write_parquet(buffer)
             self.s3.put_object(Bucket=self.bucket, Key=path_prata_atual, Body=buffer.getvalue())
@@ -132,7 +141,7 @@ class ProcessamentoPrata:
             estado[str(ano)] = tamanho_atual
             return True
         except Exception as e:
-            logger.error(f"PRATA: Erro crítico no ano {ano}: {e}")
+            logger.error(f"PRATA: Falha no ciclo de {ano}: {e}")
             return False
 
     def _injetar_deltas(self, df_atual, path_anterior):
