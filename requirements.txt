@@ -10,5 +10,6 @@ lightgbm
 scikit-learn
 pandas
 google-cloud-bigquery
+db-dtypes
 joblib
 pytest
