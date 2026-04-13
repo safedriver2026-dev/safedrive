@@ -1,22 +1,14 @@
-# Processamento de Dados
-pandas
-pyarrow
-numpy
 polars
-
-# Inteligência Artificial (Ensemble)
-lightgbm
-catboost
-scikit-learn
-joblib
-
-# Inteligência Geoespacial
-h3
-
-# Cloud e Infraestrutura (R2 e BigQuery)
-boto3
-google-cloud-bigquery
-
-# Captura e Leitura de Arquivos
-requests
+fastexcel
 openpyxl
+pyarrow
+requests
+boto3
+h3
+catboost
+lightgbm
+scikit-learn
+pandas
+google-cloud-bigquery
+joblib
+pytest
