@@ -1,26 +1,26 @@
-# Processamento de Dados
+# Processamento de Dados de Alta Performance
 polars
+fastexcel
+calamine
 pandas
-pyarrow
+numpy
 openpyxl
 
-# Nuvem e Armazenamento (R2/S3)
+# Infraestrutura Cloud (R2 & BigQuery)
 boto3
+botocore
+google-cloud-bigquery
+google-auth
+pyarrow
 
-# Geo-Processamento
-h3
-
-# Inteligência Artificial
+# Inteligência Artificial e Modelagem
+scikit-learn
 catboost
 lightgbm
 joblib
-scikit-learn
 
-# Google Cloud & BigQuery
-google-cloud-bigquery
-google-auth
-pandas-gbq
-
-# Comunicação e Web
-requests
+# Geo-análise e Utilitários
+h3
 holidays
+requests
+python-dotenv
