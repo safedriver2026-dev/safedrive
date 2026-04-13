@@ -9,7 +9,9 @@ import json
 from datetime import datetime
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from .comunicador import RoboComunicador
+
+# Importações Absolutas para evitar ModuleNotFoundError
+from autobot.comunicador import RoboComunicador
 
 class SincronizacaoOuro:
     def __init__(self, robo: RoboComunicador):
@@ -24,28 +26,33 @@ class SincronizacaoOuro:
         self.credenciais_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
 
     def carregar_modelos_ia(self):
+        """Carrega os pesos do Ensemble do R2"""
         try:
-            obj_lgb = self.s3.get_object(Bucket=self.bucket, Key="modelos/lgbm_safedriver_v1.pkl")
-            obj_cat = self.s3.get_object(Bucket=self.bucket, Key="modelos/catboost_safedriver_v1.pkl")
+            obj_lgb = self.s3.get_object(Bucket=self.bucket, Key="modelos/lgbm_v1.pkl")
+            obj_cat = self.s3.get_object(Bucket=self.bucket, Key="modelos/catboost_v1.pkl")
             return joblib.load(io.BytesIO(obj_lgb['Body'].read())), joblib.load(io.BytesIO(obj_cat['Body'].read()))
         except:
+            self.robo.enviar_alerta_tecnico("Modelos não encontrados", "Usando heurística básica para a Ouro.")
             return None, None
 
-    def aplicar_suavizacao_espacial(self, df):
-        mapa_risco = df.groupby('H3_INDEX')['RISCO_PONTUAL'].mean().to_dict()
+    def suavizar_risco_espacial(self, df):
+        """Distribui o risco entre vizinhos H3 para evitar efeito tabuleiro"""
+        # Agrupa média de risco por hexágono
+        mapa_risco = df.groupby('H3_INDEX')['PREVISAO_PONTUAL'].mean().to_dict()
         
         def calcular_vizinhanca(hex_id):
-            vizinhos = h3.grid_disk(hex_id, 1)
+            vizinhos = h3.grid_disk(hex_id, 1) # Hexágono + 6 vizinhos
             valores = [mapa_risco.get(v, 0) for v in vizinhos]
-            return sum(valores) / len(valores) if valores else 0
+            return (sum(valores) / len(valores)) if valores else 0
 
-        df['RISCO_PREDITIVO_FINAL'] = df['H3_INDEX'].apply(calcular_vizinhanca)
+        df['RISCO_FINAL'] = df['H3_INDEX'].apply(calcular_vizinhanca)
         return df
 
-    def executar_ensemble(self, df):
+    def executar_predicao_ensemble(self, df):
         lgb, cat = self.carregar_modelos_ia()
         
-        features = [
+        # Features completas vindas da Prata (incluindo Residências)
+        recursos = [
             'DENSIDADE_LOGRADOUROS', 
             'TOTAL_RESIDENCIAS_H3', 
             'TOTAL_EDIFICACOES_H3', 
@@ -55,44 +62,45 @@ class SincronizacaoOuro:
             'PESO_CRIME'
         ]
         
-        x = df[features].fillna(0)
+        x = df[recursos].fillna(0)
 
         if lgb and cat:
+            # Ponderação do Ensemble: 40% LGBM / 60% CatBoost
             p_lgb = lgb.predict_proba(x)[:, 1]
             p_cat = cat.predict_proba(x)[:, 1]
-            df['RISCO_PONTUAL'] = (p_lgb * 0.4) + (p_cat * 0.6)
+            df['PREVISAO_PONTUAL'] = (p_lgb * 0.4) + (p_cat * 0.6)
         else:
-            df['RISCO_PONTUAL'] = (df['PESO_CRIME'] * 0.3) + (df['DENSIDADE_LOGRADOUROS'] * 0.7)
+            # Fallback caso a IA não esteja disponível
+            df['PREVISAO_PONTUAL'] = (df['PESO_CRIME'] * 0.3) + (df['DENSIDADE_LOGRADOUROS'] * 0.7)
             
-        return self.aplicar_suavizacao_espacial(df)
+        # Aplica suavização e arredonda para 1 casa decimal (Ex: 8.4)
+        df = self.suavizar_risco_espacial(df)
+        df['RISCO_FINAL'] = df['RISCO_FINAL'].astype(float).round(1)
+        
+        return df
 
     def executar(self, ano):
         caminho_prata = f"datalake/prata/ssp_{ano}_prata.parquet"
-        caminho_ouro_r2 = f"datalake/ouro/ssp_{ano}_ouro.parquet"
         tabela_bq = f"{self.projeto_id}.{self.dataset_id}.ouro_{ano}"
 
         try:
-            self.robo.enviar_relatorio_operacional(f"Iniciando Ensemble Ouro {ano}")
+            self.robo.enviar_relatorio_operacional(f"Gerando Inteligência Ouro {ano}")
 
+            # Lê da Prata
             resp = self.s3.get_object(Bucket=self.bucket, Key=caminho_prata)
             df_prata = pd.read_parquet(io.BytesIO(resp['Body'].read()))
 
-            df_ouro = self.executar_ensemble(df_prata)
+            # Processa Predição
+            df_ouro = self.executar_predicao_ensemble(df_prata)
             df_ouro['DATA_PROCESSAMENTO'] = datetime.now()
 
-            buffer = io.BytesIO()
-            df_ouro.to_parquet(buffer, index=False)
-            self.s3.put_object(Bucket=self.bucket, Key=caminho_ouro_r2, Body=buffer.getvalue())
-
+            # Sincronização BigQuery (Delta Sync via Overwrite de Tabela Anual)
             info_bq = json.loads(self.credenciais_json)
             creds = service_account.Credentials.from_service_account_info(info_bq)
-            cliente_bq = bigquery.Client(project=self.projeto_id, credentials=creds)
+            cliente = bigquery.Client(project=self.projeto_id, credentials=creds)
             
-            job = cliente_bq.load_table_from_dataframe(
-                df_ouro, 
-                tabela_bq, 
-                job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-            )
+            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+            job = cliente.load_table_from_dataframe(df_ouro, tabela_bq, job_config=job_config)
             job.result()
 
             self.robo.enviar_relatorio_operacional(f"Ouro Finalizada {ano}", {"Registros": len(df_ouro)})
@@ -101,7 +109,3 @@ class SincronizacaoOuro:
         except Exception:
             self.robo.enviar_alerta_tecnico(f"Erro Camada Ouro {ano}", traceback.format_exc())
             return False
-
-def iniciar_ouro(robo, ano):
-    servico = SincronizacaoOuro(robo)
-    return servico.executar(ano)
