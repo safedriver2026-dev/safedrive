@@ -8,53 +8,61 @@ from autobot.treinador_ia import TreinadorEvolutivo
 from autobot.ia_sincronizacao_ouro import CamadaOuroSafeDriver
 from autobot.comunicador import ComunicadorSafeDriver
 
+# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 def executar_pipeline():
-    parser = argparse.ArgumentParser(description="Orquestrador do Pipeline SafeDriver")
-    parser.add_argument("--weekly", action="store_true", help="Executa o ciclo de Extracao e Transformacao (Bronze/Prata)")
-    parser.add_argument("--daily", action="store_true", help="Executa o ciclo de Inteligencia Artificial (Treino/Ouro)")
+    parser = argparse.ArgumentParser(description="Orquestrador SafeDriver Autobot")
+    parser.add_argument("--weekly", action="store_true", help="Executa Bronze (Ingestão) e Prata (Limpeza)")
+    parser.add_argument("--daily", action="store_true", help="Executa Treino IA e Ouro (BigQuery)")
     args = parser.parse_args()
 
     comunicador = ComunicadorSafeDriver()
-    inicio = datetime.now()
-    ano_atual = inicio.year
+    inicio_geral = datetime.now()
+    ano_atual = inicio_geral.year
 
     try:
+        # --- CICLO SEMANAL: DADOS BRUTOS ---
         if args.weekly:
-            logger.info("=== Iniciando Ciclo Semanal: Carga de Dados (Bronze -> Prata) ===")
+            logger.info("🚀 Iniciando Ciclo Semanal: Bronze e Prata")
             raw = IngestaoRaw()
             prata = ProcessamentoPrata()
             
             for ano in range(2022, ano_atual + 1):
-                # O pipeline so tenta processar a Prata se a Bronze for bem-sucedida (ou se ja existir)
+                # Só avança para a Prata se a Ingestão (Bronze) der OK ou o arquivo já existir
                 if raw.executar_ingestao(ano):
                     prata.executar_prata(ano)
+                else:
+                    logger.warning(f"Aviso: Pulando processamento Prata para o ano {ano} devido a falha na Bronze.")
             
-            comunicador.relatar_sucesso(ano_atual, str(datetime.now() - inicio), "Ingestao (Bronze) e Limpeza (Prata) concluidas.")
+            tempo_total = str(datetime.now() - inicio_geral).split(".")[0]
+            comunicador.relatar_sucesso(ano_atual, tempo_total, "Dados extraídos da SSP e higienizados na Prata (R2).")
 
+        # --- CICLO DIÁRIO: INTELIGÊNCIA E SCORE ---
         if args.daily:
-            logger.info("=== Iniciando Ciclo Diario: Machine Learning e Analytics (Treino -> Ouro) ===")
+            logger.info("🧠 Iniciando Ciclo Diário: Treino e Ouro")
             treinador = TreinadorEvolutivo()
             ouro = CamadaOuroSafeDriver()
 
-            # O modelo so avanca para a Ouro (BigQuery) se o retreino for bem-sucedido
+            # O pipeline só sobe para o BigQuery se o retreino dos modelos for bem-sucedido
             if treinador.treinar_modelo_mestre():
-                logger.info("IA: Modelos retreinados com sucesso. Iniciando sincronizacao Delta com BigQuery.")
+                logger.info("Modelos atualizados. Sincronizando com BigQuery...")
                 for ano in range(2022, ano_atual + 1):
                     ouro.processar_ouro(ano)
 
-                comunicador.relatar_sucesso(ano_atual, str(datetime.now() - inicio), "Sincronizacao Ouro (BigQuery) e Modelos IA atualizados.")
+                tempo_total = str(datetime.now() - inicio_geral).split(".")[0]
+                comunicador.relatar_sucesso(ano_atual, tempo_total, "Modelos IA retreinados e BigQuery atualizado via Merge Delta.")
             else:
-                logger.warning("Treinamento cancelado ou sem dados novos. A Camada Ouro foi ignorada para proteger o BigQuery.")
+                logger.warning("Treinamento não gerou novos modelos. Camada Ouro ignorada para segurança.")
 
         if not args.weekly and not args.daily:
-            logger.warning("Nenhum argumento fornecido. Usa --weekly ou --daily.")
+            logger.warning("Nenhum modo de execução selecionado. Use --weekly ou --daily.")
 
     except Exception as e:
-        logger.error(f"Falha critica no orquestrador: {e}")
-        comunicador.relatar_erro("Orquestrador Geral (main.py)", str(e))
+        logger.error(f"Falha Crítica no Pipeline: {e}")
+        # Envia o erro direto para o seu canal DISCORD_ERRO
+        comunicador.relatar_erro("Orquestrador (main.py)", str(e))
         sys.exit(1)
 
 if __name__ == "__main__":
