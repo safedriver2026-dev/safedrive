@@ -2,8 +2,8 @@ import os
 import sys
 from datetime import datetime
 from comunicador import RoboComunicador
-import autobot.0_ingestao_raw as ingestao_raw
-import autobot.1_processamento_prata as processamento_prata
+import autobot.ingestao_raw as ingestao_raw
+import autobot.processamento_prata as processamento_prata
 
 def executar_pipeline_bronze_prata():
     robo = RoboComunicador(
