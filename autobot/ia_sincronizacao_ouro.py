@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 class CamadaOuroSafeDriver:
     def __init__(self):
-        # Infraestrutura R2
-        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip()
+        # Infraestrutura R2 (Limpando inputs)
+        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -36,9 +36,10 @@ class CamadaOuroSafeDriver:
         self.comunicador = ComunicadorSafeDriver()
 
         # Configuração de Pesos (Weighted Ensemble)
+        # Prioridade total ao CatBoost devido ao MAE superior
         self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
         
-        # Features do Modelo
+        # Features do Modelo (Consistentes com o Treinador)
         self.features_base = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
         self.meta_features = ['ULTIMO_MAE_CAT', 'ULTIMO_MAE_LGB']
 
@@ -56,22 +57,32 @@ class CamadaOuroSafeDriver:
             raise e
 
     def processar_ouro(self, ano):
-        path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
+        # CAMINHO AJUSTADO conforme a imagem do seu R2
+        path_prata = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
+        
         try:
-            logger.info(f"OURO: Iniciando processamento para o ano {ano}...")
+            logger.info(f"OURO: Iniciando processamento evolutivo para {ano}...")
+            
+            # 1. Download dos dados da Prata
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read()))
 
+            # 2. Carregar modelos (latest)
             modelos = self._carregar_modelos_latest()
+            
+            # 3. Gerar Scores Ponderados
             df_final = self._gerar_scores_evolutivos(lf, modelos)
 
+            # 4. Upsert no BigQuery
             self._sincronizar_bigquery_delta(df_final)
             return True
+            
         except Exception as e:
             logger.error(f"Falha na Camada Ouro ({ano}): {e}")
             raise e
 
     def _carregar_modelos_latest(self):
+        """Busca os ponteiros 'latest' gerados pelo Treinador."""
         modelos = {}
         for p in ["motorista", "pedestre", "motociclista"]:
             modelos[p] = {}
@@ -81,10 +92,12 @@ class CamadaOuroSafeDriver:
                     obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                     modelos[p][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
                 except:
+                    logger.warning(f"Aviso: Modelo {path} ainda não disponível.")
                     modelos[p][alg] = None
         return modelos
 
-    def _buscar_meta_features_cold_start(self, persona):
+    def _buscar_meta_features(self, persona):
+        """Lê a performance do último treino para usar como feature (Memória)."""
         path = f"modelos_ml/meta_perf_{persona}.json"
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path)
@@ -94,29 +107,37 @@ class CamadaOuroSafeDriver:
                 "ULTIMO_MAE_LGB": meta.get("mae_lgb", 0.0)
             }
         except:
+            # Cold Start: Se não houver metadados, assume erro zero
             return {"ULTIMO_MAE_CAT": 0.0, "ULTIMO_MAE_LGB": 0.0}
 
     def _gerar_scores_evolutivos(self, lf, modelos):
         df = lf.to_pandas()
+        
+        # Padronização de colunas (Safe Check)
         if "TOTAL_NAO_RESIDENCIAIS_H3" in df.columns:
             df = df.rename(columns={"TOTAL_NAO_RESIDENCIAIS_H3": "TOTAL_NAO_RES_H3"})
 
         for persona, mods in modelos.items():
             col_score = f"SCORE_RISCO_{persona.upper()}"
-            meta = self._buscar_meta_features_cold_start(persona)
+            
+            # Injeção de Meta-Features para esta persona
+            meta = self._buscar_meta_features(persona)
             df['ULTIMO_MAE_CAT'] = meta["ULTIMO_MAE_CAT"]
             df['ULTIMO_MAE_LGB'] = meta["ULTIMO_MAE_LGB"]
 
             features_finais = self.features_base + self.meta_features
             
+            # Predição do Ensemble
             p_cat = mods["cat"].predict(df[features_finais]) if mods["cat"] is not None else None
             p_lgb = mods["lgb"].predict(df[features_finais]) if mods["lgb"] is not None else None
 
             if p_cat is not None and p_lgb is not None:
+                # Aplicação da Ponderação 80/20
                 score_raw = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
             else:
                 score_raw = p_cat if p_cat is not None else (p_lgb if p_lgb is not None else 0.0)
 
+            # Normalização 0-100 baseada no maior risco do lote
             if hasattr(score_raw, "max") and score_raw.max() > 0:
                 df[col_score] = (score_raw / score_raw.max() * 100).clip(0, 100)
             else:
@@ -129,13 +150,16 @@ class CamadaOuroSafeDriver:
         tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
         tabela_stg = f"{tabela_final}_stg"
 
+        # 1. Verifica/Cria Tabela Final
         try:
             self.bq_client.get_table(tabela_final)
         except NotFound:
+            logger.info(f"OURO: Criando tabela destino {tabela_final}")
             job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
             self.bq_client.load_table_from_dataframe(df, tabela_final, job_config=job_config).result()
             return
 
+        # 2. Upload para Staging e MERGE
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
 
@@ -154,3 +178,8 @@ class CamadaOuroSafeDriver:
           VALUES (S.H3_INDEX, S.ANO_REFERENCIA, S.SCORE_RISCO_MOTORISTA, S.SCORE_RISCO_PEDESTRE, S.SCORE_RISCO_MOTOCICLISTA, S.ULTIMA_ATUALIZACAO, S.INDICE_RESIDENCIAL, S.TOTAL_NAO_RES_H3, S.DENSIDADE_ENDERECOS)
         """
         self.bq_client.query(sql_merge).result()
+        logger.info(f"OURO: Dados sincronizados com BigQuery.")
+
+if __name__ == "__main__":
+    # Teste para o ano atual
+    CamadaOuroSafeDriver().processar_ouro(datetime.now().year)
