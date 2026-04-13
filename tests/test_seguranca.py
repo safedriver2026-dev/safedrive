@@ -5,16 +5,13 @@ import hashlib
 import boto3
 from datetime import datetime
 
-# Definir caminhos no R2
 ANO_ATUAL = datetime.now().year
 CAMINHO_PRATA_R2 = f"safedriver/datalake/silver/prata_{ANO_ATUAL}.parquet"
 CAMINHO_CRIME_REAL_AGREGADO_R2 = f"safedriver/datalake/validation/crime_real_agregado_{ANO_ATUAL}.parquet"
 
-# Variáveis para arquivos locais temporários para os testes
 CAMINHO_PRATA_LOCAL = "camada_prata_test.parquet"
 CAMINHO_CRIME_REAL_AGREGADO_LOCAL = "crime_real_agregado_test.parquet"
 
-# Configuração do S3 (R2)
 s3_client = boto3.client('s3',
                          endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
                          aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
@@ -23,15 +20,12 @@ BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_teardown_r2_files():
-    # Flag para indicar se os arquivos foram baixados com sucesso
     prata_baixada = False
     crime_real_baixado = False
 
-    # Baixar arquivos do R2 antes de todos os testes neste módulo
     try:
-        # Tenta baixar o arquivo da camada prata
         try:
-            s3_client.head_object(Bucket=BUCKET_NAME, Key=CAMINHO_PRATA_R2) # Verifica se existe
+            s3_client.head_object(Bucket=BUCKET_NAME, Key=CAMINHO_PRATA_R2)
             s3_client.download_file(BUCKET_NAME, CAMINHO_PRATA_R2, CAMINHO_PRATA_LOCAL)
             prata_baixada = True
             print(f"Arquivo {CAMINHO_PRATA_R2} baixado com sucesso para testes.")
@@ -39,11 +33,10 @@ def setup_teardown_r2_files():
             if e.response['Error']['Code'] == 'NotFound':
                 print(f"Arquivo {CAMINHO_PRATA_R2} não encontrado no R2. Pulando download para testes.")
             else:
-                raise # Re-lança outros erros do S3
+                raise
 
-        # Tenta baixar o arquivo de crime real agregado
         try:
-            s3_client.head_object(Bucket=BUCKET_NAME, Key=CAMINHO_CRIME_REAL_AGREGADO_R2) # Verifica se existe
+            s3_client.head_object(Bucket=BUCKET_NAME, Key=CAMINHO_CRIME_REAL_AGREGADO_R2)
             s3_client.download_file(BUCKET_NAME, CAMINHO_CRIME_REAL_AGREGADO_R2, CAMINHO_CRIME_REAL_AGREGADO_LOCAL)
             crime_real_baixado = True
             print(f"Arquivo {CAMINHO_CRIME_REAL_AGREGADO_R2} baixado com sucesso para testes.")
@@ -51,20 +44,18 @@ def setup_teardown_r2_files():
             if e.response['Error']['Code'] == 'NotFound':
                 print(f"Arquivo {CAMINHO_CRIME_REAL_AGREGADO_R2} não encontrado no R2. Pulando download para testes.")
             else:
-                raise # Re-lança outros erros do S3
+                raise
 
     except Exception as e:
         pytest.fail(f"Falha inesperada ao tentar baixar arquivos do R2 para testes: {e}")
 
-    yield # Executa os testes
+    yield
 
-    # Limpar arquivos locais após todos os testes
     if os.path.exists(CAMINHO_PRATA_LOCAL):
         os.remove(CAMINHO_PRATA_LOCAL)
     if os.path.exists(CAMINHO_CRIME_REAL_AGREGADO_LOCAL):
         os.remove(CAMINHO_CRIME_REAL_AGREGADO_LOCAL)
 
-# Os testes individuais agora precisam verificar se o arquivo foi baixado antes de tentar lê-lo
 def test_camada_prata_foi_gerada():
     if not os.path.exists(CAMINHO_PRATA_LOCAL):
         pytest.skip(f"Arquivo {CAMINHO_PRATA_LOCAL} não encontrado, pulando teste.")
