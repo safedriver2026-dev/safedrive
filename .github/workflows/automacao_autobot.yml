@@ -1,36 +1,37 @@
-name: Automacao SafeDriver Incremental
+name: SafeDriver Workflow Incremental
 
 on:
   schedule:
-    - cron: '0 3 * * *'
+    # 1. Turno Diário (02:00 AM): Apenas a Camada Ouro (Predição)
+    - cron: '0 2 * * *'
+    # 2. Turno Semanal (Domingo 00:00): Bronze, Prata e Ouro (Full ETL)
     - cron: '0 0 * * 0'
   workflow_dispatch:
     inputs:
       modo:
-        description: 'Escolha: full ou predicao'
-        default: 'predicao'
+        description: 'Escolha o modo: diario ou full'
+        default: 'diario'
         required: true
 
 jobs:
-  execucao:
+  pipeline:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do repositorio
+      - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Instalacao do Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Instalacao de Dependencias
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas pyarrow numpy lightgbm catboost scikit-learn joblib h3 boto3 google-cloud-bigquery requests openpyxl
+      - name: Install Deps
+        run: pip install -r requirements.txt
 
-      - name: Rodar SafeDriver
+      - name: Executar Motor SafeDriver
         env:
-          PYTHONPATH: .
+          PYTHONPATH: ${{ github.workspace }}
+          # Segredos do R2 e GCP
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -40,5 +41,14 @@ jobs:
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
-          MODO_EXECUCAO=${{ github.event.schedule == '0 0 * * 0' && 'full' || github.event.inputs.modo || 'predicao' }}
-          python -m autobot.motor_analise_preditiva $MODO_EXECUCAO
+          # Lógica para definir o modo de execução
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            MODO="${{ github.event.inputs.modo }}"
+          elif [ "${{ github.event.schedule }}" == "0 0 * * 0" ]; then
+            MODO="full"
+          else
+            MODO="diario"
+          fi
+          
+          echo "Iniciando SafeDriver em modo: $MODO"
+          python -m autobot.motor_analise_preditiva $MODO
