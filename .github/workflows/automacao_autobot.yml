@@ -1,96 +1,23 @@
-name: SafeDriver - Orquestrador de Dados e IA
+name: SafeDriver Autobot
 
 on:
   schedule:
     # Execução diária às 04:00 UTC (01:00 Horário de Brasília)
+    # Garante que os dados estejam frescos antes do início do horário comercial
     - cron: "0 4 * * *"
   
   workflow_dispatch:
-    # Interface para execução manual no painel do GitHub
+    # Interface gráfica no GitHub para execução manual sob demanda
     inputs:
       force_execution:
-        description: 'Forçar execução? (Ignora validações de calendário e dados)'
+        description: 'Forçar execução? (Ignora CDC, Calendário e Integridade)'
         required: true
         type: boolean
         default: false
 
 jobs:
-  decisao_estrategica:
-    name: Verificação de Integridade e Calendário
-    runs-on: ubuntu-latest
-    outputs:
-      deve_prosseguir: ${{ steps.verificador.outputs.status }}
-    
-    steps:
-      - name: Checkout do Repositório
-        uses: actions/checkout@v4
-
-      - name: Configurar Python Leve
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Instalar Dependências do Sensor
-        run: |
-          python -m pip install --upgrade pip
-          pip install holidays boto3 pandas
-
-      - name: Analisar Condições de Execução
-        id: verificador
-        env:
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: |
-          # 1. Verifica se foi um acionamento manual forçado
-          if [ "${{ github.event.inputs.force_execution }}" == "true" ]; then
-            echo "status=True" >> $GITHUB_OUTPUT
-            echo "Decisão: Execução manual forçada ativada."
-            exit 0
-          fi
-
-          # 2. Verifica se o Datalake está vazio (Gatilho de Integridade)
-          DADOS_AUSENTES=$(python -c "
-          import os, boto3
-          from botocore.config import Config
-          try:
-              s3 = boto3.client(
-                  's3', 
-                  endpoint_url=os.getenv('R2_ENDPOINT_URL').strip().rstrip('/'), 
-                  aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'), 
-                  aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
-                  config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
-              )
-              # Caminho absoluto mapeado para a infraestrutura do R2
-              s3.head_object(Bucket=os.getenv('R2_BUCKET_NAME'), Key='safedriver/modelos_ml/latest_cat_motorista.pkl')
-              print('False')
-          except:
-              print('True')
-          ")
-
-          if [ "$DADOS_AUSENTES" == "True" ]; then
-            echo "status=True" >> $GITHUB_OUTPUT
-            echo "Decisão: Dados críticos ausentes no R2. Restauração obrigatória."
-            exit 0
-          fi
-
-          # 3. Verifica o Calendário Estratégico (Domingo, Pagamento, Feriado)
-          CALENDARIO=$(python -c "from autobot.calendario_estrategico import CalendarioEstrategico; print(CalendarioEstrategico().deve_rodar_hoje())")
-          
-          if [ "$CALENDARIO" == "True" ]; then
-            echo "status=True" >> $GITHUB_OUTPUT
-            echo "Decisão: Calendário estratégico ativado."
-          else
-            echo "status=False" >> $GITHUB_OUTPUT
-            echo "Decisão: Fora de ciclo. Operação suspensa."
-          fi
-
   pipeline_producao:
-    name: Motor Principal (Prata -> Treino -> Ouro)
-    needs: decisao_estrategica
-    # Só acorda a máquina pesada se o sensor der luz verde
-    if: needs.decisao_estrategica.outputs.deve_prosseguir == 'True'
+    name: Maestro - Orquestração do Data Lake e ML
     runs-on: ubuntu-latest
     
     steps:
@@ -101,33 +28,35 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: 'pip' # FinOps: Reduz o tempo de instalação de minutos para segundos nas execuções diárias
 
-      - name: Instalação de Dependências de Produção
+      - name: Instalação de Dependências Corporativas
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install holidays h3 # Garantia de instalação explícita contra falhas de cache
+          # Garantia de resiliência caso pacotes críticos sejam removidos do requirements por engano
+          pip install requests boto3 holidays h3 polars catboost lightgbm scikit-learn google-cloud-bigquery
 
-      - name: Executar Orquestrador Principal (main.py)
+      - name: Acionar Motor SafeDriver (main.py)
         env:
-          # Credenciais Storage
+          # Credenciais Cloudflare Storage (R2)
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           
-          # Credenciais BigQuery
+          # Credenciais Google Cloud Data Warehouse (BigQuery)
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
           
-          # Webhooks e Criptografia
+          # Webhooks de Monitorização (Discord) e Segurança
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
           if [ "${{ github.event.inputs.force_execution }}" == "true" ]; then
+            echo "Aviso: Execução forçada ativada via interface do GitHub."
             python main.py --force
           else
             python main.py
