@@ -44,6 +44,7 @@ def executar_silver(robo: RoboComunicador):
         caminho_raw = f"safedriver/datalake/raw/ssp_{ano}_incremental.parquet"
         caminho_master = "safedriver/datalake/base_geografica/safedriver_geo_base_sp_h3_8.parquet"
         caminho_silver_r2 = f"safedriver/datalake/silver/prata_{ano}.parquet"
+        caminho_crime_real_agregado_r2 = f"safedriver/datalake/validation/crime_real_agregado_{ano}.parquet"
 
         s3.download_file(bucket, caminho_raw, "raw.parquet")
         s3.download_file(bucket, caminho_master, "master.parquet")
@@ -74,15 +75,27 @@ def executar_silver(robo: RoboComunicador):
         df_silver.to_parquet("camada_prata_temp.parquet", index=False)
         s3.upload_file("camada_prata_temp.parquet", bucket, caminho_silver_r2)
 
+        # Geração e persistência da tabela de crime real agregado para validação
+        df_crime_real_agregado = df_silver.groupby(['INDICE_H3', df_silver['DATA'].dt.normalize()]).agg(
+            NUMERO_OCORRENCIAS_REAIS=('NUM_BO', 'count'),
+            RISCO_OBSERVADO_REAL=('PESO_CRIME', 'sum')
+        ).reset_index()
+        df_crime_real_agregado = df_crime_real_agregado.rename(columns={'DATA': 'DATA_OCORRENCIA'})
+
+        df_crime_real_agregado.to_parquet("crime_real_agregado_temp.parquet", index=False)
+        s3.upload_file("crime_real_agregado_temp.parquet", bucket, caminho_crime_real_agregado_r2)
+
         if os.path.exists("raw.parquet"):
             os.remove("raw.parquet")
         if os.path.exists("master.parquet"):
             os.remove("master.parquet")
         if os.path.exists("camada_prata_temp.parquet"):
             os.remove("camada_prata_temp.parquet")
+        if os.path.exists("crime_real_agregado_temp.parquet"):
+            os.remove("crime_real_agregado_temp.parquet")
 
         robo.enviar_relatorio_operacional("Camada Prata processada com sucesso.", 
-                                   {"Registos Fundidos": len(df_silver), 
+                                   {"Registros Fundidos": len(df_silver), 
                                     "Segurança": "LGPD Ativa",
                                     "Camada": "Silver (Prata)"})
 
