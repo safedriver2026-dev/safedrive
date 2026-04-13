@@ -7,22 +7,25 @@ import os
 import json
 import logging
 from datetime import datetime
-from catboost import CatBoostRegressor
-from lightgbm import LGBMRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
+from google.cloud import bigquery
+from google.oauth2 import service_account
+from google.cloud.exceptions import NotFound
+from autobot.comunicador import ComunicadorSafeDriver
 
-# Configuração de Log para máxima visibilidade no GitHub Actions
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
-class TreinadorEvolutivo:
+class CamadaOuroSafeDriver:
     def __init__(self):
-        # Conexão R2
+        # Infraestrutura R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip()
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
+        
+        # Infraestrutura BigQuery
+        self.project_id = os.getenv("BQ_PROJECT_ID", "").strip()
+        self.dataset_id = os.getenv("BQ_DATASET_ID", "").strip()
 
         self.s3 = boto3.client(
             's3',
@@ -30,152 +33,124 @@ class TreinadorEvolutivo:
             aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key
         )
+        self.comunicador = ComunicadorSafeDriver()
+
+        # Configuração de Pesos (Weighted Ensemble)
+        self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
         
-        # Identificador de Versão para MLOps
-        self.version = datetime.now().strftime("%Y%m%d_%H%M")
-        
-        # Definição do Core de Negócio
-        self.personas = {
-            "motorista": "TOTAL_CRIMES_MOTORISTA",
-            "pedestre": "TOTAL_CRIMES_PEDESTRE",
-            "motociclista": "TOTAL_CRIMES_MOTOCICLISTA"
-        }
-        
-        # Features: Base + Memória de Performance (Meta-Features)
+        # Features do Modelo
         self.features_base = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
         self.meta_features = ['ULTIMO_MAE_CAT', 'ULTIMO_MAE_LGB']
 
-    def treinar_modelo_mestre(self):
-        logger.info(f"IA: Invocando Ciclo de Treinamento Versionado [{self.version}]")
-        
-        # 1. Carregamento com Injeção de Meta-Features
-        df_treino = self._carregar_base_com_meta_features()
-        
-        # Validação de Segurança (Cold Start / Data Quality)
-        if df_treino is None or df_treino.shape[0] < 50:
-            logger.warning(f"IA: Abortando. Base insuficiente para evolução ({df_treino.shape[0] if df_treino is not None else 0} linhas).")
-            return False
+        # Autenticação GCP
+        gcp_json_raw = os.getenv("GCP_SA_JSON", "").strip()
+        try:
+            if gcp_json_raw and gcp_json_raw.startswith("{"):
+                cred_info = json.loads(gcp_json_raw)
+                credentials = service_account.Credentials.from_service_account_info(cred_info)
+                self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
+            else:
+                self.bq_client = bigquery.Client(project=self.project_id)
+        except Exception as e:
+            logger.error(f"Erro na autenticação BigQuery: {e}")
+            raise e
 
-        features_finais = self.features_base + self.meta_features
-        logger.info(f"IA: Treinando com features: {features_finais}")
+    def processar_ouro(self, ano):
+        path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
+        try:
+            logger.info(f"OURO: Iniciando processamento para o ano {ano}...")
+            resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
+            lf = pl.read_parquet(io.BytesIO(resp['Body'].read()))
 
-        for persona, target in self.personas.items():
-            logger.info(f"IA: Processando Ensemble para {persona.upper()}")
-            
-            X = df_treino[features_finais]
-            y = df_treino[target]
-            
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            modelos = self._carregar_modelos_latest()
+            df_final = self._gerar_scores_evolutivos(lf, modelos)
 
-            # --- Modelo A: CatBoost (O Líder) ---
-            model_cat = CatBoostRegressor(iterations=600, depth=7, learning_rate=0.08, verbose=0)
-            model_cat.fit(X_train, y_train)
-            mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
+            self._sincronizar_bigquery_delta(df_final)
+            return True
+        except Exception as e:
+            logger.error(f"Falha na Camada Ouro ({ano}): {e}")
+            raise e
 
-            # --- Modelo B: LightGBM (O Suporte) ---
-            model_lgb = LGBMRegressor(n_estimators=150, learning_rate=0.05, verbosity=-1)
-            model_lgb.fit(X_train, y_train)
-            mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
+    def _carregar_modelos_latest(self):
+        modelos = {}
+        for p in ["motorista", "pedestre", "motociclista"]:
+            modelos[p] = {}
+            for alg in ["cat", "lgb"]:
+                path = f"modelos_ml/latest_{alg}_{p}.pkl"
+                try:
+                    obj = self.s3.get_object(Bucket=self.bucket, Key=path)
+                    modelos[p][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
+                except:
+                    modelos[p][alg] = None
+        return modelos
 
-            logger.info(f"📊 {persona.upper()} -> MAE Cat: {mae_cat:.4f} | MAE LGB: {mae_lgb:.4f}")
-
-            # 2. Exportação Versionada (MLOps)
-            self._exportar_modelo(model_cat, f"cat_{persona}")
-            self._exportar_modelo(model_lgb, f"lgb_{persona}")
-            
-            # 3. Persistência de Performance (Criação da Memória para o próximo treino)
-            self._persistir_metadados_performance(persona, mae_cat, mae_lgb)
-
-        return True
-
-    def _carregar_base_com_meta_features(self):
-        """Une os dados da Prata com o histórico de erro (Cold Start Friendly)."""
-        df = self._carregar_base_historica_debug() 
-        
-        if df is None: return None
-        
-        for persona in self.personas.keys():
-            meta = self._buscar_metadados_performance(persona)
-            df['ULTIMO_MAE_CAT'] = meta.get('mae_cat', 0.0)
-            df['ULTIMO_MAE_LGB'] = meta.get('mae_lgb', 0.0)
-            
-        return df
-
-    def _carregar_base_historica_debug(self):
-        """Versão com logs detalhados para rastrear falhas de leitura no R2."""
-        lista_dfs = []
-        ano_atual = datetime.now().year
-        
-        logger.info(f"🔍 Buscando arquivos em: {self.bucket}/datalake/prata/")
-
-        for ano in range(2022, ano_atual + 1):
-            path = f"datalake/prata/ssp_consolidada_{ano}.parquet"
-            try:
-                # Validação de existência
-                self.s3.head_object(Bucket=self.bucket, Key=path)
-                
-                resp = self.s3.get_object(Bucket=self.bucket, Key=path)
-                df_temp = pl.read_parquet(io.BytesIO(resp['Body'].read()))
-                
-                if df_temp.shape[0] > 0:
-                    # Normalização de nomes de colunas
-                    if "TOTAL_NAO_RESIDENCIAIS_H3" in df_temp.columns:
-                        df_temp = df_temp.rename({"TOTAL_NAO_RESIDENCIAIS_H3": "TOTAL_NAO_RES_H3"})
-                    
-                    lista_dfs.append(df_temp)
-                    logger.info(f"✅ Sucesso ao carregar {ano} ({df_temp.shape[0]} linhas).")
-                else:
-                    logger.warning(f"⚠️ Arquivo de {ano} existe mas está vazio.")
-
-            except Exception as e:
-                logger.debug(f"❌ Falha no ano {ano}: {str(e)}")
-                continue
-        
-        if not lista_dfs:
-            logger.error("🚨 CRÍTICO: Nenhum dado carregado da Prata. O pipeline de ML não tem o que processar.")
-            return None
-        
-        # Consolida tudo e converte para Pandas (exigência do CatBoost/LGBM)
-        full_df = pl.concat(lista_dfs, how="diagonal").to_pandas().fillna(0)
-        logger.info(f"📈 Base consolidada final: {full_df.shape[0]} registros.")
-        return full_df
-
-    def _buscar_metadados_performance(self, persona):
-        """Lógica de Cold Start: busca erro anterior ou assume zero."""
+    def _buscar_meta_features_cold_start(self, persona):
         path = f"modelos_ml/meta_perf_{persona}.json"
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path)
-            return json.loads(resp['Body'].read())
+            meta = json.loads(resp['Body'].read())
+            return {
+                "ULTIMO_MAE_CAT": meta.get("mae_cat", 0.0),
+                "ULTIMO_MAE_LGB": meta.get("mae_lgb", 0.0)
+            }
         except:
-            return {"mae_cat": 0.0, "mae_lgb": 0.0}
+            return {"ULTIMO_MAE_CAT": 0.0, "ULTIMO_MAE_LGB": 0.0}
 
-    def _persistir_metadados_performance(self, persona, mae_cat, mae_lgb):
-        """Salva a 'memória' do erro para o treino subsequente."""
-        path = f"modelos_ml/meta_perf_{persona}.json"
-        meta = {
-            "mae_cat": mae_cat,
-            "mae_lgb": mae_lgb,
-            "versao_treino": self.version
-        }
-        self.s3.put_object(Bucket=self.bucket, Key=path, Body=json.dumps(meta))
+    def _gerar_scores_evolutivos(self, lf, modelos):
+        df = lf.to_pandas()
+        if "TOTAL_NAO_RESIDENCIAIS_H3" in df.columns:
+            df = df.rename(columns={"TOTAL_NAO_RESIDENCIAIS_H3": "TOTAL_NAO_RES_H3"})
 
-    def _exportar_modelo(self, modelo, nome_base):
-        """Salva a versão histórica e o atalho 'latest' para a Ouro."""
-        path_version = f"modelos_ml/versions/v{self.version}_{nome_base}.pkl"
-        path_latest = f"modelos_ml/latest_{nome_base}.pkl"
-        
-        buffer = io.BytesIO()
-        joblib.dump(modelo, buffer)
-        payload = buffer.getvalue()
+        for persona, mods in modelos.items():
+            col_score = f"SCORE_RISCO_{persona.upper()}"
+            meta = self._buscar_meta_features_cold_start(persona)
+            df['ULTIMO_MAE_CAT'] = meta["ULTIMO_MAE_CAT"]
+            df['ULTIMO_MAE_LGB'] = meta["ULTIMO_MAE_LGB"]
+
+            features_finais = self.features_base + self.meta_features
+            
+            p_cat = mods["cat"].predict(df[features_finais]) if mods["cat"] is not None else None
+            p_lgb = mods["lgb"].predict(df[features_finais]) if mods["lgb"] is not None else None
+
+            if p_cat is not None and p_lgb is not None:
+                score_raw = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
+            else:
+                score_raw = p_cat if p_cat is not None else (p_lgb if p_lgb is not None else 0.0)
+
+            if hasattr(score_raw, "max") and score_raw.max() > 0:
+                df[col_score] = (score_raw / score_raw.max() * 100).clip(0, 100)
+            else:
+                df[col_score] = 0.0
+
+        df['ULTIMA_ATUALIZACAO'] = pd.Timestamp.now()
+        return df
+
+    def _sincronizar_bigquery_delta(self, df):
+        tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
+        tabela_stg = f"{tabela_final}_stg"
 
         try:
-            # Salva histórico (Auditabilidade)
-            self.s3.put_object(Bucket=self.bucket, Key=path_version, Body=payload)
-            # Salva produção (Uso imediato pela Ouro)
-            self.s3.put_object(Bucket=self.bucket, Key=path_latest, Body=payload)
-            logger.info(f"💾 {nome_base} atualizado no R2.")
-        except Exception as e:
-            logger.error(f"❌ Erro ao exportar modelo {nome_base}: {e}")
+            self.bq_client.get_table(tabela_final)
+        except NotFound:
+            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+            self.bq_client.load_table_from_dataframe(df, tabela_final, job_config=job_config).result()
+            return
 
-if __name__ == "__main__":
-    TreinadorEvolutivo().treinar_modelo_mestre()
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+        self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
+
+        sql_merge = f"""
+        MERGE `{tabela_final}` T
+        USING `{tabela_stg}` S
+        ON T.H3_INDEX = S.H3_INDEX AND T.ANO_REFERENCIA = S.ANO_REFERENCIA
+        WHEN MATCHED THEN
+          UPDATE SET 
+            T.SCORE_RISCO_MOTORISTA = S.SCORE_RISCO_MOTORISTA,
+            T.SCORE_RISCO_PEDESTRE = S.SCORE_RISCO_PEDESTRE,
+            T.SCORE_RISCO_MOTOCICLISTA = S.SCORE_RISCO_MOTOCICLISTA,
+            T.ULTIMA_ATUALIZACAO = S.ULTIMA_ATUALIZACAO
+        WHEN NOT MATCHED THEN
+          INSERT (H3_INDEX, ANO_REFERENCIA, SCORE_RISCO_MOTORISTA, SCORE_RISCO_PEDESTRE, SCORE_RISCO_MOTOCICLISTA, ULTIMA_ATUALIZACAO, INDICE_RESIDENCIAL, TOTAL_NAO_RES_H3, DENSIDADE_ENDERECOS)
+          VALUES (S.H3_INDEX, S.ANO_REFERENCIA, S.SCORE_RISCO_MOTORISTA, S.SCORE_RISCO_PEDESTRE, S.SCORE_RISCO_MOTOCICLISTA, S.ULTIMA_ATUALIZACAO, S.INDICE_RESIDENCIAL, S.TOTAL_NAO_RES_H3, S.DENSIDADE_ENDERECOS)
+        """
+        self.bq_client.query(sql_merge).result()
