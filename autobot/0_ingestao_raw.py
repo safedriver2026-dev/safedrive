@@ -38,10 +38,17 @@ def executar_ingestao(robo: RoboComunicador):
         except s3.exceptions.ClientError as e:
             if e.response['Error']['Code'] == 'NotFound':
                 base_existente_no_r2 = False # Explicitamente False se não encontrado
+                print(f"DEBUG: Arquivo {path_raw} NÃO encontrado no R2.")
             else:
+                print(f"DEBUG: Erro ao verificar {path_raw} no R2: {e}")
                 raise # Re-lança outros erros do S3
 
-        # 3. Lógica de pular ingestão se a fonte não foi atualizada E o arquivo existe no R2
+        print(f"DEBUG: base_existente_no_r2: {base_existente_no_r2}, tamanho_ssp_r2: {tamanho_ssp_r2}")
+        print(f"DEBUG: tamanho_ssp_fonte: {tamanho_ssp_fonte}")
+
+        # 3. Lógica para decidir se deve pular a ingestão
+        # Pula a ingestão SOMENTE SE o arquivo existe no R2 E o tamanho da fonte é o MESMO do R2.
+        # Em qualquer outro caso (arquivo não existe no R2, ou existe mas a fonte é maior), a ingestão prossegue.
         if base_existente_no_r2 and tamanho_ssp_fonte == tamanho_ssp_r2:
             print(f"✅ Camada Bronze: Fonte SSP não atualizada. Tamanho {tamanho_ssp_fonte} bytes. Pulando ingestão.")
             robo.enviar_relatorio_operacional("Camada Bronze: Fonte SSP não atualizada. Ingestão pulada.", 
@@ -49,7 +56,9 @@ def executar_ingestao(robo: RoboComunicador):
                                         "Camada": "Bronze (Raw)"})
             return False
 
-        # Se chegamos aqui, ou o arquivo não existe no R2, ou a fonte foi atualizada.
+        # Se chegamos aqui, significa que precisamos fazer a ingestão:
+        # - Ou porque o arquivo não existe no R2 (primeira execução).
+        # - Ou porque o arquivo existe no R2, mas a fonte SSP tem uma versão mais nova (tamanho diferente).
         print(f"📥 A extrair dados da SSP: {url}")
         res_data = requests.get(url, timeout=120)
 
@@ -72,7 +81,7 @@ def executar_ingestao(robo: RoboComunicador):
         df_final = df_novo
         novos_registros = len(df_novo)
 
-        if base_existente_no_r2:
+        if base_existente_no_r2: # Se a base já existia no R2, tentamos fazer a concatenação incremental
             try:
                 s3.download_file(bucket, path_raw, "raw_local.parquet")
                 df_atual = pd.read_parquet("raw_local.parquet")
@@ -87,7 +96,7 @@ def executar_ingestao(robo: RoboComunicador):
                 print(f"Aviso: Falha ao carregar base existente do R2 para concatenação: {concat_e}. Prosseguindo com apenas os novos dados.")
                 # Se falhar ao carregar a base existente, usa apenas os novos dados.
                 # novos_registros já está com len(df_novo)
-        else:
+        else: # Se a base NÃO existia no R2, é a primeira ingestão
             print("Primeira ingestão da camada Bronze. Criando arquivo no R2.")
             # novos_registros já está com len(df_novo)
 
