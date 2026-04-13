@@ -6,78 +6,93 @@ import traceback
 from datetime import datetime
 
 # =================================================================
-# 🛡️ ESCUDO DE PATH (Anti-ModuleNotFoundError)
-# Garante que o Python encontre a pasta 'autobot' no ambiente do GitHub
+# 🛡️ ESCUDO DE AMBIENTE (Anti-ModuleNotFoundError)
+# Força o Python a enxergar a pasta 'autobot' no GitHub Actions
 # =================================================================
 diretorio_raiz = os.path.dirname(os.path.abspath(__file__))
 if diretorio_raiz not in sys.path:
     sys.path.insert(0, diretorio_raiz)
 
 # =================================================================
-# 📥 IMPORTS CORRIGIDOS (Conforme sua hierarquia real)
+# 📥 IMPORTS (Nomes exatos da sua hierarquia)
 # =================================================================
 try:
-    # Ajustado para os nomes exatos dos seus arquivos
+    from autobot.ingestao_raw import IngestaoRaw
     from autobot.processamento_prata import ProcessamentoPrata
+    from autobot.treinador_ia import TreinadorEvolutivo
     from autobot.ia_sincronizacao_ouro import CamadaOuroSafeDriver
     from autobot.comunicador import ComunicadorSafeDriver
-    from autobot.treinador_ia import TreinadorEvolutivo 
 except ImportError as e:
-    print(f"❌ Erro de importação: {e}")
-    print(f"🔍 Verifique se os nomes dos arquivos em /autobot estão corretos.")
+    print(f"❌ Erro crítico de hierarquia: {e}")
     sys.exit(1)
 
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
-class OrquestradorSafeDriver:
+class OrquestradorMestre:
     def __init__(self):
         self.comunicador = ComunicadorSafeDriver()
         self.ano_inicial = 2022
         self.ano_atual = datetime.now().year
+        self.anos = list(range(self.ano_inicial, self.ano_atual + 1))
 
-    def executar_fluxo(self):
+    def executar_fluxo_completo(self):
+        """
+        Execução em Cascata:
+        1. RAW (Bronze) -> Busca na fonte se não existir.
+        2. PRATA (Silver) -> Refina e aplica H3.
+        3. TREINO (IA) -> Atualiza o modelo com os novos dados.
+        4. OURO (Gold) -> Sincroniza Score com BigQuery.
+        """
         tempo_inicio = time.time()
-        anos_para_processar = list(range(self.ano_inicial, self.ano_atual + 1))
-        
-        logger.info(f"🚀 SAFEDRIVER: Iniciando processamento escalável ({self.ano_inicial} a {self.ano_atual})")
+        logger.info(f"🚀 INICIANDO PIPELINE SAFEDRIVER ({self.ano_inicial}-{self.ano_atual})")
 
         try:
-            # 1. Fase de Treinamento (Opcional: Pode ser movido para fora do loop se desejar)
-            logger.info("🧠 Atualizando cérebro da IA com base histórica...")
-            treinador = TreinadorEvolutivo()
-            treinador.treinar_modelo_mestre()
-
-            # 2. Loop de Processamento por Ano
-            for ano in anos_para_processar:
-                logger.info(f"--- 🛠️ TRABALHANDO NO ANO: {ano} ---")
+            # --- FASE 1: INGESTÃO E REFINO (LOOP DE ANOS) ---
+            for ano in self.anos:
+                logger.info(f"--- 🛠️ PROCESSANDO ANO: {ano} ---")
                 
-                # Camada Prata
+                # Ingestão Raw (Bronze)
+                logger.info(f"🥉 [BRONZE] Verificando dados brutos...")
+                raw = IngestaoRaw()
+                raw.executar_ingestao(ano) 
+                
+                # Processamento Prata (Silver)
+                logger.info(f"🥈 [PRATA] Transformando e Geocodificando...")
                 prata = ProcessamentoPrata()
                 prata.executar_prata(ano)
-                
-                # Camada Ouro (IA + BigQuery)
-                ouro = CamadaOuroSafeDriver()
-                ouro.processar_ouro(ano)
-                
-                logger.info(f"✅ Ano {ano} processado com sucesso.")
 
-            # 3. Notificação de Sucesso
-            tempo_total = time.strftime("%M min %S seg", time.gmtime(time.time() - tempo_inicio))
+            # --- FASE 2: INTELIGÊNCIA (TREINO) ---
+            # O treino acontece após o loop de anos para garantir base histórica completa
+            logger.info("🧠 [TREINO] Atualizando modelos de IA com base acumulada...")
+            treinador = TreinadorEvolutivo()
+            treino_ok = treinador.treinar_modelo_mestre()
+
+            # --- FASE 3: SINCRONIZAÇÃO (OURO) ---
+            if treino_ok:
+                for ano in self.anos:
+                    logger.info(f"🥇 [OURO] Gerando Scores e subindo para BigQuery: {ano}")
+                    ouro = CamadaOuroSafeDriver()
+                    ouro.processar_ouro(ano)
+            else:
+                logger.warning("⚠️ Treinamento não gerou novos modelos. Pulando sincronização Ouro.")
+
+            # --- SUCESSO ---
+            duracao = time.strftime("%M min %S seg", time.gmtime(time.time() - tempo_inicio))
             self.comunicador.relatar_sucesso(
                 ano_ref=f"{self.ano_inicial}-{self.ano_atual}",
-                tempo_execucao=tempo_total,
-                total_linhas="Pipeline Multi-Ano Concluído"
+                tempo_execucao=duracao,
+                total_linhas="Pipeline Completo Finalizado"
             )
-            logger.info(f"🏁 PIPELINE FINALIZADO EM {tempo_total}!")
+            logger.info(f"🏁 PIPELINE CONCLUÍDO COM SUCESSO EM {duracao}")
 
         except Exception as e:
-            logger.error(f"💥 FALHA NO PIPELINE: {e}")
-            erro_full = traceback.format_exc()
-            self.comunicador.relatar_erro("Orquestrador / Main", erro_full)
+            logger.error(f"💥 FALHA NO ORQUESTRADOR: {e}")
+            erro_trace = traceback.format_exc()
+            self.comunicador.relatar_erro("Main / Orquestrador", erro_trace)
             raise e
 
 if __name__ == "__main__":
-    safedriver = OrquestradorSafeDriver()
-    safedriver.executar_fluxo()
+    autobot = OrquestradorMestre()
+    autobot.executar_fluxo_completo()
