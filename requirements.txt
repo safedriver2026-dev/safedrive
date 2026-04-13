@@ -1,12 +1,11 @@
-# Processamento de Dados de Alta Performance
+# Processamento de Dados
 polars
 fastexcel
-calamine
 pandas
 numpy
 openpyxl
 
-# Infraestrutura Cloud (R2 & BigQuery)
+# Infraestrutura Cloud R2 e BigQuery
 boto3
 botocore
 google-cloud-bigquery
