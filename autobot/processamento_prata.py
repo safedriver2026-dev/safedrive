@@ -14,13 +14,11 @@ logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
-        # Definições de ambiente para o Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
-        # Configuração de conectividade com padrão S3v4 e Addressing Style de caminho
         self.s3 = boto3.client(
             's3',
             endpoint_url=self.endpoint,
@@ -30,32 +28,45 @@ class ProcessamentoPrata:
         )
 
     def executar_todos_os_anos(self):
-        """Orquestra o processamento do Datalake varrendo os anos através de leitura direta."""
-        logger.info("PRATA: Iniciando consolidação de dados e cálculo de tendências (Deltas).")
-        
+        logger.info("PRATA: Iniciando Radar de Busca e processamento de tendências...")
         ano_atual = datetime.now().year
-        
-        # Percorre o histórico de forma cronológica para garantir que o Delta do ano anterior exista
         for ano in range(2022, ano_atual + 1):
             self.processar_ano_com_delta(ano)
 
     def processar_ano_com_delta(self, ano):
-        """Processa a base de um ano específico e calcula a variação em relação ao ano anterior."""
+        # O Radar: Tenta as três variações mais comuns de estrutura no Cloudflare R2
+        possiveis_chaves_bronze = [
+            f"safedriver/datalake/bronze/ssp_raw_{ano}.xlsx",           # 1. Sub-pasta com o nome do bucket
+            f"datalake/bronze/ssp_raw_{ano}.xlsx",                      # 2. Direto na raiz do bucket
+            f"safedriver/safedriver/datalake/bronze/ssp_raw_{ano}.xlsx" # 3. Dupla sub-pasta
+        ]
+
+        resp = None
+        chave_encontrada = None
         
-        # Mapeamento absoluto de chaves baseado na infraestrutura do R2
-        path_bronze = f"safedriver/datalake/bronze/ssp_raw_{ano}.xlsx"
-        path_prata_atual = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
-        path_prata_anterior = f"safedriver/datalake/prata/ssp_consolidada_{ano - 1}.parquet"
+        for chave in possiveis_chaves_bronze:
+            try:
+                resp = self.s3.get_object(Bucket=self.bucket, Key=chave)
+                chave_encontrada = chave
+                logger.info(f"PRATA: Arquivo bruto de {ano} localizado via Radar em: {chave}")
+                break # Encontrou? Sai do loop de busca.
+            except ClientError:
+                continue
+
+        if not resp:
+            logger.warning(f"PRATA: Dados brutos de {ano} não localizados em nenhuma das estruturas. Ignorando.")
+            return
+
+        # Define os caminhos da Prata de forma dinâmica, baseados na estrutura que funcionou na Bronze
+        prefixo = chave_encontrada.split('datalake/bronze/')[0]
+        path_prata_atual = f"{prefixo}datalake/prata/ssp_consolidada_{ano}.parquet"
+        path_prata_anterior = f"{prefixo}datalake/prata/ssp_consolidada_{ano - 1}.parquet"
 
         try:
-            # 1. Leitura Direta (Evita ListObjectsV2 e previne erros de API)
-            resp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
-            logger.info(f"PRATA: Processando ciclo estatístico de {ano}...")
-            
+            # 1. Leitura e Limpeza Inicial
             df = pl.read_excel(io.BytesIO(resp['Body'].read()))
             df = df.rename({c: c.replace("Ç", "C").replace("Ã", "A") for c in df.columns})
 
-            # 2. Tratamento e Normalização Espacial
             df = df.with_columns([
                 pl.col("LATITUDE").cast(pl.Float64, strict=False),
                 pl.col("LONGITUDE").cast(pl.Float64, strict=False)
@@ -64,14 +75,13 @@ class ProcessamentoPrata:
             )
 
             if df.is_empty():
-                logger.warning(f"PRATA: Ficheiro de {ano} ignorado (sem coordenadas geolocalizadas válidas).")
                 return
 
-            # Conversão para Índice H3 (Resolução 8)
+            # 2. Tradução para Malha H3
             h3_list = [h3.geo_to_h3(lat, lon, 8) for lat, lon in zip(df["LATITUDE"], df["LONGITUDE"])]
             df = df.with_columns(pl.Series("H3_INDEX", h3_list))
 
-            # 3. Consolidação de Features
+            # 3. Consolidação de Features Geográficas
             df_atual = df.group_by(["H3_INDEX"]).agg([
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Roubo|Furto|Veículo|Carga")).count().alias("TOTAL_CRIMES_MOTORISTA"),
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Celular|Transeunte|Pessoa")).count().alias("TOTAL_CRIMES_PEDESTRE"),
@@ -81,23 +91,17 @@ class ProcessamentoPrata:
                 pl.col("LOGRADOURO").n_unique().alias("DENSIDADE_ENDERECOS")
             ]).with_columns(pl.lit(ano).alias("ANO_REFERENCIA"))
 
-            # 4. Injeção de Features Temporais (Motor de Deltas)
+            # 4. Cálculo de Variação (Delta)
             df_final = self._injetar_deltas(df_atual, path_prata_anterior)
 
-            # 5. Persistência na Camada Prata (Formato Parquet Otimizado)
+            # 5. Persistência Dinâmica
             buffer = io.BytesIO()
             df_final.write_parquet(buffer)
             self.s3.put_object(Bucket=self.bucket, Key=path_prata_atual, Body=buffer.getvalue())
-            logger.info(f"PRATA: Ciclo {ano} consolidado com sucesso ({len(df_final)} áreas H3 mapeadas).")
+            logger.info(f"✅ PRATA: Ciclo {ano} consolidado com sucesso em: {path_prata_atual}")
 
-        except ClientError as e:
-            # Tratamento de erro governado para ficheiros não existentes
-            if 'NoSuchKey' in str(e):
-                logger.info(f"PRATA: Dados brutos de {ano} não localizados em {path_bronze}. Ignorando.")
-            else:
-                logger.error(f"Erro de conectividade com o Cloudflare R2 no ciclo {ano}: {e}")
         except Exception as e:
-            logger.error(f"Falha sistémica no processamento da Camada Prata ({ano}): {e}")
+            logger.error(f"Falha ao processar o ciclo {ano}: {e}")
 
     def _injetar_deltas(self, df_atual, path_anterior):
         """Cruza os dados do ano corrente com o ano anterior para identificar tendências de criminalidade."""
@@ -105,7 +109,6 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_anterior)
             df_passado = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             
-            # Junção (Left Join) baseada no identificador de área H3
             df_join = df_atual.join(
                 df_passado.select(["H3_INDEX", "TOTAL_CRIMES_MOTORISTA", "TOTAL_CRIMES_PEDESTRE", "TOTAL_CRIMES_MOTOCICLISTA"]),
                 on="H3_INDEX",
@@ -113,7 +116,6 @@ class ProcessamentoPrata:
                 suffix="_PASSADO"
             ).fill_null(0)
 
-            # Cálculo de variação real e remoção de colunas temporárias
             return df_join.with_columns([
                 (pl.col("TOTAL_CRIMES_MOTORISTA") - pl.col("TOTAL_CRIMES_MOTORISTA_PASSADO")).alias("DELTA_MOTORISTA"),
                 (pl.col("TOTAL_CRIMES_PEDESTRE") - pl.col("TOTAL_CRIMES_PEDESTRE_PASSADO")).alias("DELTA_PEDESTRE"),
@@ -121,7 +123,7 @@ class ProcessamentoPrata:
             ]).drop([c for c in df_join.columns if "_PASSADO" in c])
             
         except ClientError:
-            # Arranque a frio (Cold Start): se o ano anterior não existir, assume delta zero
+            # Arranque a frio: se o ano anterior não existir, assume delta zero
             return df_atual.with_columns([
                 pl.lit(0).alias("DELTA_MOTORISTA"),
                 pl.lit(0).alias("DELTA_PEDESTRE"),
