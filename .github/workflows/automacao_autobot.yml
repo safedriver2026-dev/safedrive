@@ -2,16 +2,12 @@ name: Pipeline Integrado SafeDriver
 
 on:
   schedule:
-    # Executa aos Domingos à meia-noite (Ciclo Pesado: Bronze e Prata)
-    - cron: "0 0 * * 0"
-    # Executa todos os dias às 02:00 da manhã (Ciclo Inteligente: Treino e Ouro)
-    - cron: "0 2 * * *"
-  # Permite executar o pipeline manualmente clicando num botão no GitHub
+    - cron: "0 0 * * 0" # Ciclo Semanal: Bronze e Prata
+    - cron: "0 2 * * *" # Ciclo Diário: Treino e Ouro
   workflow_dispatch:
 
 jobs:
   ingestao_semanal:
-    # Condição: Só corre se for domingo OU se for clicado manualmente
     if: github.event.schedule == '0 0 * * 0' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -24,7 +20,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Instalar Dependências
+      - name: Install Dependencies
         run: pip install -r requirements.txt
 
       - name: Executar Ciclo Semanal (Bronze e Prata)
@@ -33,12 +29,12 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          DISCORD_WEBHOOK_SUCESSO: ${{ secrets.DISCORD_WEBHOOK_SUCESSO }}
-          DISCORD_WEBHOOK_ERRO: ${{ secrets.DISCORD_WEBHOOK_ERRO }}
+          # Mapeamento para o Comunicador
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python main.py --weekly
 
   inteligencia_diaria:
-    # Condição: Corre sempre (diariamente ou manual), e espera que o semanal termine caso corram no mesmo dia
     if: always()
     needs: [ingestao_semanal]
     runs-on: ubuntu-latest
@@ -52,7 +48,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Instalar Dependências
+      - name: Install Dependencies
         run: pip install -r requirements.txt
 
       - name: Executar Ciclo Diário (Treino IA e Camada Ouro)
@@ -63,8 +59,9 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-          # Mapeamento corrigido para ler o segredo exato da sua conta
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.SERVICE_ACCOUNT_JSON }}
-          DISCORD_WEBHOOK_SUCESSO: ${{ secrets.DISCORD_WEBHOOK_SUCESSO }}
-          DISCORD_WEBHOOK_ERRO: ${{ secrets.DISCORD_WEBHOOK_ERRO }}
+          # Mapeamento do JSON da Service Account
+          GCP_SA_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
+          # Mapeamento para o Comunicador
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: python main.py --daily
