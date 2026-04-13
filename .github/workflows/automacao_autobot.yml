@@ -1,14 +1,19 @@
-name: Automacao SafeDriver
+name: Automacao SafeDriver Incremental
 
 on:
   schedule:
-    - cron: '0 0 1 * *'
+    - cron: '0 3 * * *'
+    - cron: '0 0 * * 0'
   workflow_dispatch:
+    inputs:
+      modo:
+        description: 'Escolha: full ou predicao'
+        default: 'predicao'
+        required: true
 
 jobs:
-  execucao_pipeline:
+  execucao:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout do repositorio
         uses: actions/checkout@v3
@@ -23,8 +28,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas pyarrow numpy lightgbm catboost scikit-learn joblib h3 boto3 google-cloud-bigquery requests openpyxl
 
-      - name: Execucao do Motor SafeDriver
+      - name: Rodar SafeDriver
         env:
+          PYTHONPATH: .
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -33,4 +39,6 @@ jobs:
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
-        run: python -m autobot.motor_analise_preditiva
+        run: |
+          MODO_EXECUCAO=${{ github.event.schedule == '0 0 * * 0' && 'full' || github.event.inputs.modo || 'predicao' }}
+          python -m autobot.motor_analise_preditiva $MODO_EXECUCAO
