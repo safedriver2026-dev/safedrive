@@ -3,7 +3,7 @@ import pandas as pd
 import boto3
 import traceback
 from datetime import datetime
-from comunicador import RoboComunicador
+from .comunicador import RoboComunicador
 import hashlib
 import h3
 
