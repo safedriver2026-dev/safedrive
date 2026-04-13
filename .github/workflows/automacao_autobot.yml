@@ -2,12 +2,11 @@ name: SafeDriver Autobot
 
 on:
   schedule:
-    # Execução diária às 04:00 UTC (01:00 Horário de Brasília)
-    # Garante que os dados estejam frescos antes do início do horário comercial
+ 
     - cron: "0 4 * * *"
   
   workflow_dispatch:
-    # Interface gráfica no GitHub para execução manual sob demanda
+
     inputs:
       force_execution:
         description: 'Forçar execução? (Ignora CDC, Calendário e Integridade)'
@@ -37,7 +36,7 @@ jobs:
           # Garantia de resiliência caso pacotes críticos sejam removidos do requirements por engano
           pip install requests boto3 holidays h3 polars catboost lightgbm scikit-learn google-cloud-bigquery
 
-      - name: Acionar Motor SafeDriver (main.py)
+      - name: Acionar Motor SafeDriver 
         env:
           # Credenciais Cloudflare
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
