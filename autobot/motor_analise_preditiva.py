@@ -1,61 +1,43 @@
 import os
-import sys
 from datetime import datetime
+from .ingestao_bruta import IngestaoBruta
+from .processamento_prata import ProcessamentoPrata
+from .sincronizacao_ouro import SincronizacaoOuro
 from .comunicador import RoboComunicador
-import autobot.ingestao_raw as ingestao_raw
-import autobot.processamento_prata as processamento_prata
-import autobot.ia_sincronizacao_ouro as ia_sincronizacao_ouro
 
-def executar_pipeline_bronze_prata_multi_ano():
-    robo = RoboComunicador(
-        webhook_sucesso=os.environ.get("DISCORD_SUCESSO"),
-        webhook_erro=os.environ.get("DISCORD_ERRO")
-    )
+class MotorAnalisePreditiva:
+    def __init__(self):
+        self.robo = RoboComunicador()
+        self.ano_inicial = 2022
+        self.ano_atual = datetime.now().year
 
-    anos_para_processar = list(range(2022, datetime.now().year + 1))
-
-    for ano_processar in anos_para_processar:
+    def executar_fluxo_completo(self):
         try:
-            robo.enviar_relatorio_operacional(f"🚀 Iniciando Pipeline SafeDriver Autobot (Bronze e Prata) para o ano {ano_processar}...")
+            self.robo.enviar_relatorio_operacional("🚀 Iniciando Maestro SafeDriver")
 
-            ingestao_bem_sucedida = ingestao_raw.executar_ingestao(robo, ano=ano_processar)
+            for ano in range(self.ano_inicial, self.ano_atual + 1):
+                
+                bruta = IngestaoBruta(self.robo)
+                sucesso_bruta = bruta.processar_ano(ano)
+                
+                if not sucesso_bruta:
+                    continue
 
-            if ingestao_bem_sucedida:
-                processamento_prata.executar_processamento(robo, ano=ano_processar)
-            else:
-                robo.enviar_relatorio_operacional(f"✅ Camada Bronze para o ano {ano_processar} não atualizada. Pulando Camada Prata.")
+                prata = ProcessamentoPrata(self.robo)
+                sucesso_prata = prata.executar(ano)
+                
+                if not sucesso_prata:
+                    continue
 
-            robo.enviar_relatorio_operacional(f"✅ Pipeline SafeDriver Autobot (Bronze e Prata) para o ano {ano_processar} concluído com sucesso!")
+                ouro = SincronizacaoOuro(self.robo)
+                ouro.executar(ano)
+
+            self.robo.enviar_relatorio_operacional("🏁 Ciclo SafeDriver Finalizado com Sucesso")
 
         except Exception as e:
-            robo.enviar_alerta_tecnico(f"Pipeline Bronze e Prata (Ano {ano_processar})", str(e))
-            sys.exit(1) # Em produção, um erro crítico deve parar o pipeline
-
-def executar_pipeline_ouro_multi_ano():
-    robo = RoboComunicador(
-        webhook_sucesso=os.environ.get("DISCORD_SUCESSO"),
-        webhook_erro=os.environ.get("DISCORD_ERRO")
-    )
-
-    anos_para_processar = list(range(2022, datetime.now().year + 1))
-
-    try:
-        robo.enviar_relatorio_operacional("🚀 Iniciando Pipeline SafeDriver Autobot (Ouro) para múltiplos anos...")
-
-        ia_sincronizacao_ouro.executar_sincronizacao_ouro(robo, anos=anos_para_processar)
-
-        robo.enviar_relatorio_operacional("✅ Pipeline SafeDriver Autobot (Ouro) concluído com sucesso para múltiplos anos!")
-
-    except Exception as e:
-        robo.enviar_alerta_tecnico("Pipeline Ouro (Múltiplos Anos)", str(e))
-        sys.exit(1) # Em produção, um erro crítico deve parar o pipeline
+            import traceback
+            self.robo.enviar_alerta_tecnico("Falha Critica no Maestro", traceback.format_exc())
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "executar_pipeline_bronze_prata":
-            executar_pipeline_bronze_prata_multi_ano()
-        elif sys.argv[1] == "executar_pipeline_ouro":
-            executar_pipeline_ouro_multi_ano()
-    else:
-        print("Uso: python motor_analise_preditiva.py [executar_pipeline_bronze_prata|executar_pipeline_ouro]")
-        sys.exit(1)
+    maestro = MotorAnalisePreditiva()
+    maestro.executar_fluxo_completo()
