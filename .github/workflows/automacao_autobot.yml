@@ -1,4 +1,4 @@
-name: SafeDriver Autobot
+name: SafeDriver - Orquestrador de Dados e IA
 
 on:
   schedule:
@@ -50,7 +50,7 @@ jobs:
             exit 0
           fi
 
-          # 2. Verifica se o Datalake está vazio (Gatilho de Integridade com Blindagem R2)
+          # 2. Verifica se o Datalake está vazio (Gatilho de Integridade)
           DADOS_AUSENTES=$(python -c "
           import os, boto3
           from botocore.config import Config
@@ -62,7 +62,8 @@ jobs:
                   aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
                   config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
               )
-              s3.head_object(Bucket=os.getenv('R2_BUCKET_NAME'), Key='modelos_ml/latest_cat_motorista.pkl')
+              # Caminho absoluto mapeado para a infraestrutura do R2
+              s3.head_object(Bucket=os.getenv('R2_BUCKET_NAME'), Key='safedriver/modelos_ml/latest_cat_motorista.pkl')
               print('False')
           except:
               print('True')
@@ -88,6 +89,7 @@ jobs:
   pipeline_producao:
     name: Motor Principal (Prata -> Treino -> Ouro)
     needs: decisao_estrategica
+    # Só acorda a máquina pesada se o sensor der luz verde
     if: needs.decisao_estrategica.outputs.deve_prosseguir == 'True'
     runs-on: ubuntu-latest
     
@@ -105,19 +107,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install holidays h3 # Garantia de instalação direta contra falhas de cache
+          pip install holidays h3 # Garantia de instalação explícita contra falhas de cache
 
       - name: Executar Orquestrador Principal (main.py)
         env:
+          # Credenciais Storage
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           
+          # Credenciais BigQuery
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
           
+          # Webhooks e Criptografia
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
