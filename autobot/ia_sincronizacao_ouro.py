@@ -1,91 +1,124 @@
 import polars as pl
 import pandas as pd
-import joblib
 import boto3
+import joblib
 import io
 import os
-from google.cloud import bigquery
-from sklearn.metrics import mean_absolute_error
 import logging
+from datetime import datetime
+from google.cloud import bigquery
+from botocore.exceptions import ClientError
+from autobot.comunicador import ComunicadorSafeDriver
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# Configuração de Logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class CamadaOuroSafeDriver:
     def __init__(self):
-        # Conexões R2 e BQ via Secrets (Projeto: safe-driver-fc3a9)
-        self.s3 = boto3.client('s3',
-                                endpoint_url=os.getenv("R2_ENDPOINT_URL"),
-                                aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
-                                aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"))
-        self.bucket = os.getenv("R2_BUCKET_NAME")
+        # 🛡️ SANITIZAÇÃO TOTAL: .strip() para evitar erros de header no R2 e BigQuery
+        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip()
+        self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+        self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+        self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        projeto_bq = os.getenv("BQ_PROJECT_ID")
-        self.dataset_id = os.getenv("BQ_DATASET_ID")
-        self.bq_client = bigquery.Client(project=projeto_bq)
+        self.project_id = os.getenv("BQ_PROJECT_ID", "").strip()
+        self.dataset_id = os.getenv("BQ_DATASET_ID", "").strip()
 
-    def _carregar_modelos(self):
+        # Clientes de Infraestrutura
+        self.s3 = boto3.client(
+            's3',
+            endpoint_url=self.endpoint,
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.secret_key
+        )
+        self.bq_client = bigquery.Client(project=self.project_id)
+        self.comunicador = ComunicadorSafeDriver()
+
+    def processar_ouro(self, ano):
+        """
+        Lê a Prata, aplica a IA e sincroniza com o BigQuery.
+        """
+        path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
+        
+        try:
+            logger.info(f"🥇 [OURO] A iniciar sincronização inteligente do ano {ano}...")
+            
+            # 1. Carregar dados refinados da Camada Prata
+            resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
+            lf = pl.read_parquet(io.BytesIO(resp['Body'].read()))
+
+            # 2. Carregar Modelos de IA Treinados
+            modelos = self._carregar_modelos_ia()
+            
+            # 3. Gerar Scores de Risco Dinâmicos
+            df_final = self._gerar_scores_risco(lf, modelos)
+
+            # 4. Deploy para o BigQuery (Data Warehouse)
+            self._sincronizar_bigquery(df_final)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Falha na Camada Ouro para o ano {ano}: {e}")
+            self.comunicador.relatar_erro(f"Ouro Sync - {ano}", str(e))
+            raise e
+
+    def _carregar_modelos_ia(self):
+        """Recupera os ficheiros .pkl do R2"""
         modelos = {}
-        for persona in ["motorista", "pedestre", "motociclista"]:
-            path = f"modelos_ml/catboost_{persona}.pkl"
-            obj = self.s3.get_object(Bucket=self.bucket, Key=path)
-            modelos[persona] = joblib.load(io.BytesIO(obj['Body'].read()))
+        for p in ["motorista", "pedestre", "motociclista"]:
+            path = f"modelos_ml/catboost_{p}.pkl"
+            try:
+                obj = self.s3.get_object(Bucket=self.bucket, Key=path)
+                modelos[p] = joblib.load(io.BytesIO(obj['Body'].read()))
+                logger.info(f"🧠 Modelo {p} carregado.")
+            except ClientError:
+                logger.warning(f"⚠️ Modelo {p} ausente. A usar fallback de densidade.")
+                modelos[p] = None
         return modelos
 
-    def processar_ouro(self, ano_ref):
-        logger.info(f"🏆 PROCESSANDO OURO INTELIGENTE - REFERÊNCIA: {ano_ref}")
+    def _gerar_scores_risco(self, lf, modelos):
+        """Aplica a lógica de inferência da IA"""
+        df = lf.to_pandas()
+        features = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RESIDENCIAL', 'DENSIDADE_ENDERECOS']
+
+        for p, mod in modelos.items():
+            col = f"SCORE_RISCO_{p.upper()}"
+            if mod:
+                # Predição via CatBoost
+                preds = mod.predict(df[features])
+                # Normalização 0-100
+                df[col] = (preds / preds.max() * 100).clip(0, 100)
+            else:
+                df[col] = 50.0 # Risco neutro se não houver cérebro treinado
+
+        df['ULTIMA_ATUALIZACAO'] = pd.Timestamp.now()
+        return df
+
+    def _sincronizar_bigquery(self, df):
+        """Sincronização atómica com o Google BigQuery"""
+        tabela = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
         
-        # 1. Carregamento da Prata
-        path_prata = f"datalake/prata/ssp_consolidada_{ano_ref}.parquet"
-        resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
-        df_base = pl.read_parquet(io.BytesIO(resp['Body'].read())).to_pandas()
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND", # Mantém o histórico e adiciona o novo
+            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+            source_format=bigquery.SourceFormat.PARQUET,
+        )
 
-        # 2. Modelos e Inferência
-        modelos = self._carregar_modelos()
-        
-        for persona, modelo in modelos.items():
-            p_upper = persona.upper()
-            
-            # Predição IA
-            df_base[f'PRED_IA_{p_upper}'] = modelo.predict(df_base[['DENSIDADE_TOTAL_ENDERECOS', 'TAXA_RESIDENCIAL']])
-            
-            # Risco Base (Heurística para áreas vazias)
-            df_base[f'SCORE_{p_upper}'] = df_base.apply(
-                lambda row: self._calcular_risco_base(row) if row.get('TOTAL_CRIMES', 0) == 0 else row[f'PRED_IA_{p_upper}'],
-                axis=1
-            )
+        logger.info(f"📤 A enviar {len(df)} linhas para o BigQuery...")
+        job = self.bq_client.load_table_from_dataframe(df, tabela, job_config=job_config)
+        job.result()
+        logger.info(f"✅ Sincronização concluída com sucesso.")
 
-        # 3. INTELIGÊNCIA: Cálculo de Backtesting (Apenas para anos passados)
-        # Se o ano já fechou, calculamos a precisão real do modelo para esse ano
-        df_base['ANO_REFERENCIA'] = ano_ref
-        df_base['METRICA_CONFIANCA'] = 1.0 # Padrão para o ano atual
-        
-        if int(ano_ref) < 2026: # Se for um ano histórico (Backtesting)
-            # Exemplo: MAE (Erro Médio Absoluto)
-            # $$MAE = \frac{1}{n} \sum_{i=1}^{n} |y_i - \hat{y}_i|$$
-            try:
-                erro = mean_absolute_error(df_base['TOTAL_CRIMES'], df_base['PRED_IA_MOTORISTA'])
-                df_base['METRICA_CONFIANCA'] = 1 - (erro / df_base['TOTAL_CRIMES'].max())
-                logger.info(f"📊 Backtesting {ano_ref}: Confiabilidade do Modelo em {df_base['METRICA_CONFIANCA'].mean():.2%}")
-            except:
-                pass
-
-        # 4. Exportação Escalável
-        # Criamos uma tabela por ano OU uma tabela única particionada. 
-        # Para o Looker Studio, o ideal é uma tabela por ano para não estourar custos de consulta.
-        self._upload_bigquery(df_base, f"risco_consolidado_{ano_ref}")
-
-    def _calcular_risco_base(self, row):
-        if row['TAXA_RESIDENCIAL'] < 0.6: return 3.0
-        if row['DENSIDADE_TOTAL_ENDERECOS'] < 50: return 2.5
-        return 1.5
-
-    def _gerar_rotulo_motivo(self, row, persona):
-        # (Mantém a lógica de rótulos anterior)
-        return "Área de monitoramento"
-
-    def _upload_bigquery(self, df, table_name):
-        table_id = f"{self.bq_client.project}.{self.dataset_id}.{table_name}"
-        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-        self.bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
-        logger.info(f"✅ Tabela {table_id} atualizada.")
+# ==========================================
+# MOTOR DE EXECUÇÃO DINÂMICO
+# ==========================================
+if __name__ == "__main__":
+    ouro = CamadaOuroSafeDriver()
+    ano_inicio = 2022
+    ano_fim = datetime.now().year # Dinâmico: deteta 2026, 2027...
+    
+    logger.info(f"🚀 A iniciar processamento Ouro de {ano_inicio} até {ano_fim}")
+    for a in range(ano_inicio, ano_fim + 1):
+        ouro.processar_ouro(a)
