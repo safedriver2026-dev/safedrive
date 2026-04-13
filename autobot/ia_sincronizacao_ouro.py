@@ -1,6 +1,8 @@
 import polars as pl
 import pandas as pd
 import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 import joblib
 import io
 import os
@@ -27,11 +29,13 @@ class CamadaOuroSafeDriver:
         self.project_id = os.getenv("BQ_PROJECT_ID", "").strip()
         self.dataset_id = os.getenv("BQ_DATASET_ID", "").strip()
 
+        # BLINDAGEM PARA CLOUDFLARE R2
         self.s3 = boto3.client(
             's3',
             endpoint_url=self.endpoint,
             aws_access_key_id=self.access_key,
-            aws_secret_access_key=self.secret_key
+            aws_secret_access_key=self.secret_key,
+            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
         )
         
         self.cal = CalendarioEstrategico()
@@ -57,24 +61,20 @@ class CamadaOuroSafeDriver:
             else:
                 self.bq_client = bigquery.Client(project=self.project_id)
         except Exception as e:
-            logger.error(f"Erro ao autenticar BigQuery: {e}")
+            logger.error(f"Erro Crítico ao autenticar BigQuery: {e}")
 
     def executar_predicao_atual(self):
         """Orquestra a inferência e sincronização dos dados de risco."""
         logger.info("OURO: Iniciando motor de Predição Atual...")
         
         try:
-            # 1. Carrega Modelos e Dados
             modelos = self._carregar_modelos_vivos()
             df_input = self._obter_contexto_recente()
             
             if df_input is None:
-                raise Exception("Base de contexto (Prata) não localizada.")
+                raise Exception("Base de contexto (Prata) não localizada no Data Lake.")
 
-            # 2. Inferência e Ajuste Estratégico (Feriados/Pagamento)
             df_predicao = self._gerar_scores_com_contexto(df_input, modelos)
-
-            # 3. Sincronização BigQuery
             self._upsert_bigquery(df_predicao)
             
             return True
@@ -92,18 +92,23 @@ class CamadaOuroSafeDriver:
                 try:
                     obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                     modelos[p][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-                except:
-                    logger.warning(f"Modelo {path} não encontrado.")
+                except ClientError as e:
+                    if 'NoSuchKey' in str(e):
+                        logger.warning(f"Modelo {path} não encontrado no storage.")
+                    else:
+                        logger.error(f"Erro de acesso ao modelo {path}: {e}")
                     modelos[p][alg] = None
         return modelos
 
     def _obter_contexto_recente(self):
-        """Busca a Prata mais atual e injeta Meta-Features."""
+        """Busca a Prata mais atual via direct read (sem ListObjects) e injeta Meta-Features."""
         ano_atual = datetime.now().year
+        
         for ano in range(ano_atual, 2021, -1):
             path = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=path)
+                logger.info(f"OURO: Utilizando Datalake Prata referência {ano}.")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read())).to_pandas().fillna(0)
                 
                 # Injeta a memória de erro (MAE)
@@ -116,8 +121,14 @@ class CamadaOuroSafeDriver:
                     except:
                         df['ULTIMO_MAE_CAT'], df['ULTIMO_MAE_LGB'] = 0.0, 0.0
                 return df
-            except:
-                continue
+                
+            except ClientError as e:
+                # Se não achou o arquivo desse ano, vai para o anterior silenciosamente
+                if 'NoSuchKey' in str(e):
+                    continue
+                else:
+                    logger.error(f"Erro de permissão ou rede ao acessar a Prata de {ano}: {e}")
+                    continue
         return None
 
     def _gerar_scores_com_contexto(self, df, modelos):
@@ -127,21 +138,18 @@ class CamadaOuroSafeDriver:
         for persona, mods in modelos.items():
             col_target = f"RISCO_PREDICAO_ATUAL_{persona.upper()}"
             
-            # 1. Inferência do Ensemble (IA)
             p_cat = mods["cat"].predict(df[features]) if mods["cat"] is not None else 0
             p_lgb = mods["lgb"].predict(df[features]) if mods["lgb"] is not None else 0
             
             score_ia = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
             
-            # 2. Ajuste Heurístico (Calendário)
-            # Se a área for comercial (TOTAL_NAO_RES_H3 > INDICE_RESIDENCIAL), aplica peso comercial
             df[col_target] = score_ia
             
+            # Ajuste de Negócio (Calendário)
             mask_comercial = df['TOTAL_NAO_RES_H3'] > df['INDICE_RESIDENCIAL']
             df.loc[mask_comercial, col_target] *= multiplicadores["comercial"]
             df.loc[~mask_comercial, col_target] *= multiplicadores["residencial"]
             
-            # Aplica o multiplicador geral e normaliza 0-100
             df[col_target] = (df[col_target] * multiplicadores["geral"])
             max_val = df[col_target].max() if df[col_target].max() > 0 else 1
             df[col_target] = (df[col_target] / max_val * 100).clip(0, 100)
@@ -153,11 +161,9 @@ class CamadaOuroSafeDriver:
         tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_predicao_atual"
         tabela_stg = f"{tabela_final}_stg"
         
-        # Load para Staging
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
 
-        # MERGE para evitar duplicidade e manter performance
         sql_merge = f"""
         MERGE `{tabela_final}` T
         USING `{tabela_stg}` S
@@ -173,7 +179,7 @@ class CamadaOuroSafeDriver:
           INSERT ROW
         """
         self.bq_client.query(sql_merge).result()
-        logger.info(f"OURO: Predição Atual sincronizada no BigQuery.")
+        logger.info(f"OURO: Predição Atual sincronizada e atualizada no BigQuery.")
 
 if __name__ == "__main__":
     CamadaOuroSafeDriver().executar_predicao_atual()
