@@ -1,111 +1,96 @@
-import os
+import polars as pl
 import pandas as pd
-import boto3
-import traceback
-import io
 import joblib
-import h3
-import json
-from datetime import datetime
+import boto3
+import io
+import os
 from google.cloud import bigquery
-from google.oauth2 import service_account
+import logging
 
-# Importações Absolutas para evitar ModuleNotFoundError
-from autobot.comunicador import RoboComunicador
+# Configuração de Logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-class SincronizacaoOuro:
-    def __init__(self, robo: RoboComunicador):
-        self.robo = robo
+class CamadaOuroSafeDriver:
+    def __init__(self):
+        # Conexões R2 e BigQuery (Project: safe-driver-fc3a9)
         self.s3 = boto3.client('s3',
-                                endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
-                                aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
-                                aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"))
-        self.bucket = os.environ.get("R2_BUCKET_NAME")
-        self.projeto_id = os.environ.get("BQ_PROJECT_ID")
-        self.dataset_id = os.environ.get("BQ_DATASET_ID")
-        self.credenciais_json = os.environ.get("BQ_SERVICE_ACCOUNT_JSON")
+                                endpoint_url=os.getenv("R2_ENDPOINT_URL"),
+                                aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+                                aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"))
+        self.bq_client = bigquery.Client(project='safe-driver-fc3a9')
+        self.bucket = os.getenv("R2_BUCKET_NAME")
+        self.dataset_id = "analise_risco_sp"
 
-    def carregar_modelos_ia(self):
-        """Carrega os pesos do Ensemble do R2"""
-        try:
-            obj_lgb = self.s3.get_object(Bucket=self.bucket, Key="modelos/lgbm_v1.pkl")
-            obj_cat = self.s3.get_object(Bucket=self.bucket, Key="modelos/catboost_v1.pkl")
-            return joblib.load(io.BytesIO(obj_lgb['Body'].read())), joblib.load(io.BytesIO(obj_cat['Body'].read()))
-        except:
-            self.robo.enviar_alerta_tecnico("Modelos não encontrados", "Usando heurística básica para a Ouro.")
-            return None, None
+    def _carregar_modelos(self):
+        logger.info("🧠 Carregando modelos CatBoost (.pkl) do Data Lake...")
+        modelos = {}
+        for persona in ["motorista", "pedestre", "motociclista"]:
+            path = f"modelos_ml/catboost_{persona}.pkl"
+            obj = self.s3.get_object(Bucket=self.bucket, Key=path)
+            modelos[persona] = joblib.load(io.BytesIO(obj['Body'].read()))
+        return modelos
 
-    def suavizar_risco_espacial(self, df):
-        """Distribui o risco entre vizinhos H3 para evitar efeito tabuleiro"""
-        # Agrupa média de risco por hexágono
-        mapa_risco = df.groupby('H3_INDEX')['PREVISAO_PONTUAL'].mean().to_dict()
+    def processar_ouro(self, ano_ref):
+        logger.info(f"🏆 INICIANDO CAMADA OURO - ANO: {ano_ref}")
         
-        def calcular_vizinhanca(hex_id):
-            vizinhos = h3.grid_disk(hex_id, 1) # Hexágono + 6 vizinhos
-            valores = [mapa_risco.get(v, 0) for v in vizinhos]
-            return (sum(valores) / len(valores)) if valores else 0
+        # 1. Carregar Dados Enriquecidos da Prata
+        path_prata = f"datalake/prata/ssp_consolidada_{ano_ref}.parquet"
+        resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
+        lf_prata = pl.scan_parquet(io.BytesIO(resp['Body'].read()))
 
-        df['RISCO_FINAL'] = df['H3_INDEX'].apply(calcular_vizinhanca)
-        return df
+        # 2. Carregar Modelos
+        modelos = self._carregar_modelos()
 
-    def executar_predicao_ensemble(self, df):
-        lgb, cat = self.carregar_modelos_ia()
+        # 3. Preparação para Inferência
+        # Agrupamos por H3 para garantir que temos 1 linha por local para o dashboard
+        df_base = lf_prata.collect().to_pandas()
         
-        # Features completas vindas da Prata (incluindo Residências)
-        recursos = [
-            'DENSIDADE_LOGRADOUROS', 
-            'TOTAL_RESIDENCIAS_H3', 
-            'TOTAL_EDIFICACOES_H3', 
-            'TOTAL_NAO_RESIDENCIAIS_H3', 
-            'PROPORCAO_RESIDENCIAL_H3', 
-            'DIVERSIDADE_LOGRADOUROS_H3',
-            'PESO_CRIME'
-        ]
+        # 4. Execução de Predições e Lógica de Risco Base
+        logger.info("🔮 Executando Inferência por Persona e calculando Risco Base...")
         
-        x = df[recursos].fillna(0)
-
-        if lgb and cat:
-            # Ponderação do Ensemble: 40% LGBM / 60% CatBoost
-            p_lgb = lgb.predict_proba(x)[:, 1]
-            p_cat = cat.predict_proba(x)[:, 1]
-            df['PREVISAO_PONTUAL'] = (p_lgb * 0.4) + (p_cat * 0.6)
-        else:
-            # Fallback caso a IA não esteja disponível
-            df['PREVISAO_PONTUAL'] = (df['PESO_CRIME'] * 0.3) + (df['DENSIDADE_LOGRADOUROS'] * 0.7)
+        for persona, modelo in modelos.items():
+            p_upper = persona.upper()
             
-        # Aplica suavização e arredonda para 1 casa decimal (Ex: 8.4)
-        df = self.suavizar_risco_espacial(df)
-        df['RISCO_FINAL'] = df['RISCO_FINAL'].astype(float).round(1)
-        
-        return df
-
-    def executar(self, ano):
-        caminho_prata = f"datalake/prata/ssp_{ano}_prata.parquet"
-        tabela_bq = f"{self.projeto_id}.{self.dataset_id}.ouro_{ano}"
-
-        try:
-            self.robo.enviar_relatorio_operacional(f"Gerando Inteligência Ouro {ano}")
-
-            # Lê da Prata
-            resp = self.s3.get_object(Bucket=self.bucket, Key=caminho_prata)
-            df_prata = pd.read_parquet(io.BytesIO(resp['Body'].read()))
-
-            # Processa Predição
-            df_ouro = self.executar_predicao_ensemble(df_prata)
-            df_ouro['DATA_PROCESSAMENTO'] = datetime.now()
-
-            # Sincronização BigQuery (Delta Sync via Overwrite de Tabela Anual)
-            info_bq = json.loads(self.credenciais_json)
-            creds = service_account.Credentials.from_service_account_info(info_bq)
-            cliente = bigquery.Client(project=self.projeto_id, credentials=creds)
+            # Predição da IA
+            # Nota: A IA usa as features do IBGE (Taxa Residencial, etc) que já estão na Prata
+            df_base[f'PRED_IA_{p_upper}'] = modelo.predict(df_base[['DENSIDADE_TOTAL_ENDERECOS', 'TAXA_RESIDENCIAL']])
             
-            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-            job = cliente.load_table_from_dataframe(df_ouro, tabela_bq, job_config=job_config)
-            job.result()
+            # Lógica de Risco Base (Onde não há crimes)
+            # Se PESO_CRIME for 0, usamos a Heurística de Solo
+            df_base[f'SCORE_{p_upper}'] = df_base.apply(
+                lambda row: self._calcular_risco_base(row) if row['TOTAL_CRIMES'] == 0 else row[f'PRED_IA_{p_upper}'],
+                axis=1
+            )
+            
+            # Atribuição de Rótulos de Motivo (Explicabilidade Simplificada)
+            df_base[f'MOTIVO_{p_upper}'] = df_base.apply(
+                lambda row: self._gerar_rotulo_motivo(row, p_upper), axis=1
+            )
 
-            self.robo.enviar_relatorio_operacional(f"Ouro Finalizada {ano}", {"Registros": len(df_ouro)})
-            return True
+        # 5. Exportação para BigQuery
+        self._upload_bigquery(df_base, f"risco_consolidado_{ano_ref}")
 
-        except Exception:
-            self.robo.enviar_alerta_tecnico(f"Erro Camada Ouro {ano}", traceback.format_exc())
-            return False
+    def _calcular_risco_base(self, row):
+        # Heurística: Áreas com baixa taxa residencial (Comerciais/Industriais) têm risco base maior
+        if row['TAXA_RESIDENCIAL'] < 0.6: return 3.0 # Zona Industrial/Comercial
+        if row['DENSIDADE_TOTAL_ENDERECOS'] < 50: return 2.5 # Zona de Baixa Ocupação
+        return 1.5 # Residencial Padrão
+
+    def _gerar_rotulo_motivo(self, row, persona):
+        if row[f'SCORE_{persona}'] > 7.0:
+            if row['TAXA_RESIDENCIAL'] < 0.5: return "Zona Industrial com baixo fluxo habitacional"
+            return "Alta concentração histórica de ocorrências"
+        return "Área de monitoramento preventivo"
+
+    def _upload_bigquery(self, df, table_name):
+        table_id = f"safe-driver-fc3a9.{self.dataset_id}.{table_name}"
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+        
+        logger.info(f"📤 Subindo {len(df)} linhas para o BigQuery: {table_id}")
+        self.bq_client.load_table_from_dataframe(df, table_id, job_config=job_config).result()
+        logger.info("✅ Dados disponíveis no BigQuery.")
+
+if __name__ == "__main__":
+    ouro = CamadaOuroSafeDriver()
+    ouro.processar_ouro(2024)
