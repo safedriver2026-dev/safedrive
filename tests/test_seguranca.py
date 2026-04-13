@@ -4,9 +4,13 @@ import os
 import hashlib
 
 CAMINHO_PRATA = "camada_prata.parquet"
+CAMINHO_CRIME_REAL_AGREGADO = "crime_real_agregado.parquet" # Novo caminho para teste
 
 def test_camada_prata_foi_gerada():
     assert os.path.exists(CAMINHO_PRATA), "Falha Crítica: O ficheiro camada_prata.parquet não foi gerado pelo módulo Silver."
+
+def test_crime_real_agregado_foi_gerado():
+    assert os.path.exists(CAMINHO_CRIME_REAL_AGREGADO), "Falha Crítica: O ficheiro crime_real_agregado.parquet não foi gerado pelo módulo Silver."
 
 def test_fusao_geografica_master():
     if os.path.exists(CAMINHO_PRATA):
