@@ -13,7 +13,7 @@ class ComunicadorSafeDriver:
         self.webhook_sucesso = os.getenv("DISCORD_SUCESSO")
         self.webhook_erro = os.getenv("DISCORD_ERRO")
 
-        # Modo Fail-Secure: Se esquecer de colocar a chave, não quebra o pipeline
+        # Modo Fail-Secure: Se esquecer de colocar a chave, o código avisa mas não quebra o pipeline
         if not self.webhook_sucesso or not self.webhook_erro:
             logger.warning("⚠️ Webhooks do Discord não encontrados (DISCORD_SUCESSO / DISCORD_ERRO). Modo silencioso ativado.")
             self.ativo = False
@@ -24,12 +24,13 @@ class ComunicadorSafeDriver:
         if not self.ativo:
             return
 
+        # O Discord exige que o payload seja enviado dentro de uma lista chamada "embeds"
         payload = {
             "embeds": [embed_payload]
         }
 
         try:
-            # Timeout de 10s evita que o GitHub Actions fique travado se o Discord cair
+            # Timeout de 10s evita que o GitHub Actions fique travado consumindo minutos
             response = requests.post(webhook_url, json=payload, timeout=10)
             response.raise_for_status()
             logger.info("📱 Notificação Embed enviada com sucesso para o Discord.")
@@ -37,15 +38,15 @@ class ComunicadorSafeDriver:
             logger.error(f"Falha ao comunicar com a API do Discord: {e}")
 
     def relatar_sucesso(self, ano_ref, tempo_execucao, total_linhas):
-        """Envia um card verde para o canal de Sucesso."""
+        """Envia um card verde formatado para o canal de Sucesso."""
         embed = {
             "title": "🟢 SafeDriver Pipeline: SUCESSO",
-            "color": 5763719, # Verde (Cor decimal para Discord Embeds)
+            "color": 5763719, # Código decimal para a cor Verde
             "description": "A esteira de processamento finalizou todas as etapas sem erros.",
             "fields": [
                 {"name": "📅 Referência", "value": str(ano_ref), "inline": True},
                 {"name": "⏱️ Tempo de Execução", "value": str(tempo_execucao), "inline": True},
-                {"name": "📊 Registros Prontos", "value": f"{total_linhas:,}", "inline": False},
+                {"name": "📊 Registros Prontos", "value": f"{total_linhas:,}".replace(",", "."), "inline": False},
                 {"name": "Status das Camadas", "value": "✅ Bronze (Ingestão RAW)\n✅ Prata (Limpeza e Geo H3)\n✅ Ouro (IA e BigQuery)", "inline": False}
             ],
             "footer": {
@@ -55,34 +56,22 @@ class ComunicadorSafeDriver:
         self._enviar_discord(self.webhook_sucesso, embed)
 
     def relatar_erro(self, camada, erro_traceback):
-        """Envia um card vermelho para o canal de Erros Críticos."""
+        """Envia um card vermelho com o log do erro para o canal de Erros Críticos."""
+
+        # Isolando a formatação do erro para evitar bugs de copy-paste
+        # A correção está aqui: a f-string foi ajustada para não ter quebra de linha inesperada.
+        erro_formatado = f"Ocorreu um erro crítico na camada **{camada}** do pipeline SafeDriver.\n\n```python\n{erro_traceback}\n```"
+
         embed = {
-            "title": "🔴 CRÍTICO: Falha no SafeDriver",
-            "color": 15548997, # Vermelho (Cor decimal para Discord Embeds)
-            "description": "O pipeline foi abortado preventivamente para não corromper o Data Lake. Verifique os logs no GitHub Actions.",
+            "title": "🔴 SafeDriver Pipeline: ERRO CRÍTICO",
+            "color": 15548997, # Código decimal para a cor Vermelha
+            "description": erro_formatado,
             "fields": [
-                {"name": "⚠️ Camada Afetada", "value": camada.upper(), "inline": False},
-                {"name": "🚨 Traceback do Erro", "value": f"```python\n{str(erro_traceback)[:1000]}...\n```", "inline": False} # Limita o traceback para não exceder o limite do Discord
+                {"name": "Camada do Erro", "value": camada, "inline": True},
+                {"name": "Data/Hora do Erro", "value": datetime.now().strftime('%d/%m/%Y %H:%M:%S'), "inline": True}
             ],
             "footer": {
-                "text": f"Ocorrido em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+                "text": "Por favor, verifique os logs para mais detalhes."
             }
         }
         self._enviar_discord(self.webhook_erro, embed)
-
-# Exemplo de uso (apenas para testar o arquivo isoladamente)
-if __name__ == "__main__":
-    # Para testar, defina estas variáveis de ambiente no seu terminal:
-    # export DISCORD_SUCESSO="SUA_WEBHOOK_URL_DE_SUCESSO"
-    # export DISCORD_ERRO="SUA_WEBHOOK_URL_DE_ERRO"
-    comunicador = ComunicadorSafeDriver()
-
-    # Teste de sucesso
-    comunicador.relatar_sucesso(2024, "02m 45s", 1543020)
-
-    # Teste de erro
-    try:
-        1 / 0
-    except Exception as e:
-        import traceback
-        comunicador.relatar_erro("Camada de Teste", traceback.format_exc())
