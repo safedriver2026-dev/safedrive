@@ -24,4 +24,4 @@ holidays
 requests
 python-dotenv
 pandas-gbq
-follium
+folium
