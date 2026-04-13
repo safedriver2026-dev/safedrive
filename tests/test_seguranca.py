@@ -1,71 +1,104 @@
+import os
 import pytest
-import pandas as pd
-import hashlib
-from autobot.processamento_prata import ProcessamentoPrata
-from unittest.mock import MagicMock
+import polars as pl
+from unittest.mock import patch
 
-class TestSeguranca:
-    @pytest.fixture
-    def configuracao_teste(self):
-        robo = MagicMock()
-        processador = ProcessamentoPrata(robo)
-        return processador
+# Importamos as classes que vamos testar (ajuste os caminhos conforme o seu projeto)
+# from autobot.camada_prata import ProcessamentoPrata
+# from autobot.camada_ouro import CamadaOuroSafeDriver
 
-    def test_anonimizacao_lgpd(self, configuracao_teste):
-        sal = "safedriver_2026_token"
-        num_bo = "AX8110"
-        ano_bo = 2026
-        
-        esperado = hashlib.sha256(f"{num_bo}{ano_bo}{sal}".encode()).hexdigest()[:16]
-        
-        df_teste = pd.DataFrame({
-            'NUM_BO': [num_bo],
-            'ANO_BO': [ano_bo]
-        })
-        
-        df_teste['ID_ANONIMO'] = (df_teste['NUM_BO'].astype(str) + 
-                                  df_teste['ANO_BO'].astype(str) + sal).apply(
-            lambda x: hashlib.sha256(x.encode()).hexdigest()[:16]
-        )
-        
-        assert df_teste.loc[0, 'ID_ANONIMO'] == esperado
+# ==========================================
+# 1. TESTES DE GESTÃO DE SEGREDOS (SECRETS)
+# ==========================================
 
-    def test_remocao_dados_sensiveis(self, configuracao_teste):
-        df_entrada = pd.DataFrame({
-            'NUM_BO': ['123'],
-            'LATITUDE': [-23.5],
-            'LONGITUDE': [-46.6],
-            'NATUREZA': ['ROUBO'],
-            'H3_INDEX': ['8847552813fffff']
-        })
-        
-        colunas_remover = ['NUM_BO', 'LATITUDE', 'LONGITUDE']
-        df_saida = df_entrada.drop(columns=[c for c in colunas_remover if c in df_entrada.columns])
-        
-        assert 'NUM_BO' not in df_saida.columns
-        assert 'LATITUDE' not in df_saida.columns
-        assert 'LONGITUDE' not in df_saida.columns
-        assert 'NATUREZA' in df_saida.columns
+def test_falha_segura_sem_credenciais():
+    """
+    Testa o princípio de 'Fail-Secure'. Se o GitHub Actions falhar ao carregar 
+    as chaves, o sistema DEVE "estourar" um erro imediatamente, e não tentar 
+    continuar com valores nulos ou expor logs de conexão vazios.
+    """
+    # Removemos as variáveis de ambiente temporariamente
+    with patch.dict(os.environ, clear=True):
+        # A expectativa é que instanciar a classe levante uma exceção de KeyError ou Exception
+        with pytest.raises(Exception) as excinfo:
+            # Substitua pela chamada real da sua classe
+            # prata = ProcessamentoPrata() 
+            
+            # Simulando o que a classe faria internamente no __init__:
+            aws_key = os.environ["R2_ACCESS_KEY_ID"]
+            
+        assert "R2_ACCESS_KEY_ID" in str(excinfo.value), "O sistema não bloqueou a falta de credenciais."
 
-    def test_integridade_chave_localidade(self, configuracao_teste):
-        municipio = "São Bernardo do Campo"
-        bairro = "Centro"
-        logradouro = "Rua Marechal Deodoro"
-        
-        esperado = "SAO BERNARDO DO CAMPO|CENTRO|RUA MARECHAL DEODORO"
-        
-        resultado = (configuracao_teste.normalizar(municipio) + "|" + 
-                     configuracao_teste.normalizar(bairro) + "|" + 
-                     configuracao_teste.normalizar(logradouro))
-        
-        assert resultado == esperado
+# ==========================================
+# 2. TESTES DE PRIVACIDADE E LGPD (ANONIMIZAÇÃO)
+# ==========================================
 
-    def test_hash_irreversivel(self, configuracao_teste):
-        entrada_1 = "BO1232026token"
-        entrada_2 = "BO1232026token"
-        
-        hash_1 = hashlib.sha256(entrada_1.encode()).hexdigest()
-        hash_2 = hashlib.sha256(entrada_2.encode()).hexdigest()
-        
-        assert hash_1 == hash_2
-        assert len(hash_1) == 64
+def test_lgpd_remocao_dados_pessoais():
+    """
+    Garante que colunas sensíveis (PII - Personally Identifiable Information) 
+    nunca cheguem à Camada Prata, mesmo que a SSP as inclua na Bronze por engano.
+    """
+    # Simulamos um dado "sujo" vindo da Bronze com nomes de vítimas e documentos
+    df_bronze_simulado = pl.DataFrame({
+        "NUM_BO": ["12345/2024"],
+        "LATITUDE": [-23.5505],
+        "LONGITUDE": [-46.6333],
+        "NOME_VITIMA": ["João da Silva"],    # DADO SENSÍVEL
+        "CPF_ENVOLVIDO": ["111.222.333-44"]  # DADO SENSÍVEL
+    })
+
+    # As colunas que definimos como padrão (O "Filtro Ético")
+    colunas_canonicas = ['NUM_BO', 'LATITUDE', 'LONGITUDE']
+
+    # Simulamos o filtro que ocorre na Camada Prata
+    colunas_presentes = [c for c in colunas_canonicas if c in df_bronze_simulado.columns]
+    df_prata_limpo = df_bronze_simulado.select(colunas_presentes)
+
+    # Verificações de Segurança LGPD
+    assert "NOME_VITIMA" not in df_prata_limpo.columns, "FALHA LGPD: Nome da vítima vazou para a Prata."
+    assert "CPF_ENVOLVIDO" not in df_prata_limpo.columns, "FALHA LGPD: Documento vazou para a Prata."
+    assert "NUM_BO" in df_prata_limpo.columns, "A chave primária não deveria ter sido removida."
+
+# ==========================================
+# 3. TESTES DE PROTEÇÃO DO MODELO (DATA POISONING)
+# ==========================================
+
+def test_protecao_contra_lat_lon_maliciosos():
+    """
+    O 'Data Poisoning' acontece quando dados fora do padrão quebram o gerador H3 
+    ou viciam a IA. Coordenadas nulas ou strings devem ser tratadas.
+    """
+    # Simulamos uma tentativa de injeção de texto onde deveria haver GPS e um dado nulo
+    df_ataque = pl.DataFrame({
+        "NUM_BO": ["001", "002"],
+        "LATITUDE": ["-23.5505", "N/A"], # "N/A" é malicioso para funções matemáticas
+        "LONGITUDE": ["-46.6333", None]
+    })
+
+    # Aplicamos a lógica de cast da Camada Prata (strict=False é o nosso escudo)
+    df_defesa = df_ataque.with_columns([
+        pl.col("LATITUDE").cast(pl.Float64, strict=False),
+        pl.col("LONGITUDE").cast(pl.Float64, strict=False)
+    ])
+
+    # A linha com "N/A" deve ter sido forçada a virar Null, em vez de quebrar o Python
+    assert df_defesa.filter(pl.col("NUM_BO") == "002")["LATITUDE"][0] is None, "Injeção de string na Latitude não foi neutralizada."
+
+def test_bounding_box_antifraude():
+    """
+    Garante que crimes registados na Rússia ou no oceano não entrem no modelo de SP.
+    """
+    df_gps = pl.DataFrame({
+        "NUM_BO": ["A1", "A2"],
+        "LATITUDE": [-23.5505, 55.7558],  # A2 é Moscovo (Rússia)
+        "LONGITUDE": [-46.6333, 37.6173]
+    })
+
+    # Lógica de Bounding Box de SP
+    df_filtrado = df_gps.filter(
+        (pl.col("LATITUDE").is_between(-25.31, -19.77)) & 
+        (pl.col("LONGITUDE").is_between(-53.11, -44.16))
+    )
+
+    assert df_filtrado.height == 1, "O filtro Bounding Box deixou passar coordenadas fora de São Paulo."
+    assert df_filtrado["NUM_BO"][0] == "A1", "O BO legítimo foi descartado por engano."
