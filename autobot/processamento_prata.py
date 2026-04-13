@@ -127,6 +127,7 @@ class ProcessamentoPrata:
     def _extrair_dados_consolidados(self, conteudo, mapa_colunas_dinamico):
         lista_dfs = []
         colunas_canonicamente_esperadas = set(mapa_colunas_dinamico.values()) if mapa_colunas_dinamico else set()
+        lixo_coordenadas = ["0", "0.0", "0,0", "NULL", "NA", "", " ", "-", "NaN", "nan"]
 
         for i in range(1, 15):
             try:
@@ -161,16 +162,26 @@ class ProcessamentoPrata:
                 if is_aba_valida:
                     df = df.with_columns(pl.all().cast(pl.Utf8))
                     
+                    # Filtro pesado contra hifens, espacos e zeros
                     df = df.filter(
                         (pl.col("LATITUDE").is_not_null()) & 
-                        (~pl.col("LATITUDE").is_in(["0", "0.0", "0,0", "NULL", "NA", "", " "]))
+                        (pl.col("LONGITUDE").is_not_null()) &
+                        (~pl.col("LATITUDE").str.strip_chars().is_in(lixo_coordenadas)) &
+                        (~pl.col("LONGITUDE").str.strip_chars().is_in(lixo_coordenadas))
                     )
                     
                     lista_dfs.append(df)
                     logger.info(f"PRATA: Aba {i} validada e extraida com sucesso.")
+                    
             except Exception as e:
-                logger.warning(f"PRATA: Aba {i} ignorada devido a erro interno: {e}")
-                continue
+                mensagem_erro = str(e).lower()
+                # Mata os Warnings de abas inexistentes
+                if "no matching sheet" in mensagem_erro or "out of bounds" in mensagem_erro:
+                    logger.info(f"PRATA: Fim do arquivo. Nao existem mais abas apos a {i-1}.")
+                    break 
+                else:
+                    logger.warning(f"PRATA: Aba {i} ignorada devido a erro interno: {e}")
+                    continue
         
         if lista_dfs:
             return pl.concat(lista_dfs, how="diagonal")
@@ -178,10 +189,24 @@ class ProcessamentoPrata:
 
     def _geocodificar_h3(self, lf):
         df_pd = lf.to_pandas()
+        
+        # Funcao blindada para conversao
+        def safe_h3(lat, lng):
+            try:
+                # Troca virgula por ponto caso venha no formato brasileiro
+                lat_float = float(str(lat).replace(",", ".").strip())
+                lng_float = float(str(lng).replace(",", ".").strip())
+                return h3.latlng_to_cell(lat_float, lng_float, self.h3_resolution)
+            except Exception:
+                return None
+                
         df_pd['H3_INDEX'] = df_pd.apply(
-            lambda r: h3.latlng_to_cell(float(r['LATITUDE']), float(r['LONGITUDE']), self.h3_resolution),
-            axis=1
+            lambda r: safe_h3(r['LATITUDE'], r['LONGITUDE']), axis=1
         )
+        
+        # Remove eventuais linhas que ainda falharam na conversao
+        df_pd = df_pd.dropna(subset=['H3_INDEX'])
+        
         return pl.from_pandas(df_pd)
 
     def _agregar_por_persona(self, lf):
@@ -211,9 +236,3 @@ class ProcessamentoPrata:
             pl.col("PROPORCAO_RESIDENCIAL_H3").alias("INDICE_RESIDENCIAL"),
             pl.col("DENSIDADE_LOGRADOUROS").alias("DENSIDADE_ENDERECOS")
         ]).fill_null(0)
-
-if __name__ == "__main__":
-    prata = ProcessamentoPrata()
-    ano_atual = datetime.now().year
-    for ano in range(2022, ano_atual + 1):
-        prata.executar_prata(ano)
