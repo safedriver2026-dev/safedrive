@@ -49,7 +49,7 @@ class ProcessamentoPrata:
 
             df_pandas = lf.to_pandas()
             df_pandas['h3_index'] = df_pandas.apply(
-                lambda row: h3.geo_to_h3(row['LATITUDE'], row['LONGITUDE'], self.h3_resolution), 
+                lambda row: h3.latlng_to_cell(row['LATITUDE'], row['LONGITUDE'], self.h3_resolution), 
                 axis=1
             )
             lf = pl.from_pandas(df_pandas)
