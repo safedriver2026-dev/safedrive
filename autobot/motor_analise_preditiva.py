@@ -1,9 +1,9 @@
 import os
 import sys
-import boto3
 from datetime import datetime
+import boto3
 
-
+# Importações Absolutas para garantir funcionamento no GitHub Actions
 from autobot.ingestao_bruta import IngestaoBruta
 from autobot.processamento_prata import ProcessamentoPrata
 from autobot.sincronizacao_ouro import SincronizacaoOuro
@@ -19,41 +19,52 @@ class MotorSafeDriver:
         self.bucket = os.environ.get("R2_BUCKET_NAME")
         self.ano_atual = datetime.now().year
 
-    def arquivo_existe_no_r2(self, caminho):
-        """Verifica se o arquivo já foi processado para garantir o Delta Sync na Bronze/Prata"""
+    def verificar_processamento_existente(self, caminho):
+        """Verifica se o arquivo já existe no R2 para evitar re-processamento (Delta Sync)"""
         try:
             self.s3.head_object(Bucket=self.bucket, Key=caminho)
             return True
         except:
             return False
 
-    def fluxo_delta(self, modo="predicao"):
-        self.robo.enviar_relatorio_operacional(f"🚀 Iniciando SafeDriver - Modo: {modo}")
+    def rodar_ciclo(self, modo="diario"):
+        self.robo.enviar_relatorio_operacional(f"🤖 SafeDriver iniciado | Modo: {modo.upper()}")
+        
+        # DEFINIÇÃO DE ESCOPO: Full (2022 até hoje) ou Diário (apenas ano atual)
+        anos_processamento = range(2022, self.ano_atual + 1) if modo == "full" else [self.ano_atual]
 
-        for ano in range(2022, self.ano_atual + 1):
+        for ano in anos_processamento:
             caminho_bruta = f"datalake/bruta/ssp_{ano}_bronze.parquet"
             caminho_prata = f"datalake/prata/ssp_{ano}_prata.parquet"
 
-            # DELTA SYNC: Só roda a ingestão pesada se o arquivo não existir ou se for o ano atual
-            if modo == "full" or ano == self.ano_atual:
-                if not self.arquivo_existe_no_r2(caminho_bruta):
-                    ingestor = IngestaoBruta(self.robo)
-                    ingestor.processar_ano(ano)
+            # --- CAMADA BRUTA E PRATA (Processamento Pesado) ---
+            # Só roda se for modo 'full' OU se o arquivo ainda não existir (Delta Sync)
+            if modo == "full" or not self.verificar_processamento_existente(caminho_prata):
+                self.robo.enviar_relatorio_operacional(f"📦 Sincronizando Base Histórica: {ano}")
                 
-                if not self.arquivo_existe_no_r2(caminho_prata):
-                    processador = ProcessamentoPrata(self.robo)
-                    processador.executar(ano)
+                # Ingestão (Bronze)
+                if not self.verificar_processamento_existente(caminho_bruta) or ano == self.ano_atual:
+                    bruta = IngestaoBruta(self.robo)
+                    bruta.processar_ano(ano)
 
-            # A camada OURO roda sempre (Diário), mas com lógica de arredondamento interna
-            sincronizador = SincronizacaoOuro(self.robo)
-            sincronizador.executar(ano)
+                # Refino (Prata - Aqui entra o peso 7.5 e as variáveis residenciais)
+                prata = ProcessamentoPrata(self.robo)
+                prata.executar(ano)
 
-        self.robo.enviar_relatorio_operacional("🏁 Ciclo Delta Sync Finalizado")
+            # --- CAMADA OURO (Predição Diária) ---
+            # Roda sempre para garantir que a predição considere o dia/hora atual
+            self.robo.enviar_relatorio_operacional(f"🧠 Atualizando Predição de Risco: {ano}")
+            ouro = SincronizacaoOuro(self.robo)
+            ouro.executar(ano)
+
+        self.robo.enviar_relatorio_operacional(f"🏁 Ciclo {modo} finalizado com sucesso.")
 
 if __name__ == "__main__":
-    # Garante que o diretório atual está no path para execução via módulo
+    # Adiciona o diretório atual ao sys.path para evitar erros de módulo
     sys.path.append(os.getcwd())
     
-    modo_selecionado = sys.argv[1] if len(sys.argv) > 1 else "predicao"
+    # Captura o modo via argumento: python -m autobot.motor_analise_preditiva full
+    modo_exec = sys.argv[1] if len(sys.argv) > 1 else "diario"
+    
     maestro = MotorSafeDriver()
-    maestro.fluxo_delta(modo=modo_selecionado)
+    maestro.rodar_ciclo(modo=modo_exec)
