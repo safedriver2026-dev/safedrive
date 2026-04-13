@@ -9,7 +9,7 @@ from urllib3.util import Retry
 from datetime import datetime
 from .comunicador import RoboComunicador
 
-class IngestaoResiliente:
+class IngestaoBruta:
     def __init__(self, robo: RoboComunicador):
         self.robo = robo
         self.s3 = boto3.client('s3',
@@ -19,7 +19,7 @@ class IngestaoResiliente:
         self.bucket = os.environ.get("R2_BUCKET_NAME")
 
         self.sessao = requests.Session()
-        tentativas = Retry(total=5, backoff_factor=2, status_forcelist=[500, 502, 503, 504])
+        tentativas = Retry(total=5, backoff_factor=3, status_forcelist=[500, 502, 503, 504])
         self.sessao.mount('https://', HTTPAdapter(max_retries=tentativas))
 
         self.ESQUEMA_ALVO = {
@@ -34,74 +34,74 @@ class IngestaoResiliente:
             'NATUREZA': ['NATUREZA_APURADA', 'RUBRICA', 'DESCR_LEI']
         }
 
-    def criar_mapeamento(self, df_metadados):
+    def criar_mapeamento_sinonimos(self, df_metadados):
         mapeamento = {}
         if 'Campos' not in df_metadados.columns:
             return mapeamento
             
-        campos_origem = df_metadados['Campos'].dropna().unique()
-        for campo in campos_origem:
-            termo = str(campo).strip().upper()
+        colunas_origem = df_metadados['Campos'].dropna().unique()
+        for coluna in colunas_origem:
+            termo = str(coluna).strip().upper()
             for canonico, sinonimos in self.ESQUEMA_ALVO.items():
                 if termo in [s.upper() for s in sinonimos]:
-                    mapeamento[campo] = canonico
+                    mapeamento[coluna] = canonico
                     break
         return mapeamento
 
-    def baixar_arquivo_grande(self, url):
-        buffer = io.BytesIO()
-        with self.sessao.get(url, stream=True, timeout=600) as r:
+    def baixar_arquivo(self, url):
+        fluxo = io.BytesIO()
+        with self.sessao.get(url, stream=True, timeout=900) as r:
             r.raise_for_status()
-            for pedaco in r.iter_content(chunk_size=1048576):
+            for pedaco in r.iter_content(chunk_size=2097152):
                 if pedaco:
-                    buffer.write(pedaco)
-        buffer.seek(0)
-        return buffer
+                    fluxo.write(pedaco)
+        fluxo.seek(0)
+        return fluxo
 
     def processar_ano(self, ano):
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-        caminho_destino = f"safedriver/datalake/bruta/ssp_{ano}_bronze.parquet"
+        caminho_destino = f"datalake/bruta/ssp_{ano}_bronze.parquet"
         
         try:
-            self.robo.enviar_relatorio_operacional(f"Iniciando captura resiliente {ano}")
+            self.robo.enviar_relatorio_operacional(f"Iniciando captura bruta {ano}")
             
-            conteudo = self.baixar_arquivo_grande(url)
-            planilha = pd.ExcelFile(conteudo)
+            conteudo_binario = self.baixar_arquivo(url)
+            leitor_excel = pd.ExcelFile(conteudo_binario)
             
-            abas = planilha.sheet_names
+            abas = leitor_excel.sheet_names
             aba_meta = [a for a in abas if 'CAMPOS' in a.upper()][0]
-            aba_dados = [a for a in abas if 'JAN' in a.upper() or 'DADOS' in a.upper() or str(ano) in a][0]
+            aba_dados = [a for a in abas if any(mes in a.upper() for mes in ['JAN', 'FEV', 'MAR', 'DADOS']) or str(ano) in a][0]
 
-            df_meta = pd.read_excel(planilha, sheet_name=aba_meta, skiprows=3)
-            df_bruto = pd.read_excel(planilha, sheet_name=aba_dados)
+            df_meta = pd.read_excel(leitor_excel, sheet_name=aba_meta, skiprows=3)
+            df_origem = pd.read_excel(leitor_excel, sheet_name=aba_dados)
 
-            mapeamento = self.criar_mapeamento(df_meta)
-            df_normalizado = df_bruto.rename(columns=mapeamento)
+            dicionario_traducao = self.criar_mapeamento_sinonimos(df_meta)
+            df_normalizado = df_origem.rename(columns=dicionario_traducao)
 
             for col in self.ESQUEMA_ALVO.keys():
                 if col not in df_normalizado.columns:
                     df_normalizado[col] = None
 
-            campos_finais = list(self.ESQUEMA_ALVO.keys()) + ['NUM_BO', 'ANO_BO']
-            colunas_validas = [c for c in campos_finais if c in df_normalizado.columns]
-            df_final = df_normalizado[colunas_validas].copy()
+            campos_obrigatorios = list(self.ESQUEMA_ALVO.keys()) + ['NUM_BO', 'ANO_BO']
+            colunas_finais = [c for c in campos_obrigatorios if c in df_normalizado.columns]
+            df_final = df_normalizado[colunas_finais].copy()
 
             if 'COD IBGE' in df_final.columns:
                 df_final = df_final.drop(columns=['COD IBGE'])
 
-            saida = io.BytesIO()
-            df_final.to_parquet(saida, index=False)
-            self.s3.put_object(Bucket=self.bucket, Key=caminho_destino, Body=saida.getvalue())
+            saida_parquet = io.BytesIO()
+            df_final.to_parquet(saida_parquet, index=False)
+            self.s3.put_object(Bucket=self.bucket, Key=caminho_destino, Body=saida_parquet.getvalue())
 
-            self.robo.enviar_relatorio_operacional(f"Captura {ano} finalizada", {"Linhas": len(df_final)})
+            self.robo.enviar_relatorio_operacional(f"Finalizado Bruta {ano}", {"Registros": len(df_final)})
             return True
             
         except Exception:
-            self.robo.enviar_alerta_tecnico(f"Falha na captura {ano}", traceback.format_exc())
+            self.robo.enviar_alerta_tecnico(f"Erro na Bruta {ano}", traceback.format_exc())
             return False
 
-def executar_periodo_completo(robo):
-    executor = IngestaoResiliente(robo)
-    ano_atual = datetime.now().year
-    for ano in range(2022, ano_atual + 1):
-        executor.processar_ano(ano)
+def iniciar_ingestao_total(robo):
+    ingestor = IngestaoBruta(robo)
+    ano_limite = datetime.now().year
+    for ano in range(2022, ano_limite + 1):
+        ingestor.processar_ano(ano)
