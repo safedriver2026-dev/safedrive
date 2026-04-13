@@ -17,7 +17,7 @@ class RoboComunicador:
             "embeds": [
                 {
                     "description": mensagem,
-                    "color": cor if cor else 0x00ff00 # Verde padrão
+                    "color": cor if cor else 0x00ff00
                 }
             ]
         }
