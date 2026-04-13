@@ -1,11 +1,9 @@
-# Conteúdo hipotético de autobot/motor_analise_preditiva.py
 import os
 import sys
 from datetime import datetime
 from comunicador import RoboComunicador
 import autobot.0_ingestao_raw as ingestao_raw
 import autobot.1_processamento_prata as processamento_prata
-# import autobot.2_processamento_ouro as processamento_ouro # Para o pipeline ouro
 
 def executar_pipeline_bronze_prata():
     robo = RoboComunicador(
@@ -17,7 +15,6 @@ def executar_pipeline_bronze_prata():
         robo.enviar_relatorio_operacional("🚀 A iniciar o Pipeline SafeDriver Autobot (Bronze e Prata)...")
 
         print("--- PASSO 1: Camada Bronze (Ingestão) ---")
-        # A função executar_ingestao retorna True se a ingestão ocorreu, False se foi pulada
         ingestao_bem_sucedida = ingestao_raw.executar_ingestao(robo)
 
         if ingestao_bem_sucedida:
@@ -25,8 +22,6 @@ def executar_pipeline_bronze_prata():
             processamento_prata.executar_processamento(robo)
         else:
             print("✅ Camada Bronze não atualizada. Pulando Camada Prata.")
-            # A mensagem de "pulando Camada Prata" já está sendo enviada pelo 0_ingestao_raw.py
-            # então não precisamos enviar outro relatório aqui, apenas o print.
 
         robo.enviar_relatorio_operacional("✅ Pipeline SafeDriver Autobot (Bronze e Prata) concluído com sucesso!")
 
@@ -43,8 +38,6 @@ def executar_pipeline_ouro():
 
     try:
         robo.enviar_relatorio_operacional("🚀 A iniciar o Pipeline SafeDriver Autobot (Ouro)...")
-
-
 
         robo.enviar_relatorio_operacional("✅ Pipeline SafeDriver Autobot (Ouro) concluído com sucesso!")
 
