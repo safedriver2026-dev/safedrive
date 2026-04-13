@@ -23,7 +23,7 @@ def executar_pipeline():
 
     try:
         if args.weekly:
-            logger.info("Ciclo Semanal: Bronze e Prata")
+            logger.info("Iniciando Ciclo Semanal: Bronze e Prata")
             raw = IngestaoRaw()
             prata = ProcessamentoPrata()
             
@@ -34,19 +34,21 @@ def executar_pipeline():
             comunicador.relatar_sucesso(ano_atual, str(datetime.now() - inicio), "Ingestao e Prata concluidas")
 
         if args.daily:
-            logger.info("Ciclo Diario: IA e Ouro")
+            logger.info("Iniciando Ciclo Diario: Treinamento e Ouro")
             treinador = TreinadorEvolutivo()
             ouro = CamadaOuroSafeDriver()
 
-            treinador.treinar_modelo_mestre()
-            for ano in range(2022, ano_atual + 1):
-                ouro.processar_ouro(ano)
+            if treinador.treinar_modelo_mestre():
+                for ano in range(2022, ano_atual + 1):
+                    ouro.processar_ouro(ano)
 
-            comunicador.relatar_sucesso(ano_atual, str(datetime.now() - inicio), "Modelos e BigQuery atualizados")
+                comunicador.relatar_sucesso(ano_atual, str(datetime.now() - inicio), "Modelos e BigQuery atualizados")
+            else:
+                logger.warning("Treinamento cancelado ou sem dados. Ouro ignorada.")
 
     except Exception as e:
-        logger.error(f"Falha no pipeline: {e}")
-        comunicador.relatar_erro("Orquestrador", str(e))
+        logger.error(f"Falha critica no pipeline: {e}")
+        comunicador.relatar_erro("Orquestrador Geral", str(e))
         sys.exit(1)
 
 if __name__ == "__main__":
