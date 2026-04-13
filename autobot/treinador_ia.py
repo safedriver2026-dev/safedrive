@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class TreinadorEvolutivo:
     def __init__(self):
-        # Conexão R2
+        # Conexão R2 (Limpando strings de ambiente)
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -39,62 +39,65 @@ class TreinadorEvolutivo:
             "motociclista": "TOTAL_CRIMES_MOTOCICLISTA"
         }
         
-        # O NOVO SET DE FEATURES (Base + Tendência + Memória)
+        # Definição do Dataset de Treino (Contexto + Tendência + Memória)
         self.features_base = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
         self.features_delta = ['DELTA_MOTORISTA', 'DELTA_PEDESTRE', 'DELTA_MOTOCICLISTA']
         self.meta_features = ['ULTIMO_MAE_CAT', 'ULTIMO_MAE_LGB']
 
     def treinar_modelo_mestre(self):
-        logger.info(f"IA: Iniciando Treinamento Evolutivo [{self.version}]")
+        """Executa o ciclo completo de treinamento para todas as personas."""
+        logger.info(f"IA: Iniciando Treinamento Evolutivo de Produção [{self.version}]")
         
-        # 1. Carrega a base consolidada de todos os anos disponíveis
+        # 1. Carrega todos os anos da Prata (Datalake completo)
         df_treino = self._carregar_base_completa()
         
         if df_treino is None or df_treino.shape[0] < 50:
-            logger.warning("IA: Dados insuficientes para um treino eficaz. Abortando.")
+            logger.warning("IA: Base insuficiente para treino (0 ou poucas linhas). Abortando.")
             return False
 
-        # Lista final de colunas que o modelo vai olhar
         colunas_modelo = self.features_base + self.features_delta + self.meta_features
-        logger.info(f"IA: Treinando com {len(colunas_modelo)} features estratégicas.")
+        logger.info(f"IA: Base consolidada com {df_treino.shape[0]} registros e {len(colunas_modelo)} features.")
 
         for persona, target in self.personas.items():
-            logger.info(f"--- Treinando Persona: {persona.upper()} ---")
-            
-            X = df_treino[colunas_modelo]
-            y = df_treino[target]
-            
-            # Split Temporal (80/20)
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            try:
+                logger.info(f"--- Evoluindo Persona: {persona.upper()} ---")
+                
+                X = df_treino[colunas_modelo]
+                y = df_treino[target]
+                
+                # Split Temporal Adaptativo
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-            # CatBoost (Foco em Precisão)
-            model_cat = CatBoostRegressor(iterations=700, depth=7, learning_rate=0.05, verbose=0)
-            model_cat.fit(X_train, y_train)
-            mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
+                # Algoritmo 1: CatBoost (Robusto a outliers de criminalidade)
+                model_cat = CatBoostRegressor(iterations=800, depth=6, learning_rate=0.04, verbose=0)
+                model_cat.fit(X_train, y_train)
+                mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
 
-            # LightGBM (Foco em Generalização)
-            model_lgb = LGBMRegressor(n_estimators=200, learning_rate=0.03, verbosity=-1)
-            model_lgb.fit(X_train, y_train)
-            mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
+                # Algoritmo 2: LightGBM (Ágil para captar micro-tendências)
+                model_lgb = LGBMRegressor(n_estimators=300, learning_rate=0.03, verbosity=-1)
+                model_lgb.fit(X_train, y_train)
+                mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
 
-            logger.info(f"📈 Resultado {persona}: MAE Cat: {mae_cat:.4f} | MAE LGB: {mae_lgb:.4f}")
+                logger.info(f"📊 {persona}: MAE Cat: {mae_cat:.4f} | MAE LGB: {mae_lgb:.4f}")
 
-            # Salva Versão e Latest no R2
-            self._exportar_modelo(model_cat, f"cat_{persona}")
-            self._exportar_modelo(model_lgb, f"lgb_{persona}")
-            
-            # Persiste o erro para ser a "Meta-Feature" de amanhã
-            self._salvar_performance_historica(persona, mae_cat, mae_lgb)
+                # Versionamento de Modelos no R2
+                self._exportar_modelo(model_cat, f"cat_{persona}")
+                self._exportar_modelo(model_lgb, f"lgb_{persona}")
+                
+                # Salva a performance para ser a Meta-Feature do próximo ciclo
+                self._persistir_performance(persona, mae_cat, mae_lgb)
+                
+            except Exception as e:
+                logger.error(f"Erro no treino da persona {persona}: {e}")
 
         return True
 
     def _carregar_base_completa(self):
-        """Busca todos os arquivos Parquet da Prata e une em um DataFrame mestre."""
+        """Une todos os arquivos Parquet da Prata em um único DataFrame."""
         lista_dfs = []
         prefixo = "safedriver/datalake/prata/"
         
         try:
-            # Lista arquivos para pegar todos os anos disponíveis
             resp_objs = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefixo)
             for obj in resp_objs.get('Contents', []):
                 if obj['Key'].endswith('.parquet'):
@@ -104,18 +107,18 @@ class TreinadorEvolutivo:
             
             if not lista_dfs: return None
             
-            # Concatenação diagonal (trata colunas faltantes entre anos)
+            # Concatenação diagonal para lidar com possíveis variações de colunas entre anos
             full_df = pl.concat(lista_dfs, how="diagonal").to_pandas().fillna(0)
             
-            # Injeção das Meta-Features de Performance
-            for persona in self.personas.keys():
-                meta = self._buscar_performance_anterior(persona)
+            # Injeta as Meta-Features (Último erro conhecido)
+            for p in self.personas.keys():
+                meta = self._buscar_performance_anterior(p)
                 full_df['ULTIMO_MAE_CAT'] = meta.get('mae_cat', 0.0)
                 full_df['ULTIMO_MAE_LGB'] = meta.get('mae_lgb', 0.0)
                 
             return full_df
         except Exception as e:
-            logger.error(f"Erro ao carregar base de treino: {e}")
+            logger.error(f"Erro ao consolidar Datalake para treino: {e}")
             return None
 
     def _buscar_performance_anterior(self, persona):
@@ -126,34 +129,30 @@ class TreinadorEvolutivo:
         except:
             return {"mae_cat": 0.0, "mae_lgb": 0.0}
 
-    def _salvar_performance_historica(self, persona, mae_cat, mae_lgb):
+    def _persistir_performance(self, persona, mae_cat, mae_lgb):
         path = f"modelos_ml/meta_perf_{persona}.json"
-        meta = {
-            "mae_cat": mae_cat,
-            "mae_lgb": mae_lgb,
-            "data_treino": self.version
-        }
+        meta = {"mae_cat": mae_cat, "mae_lgb": mae_lgb, "versao": self.version}
         self.s3.put_object(Bucket=self.bucket, Key=path, Body=json.dumps(meta))
 
     def _exportar_modelo(self, modelo, nome_base):
-        """Versionamento MLOps: Salva com data e atualiza o ponteiro de produção."""
+        """Salva a versão datada e o ponteiro 'latest' para a Camada Ouro."""
         buffer = io.BytesIO()
         joblib.dump(modelo, buffer)
         payload = buffer.getvalue()
         
-        # Caminho da Versão (Auditabilidade)
+        # Versionamento histórico
         self.s3.put_object(
             Bucket=self.bucket, 
             Key=f"modelos_ml/versions/v{self.version}_{nome_base}.pkl", 
             Body=payload
         )
-        # Caminho Latest (Produção)
+        # Ponteiro de produção
         self.s3.put_object(
             Bucket=self.bucket, 
             Key=f"modelos_ml/latest_{nome_base}.pkl", 
             Body=payload
         )
-        logger.info(f"💾 Modelo {nome_base} versionado.")
+        logger.info(f"💾 Modelo {nome_base} persistido no R2.")
 
 if __name__ == "__main__":
     TreinadorEvolutivo().treinar_modelo_mestre()
