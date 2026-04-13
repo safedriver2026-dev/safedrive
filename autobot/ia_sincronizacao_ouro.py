@@ -9,7 +9,7 @@ import logging
 from datetime import datetime
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from google.cloud.exceptions import NotFound
+from autobot.calendario_estrategico import CalendarioEstrategico
 from autobot.comunicador import ComunicadorSafeDriver
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -17,13 +17,13 @@ logger = logging.getLogger(__name__)
 
 class CamadaOuroSafeDriver:
     def __init__(self):
-        # Infraestrutura R2 (Limpando inputs)
+        # Conexões Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        # Infraestrutura BigQuery
+        # Conexões Google BigQuery
         self.project_id = os.getenv("BQ_PROJECT_ID", "").strip()
         self.dataset_id = os.getenv("BQ_DATASET_ID", "").strip()
 
@@ -33,56 +33,57 @@ class CamadaOuroSafeDriver:
             aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key
         )
+        
+        self.cal = CalendarioEstrategico()
         self.comunicador = ComunicadorSafeDriver()
 
-        # Configuração de Pesos (Weighted Ensemble)
-        # Prioridade total ao CatBoost devido ao MAE superior
+        # Configuração de Pesos do Ensemble (Produção)
         self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
         
-        # Features do Modelo (Consistentes com o Treinador)
+        # Features alinhadas com o Treinador
         self.features_base = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
+        self.features_delta = ['DELTA_MOTORISTA', 'DELTA_PEDESTRE', 'DELTA_MOTOCICLISTA']
         self.meta_features = ['ULTIMO_MAE_CAT', 'ULTIMO_MAE_LGB']
 
-        # Autenticação GCP
-        gcp_json_raw = os.getenv("GCP_SA_JSON", "").strip()
+        self._conectar_bigquery()
+
+    def _conectar_bigquery(self):
+        gcp_json = os.getenv("GCP_SA_JSON", "").strip()
         try:
-            if gcp_json_raw and gcp_json_raw.startswith("{"):
-                cred_info = json.loads(gcp_json_raw)
+            if gcp_json.startswith("{"):
+                cred_info = json.loads(gcp_json)
                 credentials = service_account.Credentials.from_service_account_info(cred_info)
                 self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
             else:
                 self.bq_client = bigquery.Client(project=self.project_id)
         except Exception as e:
-            logger.error(f"Erro na autenticação BigQuery: {e}")
-            raise e
+            logger.error(f"Erro ao autenticar BigQuery: {e}")
 
-    def processar_ouro(self, ano):
-        # CAMINHO AJUSTADO conforme a imagem do seu R2
-        path_prata = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
+    def executar_predicao_atual(self):
+        """Orquestra a inferência e sincronização dos dados de risco."""
+        logger.info("OURO: Iniciando motor de Predição Atual...")
         
         try:
-            logger.info(f"OURO: Iniciando processamento evolutivo para {ano}...")
+            # 1. Carrega Modelos e Dados
+            modelos = self._carregar_modelos_vivos()
+            df_input = self._obter_contexto_recente()
             
-            # 1. Download dos dados da Prata
-            resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
-            lf = pl.read_parquet(io.BytesIO(resp['Body'].read()))
+            if df_input is None:
+                raise Exception("Base de contexto (Prata) não localizada.")
 
-            # 2. Carregar modelos (latest)
-            modelos = self._carregar_modelos_latest()
+            # 2. Inferência e Ajuste Estratégico (Feriados/Pagamento)
+            df_predicao = self._gerar_scores_com_contexto(df_input, modelos)
+
+            # 3. Sincronização BigQuery
+            self._upsert_bigquery(df_predicao)
             
-            # 3. Gerar Scores Ponderados
-            df_final = self._gerar_scores_evolutivos(lf, modelos)
-
-            # 4. Upsert no BigQuery
-            self._sincronizar_bigquery_delta(df_final)
             return True
-            
-        except Exception as e:
-            logger.error(f"Falha na Camada Ouro ({ano}): {e}")
-            raise e
 
-    def _carregar_modelos_latest(self):
-        """Busca os ponteiros 'latest' gerados pelo Treinador."""
+        except Exception as e:
+            logger.error(f"FALHA NA CAMADA OURO: {e}")
+            return False
+
+    def _carregar_modelos_vivos(self):
         modelos = {}
         for p in ["motorista", "pedestre", "motociclista"]:
             modelos[p] = {}
@@ -92,94 +93,87 @@ class CamadaOuroSafeDriver:
                     obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                     modelos[p][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
                 except:
-                    logger.warning(f"Aviso: Modelo {path} ainda não disponível.")
+                    logger.warning(f"Modelo {path} não encontrado.")
                     modelos[p][alg] = None
         return modelos
 
-    def _buscar_meta_features(self, persona):
-        """Lê a performance do último treino para usar como feature (Memória)."""
-        path = f"modelos_ml/meta_perf_{persona}.json"
-        try:
-            resp = self.s3.get_object(Bucket=self.bucket, Key=path)
-            meta = json.loads(resp['Body'].read())
-            return {
-                "ULTIMO_MAE_CAT": meta.get("mae_cat", 0.0),
-                "ULTIMO_MAE_LGB": meta.get("mae_lgb", 0.0)
-            }
-        except:
-            # Cold Start: Se não houver metadados, assume erro zero
-            return {"ULTIMO_MAE_CAT": 0.0, "ULTIMO_MAE_LGB": 0.0}
+    def _obter_contexto_recente(self):
+        """Busca a Prata mais atual e injeta Meta-Features."""
+        ano_atual = datetime.now().year
+        for ano in range(ano_atual, 2021, -1):
+            path = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
+            try:
+                resp = self.s3.get_object(Bucket=self.bucket, Key=path)
+                df = pl.read_parquet(io.BytesIO(resp['Body'].read())).to_pandas().fillna(0)
+                
+                # Injeta a memória de erro (MAE)
+                for p in ["motorista", "pedestre", "motociclista"]:
+                    try:
+                        meta_resp = self.s3.get_object(Bucket=self.bucket, Key=f"modelos_ml/meta_perf_{p}.json")
+                        meta = json.loads(meta_resp['Body'].read())
+                        df['ULTIMO_MAE_CAT'] = meta.get('mae_cat', 0.0)
+                        df['ULTIMO_MAE_LGB'] = meta.get('mae_lgb', 0.0)
+                    except:
+                        df['ULTIMO_MAE_CAT'], df['ULTIMO_MAE_LGB'] = 0.0, 0.0
+                return df
+            except:
+                continue
+        return None
 
-    def _gerar_scores_evolutivos(self, lf, modelos):
-        df = lf.to_pandas()
+    def _gerar_scores_com_contexto(self, df, modelos):
+        features = self.features_base + self.features_delta + self.meta_features
+        multiplicadores = self.cal.obter_multiplicadores()
         
-        # Padronização de colunas (Safe Check)
-        if "TOTAL_NAO_RESIDENCIAIS_H3" in df.columns:
-            df = df.rename(columns={"TOTAL_NAO_RESIDENCIAIS_H3": "TOTAL_NAO_RES_H3"})
-
         for persona, mods in modelos.items():
-            col_score = f"SCORE_RISCO_{persona.upper()}"
+            col_target = f"RISCO_PREDICAO_ATUAL_{persona.upper()}"
             
-            # Injeção de Meta-Features para esta persona
-            meta = self._buscar_meta_features(persona)
-            df['ULTIMO_MAE_CAT'] = meta["ULTIMO_MAE_CAT"]
-            df['ULTIMO_MAE_LGB'] = meta["ULTIMO_MAE_LGB"]
-
-            features_finais = self.features_base + self.meta_features
+            # 1. Inferência do Ensemble (IA)
+            p_cat = mods["cat"].predict(df[features]) if mods["cat"] is not None else 0
+            p_lgb = mods["lgb"].predict(df[features]) if mods["lgb"] is not None else 0
             
-            # Predição do Ensemble
-            p_cat = mods["cat"].predict(df[features_finais]) if mods["cat"] is not None else None
-            p_lgb = mods["lgb"].predict(df[features_finais]) if mods["lgb"] is not None else None
-
-            if p_cat is not None and p_lgb is not None:
-                # Aplicação da Ponderação 80/20
-                score_raw = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
-            else:
-                score_raw = p_cat if p_cat is not None else (p_lgb if p_lgb is not None else 0.0)
-
-            # Normalização 0-100 baseada no maior risco do lote
-            if hasattr(score_raw, "max") and score_raw.max() > 0:
-                df[col_score] = (score_raw / score_raw.max() * 100).clip(0, 100)
-            else:
-                df[col_score] = 0.0
-
-        df['ULTIMA_ATUALIZACAO'] = pd.Timestamp.now()
+            score_ia = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
+            
+            # 2. Ajuste Heurístico (Calendário)
+            # Se a área for comercial (TOTAL_NAO_RES_H3 > INDICE_RESIDENCIAL), aplica peso comercial
+            df[col_target] = score_ia
+            
+            mask_comercial = df['TOTAL_NAO_RES_H3'] > df['INDICE_RESIDENCIAL']
+            df.loc[mask_comercial, col_target] *= multiplicadores["comercial"]
+            df.loc[~mask_comercial, col_target] *= multiplicadores["residencial"]
+            
+            # Aplica o multiplicador geral e normaliza 0-100
+            df[col_target] = (df[col_target] * multiplicadores["geral"])
+            max_val = df[col_target].max() if df[col_target].max() > 0 else 1
+            df[col_target] = (df[col_target] / max_val * 100).clip(0, 100)
+            
+        df['TIMESTAMP_PREDICAO'] = datetime.now()
         return df
 
-    def _sincronizar_bigquery_delta(self, df):
-        tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
+    def _upsert_bigquery(self, df):
+        tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_predicao_atual"
         tabela_stg = f"{tabela_final}_stg"
-
-        # 1. Verifica/Cria Tabela Final
-        try:
-            self.bq_client.get_table(tabela_final)
-        except NotFound:
-            logger.info(f"OURO: Criando tabela destino {tabela_final}")
-            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-            self.bq_client.load_table_from_dataframe(df, tabela_final, job_config=job_config).result()
-            return
-
-        # 2. Upload para Staging e MERGE
+        
+        # Load para Staging
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
 
+        # MERGE para evitar duplicidade e manter performance
         sql_merge = f"""
         MERGE `{tabela_final}` T
         USING `{tabela_stg}` S
-        ON T.H3_INDEX = S.H3_INDEX AND T.ANO_REFERENCIA = S.ANO_REFERENCIA
+        ON T.H3_INDEX = S.H3_INDEX
         WHEN MATCHED THEN
           UPDATE SET 
-            T.SCORE_RISCO_MOTORISTA = S.SCORE_RISCO_MOTORISTA,
-            T.SCORE_RISCO_PEDESTRE = S.SCORE_RISCO_PEDESTRE,
-            T.SCORE_RISCO_MOTOCICLISTA = S.SCORE_RISCO_MOTOCICLISTA,
-            T.ULTIMA_ATUALIZACAO = S.ULTIMA_ATUALIZACAO
+            T.RISCO_PREDICAO_ATUAL_MOTORISTA = S.RISCO_PREDICAO_ATUAL_MOTORISTA,
+            T.RISCO_PREDICAO_ATUAL_PEDESTRE = S.RISCO_PREDICAO_ATUAL_PEDESTRE,
+            T.RISCO_PREDICAO_ATUAL_MOTOCICLISTA = S.RISCO_PREDICAO_ATUAL_MOTOCICLISTA,
+            T.TIMESTAMP_PREDICAO = S.TIMESTAMP_PREDICAO,
+            T.DELTA_MOTORISTA = S.DELTA_MOTORISTA
         WHEN NOT MATCHED THEN
-          INSERT (H3_INDEX, ANO_REFERENCIA, SCORE_RISCO_MOTORISTA, SCORE_RISCO_PEDESTRE, SCORE_RISCO_MOTOCICLISTA, ULTIMA_ATUALIZACAO, INDICE_RESIDENCIAL, TOTAL_NAO_RES_H3, DENSIDADE_ENDERECOS)
-          VALUES (S.H3_INDEX, S.ANO_REFERENCIA, S.SCORE_RISCO_MOTORISTA, S.SCORE_RISCO_PEDESTRE, S.SCORE_RISCO_MOTOCICLISTA, S.ULTIMA_ATUALIZACAO, S.INDICE_RESIDENCIAL, S.TOTAL_NAO_RES_H3, S.DENSIDADE_ENDERECOS)
+          INSERT ROW
         """
         self.bq_client.query(sql_merge).result()
-        logger.info(f"OURO: Dados sincronizados com BigQuery.")
+        logger.info(f"OURO: Predição Atual sincronizada no BigQuery.")
 
 if __name__ == "__main__":
-    # Teste para o ano atual
-    CamadaOuroSafeDriver().processar_ouro(datetime.now().year)
+    CamadaOuroSafeDriver().executar_predicao_atual()
