@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from google.cloud.exceptions import NotFound
 from autobot.comunicador import ComunicadorSafeDriver
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -32,17 +33,19 @@ class CamadaOuroSafeDriver:
         )
         self.comunicador = ComunicadorSafeDriver()
 
-        # Lógica de Autenticação para GitHub Actions (Memória) ou Local (Arquivo)
+        # Configuração de Pesos do Ensemble
+        self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
+
+        # Autenticação Google Cloud (Memória ou Local)
         gcp_json_raw = os.getenv("GCP_SA_JSON", "").strip()
-        
         try:
             if gcp_json_raw and gcp_json_raw.startswith("{"):
-                logger.info("OURO: Autenticando via Service Account JSON (Memoria).")
+                logger.info("OURO: Autenticando via Service Account JSON (Memória).")
                 cred_info = json.loads(gcp_json_raw)
                 credentials = service_account.Credentials.from_service_account_info(cred_info)
                 self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
             else:
-                logger.info("OURO: GCP_SA_JSON nao detectado. Usando Default Credentials locais.")
+                logger.info("OURO: Usando credenciais padrão locais.")
                 self.bq_client = bigquery.Client(project=self.project_id)
         except Exception as e:
             logger.error(f"Erro ao configurar cliente BigQuery: {e}")
@@ -51,17 +54,17 @@ class CamadaOuroSafeDriver:
     def processar_ouro(self, ano):
         path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
         try:
-            logger.info(f"OURO: Lendo dados da Prata para {ano}...")
+            logger.info(f"OURO: Iniciando processamento para o ano {ano}...")
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read()))
 
             modelos = self._carregar_modelos_ensemble()
-            df_final = self._gerar_scores_ensemble(lf, modelos)
+            df_final = self._gerar_scores_weighted_ensemble(lf, modelos)
 
             self._sincronizar_bigquery_delta(df_final)
             return True
         except Exception as e:
-            logger.error(f"Falha na Camada Ouro ({ano}): {e}")
+            logger.error(f"Falha na Camada Ouro para o ano {ano}: {e}")
             raise e
 
     def _carregar_modelos_ensemble(self):
@@ -77,21 +80,24 @@ class CamadaOuroSafeDriver:
                     modelos[p][alg] = None
         return modelos
 
-    def _gerar_scores_ensemble(self, lf, modelos):
+    def _gerar_scores_weighted_ensemble(self, lf, modelos):
         df = lf.to_pandas()
         features = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
 
         for p, mods in modelos.items():
             col = f"SCORE_RISCO_{p.upper()}"
-            preds_final = []
-            if all(f in df.columns for f in features):
-                if mods["catboost"]: preds_final.append(mods["catboost"].predict(df[features]))
-                if mods["lightgbm"]: preds_final.append(mods["lightgbm"].predict(df[features]))
+            
+            p_cat = mods["catboost"].predict(df[features]) if mods["catboost"] is not None else None
+            p_lgb = mods["lightgbm"].predict(df[features]) if mods["lightgbm"] is not None else None
 
-            if preds_final:
-                avg_preds = pd.DataFrame(preds_final).mean().values
-                max_val = avg_preds.max() if avg_preds.max() > 0 else 1
-                df[col] = (avg_preds / max_val * 100).clip(0, 100)
+            if p_cat is not None and p_lgb is not None:
+                score_final = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
+            else:
+                score_final = p_cat if p_cat is not None else (p_lgb if p_lgb is not None else 0.0)
+
+            # Normalização 0-100
+            if hasattr(score_final, "max") and score_final.max() > 0:
+                df[col] = (score_final / score_final.max() * 100).clip(0, 100)
             else:
                 df[col] = 0.0
 
@@ -102,6 +108,16 @@ class CamadaOuroSafeDriver:
         tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
         tabela_stg = f"{tabela_final}_stg"
 
+        # Garante a existência da tabela destino
+        try:
+            self.bq_client.get_table(tabela_final)
+        except NotFound:
+            logger.info(f"OURO: Criando tabela {tabela_final}...")
+            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+            self.bq_client.load_table_from_dataframe(df, tabela_final, job_config=job_config).result()
+            return
+
+        # Sincronização via MERGE
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
 
@@ -120,7 +136,7 @@ class CamadaOuroSafeDriver:
           VALUES (S.H3_INDEX, S.ANO_REFERENCIA, S.SCORE_RISCO_MOTORISTA, S.SCORE_RISCO_PEDESTRE, S.SCORE_RISCO_MOTOCICLISTA, S.ULTIMA_ATUALIZACAO, S.INDICE_RESIDENCIAL, S.TOTAL_NAO_RES_H3, S.DENSIDADE_ENDERECOS)
         """
         self.bq_client.query(sql_merge).result()
-        logger.info(f"OURO: Sincronizacao Delta concluida para {tabela_final}")
+        logger.info(f"OURO: Upsert finalizado em {tabela_final}")
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver()
