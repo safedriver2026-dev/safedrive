@@ -2,104 +2,100 @@ import os
 import pandas as pd
 import boto3
 import traceback
-from datetime import datetime
-from .comunicador import RoboComunicador
+import io
 import hashlib
 import h3
-import json
+import unicodedata
+from .comunicador import RoboComunicador
 
-def executar_processamento(robo: RoboComunicador, ano: int):
-    s3 = boto3.client('s3',
-                      endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
-                      aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
-                      aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"))
+class ProcessamentoPrata:
+    def __init__(self, robo: RoboComunicador):
+        self.robo = robo
+        self.s3 = boto3.client('s3',
+                                endpoint_url=os.environ.get("R2_ENDPOINT_URL"),
+                                aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
+                                aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"))
+        self.bucket = os.environ.get("R2_BUCKET_NAME")
+        self.sal_lgpd = os.environ.get("LGPD_SALT", "padrao_seguranca_safedriver")
 
-    bucket = os.environ.get("R2_BUCKET_NAME")
-    path_raw = f"safedriver/datalake/raw/ssp_{ano}_incremental.parquet"
-    path_silver = f"safedriver/datalake/silver/prata_{ano}.parquet"
-    geojson_path_r2 = "safedriver/geodata/BR_bairros_CD2022.geojson"
-    geojson_local_path = "BR_bairros_CD2022.geojson"
+    def normalizar(self, texto):
+        if not isinstance(texto, str):
+            return ""
+        texto = unicodedata.normalize("NFKD", texto)
+        texto = "".join(c for c in texto if not unicodedata.combining(c))
+        return texto.upper().strip()
 
-    lgpd_salt = os.environ.get("LGPD_SALT")
-    if not lgpd_salt:
-        robo.enviar_alerta_tecnico("Processamento Camada Prata", "LGPD_SALT não configurado. Usando salt padrão. **ATENÇÃO: Isso pode comprometer a segurança em produção.**")
-        lgpd_salt = "default_salt_para_testes_lgpd_producao"
-
-    try:
-        s3.download_file(bucket, path_raw, f"raw_data_temp_{ano}.parquet")
-        df_raw = pd.read_parquet(f"raw_data_temp_{ano}.parquet")
-        os.remove(f"raw_data_temp_{ano}.parquet")
-
-        # 1. Anonimização LGPD
-        df_raw['ID_ANONIMO'] = df_raw['NUM_BO'].astype(str) + df_raw['ANO_BO'].astype(str) + df_raw['NOME_DELEGACIA']
-        df_raw['ID_ANONIMO'] = df_raw['ID_ANONIMO'].apply(lambda x: hashlib.sha256(f"{x}{lgpd_salt}".encode()).hexdigest()[:12])
-
-        # Remover colunas sensíveis após anonimização, se necessário
-        # Ex: df_raw = df_raw.drop(columns=['NUM_BO', 'NOME_DELEGACIA'], errors='ignore')
-
-        # 2. Geoprocessamento H3
-        if 'LATITUDE' in df_raw.columns and 'LONGITUDE' in df_raw.columns:
-            df_raw['INDICE_H3'] = df_raw.apply(lambda row: h3.geo_to_h3(row['LATITUDE'], row['LONGITUDE'], 9) if pd.notna(row['LATITUDE']) and pd.notna(row['LONGITUDE']) else None, axis=1)
-        else:
-            robo.enviar_relatorio_operacional(f"Aviso: Colunas LATITUDE/LONGITUDE ausentes para o ano {ano}. INDICE_H3 não gerado.", 
-                                       {"Ano": ano, "Camada": "Prata"})
-            df_raw['INDICE_H3'] = None
-
-        # 3. Enriquecimento Geográfico com GeoJSON (Geógrafo)
+    def carregar_base_geografica(self):
+        caminho_geo = "safedriver/datalake/base_geografica/safedriver_geo_base_sp_h3_8.parquet"
         try:
-            s3.download_file(bucket, geojson_path_r2, geojson_local_path)
-            with open(geojson_local_path, 'r') as f:
-                geojson_data = json.load(f)
+            resposta = self.s3.get_object(Bucket=self.bucket, Key=caminho_geo)
+            df_geo = pd.read_parquet(io.BytesIO(resposta['Body'].read()))
+            df_geo['CHAVE_LOCALIDADE'] = (
+                df_geo['NM_MUN'].apply(self.normalizar) + "|" +
+                df_geo['NM_BAIRRO'].apply(self.normalizar) + "|" +
+                df_geo['LOGRADOURO_NORMALIZADO'].apply(self.normalizar)
+            )
+            return df_geo[['CHAVE_LOCALIDADE', 'H3_INDEX', 'DENSIDADE_LOGRADOUROS', 'PROPORCAO_RESIDENCIAL_H3']]
+        except Exception:
+            raise Exception("Falha ao carregar Master Geo Table do R2")
 
-            # Exemplo de enriquecimento: mapear H3 para nome de bairro ou outras features
-            # Esta é uma lógica simplificada. Em um cenário real, você faria um join espacial
-            # ou usaria o H3 para buscar propriedades de regiões.
+    def executar(self, ano):
+        caminho_bruta = f"safedriver/datalake/bruta/ssp_{ano}_bronze.parquet"
+        caminho_prata = f"safedriver/datalake/prata/ssp_{ano}_prata.parquet"
 
-            # Criar um dicionário de H3 para features do GeoJSON (exemplo)
-            h3_to_feature = {}
-            for feature in geojson_data['features']:
-                # Supondo que o GeoJSON tenha uma propriedade 'h3_index' ou similar
-                # Ou que você possa gerar H3 a partir das geometrias do GeoJSON
-                # Para este exemplo, vamos simular o enriquecimento
-                h3_to_feature[feature['properties'].get('CD_BAIRRO', 'UNKNOWN')] = {
-                    'NOME_BAIRRO_GEO': feature['properties'].get('NM_BAIRRO', 'Desconhecido'),
-                    'DENSIDADE_POP_GEO': 1000 # Exemplo
-                }
+        try:
+            self.robo.enviar_relatorio_operacional(f"Inicio Processamento Prata {ano}")
 
-            # Mapear o INDICE_H3 do DataFrame para as features do GeoJSON
-            # df_raw['NOME_BAIRRO_ENRIQUECIDO'] = df_raw['INDICE_H3'].map(h3_to_feature.get('h3_index_do_geojson', {}).get('NOME_BAIRRO_GEO'))
-            # Por enquanto, vamos usar placeholders para as features urbanas
-            df_raw['DENSIDADE_LOGRADOUROS'] = 0.5
-            df_raw['PROPORCAO_RESIDENCIAL_H3'] = 0.7
-            df_raw['TOTAL_EDIFICACOES_H3'] = 100
+            resposta_bruta = self.s3.get_object(Bucket=self.bucket, Key=caminho_bruta)
+            df = pd.read_parquet(io.BytesIO(resposta_bruta['Body'].read()))
 
-        except s3.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == 'NotFound':
-                robo.enviar_relatorio_operacional(f"Aviso: Arquivo GeoJSON '{geojson_path_r2}' não encontrado no R2. Enriquecimento geográfico pulado.", 
-                                           {"Ano": ano, "Camada": "Prata"})
-            else:
-                raise
-        except Exception as e:
-            robo.enviar_alerta_tecnico(f"Processamento Camada Prata - Erro no enriquecimento geográfico para o ano {ano}", str(e))
-            raise
-        finally:
-            if os.path.exists(geojson_local_path):
-                os.remove(geojson_local_path)
+            df['MUNICIPIO'] = df['MUNICIPIO'].apply(self.normalizar)
+            df['BAIRRO'] = df['BAIRRO'].apply(self.normalizar)
+            df['LOGRADOURO'] = df['LOGRADOURO'].apply(self.normalizar)
+            df['CHAVE_LOCALIDADE'] = df['MUNICIPIO'] + "|" + df['BAIRRO'] + "|" + df['LOGRADOURO']
 
-        # 4. Enriquecimento Temporal (Exemplo)
-        df_raw['DATA_OCORRENCIA_BO'] = pd.to_datetime(df_raw['DATA_OCORRENCIA_BO'], errors='coerce')
-        df_raw['EH_FERIADO'] = False # Lógica de feriados seria implementada aqui
-        df_raw['DIA_PAGAMENTO'] = False # Lógica de dia de pagamento seria implementada aqui
-        df_raw['PESO_CRIME'] = 1 # Lógica de peso do crime seria implementada aqui
+            df['LATITUDE'] = pd.to_numeric(df['LATITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
+            df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
 
-        df_raw.to_parquet(f"silver_data_temp_{ano}.parquet", index=False)
-        s3.upload_file(f"silver_data_temp_{ano}.parquet", bucket, path_silver)
-        os.remove(f"silver_data_temp_{ano}.parquet")
+            mask_gps_valido = (df['LATITUDE'].notnull()) & (df['LATITUDE'] != 0) & (df['LONGITUDE'] != 0)
+            
+            df.loc[mask_gps_valido, 'H3_INDEX'] = [
+                h3.latlng_to_cell(lat, lon, 8) 
+                for lat, lon in zip(df.loc[mask_gps_valido, 'LATITUDE'], df.loc[mask_gps_valido, 'LONGITUDE'])
+            ]
 
-        robo.enviar_relatorio_operacional(f"✅ Camada Prata processada e salva no R2 para o ano {ano}.", 
-                                   {"Registros Processados": len(df_raw),
-                                    "Camada": "Prata"})
-        return True
-    except Exception:
-        robo.enviar_alerta_tecnico(f"Processamento Camada Prata - Ano {ano}", traceback.format_exc())
-        return False
+            df_geo = self.carregar_base_geografica()
+
+            mask_recuperacao = df['H3_INDEX'].isnull()
+            if mask_recuperacao.any():
+                df_recuperado = pd.merge(
+                    df.loc[mask_recuperacao].drop(columns=['H3_INDEX']),
+                    df_geo[['CHAVE_LOCALIDADE', 'H3_INDEX']],
+                    on='CHAVE_LOCALIDADE',
+                    how='inner'
+                )
+                df = pd.concat([df.loc[~mask_recuperacao], df_recuperado], ignore_index=True)
+
+            df = pd.merge(df, df_geo.drop(columns=['CHAVE_LOCALIDADE', 'H3_INDEX']), on='H3_INDEX', how='inner')
+
+            df['ID_ANONIMO'] = (df['NUM_BO'].astype(str) + df['ANO_BO'].astype(str) + self.sal_lgpd).apply(
+                lambda x: hashlib.sha256(x.encode()).hexdigest()[:16]
+            )
+
+            colunas_remover = ['NUM_BO', 'LATITUDE', 'LONGITUDE', 'CHAVE_LOCALIDADE']
+            df_final = df.drop(columns=[c for c in colunas_remover if c in df.columns])
+
+            buffer = io.BytesIO()
+            df_final.to_parquet(buffer, index=False)
+            self.s3.put_object(Bucket=self.bucket, Key=caminho_prata, Body=buffer.getvalue())
+
+            self.robo.enviar_relatorio_operacional(f"Sucesso Prata {ano}", {"Registros Finais": len(df_final)})
+            return True
+
+        except Exception:
+            self.robo.enviar_alerta_tecnico(f"Erro Prata {ano}", traceback.format_exc())
+            return False
+
+def iniciar_processamento_prata(robo, ano):
+    processador = ProcessamentoPrata(robo)
+    return processador.executar(ano)
