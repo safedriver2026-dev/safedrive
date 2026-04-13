@@ -8,14 +8,18 @@ from autobot.treinador_ia import TreinadorEvolutivo
 from autobot.ia_sincronizacao_ouro import CamadaOuroSafeDriver
 from autobot.comunicador import ComunicadorSafeDriver
 
-# Configuração de Logs
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+# Configuração de Log Profissional
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
 
 def executar_pipeline():
-    parser = argparse.ArgumentParser(description="Orquestrador SafeDriver Autobot")
-    parser.add_argument("--weekly", action="store_true", help="Executa Bronze (Ingestão) e Prata (Limpeza)")
-    parser.add_argument("--daily", action="store_true", help="Executa Treino IA e Ouro (BigQuery)")
+    parser = argparse.ArgumentParser(description="Orquestrador SafeDriver Autobot v3.0 - MLOps Edition")
+    parser.add_argument("--weekly", action="store_true", help="Ciclo de Engenharia: Bronze e Prata")
+    parser.add_argument("--daily", action="store_true", help="Ciclo de Inteligência: Treino Evolutivo e Ouro")
     args = parser.parse_args()
 
     comunicador = ComunicadorSafeDriver()
@@ -23,46 +27,53 @@ def executar_pipeline():
     ano_atual = inicio_geral.year
 
     try:
-        # --- CICLO SEMANAL: DADOS BRUTOS ---
+        # --- CICLO SEMANAL: ENGENHARIA DE DADOS ---
         if args.weekly:
-            logger.info("🚀 Iniciando Ciclo Semanal: Bronze e Prata")
+            logger.info("🚀 [WEEKLY] Iniciando extração e higienização (Bronze -> Prata)")
             raw = IngestaoRaw()
             prata = ProcessamentoPrata()
             
             for ano in range(2022, ano_atual + 1):
-                # Só avança para a Prata se a Ingestão (Bronze) der OK ou o arquivo já existir
+                # A Prata só roda se a Bronze garantir o dado bruto
                 if raw.executar_ingestao(ano):
                     prata.executar_prata(ano)
                 else:
-                    logger.warning(f"Aviso: Pulando processamento Prata para o ano {ano} devido a falha na Bronze.")
+                    logger.warning(f"Aviso: Bronze falhou para {ano}. Prata abortada para este ano.")
             
-            tempo_total = str(datetime.now() - inicio_geral).split(".")[0]
-            comunicador.relatar_sucesso(ano_atual, tempo_total, "Dados extraídos da SSP e higienizados na Prata (R2).")
+            tempo = str(datetime.now() - inicio_geral).split(".")[0]
+            comunicador.relatar_sucesso(ano_atual, tempo, "Carga semanal finalizada. Dados prontos no R2.")
 
-        # --- CICLO DIÁRIO: INTELIGÊNCIA E SCORE ---
+        # --- CICLO DIÁRIO: IA E ANALYTICS ---
         if args.daily:
-            logger.info("🧠 Iniciando Ciclo Diário: Treino e Ouro")
+            logger.info("🧠 [DAILY] Iniciando ciclo de MLOps (Treino -> Ouro)")
             treinador = TreinadorEvolutivo()
             ouro = CamadaOuroSafeDriver()
 
-            # O pipeline só sobe para o BigQuery se o retreino dos modelos for bem-sucedido
+            # 1. Treinador: Gera modelos versionados e meta-features (Memória)
             if treinador.treinar_modelo_mestre():
-                logger.info("Modelos atualizados. Sincronizando com BigQuery...")
+                logger.info("IA: Novos modelos versionados exportados com sucesso.")
+                
+                # 2. Ouro: Aplica os modelos (Cold Start ou Evolutivo) e sobe para o BigQuery
                 for ano in range(2022, ano_atual + 1):
                     ouro.processar_ouro(ano)
 
-                tempo_total = str(datetime.now() - inicio_geral).split(".")[0]
-                comunicador.relatar_sucesso(ano_atual, tempo_total, "Modelos IA retreinados e BigQuery atualizado via Merge Delta.")
+                tempo = str(datetime.now() - inicio_geral).split(".")[0]
+                comunicador.relatar_sucesso(
+                    ano_atual, 
+                    tempo, 
+                    "Ensemble 80/20 aplicado com Meta-Features. BigQuery atualizado."
+                )
             else:
-                logger.warning("Treinamento não gerou novos modelos. Camada Ouro ignorada para segurança.")
+                logger.error("IA: Falha no treinamento evolutivo. Abortando atualização da Ouro.")
+                comunicador.relatar_erro("Treinador IA", "Falha ao gerar modelos evolutivos.")
 
         if not args.weekly and not args.daily:
-            logger.warning("Nenhum modo de execução selecionado. Use --weekly ou --daily.")
+            logger.warning("Nenhum argumento detectado. Use --weekly ou --daily para iniciar.")
 
     except Exception as e:
-        logger.error(f"Falha Crítica no Pipeline: {e}")
-        # Envia o erro direto para o seu canal DISCORD_ERRO
-        comunicador.relatar_erro("Orquestrador (main.py)", str(e))
+        logger.error(f"💥 FALHA CRÍTICA: {e}")
+        # Notifica o canal DISCORD_ERRO imediatamente
+        comunicador.relatar_erro("Orquestrador Geral", str(e))
         sys.exit(1)
 
 if __name__ == "__main__":
