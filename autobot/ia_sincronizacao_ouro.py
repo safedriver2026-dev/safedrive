@@ -4,9 +4,11 @@ import boto3
 import joblib
 import io
 import os
+import json
 import logging
 from datetime import datetime
 from google.cloud import bigquery
+from google.oauth2 import service_account
 from botocore.exceptions import ClientError
 from autobot.comunicador import ComunicadorSafeDriver
 
@@ -29,8 +31,25 @@ class CamadaOuroSafeDriver:
             aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key
         )
-        self.bq_client = bigquery.Client(project=self.project_id)
         self.comunicador = ComunicadorSafeDriver()
+
+        # Autenticação Inteligente para Google Cloud / BigQuery
+        gcp_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        
+        try:
+            if gcp_creds.startswith("{"):
+                # Modo GitHub Actions: Carrega as credenciais a partir da string JSON do Secret
+                logger.info("OURO: Autenticando via Service Account JSON (Memoria).")
+                cred_info = json.loads(gcp_creds)
+                credentials = service_account.Credentials.from_service_account_info(cred_info)
+                self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
+            else:
+                # Modo Local: Usa o caminho do arquivo definido na variavel de ambiente
+                logger.info("OURO: Autenticando via arquivo de credenciais local.")
+                self.bq_client = bigquery.Client(project=self.project_id)
+        except Exception as e:
+            logger.error(f"Erro ao configurar cliente BigQuery: {e}")
+            raise e
 
     def processar_ouro(self, ano):
         path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
@@ -68,14 +87,17 @@ class CamadaOuroSafeDriver:
     def _gerar_scores_ensemble(self, lf, modelos):
         df = lf.to_pandas()
         
-        # As features exatas que saem da Camada Prata apos o Join com o IBGE
-        features = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
+        # Features atualizadas conforme a Camada Prata semantica
+        features = ['INDICE_RESIDENCIAL', 'TOTAL_NA_RES_H3', 'DENSIDADE_ENDERECOS']
+        
+        # Fallback caso os nomes variem levemente
+        if 'TOTAL_NAO_RES_H3' in df.columns:
+            features[1] = 'TOTAL_NAO_RES_H3'
 
         for p, mods in modelos.items():
             col = f"SCORE_RISCO_{p.upper()}"
             preds_final = []
             
-            # Valida se as features estao no dataframe antes de prever
             if all(f in df.columns for f in features):
                 if mods["catboost"]:
                     preds_final.append(mods["catboost"].predict(df[features]))
@@ -96,11 +118,11 @@ class CamadaOuroSafeDriver:
         tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidado"
         tabela_stg = f"{tabela_final}_stg"
 
-        # 1. Carrega para tabela de Staging (Sobrescreve sempre a STG)
+        # 1. Upload para Tabela de Staging (WRITE_TRUNCATE limpa a stg anterior)
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
 
-        # 2. Executa o MERGE (Upsert)
+        # 2. Execução do MERGE (Lógica Delta para evitar duplicidade)
         sql_merge = f"""
         MERGE `{tabela_final}` T
         USING `{tabela_stg}` S
@@ -116,8 +138,10 @@ class CamadaOuroSafeDriver:
           VALUES (S.H3_INDEX, S.ANO_REFERENCIA, S.SCORE_RISCO_MOTORISTA, S.SCORE_RISCO_PEDESTRE, S.SCORE_RISCO_MOTOCICLISTA, S.ULTIMA_ATUALIZACAO, S.INDICE_RESIDENCIAL, S.TOTAL_NAO_RES_H3, S.DENSIDADE_ENDERECOS)
         """
         self.bq_client.query(sql_merge).result()
-        logger.info(f"OURO: Sincronizacao Delta concluida para {tabela_final}")
+        logger.info(f"OURO: Sincronizacao Delta (Merge) concluida para {tabela_final}")
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver()
-    ouro.processar_ouro(datetime.now().year)
+    ano_atual = datetime.now().year
+    for ano in range(2022, ano_atual + 1):
+        ouro.processar_ouro(ano)
