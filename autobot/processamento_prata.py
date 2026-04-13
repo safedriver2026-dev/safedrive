@@ -6,6 +6,7 @@ import h3
 import logging
 from datetime import datetime
 from botocore.exceptions import ClientError
+from autobot.sanitizador_lgpd import SanitizadorLGPD
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class ProcessamentoPrata:
             aws_secret_access_key=self.secret_key
         )
         self.h3_resolution = 8
+        self.sanitizador = SanitizadorLGPD()
 
     def executar_prata(self, ano):
         path_bronze = f"datalake/bronze/ssp_raw_{ano}.xlsx"
@@ -58,6 +60,8 @@ class ProcessamentoPrata:
                 axis=1
             )
             lf_ssp = pl.from_pandas(df_pandas)
+
+            lf_ssp = self.sanitizador.higienizar(lf_ssp)
 
             lf_crimes = self._agregar_crimes(lf_ssp)
 
