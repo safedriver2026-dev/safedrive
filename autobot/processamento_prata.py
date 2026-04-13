@@ -44,11 +44,14 @@ class ProcessamentoPrata:
             except:
                 pass
 
-            logger.info(f"PRATA: Lendo dados brutos de {ano}...")
+            logger.info(f"PRATA: Lendo e consolidando todas as abas de {ano}...")
             resp_ssp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
             conteudo_excel = resp_ssp['Body'].read()
 
-            lf_ssp = self._ler_aba_correta(conteudo_excel, ano)
+            lf_ssp = self._extrair_todas_as_abas(conteudo_excel)
+
+            if lf_ssp is None or lf_ssp.is_empty():
+                raise ValueError(f"Nenhum dado valido encontrado no arquivo de {ano}")
 
             resp_geo = self.s3.get_object(Bucket=self.bucket, Key=path_geo)
             lf_geo = pl.read_parquet(io.BytesIO(resp_geo['Body'].read()))
@@ -84,30 +87,42 @@ class ProcessamentoPrata:
                 Body=buffer.getvalue()
             )
 
-            logger.info(f"PRATA: Processamento concluido para {ano}.")
+            logger.info(f"PRATA: Consolidacao total concluida para {ano}.")
             return True
 
         except Exception as e:
             logger.error(f"Erro na Camada Prata ({ano}): {e}")
             raise e
 
-    def _ler_aba_correta(self, conteudo, ano):
-        for aba_id in [2, 1, 3]:
+    def _extrair_todas_as_abas(self, conteudo):
+        lista_dfs = []
+        excel = pl.read_excel(io.BytesIO(conteudo), sheet_id=0) # Apenas para validar se abre
+        
+        # Tenta ler ate 13 abas (capa + 12 meses)
+        for i in range(1, 14):
             try:
-                df = pl.read_excel(io.BytesIO(conteudo), sheet_id=aba_id)
-                if "LATITUDE" in df.columns or "Latitude" in df.columns:
-                    if "Latitude" in df.columns:
-                        df = df.rename({"Latitude": "LATITUDE", "Longitude": "LONGITUDE"})
-                    logger.info(f"PRATA: Dados encontrados na aba {aba_id} do arquivo de {ano}.")
-                    return df
+                df = pl.read_excel(io.BytesIO(conteudo), sheet_id=i)
+                
+                # Normaliza nomes de colunas para busca
+                colunas_atuais = {c: c.upper() for c in df.columns}
+                df = df.rename(colunas_atuais)
+
+                if "LATITUDE" in df.columns:
+                    logger.info(f"PRATA: Extraindo dados da aba {i}.")
+                    # Garante que as colunas criticas sejam strings para evitar conflitos no concat
+                    df = df.with_columns(pl.all().cast(pl.Utf8))
+                    lista_dfs.append(df)
             except:
                 continue
-        raise ValueError(f"Nao foi possivel encontrar a coluna LATITUDE no Excel de {ano}")
+        
+        if lista_dfs:
+            return pl.concat(lista_dfs, how="diagonal")
+        return None
 
     def _agregar_crimes(self, lf):
         return lf.group_by("H3_INDEX").agg([
             pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("(?i)Veículo|Automóvel|Carro")).count().alias("TOTAL_CRIMES_MOTORISTA"),
-            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("(?i)Celular|Transeunte|Transeunte")).count().alias("TOTAL_CRIMES_PEDESTRE"),
+            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("(?i)Celular|Transeunte")).count().alias("TOTAL_CRIMES_PEDESTRE"),
             pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("(?i)Motocicleta|Moto")).count().alias("TOTAL_CRIMES_MOTOCICLISTA")
         ])
 
