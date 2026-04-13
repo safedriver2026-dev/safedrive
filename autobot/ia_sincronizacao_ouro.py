@@ -19,17 +19,14 @@ logger = logging.getLogger(__name__)
 
 class CamadaOuroSafeDriver:
     def __init__(self):
-        # Conexões Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        # Conexões Google BigQuery
         self.project_id = os.getenv("BQ_PROJECT_ID", "").strip()
         self.dataset_id = os.getenv("BQ_DATASET_ID", "").strip()
 
-        # BLINDAGEM PARA CLOUDFLARE R2
         self.s3 = boto3.client(
             's3',
             endpoint_url=self.endpoint,
@@ -40,11 +37,8 @@ class CamadaOuroSafeDriver:
         
         self.cal = CalendarioEstrategico()
         self.comunicador = ComunicadorSafeDriver()
-
-        # Configuração de Pesos do Ensemble (Produção)
         self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
         
-        # Features alinhadas com o Treinador
         self.features_base = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
         self.features_delta = ['DELTA_MOTORISTA', 'DELTA_PEDESTRE', 'DELTA_MOTOCICLISTA']
         self.meta_features = ['ULTIMO_MAE_CAT', 'ULTIMO_MAE_LGB']
@@ -52,7 +46,7 @@ class CamadaOuroSafeDriver:
         self._conectar_bigquery()
 
     def _conectar_bigquery(self):
-        gcp_json = os.getenv("GCP_SA_JSON", "").strip()
+        gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
         try:
             if gcp_json.startswith("{"):
                 cred_info = json.loads(gcp_json)
@@ -61,125 +55,106 @@ class CamadaOuroSafeDriver:
             else:
                 self.bq_client = bigquery.Client(project=self.project_id)
         except Exception as e:
-            logger.error(f"Erro Crítico ao autenticar BigQuery: {e}")
+            logger.error(f"Falha na autenticação do Google Cloud: {e}")
 
     def executar_predicao_atual(self):
-        """Orquestra a inferência e sincronização dos dados de risco."""
-        logger.info("OURO: Iniciando motor de Predição Atual...")
-        
+        logger.info("OURO: Iniciando processamento de Predição de Risco Atual.")
         try:
-            modelos = self._carregar_modelos_vivos()
-            df_input = self._obter_contexto_recente()
+            modelos = self._carregar_modelos_producao()
+            df_input = self._obter_contexto_datalake()
             
             if df_input is None:
-                raise Exception("Base de contexto (Prata) não localizada no Data Lake.")
+                raise FileNotFoundError("Base de contexto (Prata) não localizada em safedriver/datalake/prata/.")
 
-            df_predicao = self._gerar_scores_com_contexto(df_input, modelos)
-            self._upsert_bigquery(df_predicao)
-            
+            df_final = self._gerar_scores_ponderados(df_input, modelos)
+            self._sincronizar_fato_risco(df_final)
             return True
-
         except Exception as e:
-            logger.error(f"FALHA NA CAMADA OURO: {e}")
+            logger.error(f"Falha na execução da Camada Ouro: {e}")
             return False
 
-    def _carregar_modelos_vivos(self):
+    def _carregar_modelos_producao(self):
         modelos = {}
-        for p in ["motorista", "pedestre", "motociclista"]:
-            modelos[p] = {}
+        for persona in ["motorista", "pedestre", "motociclista"]:
+            modelos[persona] = {}
             for alg in ["cat", "lgb"]:
-                path = f"modelos_ml/latest_{alg}_{p}.pkl"
+                # Caminho atualizado conforme estrutura do bucket
+                path = f"safedriver/modelos_ml/latest_{alg}_{persona}.pkl"
                 try:
                     obj = self.s3.get_object(Bucket=self.bucket, Key=path)
-                    modelos[p][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-                except ClientError as e:
-                    if 'NoSuchKey' in str(e):
-                        logger.warning(f"Modelo {path} não encontrado no storage.")
-                    else:
-                        logger.error(f"Erro de acesso ao modelo {path}: {e}")
-                    modelos[p][alg] = None
+                    modelos[persona][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
+                except ClientError:
+                    modelos[persona][alg] = None
         return modelos
 
-    def _obter_contexto_recente(self):
-        """Busca a Prata mais atual via direct read (sem ListObjects) e injeta Meta-Features."""
+    def _obter_contexto_datalake(self):
         ano_atual = datetime.now().year
-        
         for ano in range(ano_atual, 2021, -1):
+            # Caminho atualizado: safedriver/datalake/prata/
             path = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=path)
-                logger.info(f"OURO: Utilizando Datalake Prata referência {ano}.")
+                logger.info(f"OURO: Contexto de inferência baseado no ciclo {ano}.")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read())).to_pandas().fillna(0)
                 
-                # Injeta a memória de erro (MAE)
-                for p in ["motorista", "pedestre", "motociclista"]:
+                for persona in ["motorista", "pedestre", "motociclista"]:
                     try:
-                        meta_resp = self.s3.get_object(Bucket=self.bucket, Key=f"modelos_ml/meta_perf_{p}.json")
-                        meta = json.loads(meta_resp['Body'].read())
+                        meta_path = f"safedriver/modelos_ml/meta_perf_{persona}.json"
+                        meta_obj = self.s3.get_object(Bucket=self.bucket, Key=meta_path)
+                        meta = json.loads(meta_obj['Body'].read())
                         df['ULTIMO_MAE_CAT'] = meta.get('mae_cat', 0.0)
                         df['ULTIMO_MAE_LGB'] = meta.get('mae_lgb', 0.0)
                     except:
                         df['ULTIMO_MAE_CAT'], df['ULTIMO_MAE_LGB'] = 0.0, 0.0
                 return df
-                
-            except ClientError as e:
-                # Se não achou o arquivo desse ano, vai para o anterior silenciosamente
-                if 'NoSuchKey' in str(e):
-                    continue
-                else:
-                    logger.error(f"Erro de permissão ou rede ao acessar a Prata de {ano}: {e}")
-                    continue
+            except ClientError:
+                continue
         return None
 
-    def _gerar_scores_com_contexto(self, df, modelos):
+    def _gerar_scores_ponderados(self, df, modelos):
         features = self.features_base + self.features_delta + self.meta_features
         multiplicadores = self.cal.obter_multiplicadores()
         
         for persona, mods in modelos.items():
-            col_target = f"RISCO_PREDICAO_ATUAL_{persona.upper()}"
-            
+            nome_col = f"RISCO_PREDICAO_ATUAL_{persona.upper()}"
             p_cat = mods["cat"].predict(df[features]) if mods["cat"] is not None else 0
             p_lgb = mods["lgb"].predict(df[features]) if mods["lgb"] is not None else 0
             
-            score_ia = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
+            score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
             
-            df[col_target] = score_ia
+            df[nome_col] = score_base
+            is_comercial = df['TOTAL_NAO_RES_H3'] > df['INDICE_RESIDENCIAL']
             
-            # Ajuste de Negócio (Calendário)
-            mask_comercial = df['TOTAL_NAO_RES_H3'] > df['INDICE_RESIDENCIAL']
-            df.loc[mask_comercial, col_target] *= multiplicadores["comercial"]
-            df.loc[~mask_comercial, col_target] *= multiplicadores["residencial"]
+            df.loc[is_comercial, nome_col] *= multiplicadores["comercial"]
+            df.loc[~is_comercial, nome_col] *= multiplicadores["residencial"]
+            df[nome_col] = (df[nome_col] * multiplicadores["geral"])
             
-            df[col_target] = (df[col_target] * multiplicadores["geral"])
-            max_val = df[col_target].max() if df[col_target].max() > 0 else 1
-            df[col_target] = (df[col_target] / max_val * 100).clip(0, 100)
+            max_risk = df[nome_col].max() if df[nome_col].max() > 0 else 1
+            df[nome_col] = (df[nome_col] / max_risk * 100).clip(0, 100)
             
-        df['TIMESTAMP_PREDICAO'] = datetime.now()
+        df['TIMESTAMP_SINCRONIZACAO'] = datetime.now()
         return df
 
-    def _upsert_bigquery(self, df):
-        tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_predicao_atual"
-        tabela_stg = f"{tabela_final}_stg"
+    def _sincronizar_fato_risco(self, df):
+        tabela_destino = f"{self.project_id}.{self.dataset_id}.fato_risco_predicao_atual"
+        tabela_staging = f"{tabela_destino}_staging"
         
-        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-        self.bq_client.load_table_from_dataframe(df, tabela_stg, job_config=job_config).result()
+        config_job = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+        self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=config_job).result()
 
-        sql_merge = f"""
-        MERGE `{tabela_final}` T
-        USING `{tabela_stg}` S
+        query_merge = f"""
+        MERGE `{tabela_destino}` T
+        USING `{tabela_staging}` S
         ON T.H3_INDEX = S.H3_INDEX
         WHEN MATCHED THEN
           UPDATE SET 
             T.RISCO_PREDICAO_ATUAL_MOTORISTA = S.RISCO_PREDICAO_ATUAL_MOTORISTA,
             T.RISCO_PREDICAO_ATUAL_PEDESTRE = S.RISCO_PREDICAO_ATUAL_PEDESTRE,
             T.RISCO_PREDICAO_ATUAL_MOTOCICLISTA = S.RISCO_PREDICAO_ATUAL_MOTOCICLISTA,
-            T.TIMESTAMP_PREDICAO = S.TIMESTAMP_PREDICAO,
+            T.TIMESTAMP_SINCRONIZACAO = S.TIMESTAMP_SINCRONIZACAO,
             T.DELTA_MOTORISTA = S.DELTA_MOTORISTA
         WHEN NOT MATCHED THEN
           INSERT ROW
         """
-        self.bq_client.query(sql_merge).result()
-        logger.info(f"OURO: Predição Atual sincronizada e atualizada no BigQuery.")
-
-if __name__ == "__main__":
-    CamadaOuroSafeDriver().executar_predicao_atual()
+        self.bq_client.query(query_merge).result()
+        logger.info("OURO: Sincronização BigQuery concluída.")
