@@ -1,140 +1,117 @@
 import polars as pl
 import boto3
-import json
-import os
 import io
+import os
 import h3
 import logging
+from datetime import datetime
+from botocore.exceptions import ClientError
 
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configuração de Logs para monitorização no GitHub Actions
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
-       
-        try:
-            self.s3 = boto3.client('s3',
-                                    endpoint_url=os.getenv("R2_ENDPOINT_URL"),
-                                    aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
-                                    aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"))
-            self.bucket = os.getenv("R2_BUCKET_NAME")
-        except Exception as e:
-            logger.error(f"Erro ao conectar ao R2: {e}")
-            raise
+        # 🛡️ SANITIZAÇÃO: .strip() remove espaços ou quebras de linha nas credenciais
+        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip()
+        self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+        self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+        self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
-        self.colunas_canonicas = [
-            'NUM_BO', 'DATA_OCORRENCIA', 'LATITUDE', 'LONGITUDE', 
-            'LOGRADOURO', 'NATUREZA_APURADA', 'DESCRICAO_LOCAL'
-        ]
-
-    def _converter_para_h3(self, lat, lon):
-        try:
-            return h3.latlng_to_cell(float(lat), float(lon), 8)
-        except:
-            return None
-
-    def executar_prata(self, ano_ref):
-        logger.info(f" INICIANDO REFINARIA PRATA - ANO: {ano_ref}")
-
-       
-        try:
-         
-            resp_dic = self.s3.get_object(Bucket=self.bucket, Key="datalake/bronze/mapa_capas_ssp.json")
-            mapa_ano = json.loads(resp_dic['Body'].read().decode('utf-8')).get(str(ano_ref), {})
-            de_para = self._gerar_mapeamento_canonico(mapa_ano)
-
+        self.s3 = boto3.client(
+            's3',
+            endpoint_url=self.endpoint,
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.secret_key
+        )
         
-            resp_geo = self.s3.get_object(Bucket=self.bucket, Key="datalake/base_geografica/safedriver_geo_base_sp_h3_8.parquet")
-      
-            lf_geo = pl.scan_parquet(io.BytesIO(resp_geo['Body'].read()))
+        # Resolução H3 Nível 8 (Equilíbrio ideal para análise de risco urbano)
+        self.h3_resolution = 8
 
-         
-            resp_raw = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/bronze/ssp_raw_{ano_ref}.parquet")
-            lf_ssp = pl.scan_parquet(io.BytesIO(resp_raw['Body'].read()))
-        except Exception as e:
-            logger.error(f"Falha no carregamento de arquivos: {e}")
-            return
+    def executar_prata(self, ano):
+        """
+        Processa o ano solicitado: Bronze (CSV) -> Prata (Parquet).
+        Aplica a lógica de H3 e enriquecimento de infraestrutura.
+        """
+        path_bronze = f"datalake/bronze/ssp_raw_{ano}.csv"
+        path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
 
-       
-        pipeline = (
-            lf_ssp.rename(de_para)
-            .select([pl.col(c) for c in self.colunas_canonicas if c in lf_ssp.columns])
-            .with_columns([
-                pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False),
-                pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False),
-                pl.col("NATUREZA_APURADA").str.to_uppercase(),
-                pl.col("LOGRADOURO").str.to_uppercase().str.strip_chars()
-            ])
-       
-            .filter(
-                (pl.col("LATITUDE").is_between(-25.31, -19.77)) & 
-                (pl.col("LONGITUDE").is_between(-53.11, -44.16))
+        try:
+            # 1. Verificação de Idempotência
+            try:
+                self.s3.head_object(Bucket=self.bucket, Key=path_prata)
+                logger.info(f"✅ [PRATA] O ano {ano} já está processado. A avançar.")
+                return True
+            except:
+                logger.info(f"🥈 [PRATA] A iniciar refinamento do ano {ano}...")
+
+            # 2. Carregar dados brutos da Camada Bronze
+            resp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
+            lf = pl.read_csv(io.BytesIO(resp['Body'].read()), ignore_errors=True)
+
+            # 3. Limpeza Geoespacial (Remove coordenadas inválidas ou fora de SP)
+            lf = lf.filter(
+                (pl.col("LATITUDE").is_not_null()) & 
+                (pl.col("LONGITUDE").is_not_null()) &
+                (pl.col("LATITUDE") < -20) & (pl.col("LATITUDE") > -26)
             )
-        )
 
-     
-        df_ssp = pipeline.collect()
-        
-        df_ssp = df_ssp.with_columns(
-            pl.struct(["LATITUDE", "LONGITUDE"])
-            .map_elements(lambda x: self._converter_para_h3(x["LATITUDE"], x["LONGITUDE"]), return_dtype=pl.Utf8)
-            .alias("H3_INDEX")
-        )
+            # 4. Indexação H3
+            # Convertemos para Pandas para usar a biblioteca h3-py de forma vetorizada
+            df_pandas = lf.to_pandas()
+            df_pandas['h3_index'] = df_pandas.apply(
+                lambda row: h3.geo_to_h3(row['LATITUDE'], row['LONGITUDE'], self.h3_resolution), 
+                axis=1
+            )
+            lf = pl.from_pandas(df_pandas)
 
-   
-        df_geo = lf_geo.collect()
-        base_busca = df_geo.select(["LOGRADOURO", "H3_INDEX"]).drop_nulls().unique(subset=["LOGRADOURO"])
+            # 5. Inteligência de Infraestrutura (Separação Residencial vs Comercial)
+            logger.info(f"🏗️ A calcular métricas de ocupação de solo para {ano}...")
+            lf = self._aplicar_engenharia_atributos(lf, ano)
 
-        com_gps = df_ssp.filter(pl.col("H3_INDEX").is_not_null())
-        sem_gps = df_ssp.filter(pl.col("H3_INDEX").is_null()).drop("H3_INDEX")
-        
-        sem_gps_recuperado = sem_gps.join(base_busca, on="LOGRADOURO", how="left")
-        
-        df_final = pl.concat([com_gps, sem_gps_recuperado], how="diagonal")
+            # 6. Gravação em formato Parquet (Otimizado para a IA)
+            buffer = io.BytesIO()
+            lf.write_parquet(buffer)
+            buffer.seek(0)
 
-       
-        df_final = df_final.filter(pl.col("H3_INDEX").is_not_null())
-        
-       
-        df_final = df_final.join(
-            df_geo.select(["H3_INDEX", "GEO_CD_SETOR", "GEO_NM_BAIRRO", "GEO_NM_MUN"]).unique(subset=["H3_INDEX"]),
-            on="H3_INDEX",
-            how="left"
-        )
+            logger.info(f"📤 A enviar Camada Prata consolidada para o R2: {path_prata}")
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=path_prata,
+                Body=buffer.getvalue()
+            )
+            return True
 
-      
-        df_final = df_final.with_columns(
-            pl.when(pl.col("NATUREZA_APURADA").str.contains("VEICULO|CARGA|ROUBO DE BENS"))
-            .then(pl.lit("MOTORISTA"))
-            .when(pl.col("NATUREZA_APURADA").str.contains("MOTOCICLETA|MOTO"))
-            .then(pl.lit("MOTOCICLISTA"))
-            .when(pl.col("NATUREZA_APURADA").str.contains("CELULAR|TRANSEUNTE|PEDESTRE"))
-            .then(pl.lit("PEDESTRE"))
-            .otherwise(pl.lit("GERAL"))
-            .alias("PERFIL_PERSONA")
-        )
+        except Exception as e:
+            logger.error(f"❌ Erro no processamento Prata de {ano}: {e}")
+            raise e
 
-     
-        buffer = io.BytesIO()
-        df_final.write_parquet(buffer)
-        
-        self.s3.put_object(
-            Bucket=self.bucket, 
-            Key=f"datalake/prata/ssp_consolidada_{ano_ref}.parquet", 
-            Body=buffer.getvalue()
-        )
-        
-        logger.info(f"✅ Camada Prata Finalizada. Retenção: {(df_final.height / lf_ssp.collect().height)*100:.2f}%")
+    def _aplicar_engenharia_atributos(self, lf, ano):
+        """
+        Lógica solicitada: Subtrai o residencial do geral para isolar o comercial/industrial.
+        Calcula também a taxa de ocupação para o modelo de IA.
+        """
+        return lf.with_columns([
+            pl.lit(ano).alias("ANO_REFERENCIA"),
+            
+            # Cálculo de endereços Não-Residenciais (Comerciais/Industriais/Públicos)
+            (pl.col("TOTAL_GERAL") - pl.col("TOTAL_RESIDENCIAL")).alias("TOTAL_NAO_RESIDENCIAL"),
+            
+            # Taxa de Residencialidade (Métrica crucial para o CatBoost)
+            (pl.col("TOTAL_RESIDENCIAL") / pl.col("TOTAL_GERAL")).alias("INDICE_RESIDENCIAL"),
+            
+            # Densidade de Ocupação
+            (pl.col("TOTAL_GERAL") / pl.col("AREA_HEXAGONO")).alias("DENSIDADE_ENDERECOS")
+        ])
 
-    def _gerar_mapeamento_canonico(self, mapa_ano):
-        de_para = {}
-        for col, desc in mapa_ano.items():
-            d = str(desc).upper()
-            if "LATITUDE" in d: de_para[col] = "LATITUDE"
-            elif "LONGITUDE" in d: de_para[col] = "LONGITUDE"
-            elif "BOLETIM" in d: de_para[col] = "NUM_BO"
-            elif "DATA" in d: de_para[col] = "DATA_OCORRENCIA"
-            elif "NATUREZA" in d: de_para[col] = "NATUREZA_APURADA"
-            elif "LOGRADOURO" in d: de_para[col] = "LOGRADOURO"
-        return de_para
+# ==========================================
+# EXECUÇÃO HISTÓRICA COMPLETA
+# ==========================================
+if __name__ == "__main__":
+    prata = ProcessamentoPrata()
+    ano_inicio = 2022
+    ano_fim = datetime.now().year
+    
+    for a in range(ano_inicio, ano_fim + 1):
+        prata.executar_prata(a)
