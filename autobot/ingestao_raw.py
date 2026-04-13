@@ -4,7 +4,7 @@ import boto3
 import pandas as pd
 import traceback
 from datetime import datetime
-from comunicador import RoboComunicador
+from .comunicador import RoboComunicador
 
 def executar_ingestao(robo: RoboComunicador):
     s3 = boto3.client('s3',
@@ -75,28 +75,29 @@ def executar_ingestao(robo: RoboComunicador):
                         df_novo = pd.concat([df_novo, df_sheet], ignore_index=True)
                 except Exception as sheet_e:
                     print(f"Aviso: Falha ao ler a aba '{sheet_name}': {sheet_e}")
-            if df_novo.empty:
-                raise ValueError("Nenhum dado válido encontrado nas abas do arquivo SSP.")
         else:
             df_novo = pd.read_excel(res_data.content)
+
+        if df_novo.empty:
+            print("Aviso: DataFrame da SSP está vazio após leitura. Nenhuma ingestão será realizada.")
+            robo.enviar_relatorio_operacional("Camada Bronze: DataFrame da SSP vazio. Ingestão pulada.", 
+                                       {"URL Fonte": url, "Camada": "Bronze (Raw)"})
+            return False
+
+        df_novo.columns = df_novo.columns.str.upper().str.strip().str.replace(' ', '_')
 
         novos_registros = len(df_novo)
 
         if base_existente_no_r2:
-            try:
-                s3.download_file(bucket, path_raw, "raw_local.parquet")
-                df_atual = pd.read_parquet("raw_local.parquet")
+            print(f"DEBUG INGESTÃO: Baixando base existente do R2 para concatenação: {path_raw}")
+            s3.download_file(bucket, path_raw, "raw_local.parquet")
+            df_existente = pd.read_parquet("raw_local.parquet")
 
-                df_final = pd.concat([df_atual, df_novo]).drop_duplicates(
-                    subset=['NUM_BO', 'ANO_BO', 'NOME_DELEGACIA'], keep='first'
-                )
-                novos_registros = len(df_final) - len(df_atual)
-                print(f"Adicionados {novos_registros} novos registros à base existente.")
-            except Exception as concat_e:
-                print(f"Aviso: Falha ao carregar base existente do R2 para concatenação: {concat_e}. Prosseguindo com apenas os novos dados.")
-                df_final = df_novo
+            df_final = pd.concat([df_existente, df_novo]).drop_duplicates().reset_index(drop=True)
+            novos_registros = len(df_final) - len(df_existente)
+            print(f"DEBUG INGESTÃO: Base existente e nova concatenadas. Total de registros: {len(df_final)}. Novos: {novos_registros}")
         else:
-            print("Primeira ingestão da camada Bronze. Criando arquivo no R2.")
+            print("DEBUG INGESTÃO: Primeira ingestão da camada Bronze. Criando arquivo no R2.")
             df_final = df_novo
 
         df_final.to_parquet("raw_final.parquet", index=False)
