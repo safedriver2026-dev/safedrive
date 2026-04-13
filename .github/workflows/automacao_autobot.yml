@@ -39,7 +39,7 @@ jobs:
         DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         LGPD_SALT: ${{ secrets.LGPD_SALT }}
       run: |
-        python autobot/motor_analise_preditiva.py executar_pipeline_bronze_prata
+        python -m autobot.motor_analise_preditiva executar_pipeline_bronze_prata
 
     - name: Executar testes de segurança (APÓS A GERAÇÃO DA PRATA)
       env:
@@ -87,4 +87,4 @@ jobs:
         BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
         BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
       run: |
-        python autobot/motor_analise_preditiva.py executar_pipeline_ouro
+        python -m autobot.motor_analise_preditiva executar_pipeline_ouro
