@@ -132,7 +132,20 @@ class ProcessamentoPrata:
             try:
                 df = pl.read_excel(io.BytesIO(conteudo), sheet_id=i)
                 
-                cabecalhos_atuais = {c: mapa_colunas_dinamico.get(c.upper().strip(), c.upper().strip()) for c in df.columns}
+                cols_originais = df.columns
+                cabecalhos_atuais = {}
+                colunas_vistas = set()
+                
+                for c in cols_originais:
+                    limpo = c.upper().strip()
+                    traduzido = mapa_colunas_dinamico.get(limpo, limpo)
+                    
+                    if traduzido in colunas_vistas:
+                        traduzido = f"{traduzido}_DUPLICADA_{len(colunas_vistas)}"
+                    
+                    colunas_vistas.add(traduzido)
+                    cabecalhos_atuais[c] = traduzido
+
                 df = df.rename(cabecalhos_atuais)
                 
                 is_aba_valida = False
@@ -146,14 +159,17 @@ class ProcessamentoPrata:
                         is_aba_valida = True
 
                 if is_aba_valida:
+                    df = df.with_columns(pl.all().cast(pl.Utf8))
+                    
                     df = df.filter(
                         (pl.col("LATITUDE").is_not_null()) & 
-                        (pl.col("LATITUDE").cast(pl.Utf8) != "0")
+                        (~pl.col("LATITUDE").is_in(["0", "0.0", "0,0", "NULL", "NA", "", " "]))
                     )
-                    df = df.with_columns(pl.all().cast(pl.Utf8))
+                    
                     lista_dfs.append(df)
-                    logger.info(f"PRATA: Aba {i} validada e colunas traduzidas com sucesso.")
-            except:
+                    logger.info(f"PRATA: Aba {i} validada e extraida com sucesso.")
+            except Exception as e:
+                logger.warning(f"PRATA: Aba {i} ignorada devido a erro interno: {e}")
                 continue
         
         if lista_dfs:
