@@ -3,7 +3,6 @@ name: SafeDriver Autobot
 on:
   schedule:
     # Execução diária às 04:00 UTC (01:00 Horário de Brasília)
-    # Garante que o processamento ocorra fora do horário de pico do R2/BigQuery
     - cron: "0 4 * * *"
   
   workflow_dispatch:
@@ -32,7 +31,6 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar Dependências do Sensor
-        # Instala apenas o necessário para consultar o calendário e a AWS/R2
         run: |
           python -m pip install --upgrade pip
           pip install holidays boto3 pandas
@@ -52,12 +50,18 @@ jobs:
             exit 0
           fi
 
-          # 2. Verifica se o Datalake está vazio (Gatilho de Integridade)
-          # Utiliza um script Python in-line rápido para verificar o R2
+          # 2. Verifica se o Datalake está vazio (Gatilho de Integridade com Blindagem R2)
           DADOS_AUSENTES=$(python -c "
           import os, boto3
+          from botocore.config import Config
           try:
-              s3 = boto3.client('s3', endpoint_url=os.getenv('R2_ENDPOINT_URL').strip().rstrip('/'), aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'), aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'))
+              s3 = boto3.client(
+                  's3', 
+                  endpoint_url=os.getenv('R2_ENDPOINT_URL').strip().rstrip('/'), 
+                  aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'), 
+                  aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
+                  config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+              )
               s3.head_object(Bucket=os.getenv('R2_BUCKET_NAME'), Key='modelos_ml/latest_cat_motorista.pkl')
               print('False')
           except:
@@ -84,7 +88,6 @@ jobs:
   pipeline_producao:
     name: Motor Principal (Prata -> Treino -> Ouro)
     needs: decisao_estrategica
-    # O pipeline pesado só arranca se a decisão anterior for 'True'
     if: needs.decisao_estrategica.outputs.deve_prosseguir == 'True'
     runs-on: ubuntu-latest
     
@@ -96,13 +99,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # Acelera consideravelmente execuções futuras
+          cache: 'pip'
 
       - name: Instalação de Dependências de Produção
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install holidays h3 # Garantia contra falhas de cache
+          pip install holidays h3 # Garantia de instalação direta contra falhas de cache
 
       - name: Executar Orquestrador Principal (main.py)
         env:
@@ -113,10 +116,11 @@ jobs:
           
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
           
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+          LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
           if [ "${{ github.event.inputs.force_execution }}" == "true" ]; then
             python main.py --force
