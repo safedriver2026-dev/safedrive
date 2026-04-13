@@ -16,7 +16,7 @@ class ProcessamentoPrata:
                                 aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID"),
                                 aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY"))
         self.bucket = os.environ.get("R2_BUCKET_NAME")
-        self.sal_lgpd = os.environ.get("LGPD_SALT", "padrao_seguranca_safedriver")
+        self.sal_lgpd = os.environ.get("LGPD_SALT", "seguranca_safedriver_2026")
 
     def normalizar(self, texto):
         if not isinstance(texto, str):
@@ -30,38 +30,38 @@ class ProcessamentoPrata:
         try:
             resposta = self.s3.get_object(Bucket=self.bucket, Key=caminho_geo)
             df_geo = pd.read_parquet(io.BytesIO(resposta['Body'].read()))
+            
             df_geo['CHAVE_LOCALIDADE'] = (
                 df_geo['NM_MUN'].apply(self.normalizar) + "|" +
                 df_geo['NM_BAIRRO'].apply(self.normalizar) + "|" +
                 df_geo['LOGRADOURO_NORMALIZADO'].apply(self.normalizar)
             )
-            return df_geo[['CHAVE_LOCALIDADE', 'H3_INDEX', 'DENSIDADE_LOGRADOUROS', 'PROPORCAO_RESIDENCIAL_H3']]
+            return df_geo
         except Exception:
-            raise Exception("Falha ao carregar Master Geo Table do R2")
+            raise Exception("Falha ao carregar Master Geo Table")
 
     def executar(self, ano):
         caminho_bruta = f"safedriver/datalake/bruta/ssp_{ano}_bronze.parquet"
         caminho_prata = f"safedriver/datalake/prata/ssp_{ano}_prata.parquet"
 
         try:
-            self.robo.enviar_relatorio_operacional(f"Inicio Processamento Prata {ano}")
+            self.robo.enviar_relatorio_operacional(f"Inicio Prata Profunda {ano}")
 
             resposta_bruta = self.s3.get_object(Bucket=self.bucket, Key=caminho_bruta)
             df = pd.read_parquet(io.BytesIO(resposta_bruta['Body'].read()))
 
-            df['MUNICIPIO'] = df['MUNICIPIO'].apply(self.normalizar)
-            df['BAIRRO'] = df['BAIRRO'].apply(self.normalizar)
-            df['LOGRADOURO'] = df['LOGRADOURO'].apply(self.normalizar)
-            df['CHAVE_LOCALIDADE'] = df['MUNICIPIO'] + "|" + df['BAIRRO'] + "|" + df['LOGRADOURO']
+            df['MUNICIPIO_NORM'] = df['MUNICIPIO'].apply(self.normalizar)
+            df['BAIRRO_NORM'] = df['BAIRRO'].apply(self.normalizar)
+            df['LOGRADOURO_NORM'] = df['LOGRADOURO'].apply(self.normalizar)
+            df['CHAVE_LOCALIDADE'] = df['MUNICIPIO_NORM'] + "|" + df['BAIRRO_NORM'] + "|" + df['LOGRADOURO_NORM']
 
             df['LATITUDE'] = pd.to_numeric(df['LATITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
             df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'].astype(str).str.replace(',', '.'), errors='coerce')
 
-            mask_gps_valido = (df['LATITUDE'].notnull()) & (df['LATITUDE'] != 0) & (df['LONGITUDE'] != 0)
-            
-            df.loc[mask_gps_valido, 'H3_INDEX'] = [
+            mask_gps = (df['LATITUDE'].notnull()) & (df['LATITUDE'] != 0) & (df['LONGITUDE'] != 0)
+            df.loc[mask_gps, 'H3_INDEX'] = [
                 h3.latlng_to_cell(lat, lon, 8) 
-                for lat, lon in zip(df.loc[mask_gps_valido, 'LATITUDE'], df.loc[mask_gps_valido, 'LONGITUDE'])
+                for lat, lon in zip(df.loc[mask_gps, 'LATITUDE'], df.loc[mask_gps, 'LONGITUDE'])
             ]
 
             df_geo = self.carregar_base_geografica()
@@ -76,20 +76,29 @@ class ProcessamentoPrata:
                 )
                 df = pd.concat([df.loc[~mask_recuperacao], df_recuperado], ignore_index=True)
 
-            df = pd.merge(df, df_geo.drop(columns=['CHAVE_LOCALIDADE', 'H3_INDEX']), on='H3_INDEX', how='inner')
+            colunas_geo = [
+                'H3_INDEX', 'DENSIDADE_LOGRADOUROS', 'TOTAL_RESIDENCIAS_H3', 
+                'TOTAL_EDIFICACOES_H3', 'TOTAL_NAO_RESIDENCIAIS_H3', 
+                'PROPORCAO_RESIDENCIAL_H3', 'DIVERSIDADE_LOGRADOUROS_H3'
+            ]
+            
+            df = pd.merge(df, df_geo[colunas_geo], on='H3_INDEX', how='inner')
 
             df['ID_ANONIMO'] = (df['NUM_BO'].astype(str) + df['ANO_BO'].astype(str) + self.sal_lgpd).apply(
                 lambda x: hashlib.sha256(x.encode()).hexdigest()[:16]
             )
 
-            colunas_remover = ['NUM_BO', 'LATITUDE', 'LONGITUDE', 'CHAVE_LOCALIDADE']
+            colunas_remover = [
+                'NUM_BO', 'LATITUDE', 'LONGITUDE', 'CHAVE_LOCALIDADE', 
+                'MUNICIPIO_NORM', 'BAIRRO_NORM', 'LOGRADOURO_NORM'
+            ]
             df_final = df.drop(columns=[c for c in colunas_remover if c in df.columns])
 
             buffer = io.BytesIO()
             df_final.to_parquet(buffer, index=False)
             self.s3.put_object(Bucket=self.bucket, Key=caminho_prata, Body=buffer.getvalue())
 
-            self.robo.enviar_relatorio_operacional(f"Sucesso Prata {ano}", {"Registros Finais": len(df_final)})
+            self.robo.enviar_relatorio_operacional(f"Sucesso Prata {ano}", {"Registros": len(df_final)})
             return True
 
         except Exception:
