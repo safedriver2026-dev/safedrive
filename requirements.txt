@@ -1,15 +1,25 @@
+# Processamento de Dados
 polars
-fastexcel
-openpyxl
+pandas
 pyarrow
-requests
+openpyxl
+
+# Nuvem e Armazenamento (R2/S3)
 boto3
+
+# Geo-Processamento
 h3
+
+# Inteligência Artificial
 catboost
 lightgbm
-scikit-learn
-pandas
-google-cloud-bigquery
-db-dtypes
 joblib
-pytest
+scikit-learn
+
+# Google Cloud & BigQuery
+google-cloud-bigquery
+google-auth
+pandas-gbq
+
+# Comunicação e Web
+requests
