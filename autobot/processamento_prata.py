@@ -59,7 +59,7 @@ class ProcessamentoPrata:
             )
 
             df_pandas = lf_ssp.to_pandas()
-            df_pandas['h3_index'] = df_pandas.apply(
+            df_pandas['H3_INDEX'] = df_pandas.apply(
                 lambda row: h3.latlng_to_cell(row['LATITUDE'], row['LONGITUDE'], self.h3_resolution), 
                 axis=1
             )
@@ -69,7 +69,7 @@ class ProcessamentoPrata:
 
             lf_crimes = self._agregar_crimes(lf_ssp)
 
-            lf_final = lf_crimes.join(lf_geo, on="h3_index", how="inner")
+            lf_final = lf_crimes.join(lf_geo, on="H3_INDEX", how="inner")
 
             lf_final = self._processar_indicadores(lf_final, ano)
 
@@ -91,7 +91,7 @@ class ProcessamentoPrata:
             raise e
 
     def _agregar_crimes(self, lf):
-        return lf.group_by("h3_index").agg([
+        return lf.group_by("H3_INDEX").agg([
             pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Veículo|Automóvel")).count().alias("TOTAL_CRIMES_MOTORISTA"),
             pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Celular|Transeunte")).count().alias("TOTAL_CRIMES_PEDESTRE"),
             pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("Motocicleta")).count().alias("TOTAL_CRIMES_MOTOCICLISTA")
@@ -100,7 +100,13 @@ class ProcessamentoPrata:
     def _processar_indicadores(self, lf, ano):
         return lf.with_columns([
             pl.lit(ano).alias("ANO_REFERENCIA"),
-            (pl.col("TOTAL_GERAL") - pl.col("TOTAL_RESIDENCIAL")).alias("TOTAL_NAO_RESIDENCIAL"),
-            (pl.col("TOTAL_RESIDENCIAL") / pl.col("TOTAL_GERAL")).alias("INDICE_RESIDENCIAL"),
-            (pl.col("TOTAL_GERAL") / pl.col("AREA_HEXAGONO")).alias("DENSIDADE_ENDERECOS")
+            pl.col("TOTAL_NAO_RESIDENCIAIS_H3").alias("TOTAL_NAO_RESIDENCIAL"),
+            pl.col("PROPORCAO_RESIDENCIAL_H3").alias("INDICE_RESIDENCIAL"),
+            pl.col("DENSIDADE_LOGRADOUROS").alias("DENSIDADE_ENDERECOS")
         ]).fill_null(0)
+
+if __name__ == "__main__":
+    prata = ProcessamentoPrata()
+    ano_inicio = 2022
+    for a in range(ano_inicio, datetime.now().year + 1):
+        prata.executar_prata(a)
