@@ -1,77 +1,76 @@
-import os
 import requests
+import os
 import logging
+import platform
 from datetime import datetime
 
-# Configuração de Log para Produção
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ComunicadorSafeDriver:
     def __init__(self):
-        # Busca os Webhooks do Discord nas variáveis de ambiente (GitHub Secrets)
-        self.webhook_sucesso = os.getenv("DISCORD_SUCESSO")
-        self.webhook_erro = os.getenv("DISCORD_ERRO")
-
-        # Modo Fail-Secure: Se esquecer de colocar a chave, o código avisa mas não quebra o pipeline
-        if not self.webhook_sucesso or not self.webhook_erro:
-            logger.warning("⚠️ Webhooks do Discord não encontrados (DISCORD_SUCESSO / DISCORD_ERRO). Modo silencioso ativado.")
-            self.ativo = False
-        else:
-            self.ativo = True
-
-    def _enviar_discord(self, webhook_url, embed_payload):
-        if not self.ativo:
-            return
-
-        # O Discord exige que o payload seja enviado dentro de uma lista chamada "embeds"
-        payload = {
-            "embeds": [embed_payload]
-        }
-
-        try:
-            # Timeout de 10s evita que o GitHub Actions fique travado consumindo minutos
-            response = requests.post(webhook_url, json=payload, timeout=10)
-            response.raise_for_status()
-            logger.info("📱 Notificação Embed enviada com sucesso para o Discord.")
-        except Exception as e:
-            logger.error(f"Falha ao comunicar com a API do Discord: {e}")
+        self.webhook_sucesso = os.getenv("DISCORD_WEBHOOK_SUCESSO", "").strip()
+        self.webhook_erro = os.getenv("DISCORD_WEBHOOK_ERRO", "").strip()
+        self.env = "GitHub Actions" if os.getenv("GITHUB_ACTIONS") else "Local Environment"
 
     def relatar_sucesso(self, ano_ref, tempo_execucao, total_linhas):
-        """Envia um card verde formatado para o canal de Sucesso."""
-        embed = {
-            "title": "🟢 SafeDriver Pipeline: SUCESSO",
-            "color": 5763719, # Código decimal para a cor Verde
-            "description": "A esteira de processamento finalizou todas as etapas sem erros.",
-            "fields": [
-                {"name": "📅 Referência", "value": str(ano_ref), "inline": True},
-                {"name": "⏱️ Tempo de Execução", "value": str(tempo_execucao), "inline": True},
-                {"name": "📊 Registros Prontos", "value": f"{total_linhas:,}".replace(",", "."), "inline": False},
-                {"name": "Status das Camadas", "value": "✅ Bronze (Ingestão RAW)\n✅ Prata (Limpeza e Geo H3)\n✅ Ouro (IA e BigQuery)", "inline": False}
-            ],
-            "footer": {
-                "text": f"Atualizado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-            }
+        url = self.webhook_sucesso if self.webhook_sucesso else self.webhook_erro
+        if not url:
+            return
+
+        payload = {
+            "username": "SafeDriver Operations",
+            "embeds": [{
+                "title": "RELATORIO EXECUTIVO - PIPELINE CONCLUIDO",
+                "color": 3066993,
+                "author": {
+                    "name": "Data Intelligence Unit",
+                    "icon_url": "https://cdn-icons-png.flaticon.com/512/2103/2103633.png"
+                },
+                "fields": [
+                    {"name": "PROJETO", "value": "SafeDriver Autobot", "inline": True},
+                    {"name": "AMBIENTE", "value": self.env, "inline": True},
+                    {"name": "ANO BASE", "value": str(ano_ref), "inline": True},
+                    {"name": "PERFORMANCE", "value": f"Tempo total: {tempo_execucao}", "inline": False},
+                    {"name": "VOLUMETRIA", "value": f"Registros processados: {total_linhas}", "inline": False},
+                    {"name": "INFRAESTRUTURA", "value": f"OS: {platform.system()} | Python: {platform.python_version()}", "inline": False}
+                ],
+                "footer": {
+                    "text": f"ID Execucao: {os.getenv('GITHUB_RUN_ID', 'N/A')} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                }
+            }]
         }
-        self._enviar_discord(self.webhook_sucesso, embed)
 
-    def relatar_erro(self, camada, erro_traceback):
-        """Envia um card vermelho com o log do erro para o canal de Erros Críticos."""
+        self._enviar(url, payload)
 
-        # Isolando a formatação do erro para evitar bugs de copy-paste
-        # A correção está aqui: a f-string foi ajustada para não ter quebra de linha inesperada.
-        erro_formatado = f"Ocorreu um erro crítico na camada **{camada}** do pipeline SafeDriver.\n\n```python\n{erro_traceback}\n```"
+    def relatar_erro(self, etapa, erro):
+        url = self.webhook_erro if self.webhook_erro else self.webhook_sucesso
+        if not url:
+            return
 
-        embed = {
-            "title": "🔴 SafeDriver Pipeline: ERRO CRÍTICO",
-            "color": 15548997, # Código decimal para a cor Vermelha
-            "description": erro_formatado,
-            "fields": [
-                {"name": "Camada do Erro", "value": camada, "inline": True},
-                {"name": "Data/Hora do Erro", "value": datetime.now().strftime('%d/%m/%Y %H:%M:%S'), "inline": True}
-            ],
-            "footer": {
-                "text": "Por favor, verifique os logs para mais detalhes."
-            }
+        payload = {
+            "username": "SafeDriver Critical Alerts",
+            "embeds": [{
+                "title": "ALERTA OPERACIONAL - FALHA NO SISTEMA",
+                "color": 15158332,
+                "fields": [
+                    {"name": "ETAPA CRITICA", "value": etapa, "inline": True},
+                    {"name": "SISTEMA", "value": "SafeDriver Autobot", "inline": True},
+                    {"name": "AMBIENTE", "value": self.env, "inline": True},
+                    {"name": "DIAGNOSTICO TECNICO", "value": f"CODE_ERROR: {str(erro)[:800]}", "inline": False},
+                    {"name": "ACAO RECOMENDADA", "value": "Verificar logs do GitHub Actions e integridade da fonte SSP.", "inline": False}
+                ],
+                "footer": {
+                    "text": f"Ocorrencia registrada em: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                }
+            }]
         }
-        self._enviar_discord(self.webhook_erro, embed)
+
+        self._enviar(url, payload)
+
+    def _enviar(self, url, payload):
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            response.raise_for_status()
+        except Exception as e:
+            logger.error(f"Falha na comunicacao externa: {e}")
