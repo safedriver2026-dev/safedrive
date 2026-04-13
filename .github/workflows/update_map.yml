@@ -1,0 +1,39 @@
+name: Update Risk Heatmap
+
+on:
+  workflow_run:
+    workflows: ["SafeDriver Autobot"] # Nome do seu YAML principal
+    types: [completed]
+  workflow_dispatch: # Permite rodar manualmente
+
+jobs:
+  build-map:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install folium h3 polars pyarrow pandas branca
+
+      - name: Generate Map
+        env:
+          # Se precisar ler do R2 ou BQ para gerar o mapa, passe as chaves aqui
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # ... outras envs
+        run: python autobot/gerador_mapa.py
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs
