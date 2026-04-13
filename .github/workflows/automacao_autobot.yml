@@ -1,73 +1,70 @@
-name: SafeDriver Pipeline Hibrido
+name:  SafeDriver Pipeline
+
 
 on:
   schedule:
-    # Turno Diário (02:00 AM): Apenas Predição
-    - cron: '0 2 * * *'
-    # Turno Semanal (Domingo 00:00): Full ETL
-    - cron: '0 0 * * 0'
+ 
+    - cron: '0 6 * * 0'
+  
   workflow_dispatch:
-    inputs:
-      modo:
-        description: 'Escolha o modo: diario ou full'
-        default: 'diario'
-        required: true
+ 
 
 jobs:
-  # CASINHA 1: Processamento de Dados (Bronze e Prata)
-  processamento_base:
-    # Só roda se for Domingo OU se você forçar o modo "full" no botão
-    if: github.event.schedule == '0 0 * * 0' || github.event.inputs.modo == 'full'
+
+  auditoria_seguranca:
+    name: 🛡️ Auditoria de Segurança e LGPD
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Checkout do Código
+        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      - name: Install Deps
+      - name: Instalar Dependências de Teste
+        run: pip install pytest polars
+
+      - name: Executar Testes de Segurança (pytest)
+       
+        run: pytest tests/test_seguranca.py -v
+
+
+  motor_dados:
+    name: ⚙️ Processamento e Inteligência (SafeDriver)
+    needs: auditoria_seguranca 
+    runs-on: ubuntu-latest
+    timeout-minutes: 60 
+
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Instalar Dependências de Produção
         run: pip install -r requirements.txt
 
-      - name: Executar Bronze e Prata (Full)
+      - name: 🔑 Autenticação Google Cloud (BigQuery)
+        uses: google-github-actions/auth@v2
+        with:
+       
+          credentials_json: '${{ secrets.GCP_CREDENTIALS_JSON }}'
+
+      - name: 🚀 Executar Orquestrador Principal (main.py)
+       
         env:
-          PYTHONPATH: ${{ github.workspace }}
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          LGPD_SALT: ${{ secrets.LGPD_SALT }}
-        run: python -m autobot.motor_analise_preditiva full
-
-  # CASINHA 2: Inteligencia e Predicao (Ouro)
-  predicao_ia:
-    # Este job roda sempre (Diário) 
-    # E se o Job de cima rodar, este espera ele acabar (needs)
-    needs: [processamento_base]
-    if: always() && (needs.processamento_base.result == 'success' || needs.processamento_base.result == 'skipped')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install Deps
-        run: pip install -r requirements.txt
-
-      - name: Executar Ouro (IA Diaria)
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-          BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-        run: python -m autobot.motor_analise_preditiva diario
+          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
+        run: |
+          python main.py
