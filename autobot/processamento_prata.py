@@ -6,7 +6,6 @@ import h3
 import logging
 from datetime import datetime
 from botocore.exceptions import ClientError
-from autobot.sanitizador_lgpd import SanitizadorLGPD
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
@@ -25,7 +24,12 @@ class ProcessamentoPrata:
             aws_secret_access_key=self.secret_key
         )
         self.h3_resolution = 8
-        self.sanitizador = SanitizadorLGPD()
+        self.colunas_lgpd = [
+            "NUM_BO", "LOGRADOURO", "NUMERO_LOGRADOURO", 
+            "NOME_DELEGACIA", "NOME_DEPARTAMENTO", "NOME_SECCIONAL",
+            "NOME_DELEGACIA_CIRCUNSCRIÇÃO", "NOME_DEPARTAMENTO_CIRCUNSCRIÇÃO",
+            "NOME_SECCIONAL_CIRCUNSCRIÇÃO"
+        ]
 
     def executar_prata(self, ano):
         path_bronze = f"datalake/bronze/ssp_raw_{ano}.xlsx"
@@ -61,7 +65,7 @@ class ProcessamentoPrata:
             )
             lf_ssp = pl.from_pandas(df_pandas)
 
-            lf_ssp = self.sanitizador.higienizar(lf_ssp)
+            lf_ssp = lf_ssp.drop([c for c in self.colunas_lgpd if c in lf_ssp.columns])
 
             lf_crimes = self._agregar_crimes(lf_ssp)
 
@@ -100,9 +104,3 @@ class ProcessamentoPrata:
             (pl.col("TOTAL_RESIDENCIAL") / pl.col("TOTAL_GERAL")).alias("INDICE_RESIDENCIAL"),
             (pl.col("TOTAL_GERAL") / pl.col("AREA_HEXAGONO")).alias("DENSIDADE_ENDERECOS")
         ]).fill_null(0)
-
-if __name__ == "__main__":
-    prata = ProcessamentoPrata()
-    ano_inicio = 2022
-    for a in range(ano_inicio, datetime.now().year + 1):
-        prata.executar_prata(a)
