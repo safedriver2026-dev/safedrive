@@ -2,28 +2,32 @@ name: Pipeline Integrado SafeDriver
 
 on:
   schedule:
+    # Executa aos Domingos à meia-noite (Ciclo Pesado: Bronze e Prata)
     - cron: "0 0 * * 0"
+    # Executa todos os dias às 02:00 da manhã (Ciclo Inteligente: Treino e Ouro)
     - cron: "0 2 * * *"
+  # Permite executar o pipeline manualmente clicando num botão no GitHub
   workflow_dispatch:
 
 jobs:
   ingestao_semanal:
+    # Condição: Só corre se for domingo OU se for clicado manualmente
     if: github.event.schedule == '0 0 * * 0' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Instalar Dependências
         run: pip install -r requirements.txt
 
-      - name: Executar Ciclo Semanal (Raw, LGPD e Prata)
+      - name: Executar Ciclo Semanal (Bronze e Prata)
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -34,6 +38,7 @@ jobs:
         run: python main.py --weekly
 
   inteligencia_diaria:
+    # Condição: Corre sempre (diariamente ou manual), e espera que o semanal termine caso corram no mesmo dia
     if: always()
     needs: [ingestao_semanal]
     runs-on: ubuntu-latest
@@ -41,16 +46,16 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Dependencies
+      - name: Instalar Dependências
         run: pip install -r requirements.txt
 
-      - name: Executar Ciclo Diario (Treino e Ouro)
+      - name: Executar Ciclo Diário (Treino IA e Camada Ouro)
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -58,7 +63,8 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
+          # Mapeamento corrigido para ler o segredo exato da sua conta
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.SERVICE_ACCOUNT_JSON }}
           DISCORD_WEBHOOK_SUCESSO: ${{ secrets.DISCORD_WEBHOOK_SUCESSO }}
           DISCORD_WEBHOOK_ERRO: ${{ secrets.DISCORD_WEBHOOK_ERRO }}
         run: python main.py --daily
