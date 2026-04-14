@@ -53,22 +53,26 @@ class TreinadorEvolutivo:
                 X = df_treino[colunas_ia].copy()
                 y = df_treino[target]
                 
+                # A CORREÇÃO: Transformando explicitamente em 'category' para o LightGBM aceitar
                 for col in self.features_categoricas:
-                    X[col] = X[col].astype(str).fillna("DESCONHECIDO")
+                    X[col] = X[col].astype(str).fillna("DESCONHECIDO").astype('category')
 
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
+                # Treino CatBoost
                 model_cat = CatBoostRegressor(
                     iterations=1000, depth=8, learning_rate=0.03,
                     cat_features=self.features_categoricas, loss_function='MAE', verbose=0
                 )
                 model_cat.fit(X_train, y_train)
                 
+                # Treino LightGBM
                 model_lgb = LGBMRegressor(
                     n_estimators=500, learning_rate=0.02, num_leaves=64, verbosity=-1
                 )
                 model_lgb.fit(X_train, y_train)
 
+                # Auditoria de Erro
                 mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
                 mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
                 
