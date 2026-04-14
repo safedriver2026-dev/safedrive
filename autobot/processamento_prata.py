@@ -26,8 +26,10 @@ class ProcessamentoPrata:
             aws_secret_access_key=self.secret_key,
             config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
         )
-        self.tracker_path = "safedriver/datalake/prata/tracker_estado_bronze.json"
-        self.malha_path = "safedriver/datalake/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
+        
+        # Caminhos relativos à raiz do Bucket (Removido prefixo redundante)
+        self.tracker_path = "datalake/prata/tracker_estado_bronze.json"
+        self.malha_path = "datalake/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         self._inicializar_dependencias()
 
     def _inicializar_dependencias(self):
@@ -41,8 +43,9 @@ class ProcessamentoPrata:
             self.dens_cidade = self.df_malha.group_by(["NM_MUN"]).agg(
                 pl.col("DENSIDADE_DEMOGRAFICA").mean().alias("DENS_CID")
             )
+            logger.info("PRATA: Malha geográfica e dicionários de densidade carregados.")
         except Exception as e:
-            logger.error(f"PRATA: Falha ao carregar malha geográfica: {e}")
+            logger.error(f"PRATA: Falha crítica ao carregar malha no R2: {e}")
             self.df_malha = None
 
     def _canonizar_texto(self, coluna):
@@ -118,6 +121,7 @@ class ProcessamentoPrata:
         buffer = io.BytesIO()
         self.df_malha.write_parquet(buffer)
         self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer.getvalue())
+        logger.info(f"PRATA: Malha geográfica enriquecida com {novos_dados.height} novos registros.")
 
     def _normalizar_bronze(self, data):
         dfs = []
@@ -139,15 +143,15 @@ class ProcessamentoPrata:
         return df.with_columns(pl.col(pl.String).str.strip_chars().str.to_uppercase())
 
     def processar_ano_com_delta(self, ano, estado, force=False):
-        path_bronze = f"safedriver/datalake/bronze/ssp_raw_{ano}.xlsx"
-        path_prata = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
+        path_bronze = f"datalake/bronze/ssp_raw_{ano}.xlsx"
+        path_prata = f"datalake/prata/ssp_consolidada_{ano}.parquet"
         
         try:
             meta = self.s3.head_object(Bucket=self.bucket, Key=path_bronze)
             tamanho = meta['ContentLength']
-        except: return False
+        except: return None
 
-        if not force and estado.get(str(ano)) == tamanho: return False
+        if not force and estado.get(str(ano)) == tamanho: return None
 
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
@@ -172,9 +176,14 @@ class ProcessamentoPrata:
 
             estado[str(ano)] = tamanho
             return {"ano": ano, "total_raw": total_raw, "bo_recuperados": resgate_h3, "malha_curada": cura_malha, "h3_unicos": df_final.height}
-        except: return None
+        except Exception as e:
+            logger.error(f"PRATA: Erro ao processar ano {ano}: {e}")
+            return None
 
     def executar_todos_os_anos(self, force=False):
+        if self.df_malha is None:
+            raise RuntimeError("Execução abortada: Malha geográfica não disponível no R2.")
+
         estado_atual = self._carregar_tracker()
         relatorio = []
         metricas_globais = {"processados": 0, "bo_recuperados": 0, "malha_resgatada": 0}
