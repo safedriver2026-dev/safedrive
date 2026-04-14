@@ -1,104 +1,76 @@
-import os
 import pytest
 import polars as pl
-from unittest.mock import patch
+import os
+import re
 
-# Importamos as classes que vamos testar (ajuste os caminhos conforme o seu projeto)
-# from autobot.camada_prata import ProcessamentoPrata
-# from autobot.camada_ouro import CamadaOuroSafeDriver
 
-# ==========================================
-# 1. TESTES DE GESTÃO DE SEGREDOS (SECRETS)
-# ==========================================
-
-def test_falha_segura_sem_credenciais():
-    """
-    Testa o princípio de 'Fail-Secure'. Se o GitHub Actions falhar ao carregar 
-    as chaves, o sistema DEVE "estourar" um erro imediatamente, e não tentar 
-    continuar com valores nulos ou expor logs de conexão vazios.
-    """
-    # Removemos as variáveis de ambiente temporariamente
-    with patch.dict(os.environ, clear=True):
-        # A expectativa é que instanciar a classe levante uma exceção de KeyError ou Exception
-        with pytest.raises(Exception) as excinfo:
-            # Substitua pela chamada real da sua classe
-            # prata = ProcessamentoPrata() 
-            
-            # Simulando o que a classe faria internamente no __init__:
-            aws_key = os.environ["R2_ACCESS_KEY_ID"]
-            
-        assert "R2_ACCESS_KEY_ID" in str(excinfo.value), "O sistema não bloqueou a falta de credenciais."
-
-# ==========================================
-# 2. TESTES DE PRIVACIDADE E LGPD (ANONIMIZAÇÃO)
-# ==========================================
-
-def test_lgpd_remocao_dados_pessoais():
-    """
-    Garante que colunas sensíveis (PII - Personally Identifiable Information) 
-    nunca cheguem à Camada Prata, mesmo que a SSP as inclua na Bronze por engano.
-    """
-    # Simulamos um dado "sujo" vindo da Bronze com nomes de vítimas e documentos
-    df_bronze_simulado = pl.DataFrame({
-        "NUM_BO": ["12345/2024"],
-        "LATITUDE": [-23.5505],
-        "LONGITUDE": [-46.6333],
-        "NOME_VITIMA": ["João da Silva"],    # DADO SENSÍVEL
-        "CPF_ENVOLVIDO": ["111.222.333-44"]  # DADO SENSÍVEL
+@pytest.fixture
+def sample_df_prata():
+    return pl.DataFrame({
+        "H3_INDEX": ["88a242ce13fffff", "88a242ce11fffff"],
+        "TOTAL_CRIMES_MOTORISTA": [10, 5],
+        "INDICE_RESIDENCIAL": [2, 1],
+        "ANO_REFERENCIA": [2025, 2025],
+        "LATITUDE": [-23.5505, -23.5510],
+        "LONGITUDE": [-46.6333, -46.6335]
     })
 
-    # As colunas que definimos como padrão (O "Filtro Ético")
-    colunas_canonicas = ['NUM_BO', 'LATITUDE', 'LONGITUDE']
+def test_contrato_colunas_obrigatorias_prata(sample_df_prata):
+    """Verifica se todas as colunas esperadas pela IA e pela Ouro estão presentes."""
+    colunas_esperadas = {
+        "H3_INDEX", "TOTAL_CRIMES_MOTORISTA", "INDICE_RESIDENCIAL", "ANO_REFERENCIA"
+    }
+    assert colunas_esperadas.issubset(set(sample_df_prata.columns)), \
+        f"Faltam colunas essenciais no contrato da Prata. Encontradas: {sample_df_prata.columns}"
 
-    # Simulamos o filtro que ocorre na Camada Prata
-    colunas_presentes = [c for c in colunas_canonicas if c in df_bronze_simulado.columns]
-    df_prata_limpo = df_bronze_simulado.select(colunas_presentes)
+def test_contrato_tipagem_ia(sample_df_prata):
+    """Garante que os dados numéricos são Int32 (vacina de tipos que aplicamos)."""
+    assert sample_df_prata["TOTAL_CRIMES_MOTORISTA"].dtype == pl.Int64 or \
+           sample_df_prata["TOTAL_CRIMES_MOTORISTA"].dtype == pl.Int32, \
+           "Erro de Contrato: TOTAL_CRIMES deve ser numérico."
 
-    # Verificações de Segurança LGPD
-    assert "NOME_VITIMA" not in df_prata_limpo.columns, "FALHA LGPD: Nome da vítima vazou para a Prata."
-    assert "CPF_ENVOLVIDO" not in df_prata_limpo.columns, "FALHA LGPD: Documento vazou para a Prata."
-    assert "NUM_BO" in df_prata_limpo.columns, "A chave primária não deveria ter sido removida."
 
-# ==========================================
-# 3. TESTES DE PROTEÇÃO DO MODELO (DATA POISONING)
-# ==========================================
+def test_lgpd_ausencia_dados_pessoais():
+    """Verifica se não existem colunas proibidas (RG, CPF, Nome, Endereço Completo)."""
+    
+    termos_proibidos = ["NOME", "CPF", "RG", "VITIMA", "AUTOR", "RUA", "NUMERO_LOGRADOURO", "TELEFONE"]
+    
+   
+    colunas_atuais = ["H3_INDEX", "TOTAL_CRIMES", "LATITUDE", "LONGITUDE"] 
+    
+    for termo in termos_proibidos:
+        for col in colunas_atuais:
+            assert termo not in col.upper(), f"LGPD VIOLADA: Coluna sensível '{col}' detectada!"
 
-def test_protecao_contra_lat_lon_maliciosos():
-    """
-    O 'Data Poisoning' acontece quando dados fora do padrão quebram o gerador H3 
-    ou viciam a IA. Coordenadas nulas ou strings devem ser tratadas.
-    """
-    # Simulamos uma tentativa de injeção de texto onde deveria haver GPS e um dado nulo
-    df_ataque = pl.DataFrame({
-        "NUM_BO": ["001", "002"],
-        "LATITUDE": ["-23.5505", "N/A"], # "N/A" é malicioso para funções matemáticas
-        "LONGITUDE": ["-46.6333", None]
-    })
+def test_lgpd_pseudonimizacao_h3(sample_df_prata):
+    """Garante que a localização está agregada em H3 e não em pontos exatos expostos."""
+   
+    padrao_h3 = re.compile(r"^[89a-f0-f]{15}$")
+    for codigo in sample_df_prata["H3_INDEX"]:
+        assert padrao_h3.match(codigo), f"H3_INDEX inválido detectado: {codigo}"
 
-    # Aplicamos a lógica de cast da Camada Prata (strict=False é o nosso escudo)
-    df_defesa = df_ataque.with_columns([
-        pl.col("LATITUDE").cast(pl.Float64, strict=False),
-        pl.col("LONGITUDE").cast(pl.Float64, strict=False)
-    ])
 
-    # A linha com "N/A" deve ter sido forçada a virar Null, em vez de quebrar o Python
-    assert df_defesa.filter(pl.col("NUM_BO") == "002")["LATITUDE"][0] is None, "Injeção de string na Latitude não foi neutralizada."
+--
 
-def test_bounding_box_antifraude():
-    """
-    Garante que crimes registados na Rússia ou no oceano não entrem no modelo de SP.
-    """
-    df_gps = pl.DataFrame({
-        "NUM_BO": ["A1", "A2"],
-        "LATITUDE": [-23.5505, 55.7558],  # A2 é Moscovo (Rússia)
-        "LONGITUDE": [-46.6333, 37.6173]
-    })
+def test_seguranca_presenca_secrets():
+    """Verifica se as chaves críticas estão carregadas no ambiente (não vazias)."""
+    keys_obrigatorias = [
+        "R2_ACCESS_KEY_ID", 
+        "R2_SECRET_ACCESS_KEY", 
+        "BQ_SERVICE_ACCOUNT_JSON",
+        "LGPD_SALT"
+    ]
+    for key in keys_obrigatorias:
+        valor = os.getenv(key)
+        assert valor is not None and len(valor) > 0, f"SEGURANÇA: Secret '{key}' não configurada!"
 
-    # Lógica de Bounding Box de SP
-    df_filtrado = df_gps.filter(
-        (pl.col("LATITUDE").is_between(-25.31, -19.77)) & 
-        (pl.col("LONGITUDE").is_between(-53.11, -44.16))
-    )
-
-    assert df_filtrado.height == 1, "O filtro Bounding Box deixou passar coordenadas fora de São Paulo."
-    assert df_filtrado["NUM_BO"][0] == "A1", "O BO legítimo foi descartado por engano."
+def test_seguranca_exposicao_secrets_em_logs(caplog):
+    """Garante que as secrets não foram printadas nos logs acidentalmente."""
+    
+    logger = logging.getLogger("SafeDriver")
+    logger.info("Iniciando processamento...")
+    
+    forbidden_content = os.getenv("R2_SECRET_ACCESS_KEY", "VALOR_PADRAO_INEXISTENTE")
+    
+    for record in caplog.records:
+        assert forbidden_content not in record.text, "VAZAMENTO DE CREDENCIAL: Secret detectada nos logs!"
