@@ -2,7 +2,6 @@ import polars as pl
 import pandas as pd
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
 import joblib
 import io
 import os
@@ -87,8 +86,9 @@ class CamadaOuroSafeDriver:
                 df['PERFIL_AREA'] = np.where(df['DENSIDADE'] > 5000, "RESIDENCIAL", 
                                     np.where(df['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
                 
+                # A CORREÇÃO ESTÁ AQUI: Convertendo para 'category' na inferência também!
                 for col in ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']:
-                    df[col] = df[col].astype(str).fillna("DESCONHECIDO")
+                    df[col] = df[col].astype(str).fillna("DESCONHECIDO").astype('category')
                 
                 return df.fillna(0)
             except: continue
@@ -116,7 +116,6 @@ class CamadaOuroSafeDriver:
             
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
         
-        # Limpando colunas inúteis antes de enviar pro BigQuery
         return df[['H3_INDEX', 'SCORE_RISCO_GERAL', 'DT_ULTIMA_SINCRONIZACAO']]
 
     def _sincronizar_fato_risco(self, df):
