@@ -13,15 +13,13 @@ from datetime import datetime
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score
+from sklearn.metrics import mean_absolute_error
 
-# Configuração de logging padrão corporativo
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class TreinadorEvolutivo:
     def __init__(self):
-        # Conectividade Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -36,78 +34,78 @@ class TreinadorEvolutivo:
         )
         
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
-        
-        # Alvos da IA
         self.personas = {
             "motorista": "TOTAL_CRIMES_MOTORISTA",
-            "pedestre": "TOTAL_CRIMES_PEDESTRE",
-            "motociclista": "TOTAL_CRIMES_MOTOCICLISTA"
+            "pedestre": "TOTAL_CRIMES_PEDESTRE"
         }
         
-        # Features
-        self.features_base = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
-        self.features_delta = ['DELTA_MOTORISTA', 'DELTA_PEDESTRE', 'DELTA_MOTOCICLISTA']
-        self.meta_features = ['ULTIMO_MAE_CAT', 'ULTIMO_MAE_LGB']
-        
-        # Dicionário de métricas para o Maestro/Discord
+        self.features_numericas = ['DENSIDADE', 'POPULACAO_H3', 'DELTA_MOT', 'DELTA_PED']
+        self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
         self.metricas_acumuladas = []
 
     def treinar_modelo_mestre(self):
-        """Executa o treinamento do Ensemble e versiona os modelos no R2."""
-        logger.info(f"IA: Iniciando pipeline de Treinamento Evolutivo [v{self.versao_modelo}]")
+        logger.info(f"IA: Iniciando Pipeline H3-L9 [v{self.versao_modelo}]")
         
         df_treino = self._carregar_datalake_consolidado()
         
-        if df_treino is None or df_treino.shape[0] < 50:
-            logger.warning("IA: Base de dados insuficiente para o treinamento. Abortando.")
+        if df_treino is None or df_treino.shape[0] < 100:
+            logger.warning("IA: Massa de dados insuficiente para H3-L9.")
             return False
 
-        colunas_ia = self.features_base + self.features_delta + self.meta_features
+        colunas_ia = self.features_numericas + self.features_categoricas
 
         for persona, target in self.personas.items():
             try:
                 logger.info(f"--- Treinando Persona: {persona.upper()} ---")
-                X = df_treino[colunas_ia]
+                
+                X = df_treino[colunas_ia].copy()
                 y = df_treino[target]
                 
+                for col in self.features_categoricas:
+                    X[col] = X[col].astype(str).fillna("DESCONHECIDO")
+
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-                # 1. CatBoost
-                model_cat = CatBoostRegressor(iterations=800, depth=6, learning_rate=0.04, verbose=0)
+                model_cat = CatBoostRegressor(
+                    iterations=1000,
+                    depth=8,
+                    learning_rate=0.03,
+                    cat_features=self.features_categoricas,
+                    loss_function='MAE',
+                    verbose=0
+                )
                 model_cat.fit(X_train, y_train)
                 preds_cat = model_cat.predict(X_test)
                 
-                # 2. LightGBM
-                model_lgb = LGBMRegressor(n_estimators=300, learning_rate=0.03, verbosity=-1)
+                model_lgb = LGBMRegressor(
+                    n_estimators=500,
+                    learning_rate=0.02,
+                    num_leaves=64,
+                    importance_type='gain',
+                    verbosity=-1
+                )
                 model_lgb.fit(X_train, y_train)
                 preds_lgb = model_lgb.predict(X_test)
 
-                # Cálculos de Performance
-                mae_persona = (mean_absolute_error(y_test, preds_cat) + mean_absolute_error(y_test, preds_lgb)) / 2
-                self.metricas_acumuladas.append(mae_persona)
+                mae_cat = mean_absolute_error(y_test, preds_cat)
+                mae_lgb = mean_absolute_error(y_test, preds_lgb)
+                
+                self.metricas_acumuladas.append({"persona": persona, "mae_cat": mae_cat, "mae_lgb": mae_lgb})
 
-                # Persistência
                 self._exportar_artefactos(model_cat, f"cat_{persona}")
                 self._exportar_artefactos(model_lgb, f"lgb_{persona}")
-                self._atualizar_meta_features(persona, mean_absolute_error(y_test, preds_cat), mean_absolute_error(y_test, preds_lgb))
+                self._atualizar_meta_perf(persona, mae_cat, mae_lgb)
                 
             except Exception as e:
-                logger.error(f"Erro no treinamento da persona {persona}: {e}")
-                return False
+                logger.error(f"Erro no treinamento {persona}: {e}")
+                continue
 
         return True
 
     def obter_metricas_finais(self):
-        """Retorna as médias de erro para o Maestro preencher o relatório do Discord."""
-        if not self.metricas_acumuladas:
-            return {"mae": 0.0}
-        
-        return {
-            "mae": sum(self.metricas_acumuladas) / len(self.metricas_acumuladas)
-        }
+        return self.metricas_acumuladas
 
     def _carregar_datalake_consolidado(self):
-        """Carrega todos os anos da Prata garantindo a compatibilidade de tipos (Int32)."""
         lista_dfs = []
         ano_atual = datetime.now().year
         
@@ -116,53 +114,37 @@ class TreinadorEvolutivo:
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=path)
                 df_ano = pl.read_parquet(io.BytesIO(resp['Body'].read()))
-                
-                # Vacina de Tipos para evitar quebra no concat (Int32)
-                df_ano = df_ano.with_columns([
-                    pl.col(pl.INTEGER_DTYPES).cast(pl.Int32)
-                ])
-                
+                df_ano = df_ano.with_columns([pl.all().cast(pl.Float64, strict=False).fill_null(0.0)])
                 lista_dfs.append(df_ano)
-                logger.info(f"IA: Dados de {ano} carregados.")
             except ClientError:
                 continue
         
         if not lista_dfs: return None
             
-        df_consolidado = pl.concat(lista_dfs, how="diagonal").to_pandas().fillna(0)
+        df_consolidado = pl.concat(lista_dfs, how="diagonal").to_pandas()
         
-        # Injeção das memórias de erro (Meta-Features)
-        for persona in self.personas.keys():
-            metricas = self._recuperar_metricas_historicas(persona)
-            df_consolidado['ULTIMO_MAE_CAT'] = metricas.get('mae_cat', 0.0)
-            df_consolidado['ULTIMO_MAE_LGB'] = metricas.get('mae_lgb', 0.0)
+        if 'POPULACAO_H3' in df_consolidado.columns and 'TOTAL_RESIDENCIAS' in df_consolidado.columns:
+            df_consolidado['PERFIL_AREA'] = np.where(
+                (df_consolidado['POPULACAO_H3'] > 50), "RESIDENCIAL",
+                np.where(df_consolidado['POPULACAO_H3'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO")
+            )
+        else:
+            df_consolidado['PERFIL_AREA'] = "MISTO"
             
         return df_consolidado
 
-    def _recuperar_metricas_historicas(self, persona):
+    def _atualizar_meta_perf(self, persona, mae_cat, mae_lgb):
         path = f"safedriver/modelos_ml/meta_perf_{persona}.json"
-        try:
-            resp = self.s3.get_object(Bucket=self.bucket, Key=path)
-            return json.loads(resp['Body'].read())
-        except ClientError:
-            return {"mae_cat": 0.0, "mae_lgb": 0.0}
-
-    def _atualizar_meta_features(self, persona, mae_cat, mae_lgb):
-        path = f"safedriver/modelos_ml/meta_perf_{persona}.json"
-        dados_meta = {"mae_cat": mae_cat, "mae_lgb": mae_lgb, "versao": self.versao_modelo}
-        self.s3.put_object(Bucket=self.bucket, Key=path, Body=json.dumps(dados_meta))
+        dados = {"mae_cat": float(mae_cat), "mae_lgb": float(mae_lgb), "timestamp": str(datetime.now())}
+        self.s3.put_object(Bucket=self.bucket, Key=path, Body=json.dumps(dados))
 
     def _exportar_artefactos(self, modelo, nome_base):
         buffer = io.BytesIO()
         joblib.dump(modelo, buffer)
         payload = buffer.getvalue()
         
-        caminho_versao = f"safedriver/modelos_ml/versions/v{self.versao_modelo}_{nome_base}.pkl"
-        caminho_producao = f"safedriver/modelos_ml/latest_{nome_base}.pkl"
-        
-        self.s3.put_object(Bucket=self.bucket, Key=caminho_versao, Body=payload)
-        self.s3.put_object(Bucket=self.bucket, Key=caminho_producao, Body=payload)
-        logger.info(f"IA: Modelo {caminho_producao} versionado.")
+        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/versions/v{self.versao_modelo}_{nome_base}.pkl", Body=payload)
+        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/latest_{nome_base}.pkl", Body=payload)
 
 if __name__ == "__main__":
     TreinadorEvolutivo().treinar_modelo_mestre()
