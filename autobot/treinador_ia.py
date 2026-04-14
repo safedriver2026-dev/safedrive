@@ -44,7 +44,7 @@ class TreinadorEvolutivo:
         
         if df_treino is None or df_treino.shape[0] < 100:
             logger.error("IA: Dados insuficientes para treinamento.")
-            return None
+            return False
 
         colunas_ia = self.features_numericas + self.features_categoricas
 
@@ -53,7 +53,7 @@ class TreinadorEvolutivo:
                 X = df_treino[colunas_ia].copy()
                 y = df_treino[target]
                 
-                # A CORREÇÃO: Transformando explicitamente em 'category' para o LightGBM aceitar
+                # Transformando explicitamente em 'category' para o LightGBM aceitar
                 for col in self.features_categoricas:
                     X[col] = X[col].astype(str).fillna("DESCONHECIDO").astype('category')
 
@@ -88,8 +88,12 @@ class TreinadorEvolutivo:
                 
             except Exception as e:
                 logger.error(f"Erro no treinamento: {e}")
-                return None
+                return False
 
+        return True
+
+    def obter_metricas_finais(self):
+        """Devolve o dicionário de métricas para o Maestro enviar ao Discord."""
         return self.metricas_detalhadas
 
     def _carregar_datalake_consolidado(self):
