@@ -53,22 +53,31 @@ class TreinadorEvolutivo:
                 X = df_treino[colunas_ia].copy()
                 y = df_treino[target]
                 
-                # Transformando explicitamente em 'category' para o LightGBM aceitar
+                # Conversão para categorias para compatibilidade LightGBM
                 for col in self.features_categoricas:
                     X[col] = X[col].astype(str).fillna("DESCONHECIDO").astype('category')
 
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-                # Treino CatBoost
+                # Treino CatBoost com Distribuição Tweedie (Mitigação de Zero-Inflated)
                 model_cat = CatBoostRegressor(
-                    iterations=1000, depth=8, learning_rate=0.03,
-                    cat_features=self.features_categoricas, loss_function='MAE', verbose=0
+                    iterations=1000, 
+                    depth=8, 
+                    learning_rate=0.03,
+                    cat_features=self.features_categoricas, 
+                    loss_function='Tweedie:variance_power=1.5',
+                    verbose=0
                 )
                 model_cat.fit(X_train, y_train)
                 
-                # Treino LightGBM
+                # Treino LightGBM com Distribuição Tweedie
                 model_lgb = LGBMRegressor(
-                    n_estimators=500, learning_rate=0.02, num_leaves=64, verbosity=-1
+                    n_estimators=500, 
+                    learning_rate=0.02, 
+                    num_leaves=64, 
+                    objective='tweedie',
+                    tweedie_variance_power=1.5,
+                    verbosity=-1
                 )
                 model_lgb.fit(X_train, y_train)
 
@@ -80,20 +89,21 @@ class TreinadorEvolutivo:
                     "persona": persona,
                     "mae_cat": round(float(mae_cat), 4),
                     "mae_lgb": round(float(mae_lgb), 4),
-                    "total_treino": len(X_train)
+                    "total_treino": len(X_train),
+                    "distribuicao": "Tweedie"
                 })
 
                 self._exportar_artefactos(model_cat, f"cat_{persona}")
                 self._exportar_artefactos(model_lgb, f"lgb_{persona}")
                 
             except Exception as e:
-                logger.error(f"Erro no treinamento: {e}")
+                logger.error(f"Erro no treinamento evolutivo: {e}")
                 return False
 
         return True
 
     def obter_metricas_finais(self):
-        """Devolve o dicionário de métricas para o Maestro enviar ao Discord."""
+        """Retorna os KPIs de performance para o orquestrador/Discord."""
         return self.metricas_detalhadas
 
     def _carregar_datalake_consolidado(self):
@@ -102,8 +112,10 @@ class TreinadorEvolutivo:
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/prata/ssp_consolidada_{ano}.parquet")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
+                # Garante cast numérico e preenchimento de nulos para evitar erros no Tweedie
                 lista_dfs.append(df.with_columns([pl.all().cast(pl.Float64, strict=False).fill_null(0.0)]))
-            except: continue
+            except Exception: 
+                continue
         
         if not lista_dfs: return None
         df = pl.concat(lista_dfs, how="diagonal").to_pandas()
