@@ -27,7 +27,6 @@ class CamadaOuroSafeDriver:
         self.project_id = os.getenv("BQ_PROJECT_ID", "").strip()
         self.dataset_id = os.getenv("BQ_DATASET_ID", "").strip()
 
-        # CORREÇÃO 1: addressing_style 'path' é obrigatório no Cloudflare R2
         self.s3 = boto3.client(
             's3',
             endpoint_url=self.endpoint,
@@ -87,15 +86,19 @@ class CamadaOuroSafeDriver:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/prata/ssp_consolidada_{ano}.parquet")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read())).to_pandas()
                 
+                # Tratamento de nulos numéricos ANTES de criar categorias
+                if 'DENSIDADE' in df.columns:
+                    df['DENSIDADE'] = df['DENSIDADE'].fillna(0.0)
+
                 df['PERFIL_AREA'] = np.where(df['DENSIDADE'] > 5000, "RESIDENCIAL", 
                                     np.where(df['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
                 
                 for col in ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']:
                     df[col] = df[col].astype(str).fillna("DESCONHECIDO").astype('category')
                 
-                return df.fillna(0)
+                # Removido o .fillna(0) daqui para não estourar as categorias
+                return df
             except Exception as e:
-                # Fim do erro silencioso! Se falhar, vamos saber.
                 logger.warning(f"OURO: Ano {ano} não encontrado ou erro de leitura: {e}")
                 continue
         return None
@@ -128,7 +131,6 @@ class CamadaOuroSafeDriver:
         tabela_destino = f"{self.project_id}.{self.dataset_id}.fato_risco_h3_atual"
         tabela_staging = f"{tabela_destino}_staging"
         
-        # CORREÇÃO 2: Checar se a tabela existe. Se for a primeira vez, cria do zero.
         try:
             self.bq_client.get_table(tabela_destino)
             tabela_existe = True
