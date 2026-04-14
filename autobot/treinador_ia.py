@@ -8,11 +8,12 @@ import io
 import os
 import json
 import logging
+import numpy as np
 from datetime import datetime
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score
 
 # Configuração de logging padrão corporativo
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -43,10 +44,13 @@ class TreinadorEvolutivo:
             "motociclista": "TOTAL_CRIMES_MOTOCICLISTA"
         }
         
-        # Features definidas no Datalake Prata
+        # Features
         self.features_base = ['INDICE_RESIDENCIAL', 'TOTAL_NAO_RES_H3', 'DENSIDADE_ENDERECOS']
         self.features_delta = ['DELTA_MOTORISTA', 'DELTA_PEDESTRE', 'DELTA_MOTOCICLISTA']
         self.meta_features = ['ULTIMO_MAE_CAT', 'ULTIMO_MAE_LGB']
+        
+        # Dicionário de métricas para o Maestro/Discord
+        self.metricas_acumuladas = []
 
     def treinar_modelo_mestre(self):
         """Executa o treinamento do Ensemble e versiona os modelos no R2."""
@@ -59,7 +63,6 @@ class TreinadorEvolutivo:
             return False
 
         colunas_ia = self.features_base + self.features_delta + self.meta_features
-        logger.info(f"IA: Datalake carregado. Registros: {df_treino.shape[0]} | Features: {len(colunas_ia)}")
 
         for persona, target in self.personas.items():
             try:
@@ -69,28 +72,39 @@ class TreinadorEvolutivo:
                 
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-                # CatBoost: Resiliência a Outliers
+                # 1. CatBoost
                 model_cat = CatBoostRegressor(iterations=800, depth=6, learning_rate=0.04, verbose=0)
                 model_cat.fit(X_train, y_train)
-                mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
-
-                # LightGBM: Velocidade e Generalização
+                preds_cat = model_cat.predict(X_test)
+                
+                # 2. LightGBM
                 model_lgb = LGBMRegressor(n_estimators=300, learning_rate=0.03, verbosity=-1)
                 model_lgb.fit(X_train, y_train)
-                mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
+                preds_lgb = model_lgb.predict(X_test)
 
-                logger.info(f"Resultados [{persona}]: MAE CatBoost: {mae_cat:.4f} | MAE LightGBM: {mae_lgb:.4f}")
+                # Cálculos de Performance
+                mae_persona = (mean_absolute_error(y_test, preds_cat) + mean_absolute_error(y_test, preds_lgb)) / 2
+                self.metricas_acumuladas.append(mae_persona)
 
                 # Persistência
                 self._exportar_artefactos(model_cat, f"cat_{persona}")
                 self._exportar_artefactos(model_lgb, f"lgb_{persona}")
-                self._atualizar_meta_features(persona, mae_cat, mae_lgb)
+                self._atualizar_meta_features(persona, mean_absolute_error(y_test, preds_cat), mean_absolute_error(y_test, preds_lgb))
                 
             except Exception as e:
                 logger.error(f"Erro no treinamento da persona {persona}: {e}")
                 return False
 
         return True
+
+    def obter_metricas_finais(self):
+        """Retorna as médias de erro para o Maestro preencher o relatório do Discord."""
+        if not self.metricas_acumuladas:
+            return {"mae": 0.0}
+        
+        return {
+            "mae": sum(self.metricas_acumuladas) / len(self.metricas_acumuladas)
+        }
 
     def _carregar_datalake_consolidado(self):
         """Carrega todos os anos da Prata garantindo a compatibilidade de tipos (Int32)."""
@@ -103,21 +117,18 @@ class TreinadorEvolutivo:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=path)
                 df_ano = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 
-                # --- VACINA DE TIPOS ---
-                # Forçamos todos os inteiros para Int32 (assinado) para permitir o concat
-                # Isso resolve o conflito entre UInt32 (arquivos velhos) e Int32 (arquivos novos)
+                # Vacina de Tipos para evitar quebra no concat (Int32)
                 df_ano = df_ano.with_columns([
                     pl.col(pl.INTEGER_DTYPES).cast(pl.Int32)
                 ])
                 
                 lista_dfs.append(df_ano)
-                logger.info(f"IA: Dados de {ano} carregados e tipados (Int32).")
+                logger.info(f"IA: Dados de {ano} carregados.")
             except ClientError:
                 continue
         
         if not lista_dfs: return None
             
-        # Concatenação diagonal para lidar com colunas extras (ex: CMD, BTL em 2024+)
         df_consolidado = pl.concat(lista_dfs, how="diagonal").to_pandas().fillna(0)
         
         # Injeção das memórias de erro (Meta-Features)
@@ -151,7 +162,7 @@ class TreinadorEvolutivo:
         
         self.s3.put_object(Bucket=self.bucket, Key=caminho_versao, Body=payload)
         self.s3.put_object(Bucket=self.bucket, Key=caminho_producao, Body=payload)
-        logger.info(f"IA: Modelo {caminho_producao} atualizado.")
+        logger.info(f"IA: Modelo {caminho_producao} versionado.")
 
 if __name__ == "__main__":
     TreinadorEvolutivo().treinar_modelo_mestre()
