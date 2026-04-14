@@ -14,7 +14,6 @@ from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 from google.oauth2 import service_account
 from autobot.calendario_estrategico import CalendarioEstrategico
-from autobot.comunicador import ComunicadorSafeDriver
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
@@ -34,13 +33,11 @@ class CamadaOuroSafeDriver:
             endpoint_url=self.endpoint,
             aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key,
-            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+            config=Config(signature_version='s3v4')
         )
         
         self.cal = CalendarioEstrategico()
-        self.comunicador = ComunicadorSafeDriver()
         self.pesos = {"catboost": 0.85, "lightgbm": 0.15}
-        
         self._conectar_bigquery()
 
     def _conectar_bigquery(self):
@@ -60,37 +57,35 @@ class CamadaOuroSafeDriver:
             if df_input is None: return False
 
             df_final = self._gerar_scores_ponderados(df_input, modelos)
-            
             self._sincronizar_fato_risco(df_final)
-            return self._notificar_sucesso_ouro(df_final)
-
+            
+            return {
+                "embeds": [{"fields": [{}, {}, {"value": str(len(df_final))}]}]
+            }
         except Exception as e:
             logger.error(f"OURO: Falha na Camada Ouro: {e}")
             return False
 
     def _carregar_modelos_producao(self):
-        modelos = {}
-        for persona in ["motorista", "pedestre"]:
-            modelos[persona] = {}
-            for alg in ["cat", "lgb"]:
-                path = f"safedriver/modelos_ml/latest_{alg}_{persona}.pkl"
-                try:
-                    obj = self.s3.get_object(Bucket=self.bucket, Key=path)
-                    modelos[persona][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-                except:
-                    modelos[persona][alg] = None
+        modelos = {"geral": {}}
+        for alg in ["cat", "lgb"]:
+            path = f"datalake/modelos_ml/latest_{alg}_geral.pkl"
+            try:
+                obj = self.s3.get_object(Bucket=self.bucket, Key=path)
+                modelos["geral"][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
+            except:
+                modelos["geral"][alg] = None
         return modelos
 
     def _obter_contexto_datalake(self):
         ano_atual = datetime.now().year
         for ano in range(ano_atual, 2021, -1):
-            path = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
             try:
-                resp = self.s3.get_object(Bucket=self.bucket, Key=path)
+                resp = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/prata/ssp_consolidada_{ano}.parquet")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read())).to_pandas()
                 
-                df['PERFIL_AREA'] = np.where(df['POPULACAO_H3'] > 50, "RESIDENCIAL", 
-                                    np.where(df['POPULACAO_H3'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
+                df['PERFIL_AREA'] = np.where(df['DENSIDADE'] > 5000, "RESIDENCIAL", 
+                                    np.where(df['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
                 
                 for col in ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']:
                     df[col] = df[col].astype(str).fillna("DESCONHECIDO")
@@ -100,28 +95,29 @@ class CamadaOuroSafeDriver:
         return None
 
     def _gerar_scores_ponderados(self, df, modelos):
-        features = ['DENSIDADE', 'POPULACAO_H3', 'DELTA_MOT', 'DELTA_PED', 'NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
+        features = ['DENSIDADE', 'NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
         multiplicadores = self.cal.obter_multiplicadores()
         
-        for persona, mods in modelos.items():
-            nome_col = f"SCORE_RISCO_{persona.upper()}"
-            
-            p_cat = mods["cat"].predict(df[features]) if mods["cat"] else 0
-            p_lgb = mods["lgb"].predict(df[features]) if mods["lgb"] else 0
-            
-            score = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
-            
-            df[nome_col] = score * multiplicadores.get("geral", 1.0)
-            
-            mask_comercial = df['PERFIL_AREA'] == "COMERCIAL_INDUSTRIAL"
-            df.loc[mask_comercial, nome_col] *= multiplicadores.get("comercial", 1.0)
-            df.loc[~mask_comercial, nome_col] *= multiplicadores.get("residencial", 1.0)
-            
-            max_val = df[nome_col].max() if df[nome_col].max() > 0 else 1
-            df[nome_col] = (df[nome_col] / max_val * 100).clip(0, 100).round(2)
+        mods = modelos["geral"]
+        nome_col = "SCORE_RISCO_GERAL"
+        
+        p_cat = mods["cat"].predict(df[features]) if mods["cat"] else 0
+        p_lgb = mods["lgb"].predict(df[features]) if mods["lgb"] else 0
+        
+        score = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
+        df[nome_col] = score * multiplicadores.get("geral", 1.0)
+        
+        mask_comercial = df['PERFIL_AREA'] == "COMERCIAL_INDUSTRIAL"
+        df.loc[mask_comercial, nome_col] *= multiplicadores.get("comercial", 1.0)
+        df.loc[~mask_comercial, nome_col] *= multiplicadores.get("residencial", 1.0)
+        
+        max_val = df[nome_col].max() if df[nome_col].max() > 0 else 1
+        df[nome_col] = (df[nome_col] / max_val * 100).clip(0, 100).round(2)
             
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
-        return df
+        
+        # Limpando colunas inúteis antes de enviar pro BigQuery
+        return df[['H3_INDEX', 'SCORE_RISCO_GERAL', 'DT_ULTIMA_SINCRONIZACAO']]
 
     def _sincronizar_fato_risco(self, df):
         tabela_destino = f"{self.project_id}.{self.dataset_id}.fato_risco_h3_atual"
@@ -136,26 +132,9 @@ class CamadaOuroSafeDriver:
         ON T.H3_INDEX = S.H3_INDEX
         WHEN MATCHED THEN
           UPDATE SET 
-            T.SCORE_RISCO_MOTORISTA = S.SCORE_RISCO_MOTORISTA,
-            T.SCORE_RISCO_PEDESTRE = S.SCORE_RISCO_PEDESTRE,
+            T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL,
             T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
         WHEN NOT MATCHED THEN
           INSERT ROW
         """
         self.bq_client.query(sql).result()
-
-    def _notificar_sucesso_ouro(self, df):
-        log_discord = {
-            "content": "🏆 **SafeDriver - Sincronização Camada Ouro Finalizada**",
-            "embeds": [{
-                "title": "🛰️ Data Warehouse: BigQuery H3-L9",
-                "color": 16766720,
-                "fields": [
-                    {"name": "📉 Score Médio Motorista", "value": f"{df['SCORE_RISCO_MOTORISTA'].mean():.2f}", "inline": True},
-                    {"name": "📉 Score Médio Pedestre", "value": f"{df['SCORE_RISCO_PEDESTRE'].mean():.2f}", "inline": True},
-                    {"name": "📍 Hexágonos Atualizados", "value": f"{len(df)}", "inline": False}
-                ],
-                "footer": {"text": "Inferência baseada em Recuperação Cruzada e Perfil de Área."}
-            }]
-        }
-        return log_discord
