@@ -1,27 +1,34 @@
 # Processamento de Dados
 polars
-fastexcel
 pandas
 numpy
-openpyxl
+pyarrow
+fastexcel
+calamine
 
-# Infraestrutura Cloud R2 e BigQuery
+# Infraestrutura e Nuvem
 boto3
 botocore
 google-cloud-bigquery
 google-auth
-pyarrow
 
-# Inteligência Artificial e Modelagem
+# Inteligência Artificial 
 scikit-learn
 catboost
 lightgbm
 joblib
 
-# Geo-análise e Utilitários
+# Geo-análise e Datas 
 h3
 holidays
+pytz
+tzdata
+
+# Utilitários e Comunicação
 requests
 python-dotenv
-pandas-gbq
+pytest
+
+# Visualização
 folium
+pandas-gbq
