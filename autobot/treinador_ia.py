@@ -41,23 +41,18 @@ class TreinadorEvolutivo:
         
         self.features_numericas = ['DENSIDADE', 'POPULACAO_H3', 'DELTA_MOT', 'DELTA_PED']
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
-        self.metricas_acumuladas = []
+        self.metricas_detalhadas = []
 
     def treinar_modelo_mestre(self):
-        logger.info(f"IA: Iniciando Pipeline H3-L9 [v{self.versao_modelo}]")
-        
         df_treino = self._carregar_datalake_consolidado()
         
         if df_treino is None or df_treino.shape[0] < 100:
-            logger.warning("IA: Massa de dados insuficiente para H3-L9.")
-            return False
+            return None
 
         colunas_ia = self.features_numericas + self.features_categoricas
 
         for persona, target in self.personas.items():
             try:
-                logger.info(f"--- Treinando Persona: {persona.upper()} ---")
-                
                 X = df_treino[colunas_ia].copy()
                 y = df_treino[target]
                 
@@ -67,84 +62,79 @@ class TreinadorEvolutivo:
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
                 model_cat = CatBoostRegressor(
-                    iterations=1000,
-                    depth=8,
-                    learning_rate=0.03,
-                    cat_features=self.features_categoricas,
-                    loss_function='MAE',
-                    verbose=0
+                    iterations=1000, depth=8, learning_rate=0.03,
+                    cat_features=self.features_categoricas, loss_function='MAE', verbose=0
                 )
                 model_cat.fit(X_train, y_train)
-                preds_cat = model_cat.predict(X_test)
                 
                 model_lgb = LGBMRegressor(
-                    n_estimators=500,
-                    learning_rate=0.02,
-                    num_leaves=64,
-                    importance_type='gain',
-                    verbosity=-1
+                    n_estimators=500, learning_rate=0.02, num_leaves=64, verbosity=-1
                 )
                 model_lgb.fit(X_train, y_train)
-                preds_lgb = model_lgb.predict(X_test)
 
-                mae_cat = mean_absolute_error(y_test, preds_cat)
-                mae_lgb = mean_absolute_error(y_test, preds_lgb)
+                mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
+                mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
                 
-                self.metricas_acumuladas.append({"persona": persona, "mae_cat": mae_cat, "mae_lgb": mae_lgb})
+                self.metricas_detalhadas.append({
+                    "persona": persona,
+                    "mae_cat": round(float(mae_cat), 4),
+                    "mae_lgb": round(float(mae_lgb), 4),
+                    "total_treino": len(X_train)
+                })
 
                 self._exportar_artefactos(model_cat, f"cat_{persona}")
                 self._exportar_artefactos(model_lgb, f"lgb_{persona}")
-                self._atualizar_meta_perf(persona, mae_cat, mae_lgb)
                 
             except Exception as e:
-                logger.error(f"Erro no treinamento {persona}: {e}")
+                logger.error(f"Erro no treinamento: {e}")
                 continue
 
-        return True
+        return self._formatar_log_discord()
 
-    def obter_metricas_finais(self):
-        return self.metricas_acumuladas
+    def _formatar_log_discord(self):
+        if not self.metricas_detalhadas: return None
+        
+        log = {
+            "content": "🧠 **SafeDriver - Pipeline de Inteligência Artificial Finalizado**",
+            "embeds": [{
+                "title": f"🤖 MLOps: Treinamento Evolutivo v{self.versao_modelo}",
+                "color": 3447003,
+                "fields": [
+                    {"name": "📍 Resolução Espacial", "value": "H3 Level 9 (Clusters de 0.1km²)", "inline": True},
+                    {"name": "📚 Massa de Dados", "value": f"{self.metricas_detalhadas[0]['total_treino']} amostras", "inline": True}
+                ],
+                "footer": {"text": "Modelos versionados e persistidos no R2 Bucket."}
+            }]
+        }
+        
+        for m in self.metricas_detalhadas:
+            log["embeds"][0]["fields"].append({
+                "name": f"👤 Persona: {m['persona'].upper()}",
+                "value": f"📉 CatBoost MAE: `{m['mae_cat']}`\n📉 LightGBM MAE: `{m['mae_lgb']}`",
+                "inline": False
+            })
+            
+        return log
 
     def _carregar_datalake_consolidado(self):
         lista_dfs = []
-        ano_atual = datetime.now().year
-        
-        for ano in range(2022, ano_atual + 1):
-            path = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
+        for ano in range(2022, datetime.now().year + 1):
             try:
-                resp = self.s3.get_object(Bucket=self.bucket, Key=path)
-                df_ano = pl.read_parquet(io.BytesIO(resp['Body'].read()))
-                df_ano = df_ano.with_columns([pl.all().cast(pl.Float64, strict=False).fill_null(0.0)])
-                lista_dfs.append(df_ano)
-            except ClientError:
-                continue
+                resp = self.s3.get_object(Bucket=self.bucket, Key=f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet")
+                df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
+                lista_dfs.append(df.with_columns([pl.all().cast(pl.Float64, strict=False).fill_null(0.0)]))
+            except: continue
         
         if not lista_dfs: return None
-            
-        df_consolidado = pl.concat(lista_dfs, how="diagonal").to_pandas()
+        df = pl.concat(lista_dfs, how="diagonal").to_pandas()
         
-        if 'POPULACAO_H3' in df_consolidado.columns and 'TOTAL_RESIDENCIAS' in df_consolidado.columns:
-            df_consolidado['PERFIL_AREA'] = np.where(
-                (df_consolidado['POPULACAO_H3'] > 50), "RESIDENCIAL",
-                np.where(df_consolidado['POPULACAO_H3'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO")
-            )
-        else:
-            df_consolidado['PERFIL_AREA'] = "MISTO"
-            
-        return df_consolidado
+        df['PERFIL_AREA'] = np.where(df['POPULACAO_H3'] > 50, "RESIDENCIAL", 
+                            np.where(df['POPULACAO_H3'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
+        return df
 
-    def _atualizar_meta_perf(self, persona, mae_cat, mae_lgb):
-        path = f"safedriver/modelos_ml/meta_perf_{persona}.json"
-        dados = {"mae_cat": float(mae_cat), "mae_lgb": float(mae_lgb), "timestamp": str(datetime.now())}
-        self.s3.put_object(Bucket=self.bucket, Key=path, Body=json.dumps(dados))
-
-    def _exportar_artefactos(self, modelo, nome_base):
+    def _exportar_artefactos(self, modelo, nome):
         buffer = io.BytesIO()
         joblib.dump(modelo, buffer)
         payload = buffer.getvalue()
-        
-        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/versions/v{self.versao_modelo}_{nome_base}.pkl", Body=payload)
-        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/latest_{nome_base}.pkl", Body=payload)
-
-if __name__ == "__main__":
-    TreinadorEvolutivo().treinar_modelo_mestre()
+        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/versions/v{self.versao_modelo}_{nome}.pkl", Body=payload)
+        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/latest_{nome}.pkl", Body=payload)
