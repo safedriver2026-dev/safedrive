@@ -48,11 +48,17 @@ class ProcessamentoPrata:
 
     def _canonizar_texto(self, coluna):
         return (
-            coluna.str.replace(r"^(RUA|R|AVENIDA|AV|ALAMEDA|AL|PRACA|PRC|ESTRADA|EST|VIELA|VL)\.?\s+", "", regex=True)
-            .str.replace_all(r"[ÁÀÂÃÄ]", "A").str.replace_all(r"[ÉÈÊË]", "E")
-            .str.replace_all(r"[ÍÌÎÏ]", "I").str.replace_all(r"[ÓÒÔÕÖ]", "O")
-            .str.replace_all(r"[ÚÙÛÜ]", "U").str.replace_all(r"[Ç]", "C")
-            .str.replace_all(r"[^A-Z0-9 ]", "").str.replace_all(r"\s+", " ").str.strip_chars()
+            # No Polars atual, regex é o padrão (literal=False)
+            coluna.str.replace(r"^(RUA|R|AVENIDA|AV|ALAMEDA|AL|PRACA|PRC|ESTRADA|EST|VIELA|VL)\.?\s+", "")
+            .str.replace_all(r"[ÁÀÂÃÄ]", "A")
+            .str.replace_all(r"[ÉÈÊË]", "E")
+            .str.replace_all(r"[ÍÌÎÏ]", "I")
+            .str.replace_all(r"[ÓÒÔÕÖ]", "O")
+            .str.replace_all(r"[ÚÙÛÜ]", "U")
+            .str.replace_all(r"[Ç]", "C")
+            .str.replace_all(r"[^A-Z0-9 ]", "")
+            .str.replace_all(r"\s+", " ")
+            .str.strip_chars()
         )
 
     def _motor_recuperacao_cruzada(self, df_bronze):
