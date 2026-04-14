@@ -86,7 +86,6 @@ class CamadaOuroSafeDriver:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/prata/ssp_consolidada_{ano}.parquet")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read())).to_pandas()
                 
-                # Tratamento de nulos numéricos ANTES de criar categorias
                 if 'DENSIDADE' in df.columns:
                     df['DENSIDADE'] = df['DENSIDADE'].fillna(0.0)
 
@@ -96,7 +95,6 @@ class CamadaOuroSafeDriver:
                 for col in ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']:
                     df[col] = df[col].astype(str).fillna("DESCONHECIDO").astype('category')
                 
-                # Removido o .fillna(0) daqui para não estourar as categorias
                 return df
             except Exception as e:
                 logger.warning(f"OURO: Ano {ano} não encontrado ou erro de leitura: {e}")
@@ -125,37 +123,77 @@ class CamadaOuroSafeDriver:
             
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
         
-        return df[['H3_INDEX', 'SCORE_RISCO_GERAL', 'DT_ULTIMA_SINCRONIZACAO']]
+        # Agora retornamos o DataFrame "Largo" (Wide) para conseguir montar as dimensões no BigQuery
+        return df[['H3_INDEX', 'SCORE_RISCO_GERAL', 'NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'DENSIDADE', 'DT_ULTIMA_SINCRONIZACAO']]
 
     def _sincronizar_fato_risco(self, df):
         tabela_destino = f"{self.project_id}.{self.dataset_id}.fato_risco_h3_atual"
         tabela_staging = f"{tabela_destino}_staging"
         
-        try:
-            self.bq_client.get_table(tabela_destino)
-            tabela_existe = True
-        except NotFound:
-            tabela_existe = False
-
-        if not tabela_existe:
-            logger.info("OURO: Tabela destino não existe. Criando do zero no BigQuery...")
-            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-            self.bq_client.load_table_from_dataframe(df, tabela_destino, job_config=job_config).result()
-            return
-
-        logger.info("OURO: Tabela destino encontrada. Fazendo MERGE...")
+        # 1. Carrega tudo (Fato + Dimensões) na tabela de Staging primeiro
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=job_config).result()
 
-        sql = f"""
-        MERGE `{tabela_destino}` T
-        USING `{tabela_staging}` S
-        ON T.H3_INDEX = S.H3_INDEX
-        WHEN MATCHED THEN
-          UPDATE SET 
-            T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL,
-            T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
-        WHEN NOT MATCHED THEN
-          INSERT ROW
+        # 2. Garante que a tabela Fato exista antes do MERGE
+        try:
+            self.bq_client.get_table(tabela_destino)
+        except NotFound:
+            logger.info("OURO: Tabela Fato não existe. Criando estrutura inicial...")
+            sql_init = f"CREATE TABLE `{tabela_destino}` AS SELECT H3_INDEX, SCORE_RISCO_GERAL, DT_ULTIMA_SINCRONIZACAO FROM `{tabela_staging}`"
+            self.bq_client.query(sql_init).result()
+
+        # 3. Orquestra a criação do Modelo Semântico (Estrela + View)
+        logger.info("OURO: Construindo Modelo Semântico Estrela no BigQuery...")
+        self._construir_modelo_semantico(tabela_staging, tabela_destino)
+
+    def _construir_modelo_semantico(self, tabela_staging, tabela_destino):
+        # A. Atualiza a Tabela Fato (Merge Clássico)
+        query_fato = f"""
+        MERGE `{tabela_destino}` T USING `{tabela_staging}` S ON T.H3_INDEX = S.H3_INDEX
+        WHEN MATCHED THEN 
+            UPDATE SET T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL, T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
+        WHEN NOT MATCHED THEN 
+            INSERT (H3_INDEX, SCORE_RISCO_GERAL, DT_ULTIMA_SINCRONIZACAO) VALUES(S.H3_INDEX, S.SCORE_RISCO_GERAL, S.DT_ULTIMA_SINCRONIZACAO)
         """
-        self.bq_client.query(sql).result()
+        self.bq_client.query(query_fato).result()
+
+        # B. Recria a Dimensão Geográfica H3
+        query_dim_h3 = f"""
+        CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.dim_h3` AS
+        SELECT DISTINCT H3_INDEX, NM_BAIRRO, NM_MUN as CIDADE, PERFIL_AREA, DENSIDADE
+        FROM `{tabela_staging}`
+        """
+        self.bq_client.query(query_dim_h3).result()
+
+        # C. Recria a Dimensão Tempo
+        query_dim_tempo = f"""
+        CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.dim_tempo` AS
+        SELECT
+            d as DATA,
+            EXTRACT(DAYOFWEEK FROM d) as DIA_SEMANA,
+            EXTRACT(MONTH FROM d) as MES,
+            FORMAT_DATE('%A', d) as NOME_DIA,
+            IF(EXTRACT(DAY FROM d) BETWEEN 1 AND 10, TRUE, FALSE) as SEMANA_PAGAMENTO
+        FROM UNNEST(GENERATE_DATE_ARRAY('2022-01-01', '2026-12-31')) d
+        """
+        self.bq_client.query(query_dim_tempo).result()
+
+        # D. Cria a View Analítica (A entrega de Ouro Final)
+        query_view = f"""
+        CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.v_safedriver_analitico` AS
+        SELECT 
+            f.H3_INDEX, 
+            f.SCORE_RISCO_GERAL,
+            g.NM_BAIRRO, 
+            g.CIDADE, 
+            g.PERFIL_AREA, 
+            g.DENSIDADE,
+            t.NOME_DIA, 
+            t.SEMANA_PAGAMENTO, 
+            f.DT_ULTIMA_SINCRONIZACAO
+        FROM `{tabela_destino}` f
+        JOIN `{self.project_id}.{self.dataset_id}.dim_h3` g ON f.H3_INDEX = g.H3_INDEX
+        LEFT JOIN `{self.project_id}.{self.dataset_id}.dim_tempo` t ON DATE(f.DT_ULTIMA_SINCRONIZACAO) = t.DATA
+        """
+        self.bq_client.query(query_view).result()
+        logger.info("OURO: View Analítica (v_safedriver_analitico) gerada com sucesso e pronta para o Streamlit!")
