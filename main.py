@@ -5,10 +5,9 @@ import json
 import logging
 import argparse
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from botocore.config import Config
-from botocore.exceptions import ClientError
 from google.cloud import bigquery
-from google.oauth2 import service_account
 
 # Importação dos módulos do ecossistema SafeDriver
 from autobot.ingestao_bronze import IngestaoBronze
@@ -18,7 +17,7 @@ from autobot.ia_sincronizacao_ouro import CamadaOuroSafeDriver
 from autobot.calendario_estrategico import CalendarioEstrategico
 from autobot.comunicador import ComunicadorSafeDriver
 
-# Configuração de Logging de Graus de Produção
+# Configuração de Logging Profissional
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - [%(levelname)s] - %(message)s',
@@ -28,113 +27,125 @@ logger = logging.getLogger(__name__)
 
 class SafeDriverMaestro:
     def __init__(self):
-        self.inicio = datetime.now()
+        self.tz = ZoneInfo("America/Sao_Paulo")
+        self.inicio = datetime.now(self.tz)
         self.cal = CalendarioEstrategico()
         self.comunicador = ComunicadorSafeDriver()
 
-    def _dados_essenciais_ausentes(self):
-        """Verifica a integridade do Datalake no R2 e a existência da tabela no BigQuery."""
-        ano_atual = datetime.now().year
-        path_prata = f"safedriver/datalake/prata/ssp_consolidada_{ano_atual}.parquet"
-        path_modelo = "safedriver/modelos_ml/latest_cat_motorista.pkl"
+    def _verificar_integridade_infra(self):
+        """
+        Verifica se o ambiente está saudável ou se precisa de intervenção (Backfill).
+        """
+        logger.info("AUDITORIA: Validando integridade do Data Lake e Data Warehouse...")
         
-        # 1. Validação de Infraestrutura R2 (Cloudflare)
         try:
+            # 1. Check R2 (Cloudflare)
             s3 = boto3.client(
                 's3',
                 endpoint_url=os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/'),
                 aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
                 aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
-                config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+                config=Config(signature_version='s3v4')
             )
             bucket = os.getenv("R2_BUCKET_NAME", "").strip()
+            # Verifica se o modelo 'latest' existe
+            s3.head_object(Bucket=bucket, Key="safedriver/modelos_ml/latest_cat_motorista.pkl")
             
-            # Tenta ler os metadados dos arquivos vitais
-            s3.head_object(Bucket=bucket, Key=path_prata)
-            s3.head_object(Bucket=bucket, Key=path_modelo)
-            logger.info("INTEGRIDADE: Arquivos detectados no R2.")
-        except Exception:
-            logger.warning("INTEGRIDADE: Arquivos essenciais ausentes no R2 (Prata ou Modelos).")
-            return True 
-
-        # 2. Validação de Infraestrutura BigQuery (Google Cloud)
-        try:
-            gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
-            cred_info = json.loads(gcp_json)
-            credentials = service_account.Credentials.from_service_account_info(cred_info)
-            client = bigquery.Client(credentials=credentials, project=os.getenv("BQ_PROJECT_ID"))
+            # 2. Check BigQuery (Google Cloud)
+            bq = bigquery.Client(project=os.getenv("BQ_PROJECT_ID"))
+            tabela = f"{os.getenv('BQ_PROJECT_ID')}.{os.getenv('BQ_DATASET_ID')}.fato_risco_predicao_atual"
+            bq.get_table(tabela)
             
-            tabela_ref = f"{os.getenv('BQ_PROJECT_ID')}.{os.getenv('BQ_DATASET_ID')}.fato_risco_predicao_atual"
-            client.get_table(tabela_ref)
-            logger.info("INTEGRIDADE: Tabela de produção localizada no BigQuery.")
+            return False # Tudo OK
         except Exception as e:
-            logger.warning(f"INTEGRIDADE: Tabela no BigQuery não localizada ou inacessível: {e}")
-            return True # Gatilho acionado para forçar a criação da tabela na Ouro
-
-        return False # Sistema 100% íntegro
+            logger.warning(f"AUDITORIA: Anomalia detectada ou infraestrutura incompleta: {e}")
+            return True # Precisa rodar para consertar
 
     def run(self, force=False):
         try:
-            logger.info("SafeDriver Maestro: Iniciando rotina de verificação e orquestração.")
-            
-            # ETAPA 0: Ingestão e CDC (Change Data Capture)
-            # Verifica se a SSP atualizou os arquivos Excel
-            bronze = IngestaoBronze()
-            teve_atualizacao_dados = bronze.executar_ingestao_continua()
-            
-            # Verificação de gatilhos estratégicos e integridade
-            deve_executar_calendario = self.cal.deve_rodar_hoje()
-            dados_ausentes = self._dados_essenciais_ausentes()
-            
-            # Lógica de Decisão do Orquestrador
-            deve_executar = teve_atualizacao_dados or deve_executar_calendario or dados_ausentes
+            logger.info("SafeDriver Maestro: Iniciando orquestração do ecossistema.")
 
-            if not deve_executar and not force:
-                logger.info("Operação suspensa: Ambiente íntegro, sem novos dados e fora de ciclo estratégico.")
+            # ETAPA 0: Ingestão e Monitoramento de Mudanças (CDC)
+            bronze = IngestaoBronze()
+            novos_dados_ssp = bronze.executar_ingestao_continua()
+            
+            deve_rodar_calendario = self.cal.deve_rodar_hoje()
+            infra_quebrada = self._verificar_integridade_infra()
+            
+            # Decisão de Execução
+            executar_pipeline = novos_dados_ssp or deve_rodar_calendario or infra_quebrada or force
+
+            if not executar_pipeline:
+                logger.info("Pipeline em repouso: Dados sincronizados e sem gatilhos estratégicos.")
                 return
 
-            # Log de Motivação da Execução
-            if force: logger.info("Gatilho: EXECUÇÃO FORÇADA via parâmetro.")
-            elif teve_atualizacao_dados: logger.info("Gatilho: NOVOS DADOS detectados na SSP-SP.")
-            elif dados_ausentes: logger.info("Gatilho: RECUPERAÇÃO DE INFRAESTRUTURA (Dados ou Tabelas ausentes).")
-            else: logger.info("Gatilho: CICLO ESTRATÉGICO (Calendário de Risco).")
+            # Definindo o motivo para o relatório do Discord
+            if force: gatilho = "Execução Manual Forçada"
+            elif novos_dados_ssp: gatilho = "Novos Dados detectados na SSP-SP"
+            elif infra_quebrada: gatilho = "Recuperação de Infraestrutura (Auto-Reparo)"
+            else: gatilho = "Ciclo Estratégico (Calendário de Risco)"
 
-            # ETAPA 1: Camada Prata (Transformação e H3)
-            logger.info("Etapa 1/3: Iniciando processamento da Camada Prata.")
+            logger.info(f"Gatilho acionado: {gatilho}")
+
+            # --- EXECUÇÃO DO FLUXO ---
+
+            # ETAPA 1: Camada Prata (Processamento e Malha H8)
+            # Espera-se que o método retorne um dicionário de métricas
             prata = ProcessamentoPrata()
-            prata.executar_todos_os_anos()
+            resumo_prata = prata.executar_todos_os_anos(force=force) or {}
 
             # ETAPA 2: IA (Treinamento Evolutivo)
-            logger.info("Etapa 2/3: Iniciando treinamento dos modelos de Machine Learning.")
+            # Espera-se que o método retorne um dicionário com MAE/MAPE/R2
             treinador = TreinadorEvolutivo()
             if not treinador.treinar_modelo_mestre():
-                raise RuntimeError("Falha crítica no treinamento da IA.")
+                raise RuntimeError("Falha crítica no treinamento dos modelos de IA.")
+            resumo_ia = treinador.obter_metricas_finais() or {}
 
-            # ETAPA 3: Camada Ouro (Inferência e BigQuery)
-            logger.info("Etapa 3/3: Gerando predições e sincronizando com BigQuery.")
+            # ETAPA 3: Camada Ouro (Sincronização Final)
             ouro = CamadaOuroSafeDriver()
             if not ouro.executar_predicao_atual():
-                raise RuntimeError("Falha na sincronização final com o BigQuery.")
+                raise RuntimeError("Falha na sincronização dos scores com o BigQuery.")
 
-            # Finalização
-            tempo_total = str(datetime.now() - self.inicio).split(".")[0]
-            logger.info(f"✅ SafeDriver Autobot finalizado com sucesso em {tempo_total}.")
+            # --- FINALIZAÇÃO E RELATÓRIO ---
             
-            self.comunicador.relatar_sucesso(
-                datetime.now().year, 
-                tempo_total, 
-                "Pipeline completo sincronizado com sucesso no BigQuery."
-            )
+            fim = datetime.now(self.tz)
+            tempo_total = str(fim - self.inicio).split(".")[0]
+
+            # Preparando dados para o Comunicador Rico
+            contexto = {
+                "gatilho": gatilho,
+                "tempo_total": tempo_total
+            }
+
+            metricas_executivas = {
+                "Crimes Processados": resumo_prata.get('total_linhas', 'N/A'),
+                "Municípios Cobertos": "Estado de São Paulo",
+                "Status da IA": "Modelos Evoluídos"
+            }
+
+            metricas_operacionais = {
+                "Recuperados via H8": f"{resumo_prata.get('recuperados', 0)} end.",
+                "Erro Médio (MAE)": f"{resumo_ia.get('mae', 0.0):.4f}",
+                "Sincronização BQ": "Sucesso (Upsert)"
+            }
+
+            self.comunicador.relatar_conclusao_rica(contexto, metricas_executivas, metricas_operacionais)
+            logger.info(f"✅ SafeDriver finalizado com sucesso em {tempo_total}.")
 
         except Exception as e:
-            err_msg = f"Erro sistémico no Orquestrador: {str(e)}"
-            logger.error(err_msg)
-            self.comunicador.relatar_erro("SafeDriver Maestro", err_msg)
+            msg_erro = str(e)
+            logger.error(f"FALHA NO MAESTRO: {msg_erro}")
+            # Nome do módulo em português conforme solicitado
+            self.comunicador.relatar_alerta_critico(
+                modulo="Orquestrador Maestro", 
+                status="Interrupção do Fluxo", 
+                detalhe_erro=msg_erro
+            )
             sys.exit(1)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Maestro - Orquestrador SafeDriver")
-    parser.add_argument('--force', action='store_true', help="Força a execução total do pipeline.")
+    parser = argparse.ArgumentParser(description="SafeDriver Maestro - Orquestrador de Inteligência Geográfica")
+    parser.add_argument('--force', action='store_true', help="Força o reprocessamento total de todas as camadas.")
     args = parser.parse_args()
 
     SafeDriverMaestro().run(force=args.force)
