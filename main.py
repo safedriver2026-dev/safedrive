@@ -32,8 +32,6 @@ class SafeDriverMaestro:
         self.comunicador = ComunicadorSafeDriver()
 
     def _verificar_integridade_infra(self):
-        logger.info("AUDITORIA: Validando integridade da infraestrutura (H3-L9 e BigQuery)...")
-        
         try:
             s3 = boto3.client(
                 's3',
@@ -43,7 +41,7 @@ class SafeDriverMaestro:
                 config=Config(signature_version='s3v4')
             )
             bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-            s3.head_object(Bucket=bucket, Key="safedriver/modelos_ml/latest_cat_motorista.pkl")
+            s3.head_object(Bucket=bucket, Key="datalake/modelos_ml/latest_cat_motorista.pkl")
             
             gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
             cred_info = json.loads(gcp_json)
@@ -54,8 +52,7 @@ class SafeDriverMaestro:
             bq.get_table(tabela_ref)
             
             return False 
-        except Exception as e:
-            logger.warning(f"AUDITORIA: Anomalia detectada: {e}")
+        except Exception:
             return True 
 
     def run(self, force=False):
@@ -107,7 +104,7 @@ class SafeDriverMaestro:
             sys.exit(1)
 
     def _disparar_feedback_discord(self, gatilho, tempo, m_prata, m_ia, r_ouro):
-        mae_medio = sum(i['mae_cat'] for i in m_ia) / len(m_ia) if m_ia else 0
+        mae_medio = sum(i.get('mae_cat', 0) for i in m_ia) / len(m_ia) if m_ia else 0
         
         payload = {
             "content": "🚀 **SafeDriver - Pipeline de Dados e IA Concluído**",
