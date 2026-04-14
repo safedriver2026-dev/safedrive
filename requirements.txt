@@ -1,34 +1,34 @@
-# Processamento de Dados
+# --- Processamento de Dados ---
 polars
 pandas
 numpy
 pyarrow
 fastexcel
-calamine
+python-calamine
 
-# Infraestrutura e Nuvem
+# --- Infraestrutura e Nuvem ---
 boto3
 botocore
 google-cloud-bigquery
 google-auth
 
-# Inteligência Artificial 
+# --- Inteligência Artificial ---
 scikit-learn
 catboost
 lightgbm
 joblib
 
-# Geo-análise e Datas 
+# --- Geo-análise e Datas ---
 h3
 holidays
 pytz
 tzdata
 
-# Utilitários e Comunicação
+# --- Utilitários e Comunicação ---
 requests
 python-dotenv
 pytest
 
-# Visualização
+# --- Visualização ---
 folium
 pandas-gbq
