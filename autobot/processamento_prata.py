@@ -27,6 +27,194 @@ class ProcessamentoPrata:
             config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
         )
         self.tracker_path = "safedriver/datalake/prata/tracker_estado_bronze.json"
+        self.malha_path = "safedriver/datalake/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
+        self._inicializar_dependencias()
+
+    def _inicializar_dependencias(self):
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
+            self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
+            
+            self.dens_distrito = self.df_malha.group_by(["NM_MUN", "NM_DIST"]).agg(
+                pl.col("DENSIDADE_DEMOGRAFICA").mean().alias("DENS_DIST")
+            )
+            self.dens_cidade = self.df_malha.group_by(["NM_MUN"]).agg(
+                pl.col("DENSIDADE_DEMOGRAFICA").mean().alias("DENS_CID")
+            )
+        except:
+            self.df_malha = None
+            self.dens_distrito = None
+            self.dens_cidade = None
+
+    def _canonizar_texto(self, coluna):
+        return (
+            coluna.str.replace(r"^(RUA|R|AVENIDA|AV|ALAMEDA|AL|PRACA|PRC|ESTRADA|EST|VIELA|VL)\.?\s+", "", regex=True)
+            .str.replace_all(r"[ÁÀÂÃÄ]", "A").str.replace_all(r"[ÉÈÊË]", "E")
+            .str.replace_all(r"[ÍÌÎÏ]", "I").str.replace_all(r"[ÓÒÔÕÖ]", "O")
+            .str.replace_all(r"[ÚÙÛÜ]", "U").str.replace_all(r"[Ç]", "C")
+            .str.replace_all(r"[^A-Z0-9 ]", "").str.replace_all(r"\s+", " ").str.strip_chars()
+        )
+
+    def _motor_recuperacao_cruzada(self, df_bronze):
+        df_ssp = df_bronze.with_columns([
+            pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
+            pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
+            self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO")
+        ])
+
+        df_gps = df_ssp.filter(pl.col("LATITUDE") != 0).with_columns(
+            pl.struct(["LATITUDE", "LONGITUDE"])
+            .map_elements(lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], 9), return_dtype=pl.String)
+            .alias("H3_INDEX")
+        )
+
+        df_cegos = df_ssp.filter(pl.col("LATITUDE") == 0)
+        
+        malha_lookup = self.df_malha.with_columns(
+            self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO")
+        ).unique(subset=["NM_MUN", "LOG_CANONICO"]).select(["NM_MUN", "LOG_CANONICO", "H3_INDEX"])
+
+        df_resgatados = df_cegos.join(
+            malha_lookup, 
+            left_on=["MUNICIPIO", "LOG_CANONICO"], 
+            right_on=["NM_MUN", "LOG_CANONICO"], 
+            how="inner"
+        )
+
+        df_unificado = pl.concat([df_gps, df_resgatados], how="diagonal")
+
+        df_cross = df_unificado.join(
+            self.df_malha.unique(subset=["H3_INDEX"]).select([
+                "H3_INDEX", "LOGRADOURO", "NM_BAIRRO", "NM_MUN", "NM_DIST", "DENSIDADE_DEMOGRAFICA"
+            ]),
+            on="H3_INDEX", how="left", suffix="_IBGE"
+        ).join(self.dens_distrito, on=["NM_MUN", "NM_DIST"], how="left"
+        ).join(self.dens_cidade, on=["NM_MUN"], how="left")
+
+        novos_bairros = df_cross.filter(
+            (pl.col("NM_BAIRRO") == "BAIRRO_PENDENTE") & (pl.col("BAIRRO").is_not_null())
+        ).group_by("H3_INDEX").agg(pl.col("BAIRRO").first().alias("BAIRRO_CURADO"))
+
+        if not novos_bairros.is_empty():
+            self._persistir_enriquecimento_malha(novos_bairros)
+
+        df_final = df_cross.with_columns([
+            pl.when(pl.col("NM_BAIRRO") == "BAIRRO_PENDENTE").then(pl.col("BAIRRO")).otherwise(pl.col("NM_BAIRRO")).alias("BAIRRO_FINAL"),
+            pl.when(pl.col("DENSIDADE_DEMOGRAFICA") > 0).then(pl.col("DENSIDADE_DEMOGRAFICA"))
+            .when(pl.col("DENS_DIST") > 0).then(pl.col("DENS_DIST"))
+            .when(pl.col("DENS_CID") > 0).then(pl.col("DENS_CID"))
+            .otherwise(0.0).alias("DENSIDADE_FINAL")
+        ])
+
+        return df_final, novos_bairros.height, df_resgatados.height
+
+    def _persistir_enriquecimento_malha(self, novos_dados):
+        self.df_malha = self.df_malha.join(novos_dados, on="H3_INDEX", how="left")
+        self.df_malha = self.df_malha.with_columns(
+            pl.when(pl.col("BAIRRO_CURADO").is_not_null())
+            .then(pl.col("BAIRRO_CURADO"))
+            .otherwise(pl.col("NM_BAIRRO"))
+            .alias("NM_BAIRRO")
+        ).drop("BAIRRO_CURADO")
+        
+        buffer = io.BytesIO()
+        self.df_malha.write_parquet(buffer)
+        self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer.getvalue())
+
+    def _normalizar_bronze(self, data):
+        dfs = []
+        for i in range(1, 6):
+            try:
+                t = pl.read_excel(io.BytesIO(data), sheet_id=i, engine="calamine").with_columns(pl.all().cast(pl.String))
+                t.columns = [c.upper().replace("Ç", "C").replace("Ã", "A").strip() for c in t.columns]
+                dfs.append(t)
+            except: continue
+        df = pl.concat(dfs, how="diagonal")
+        mapa = {"MUNICIPIO": ["NOME_MUNICIPIO", "CIDADE"], "LOGRADOURO": ["NOME_LOGRADOURO", "LOGRADOURO"], "BAIRRO": ["BAIRRO", "NOME_BAIRRO"]}
+        for alvo, origens in mapa.items():
+            col = next((o for o in origens if o in df.columns), None)
+            if col: df = df.rename({col: alvo})
+        return df.with_columns(pl.col(pl.String).str.strip_chars().str.to_uppercase())
+
+    def processar_ano_com_delta(self, ano, estado, force=False):
+        path_bronze = f"safedriver/datalake/bronze/ssp_raw_{ano}.xlsx"
+        path_prata = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
+        
+        try:
+            meta = self.s3.head_object(Bucket=self.bucket, Key=path_bronze)
+            tamanho = meta['ContentLength']
+        except: return False
+
+        if not force and estado.get(str(ano)) == tamanho: return False
+
+        resp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
+        df_bronze = self._normalizar_bronze(resp['Body'].read())
+        total_raw = df_bronze.height
+
+        df_curado, cura_malha, resgate_h3 = self._motor_recuperacao_cruzada(df_bronze)
+
+        df_final = df_curado.group_by(["H3_INDEX"]).agg([
+            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO")).count().alias("TOTAL_CRIMES"),
+            pl.col("BAIRRO_FINAL").first().alias("NM_BAIRRO"),
+            pl.col("NM_MUN").first().alias("NM_MUN"),
+            pl.col("DENSIDADE_FINAL").first().alias("DENSIDADE")
+        ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
+
+        buffer = io.BytesIO()
+        df_final.write_parquet(buffer)
+        self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
+
+        estado[str(ano)] = tamanho
+        return {
+            "ano": ano,
+            "total_raw": total_raw,
+            "bo_resgatados": resgate_h3,
+            "malha_curada": cura_malha,
+            "h3_unicos": df_final.height
+        }
+
+    def executar_todos_os_anos(self, force=False):
+        ano_atual = datetime.now().year
+        estado_atual = self._carregar_tracker()
+        relatorio = []
+        
+        for ano in range(2022, ano_atual + 1):
+            res = self.processar_ano_com_delta(ano, estado_atual, force)
+            if res:
+                self._salvar_tracker(estado_atual)
+                relatorio.append(res)
+        
+        return self._formatar_log_discord(relatorio)
+
+    def _formatar_log_discord(self, relatorio):
+        if not relatorio: return None
+        
+        total_bo = sum(r['total_raw'] for r in relatorio)
+        total_resgate = sum(r['bo_resgatados'] for r in relatorio)
+        total_cura = sum(r['malha_curada'] for r in relatorio)
+        
+        log = {
+            "content": "🚀 **SafeDriver - Consolidação Camada Prata Finalizada**",
+            "embeds": [{
+                "title": "📊 Relatório de Recuperação Cruzada e Enriquecimento",
+                "color": 5814783,
+                "fields": [
+                    {"name": "📂 Volume Processado", "value": f"{total_bo} Boletins de Ocorrência", "inline": True},
+                    {"name": "🩹 Resgate de Geometria", "value": f"{total_resgate} B.Os recuperados via Malha", "inline": True},
+                    {"name": "🏛️ Cura de Atributos", "value": f"{total_cura} Bairros injetados na Malha IBGE", "inline": False}
+                ],
+                "footer": {"text": "Integridade de Bases: SSP ↔ IBGE | Nível de Resolução: H3-L9"}
+            }]
+        }
+        
+        for r in relatorio:
+            log["embeds"][0]["fields"].append({
+                "name": f"📅 Safra {r['ano']}",
+                "value": f"Clusters: {r['h3_unicos']} | Resgates: {r['bo_resgatados']}",
+                "inline": True
+            })
+            
+        return log
 
     def _carregar_tracker(self):
         try:
@@ -36,159 +224,3 @@ class ProcessamentoPrata:
 
     def _salvar_tracker(self, estado):
         self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
-
-    def executar_todos_os_anos(self, force=False):
-        """
-        Orquestra o processamento e retorna métricas para o Maestro.
-        """
-        logger.info("PRATA: Iniciando consolidação com Auditoria de Malha H8...")
-        ano_atual = datetime.now().year
-        estado_atual = self._carregar_tracker()
-        
-        # Métricas para o relatório do Discord
-        metricas_totais = {"total_linhas": 0, "recuperados": 0}
-
-        for ano in range(2022, ano_atual + 1):
-            resultado = self.processar_ano_com_delta(ano, estado_atual, force)
-            
-            if resultado:
-                self._salvar_tracker(estado_atual)
-                metricas_totais["total_linhas"] += resultado["total_linhas"]
-                metricas_totais["recuperados"] += resultado["recuperados"]
-                logger.info(f"PRATA: Ciclo {ano} finalizado. Recuperados via H8: {resultado['recuperados']}")
-
-        return metricas_totais
-
-    def processar_ano_com_delta(self, ano, estado, force=False):
-        path_bronze = f"safedriver/datalake/bronze/ssp_raw_{ano}.xlsx"
-        path_prata_atual = f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet"
-        path_prata_anterior = f"safedriver/datalake/prata/ssp_consolidada_{ano - 1}.parquet"
-
-        try:
-            meta = self.s3.head_object(Bucket=self.bucket, Key=path_bronze)
-            tamanho_atual = meta['ContentLength']
-        except ClientError: return False
-
-        # Verifica CDC (Se force=True, ignora o tracker e processa tudo)
-        if not force and estado.get(str(ano)) == tamanho_atual:
-            logger.info(f"PRATA: [{ano}] Sem alterações detectadas.")
-            return False
-
-        try:
-            resp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
-            excel_data = resp['Body'].read()
-            dfs_abas = []
-
-            for sheet_idx in range(1, 6):
-                try:
-                    # Leitura ultra-rápida com Calamine
-                    temp_df = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine")
-                    temp_df = temp_df.with_columns(pl.all().cast(pl.String))
-                    
-                    # Normalização de nomes
-                    temp_df = temp_df.rename({
-                        c: str(c).upper().replace("Ç", "C").replace("Ã", "A").strip() 
-                        for c in temp_df.columns
-                    })
-                    
-                    if any(k in temp_df.columns for k in ["LATITUDE", "RUBRICA"]):
-                        dfs_abas.append(temp_df)
-                except: continue
-
-            if not dfs_abas: return False
-
-            df = pl.concat(dfs_abas, how="diagonal")
-
-            # --- DICIONÁRIO DE SINÔNIMOS ---
-            sinonimos = {
-                "MUNICIPIO": ["NOME_MUNICIPIO", "CIDADE"],
-                "LOCAL_TIPO": ["DESCR_SUBTIPOLOCAL", "DESCR_TIPOLOCAL"],
-                "PERIODO": ["DESC_PERIODO", "DESCR_PERIODO"],
-                "LOGRADOURO": ["LOGRADOURO", "NOME_LOGRADOURO"]
-            }
-
-            for alvo, origens in sinonimos.items():
-                col_encontrada = next((o for o in origens if o in df.columns), None)
-                if col_encontrada:
-                    df = df.rename({col_encontrada: alvo})
-                    outros = [o for o in origens if o in df.columns and o != alvo]
-                    if outros: df = df.drop(outros)
-
-          
-            df = df.with_columns(pl.col(pl.String).str.strip_chars().str.to_uppercase())
-
-        
-            total_raw = df.height
-            
-        
-            df = df.with_columns([
-                pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
-                pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0)
-            ])
-            
-            nulos_origem = df.filter((pl.col("LATITUDE") == 0) | (pl.col("LATITUDE").is_null())).height
-
-           
-            df_valido = df.filter((pl.col("LATITUDE") != 0) & (pl.col("LATITUDE").is_not_null()))
-            
-            
-            total_final_ano = df_valido.height
-            # Se o total final for maior que o que veio com coordenada, houve recuperação
-            recuperados = max(0, total_final_ano - (total_raw - nulos_origem))
-
-            if df_valido.is_empty(): return False
-
-            # Geração do H3
-            h3_list = [h3.latlng_to_cell(lat, lon, 8) for lat, lon in zip(df_valido["LATITUDE"], df_valido["LONGITUDE"])]
-            df_valido = df_valido.with_columns(pl.Series("H3_INDEX", h3_list))
-
-            # Agregação para IA
-            df_atual = df_valido.group_by(["H3_INDEX"]).agg([
-                pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO|VEICULO|CARGA")).count().cast(pl.Int32).alias("TOTAL_CRIMES_MOTORISTA"),
-                pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("CELULAR|TRANSEUNTE|PESSOA")).count().cast(pl.Int32).alias("TOTAL_CRIMES_PEDESTRE"),
-                pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("MOTOCICLETA|MOTO")).count().cast(pl.Int32).alias("TOTAL_CRIMES_MOTOCICLISTA"),
-                pl.col("LOCAL_TIPO").filter(pl.col("LOCAL_TIPO").str.contains("RESIDENCIA|CONDOMINIO")).count().cast(pl.Int32).alias("INDICE_RESIDENCIAL"),
-                pl.col("LOCAL_TIPO").filter(~pl.col("LOCAL_TIPO").str.contains("RESIDENCIA")).count().cast(pl.Int32).alias("TOTAL_NAO_RES_H3"),
-                pl.col("LOGRADOURO").n_unique().cast(pl.Int32).alias("DENSIDADE_ENDERECOS")
-            ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
-
-            # Injeção de Deltas
-            df_final = self._injetar_deltas(df_atual, path_prata_anterior)
-            
-            # Persistência no R2
-            buffer = io.BytesIO()
-            df_final.write_parquet(buffer)
-            self.s3.put_object(Bucket=self.bucket, Key=path_prata_atual, Body=buffer.getvalue())
-            
-            estado[str(ano)] = tamanho_atual
-            
-            return {
-                "total_linhas": total_raw,
-                "recuperados": recuperados
-            }
-
-        except Exception as e:
-            logger.error(f"PRATA: Falha no ciclo de {ano}: {e}")
-            return None
-
-    def _injetar_deltas(self, df_atual, path_anterior):
-        try:
-            resp = self.s3.get_object(Bucket=self.bucket, Key=path_anterior)
-            df_passado = pl.read_parquet(io.BytesIO(resp['Body'].read()))
-            
-            df_join = df_atual.join(
-                df_passado.select(["H3_INDEX", "TOTAL_CRIMES_MOTORISTA", "TOTAL_CRIMES_PEDESTRE", "TOTAL_CRIMES_MOTOCICLISTA"]),
-                on="H3_INDEX", how="left", suffix="_PASSADO"
-            ).fill_null(0)
-            
-            return df_join.with_columns([
-                (pl.col("TOTAL_CRIMES_MOTORISTA") - pl.col("TOTAL_CRIMES_MOTORISTA_PASSADO")).cast(pl.Int32).alias("DELTA_MOTORISTA"),
-                (pl.col("TOTAL_CRIMES_PEDESTRE") - pl.col("TOTAL_CRIMES_PEDESTRE_PASSADO")).cast(pl.Int32).alias("DELTA_PEDESTRE"),
-                (pl.col("TOTAL_CRIMES_MOTOCICLISTA") - pl.col("TOTAL_CRIMES_MOTOCICLISTA_PASSADO")).cast(pl.Int32).alias("DELTA_MOTOCICLISTA")
-            ]).drop([c for c in df_join.columns if "_PASSADO" in c])
-        except:
-            return df_atual.with_columns([
-                pl.lit(0).cast(pl.Int32).alias("DELTA_MOTORISTA"),
-                pl.lit(0).cast(pl.Int32).alias("DELTA_PEDESTRE"),
-                pl.lit(0).cast(pl.Int32).alias("DELTA_MOTOCICLISTA")
-            ])
