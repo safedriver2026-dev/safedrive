@@ -34,12 +34,8 @@ class TreinadorEvolutivo:
         )
         
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
-        self.personas = {
-            "motorista": "TOTAL_CRIMES_MOTORISTA",
-            "pedestre": "TOTAL_CRIMES_PEDESTRE"
-        }
-        
-        self.features_numericas = ['DENSIDADE', 'POPULACAO_H3', 'DELTA_MOT', 'DELTA_PED']
+        self.personas = {"geral": "TOTAL_CRIMES"}
+        self.features_numericas = ['DENSIDADE']
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
         self.metricas_detalhadas = []
 
@@ -47,6 +43,7 @@ class TreinadorEvolutivo:
         df_treino = self._carregar_datalake_consolidado()
         
         if df_treino is None or df_treino.shape[0] < 100:
+            logger.error("IA: Dados insuficientes para treinamento.")
             return None
 
         colunas_ia = self.features_numericas + self.features_categoricas
@@ -87,40 +84,15 @@ class TreinadorEvolutivo:
                 
             except Exception as e:
                 logger.error(f"Erro no treinamento: {e}")
-                continue
+                return None
 
-        return self._formatar_log_discord()
-
-    def _formatar_log_discord(self):
-        if not self.metricas_detalhadas: return None
-        
-        log = {
-            "content": "🧠 **SafeDriver - Pipeline de Inteligência Artificial Finalizado**",
-            "embeds": [{
-                "title": f"🤖 MLOps: Treinamento Evolutivo v{self.versao_modelo}",
-                "color": 3447003,
-                "fields": [
-                    {"name": "📍 Resolução Espacial", "value": "H3 Level 9 (Clusters de 0.1km²)", "inline": True},
-                    {"name": "📚 Massa de Dados", "value": f"{self.metricas_detalhadas[0]['total_treino']} amostras", "inline": True}
-                ],
-                "footer": {"text": "Modelos versionados e persistidos no R2 Bucket."}
-            }]
-        }
-        
-        for m in self.metricas_detalhadas:
-            log["embeds"][0]["fields"].append({
-                "name": f"👤 Persona: {m['persona'].upper()}",
-                "value": f"📉 CatBoost MAE: `{m['mae_cat']}`\n📉 LightGBM MAE: `{m['mae_lgb']}`",
-                "inline": False
-            })
-            
-        return log
+        return self.metricas_detalhadas
 
     def _carregar_datalake_consolidado(self):
         lista_dfs = []
         for ano in range(2022, datetime.now().year + 1):
             try:
-                resp = self.s3.get_object(Bucket=self.bucket, Key=f"safedriver/datalake/prata/ssp_consolidada_{ano}.parquet")
+                resp = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/prata/ssp_consolidada_{ano}.parquet")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 lista_dfs.append(df.with_columns([pl.all().cast(pl.Float64, strict=False).fill_null(0.0)]))
             except: continue
@@ -128,13 +100,13 @@ class TreinadorEvolutivo:
         if not lista_dfs: return None
         df = pl.concat(lista_dfs, how="diagonal").to_pandas()
         
-        df['PERFIL_AREA'] = np.where(df['POPULACAO_H3'] > 50, "RESIDENCIAL", 
-                            np.where(df['POPULACAO_H3'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
+        df['PERFIL_AREA'] = np.where(df['DENSIDADE'] > 5000, "RESIDENCIAL", 
+                            np.where(df['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
         return df
 
     def _exportar_artefactos(self, modelo, nome):
         buffer = io.BytesIO()
         joblib.dump(modelo, buffer)
         payload = buffer.getvalue()
-        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/versions/v{self.versao_modelo}_{nome}.pkl", Body=payload)
-        self.s3.put_object(Bucket=self.bucket, Key=f"safedriver/modelos_ml/latest_{nome}.pkl", Body=payload)
+        self.s3.put_object(Bucket=self.bucket, Key=f"datalake/modelos_ml/versions/v{self.versao_modelo}_{nome}.pkl", Body=payload)
+        self.s3.put_object(Bucket=self.bucket, Key=f"datalake/modelos_ml/latest_{nome}.pkl", Body=payload)
