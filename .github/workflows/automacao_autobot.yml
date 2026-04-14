@@ -1,17 +1,12 @@
 name: SafeDriver Autobot
 
 on:
-
   push:
     branches:
       - main
       - master
-
-
   schedule:
     - cron: "0 4 * * *"
-  
-
   workflow_dispatch:
     inputs:
       force_execution:
@@ -29,9 +24,9 @@ jobs:
     name: Processamento e Treinamento IA
     runs-on: ubuntu-latest
     
-   
     env:
       TZ: "America/Sao_Paulo"
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout do Código
@@ -49,9 +44,8 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytz tzdata pytest
 
-      - name: 🛡️ Execução de Testes (Contrato e LGPD)
+      - name: 🛡️ Execução de Testes 
         env:
-       
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
@@ -59,29 +53,24 @@ jobs:
         run: |
           pytest tests/test_seguranca.py --maxfail=1 --disable-warnings
 
-      - name:  Acionamento do SafeDriver
+      - name: 🚀 Acionamento do SafeDriver
         env:
-         
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          
-        
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-          
-      
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-          LG_SALT: ${{ secrets.LGPD_SALT }}
+          LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
           if [ "${{ github.event.inputs.force_execution }}" == "true" ]; then
-            echo "EXECUTANDO EM MODO FORÇADO (REPROCESSAMENTO HISTÓRICO)"
+            echo "MODO: REPROCESSAMENTO HISTÓRICO"
             python main.py --force
           else
-            echo "EXECUTANDO CICLO PADRÃO DE DADOS"
+            echo "MODO: CICLO PADRÃO"
             python main.py
           fi
 
