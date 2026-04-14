@@ -7,9 +7,8 @@ logger = logging.getLogger(__name__)
 
 class CalendarioEstrategico:
     def __init__(self):
-        # Define a data de hoje (ou pode ser injetada para testes)
         self.hoje = datetime.now()
-        # Feriados oficiais de São Paulo (Estaduais e Nacionais)
+        # Feriados oficiais de São Paulo Estaduais e Nacionais
         self.feriados_sp = holidays.BR(state='SP')
 
     def eh_semana_de_pagamento(self):
@@ -29,7 +28,7 @@ class CalendarioEstrategico:
         amanha = self.hoje + timedelta(days=1)
         depois_amanha = self.hoje + timedelta(days=2)
         
-        # Verifica se hoje, amanhã ou depois consta na lista de feriados
+     
         return (self.hoje in self.feriados_sp) or \
                (amanha in self.feriados_sp) or \
                (depois_amanha in self.feriados_sp)
@@ -45,7 +44,7 @@ class CalendarioEstrategico:
             "geral": 1.0          # Multiplicador final do Score
         }
         
-        # Ajuste para Semana de Pagamento (Foco em áreas comerciais/bancárias)
+
         if self.eh_semana_de_pagamento():
             pesos["comercial"] = 1.25  # +25% de risco em áreas comerciais
             pesos["geral"] = 1.10      # +10% de elevação basal
@@ -64,22 +63,22 @@ class CalendarioEstrategico:
         Lógica de decisão para o GitHub Actions (Batedor).
         Retorna True se for Domingo OU se houver contexto estratégico.
         """
-        # 1. Ciclo Padrão: Domingo (weekday 6)
+     
         if self.hoje.weekday() == 6:
             logger.info("Decisão: Domingo detectado. Execução semanal obrigatória.")
             return True
         
-        # 2. Ciclo de Antecipação: Pagamento ou Feriado
+       
         if self.eh_semana_de_pagamento() or self.eh_vespera_de_feriado():
             logger.info("Decisão: Contexto estratégico detectado. Execução antecipada autorizada.")
             return True
         
-        # Caso contrário, mantém o pipeline em repouso
+    
         logger.info("Decisão: Sem gatilhos estratégicos para hoje. Pipeline em repouso.")
         return False
 
 if __name__ == "__main__":
-    # Teste rápido de console
+   
     cal = CalendarioEstrategico()
     print(f"Data: {cal.hoje.strftime('%d/%m/%Y')}")
     print(f"Deve rodar hoje? {cal.deve_rodar_hoje()}")
