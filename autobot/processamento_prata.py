@@ -41,24 +41,17 @@ class ProcessamentoPrata:
             self.dens_cidade = self.df_malha.group_by(["NM_MUN"]).agg(
                 pl.col("DENSIDADE_DEMOGRAFICA").mean().alias("DENS_CID")
             )
-        except:
+        except Exception as e:
+            logger.error(f"PRATA: Falha ao carregar malha geográfica: {e}")
             self.df_malha = None
-            self.dens_distrito = None
-            self.dens_cidade = None
 
     def _canonizar_texto(self, coluna):
         return (
-            # No Polars atual, regex é o padrão (literal=False)
             coluna.str.replace(r"^(RUA|R|AVENIDA|AV|ALAMEDA|AL|PRACA|PRC|ESTRADA|EST|VIELA|VL)\.?\s+", "")
-            .str.replace_all(r"[ÁÀÂÃÄ]", "A")
-            .str.replace_all(r"[ÉÈÊË]", "E")
-            .str.replace_all(r"[ÍÌÎÏ]", "I")
-            .str.replace_all(r"[ÓÒÔÕÖ]", "O")
-            .str.replace_all(r"[ÚÙÛÜ]", "U")
-            .str.replace_all(r"[Ç]", "C")
-            .str.replace_all(r"[^A-Z0-9 ]", "")
-            .str.replace_all(r"\s+", " ")
-            .str.strip_chars()
+            .str.replace_all(r"[ÁÀÂÃÄ]", "A").str.replace_all(r"[ÉÈÊË]", "E")
+            .str.replace_all(r"[ÍÌÎÏ]", "I").str.replace_all(r"[ÓÒÔÕÖ]", "O")
+            .str.replace_all(r"[ÚÙÛÜ]", "U").str.replace_all(r"[Ç]", "C")
+            .str.replace_all(r"[^A-Z0-9 ]", "").str.replace_all(r"\s+", " ").str.strip_chars()
         )
 
     def _motor_recuperacao_cruzada(self, df_bronze):
@@ -75,7 +68,6 @@ class ProcessamentoPrata:
         )
 
         df_cegos = df_ssp.filter(pl.col("LATITUDE") == 0)
-        
         malha_lookup = self.df_malha.with_columns(
             self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO")
         ).unique(subset=["NM_MUN", "LOG_CANONICO"]).select(["NM_MUN", "LOG_CANONICO", "H3_INDEX"])
@@ -91,7 +83,7 @@ class ProcessamentoPrata:
 
         df_cross = df_unificado.join(
             self.df_malha.unique(subset=["H3_INDEX"]).select([
-                "H3_INDEX", "LOGRADOURO", "NM_BAIRRO", "NM_MUN", "NM_DIST", "DENSIDADE_DEMOGRAFICA"
+                "H3_INDEX", "LOGRADOURO", "NM_BAIRRO", "NM_MUN", "NM_DIST", "DENSIDADE_DEMOGRAFICA", "POPULACAO_H3"
             ]),
             on="H3_INDEX", how="left", suffix="_IBGE"
         ).join(self.dens_distrito, on=["NM_MUN", "NM_DIST"], how="left"
@@ -135,11 +127,15 @@ class ProcessamentoPrata:
                 t.columns = [c.upper().replace("Ç", "C").replace("Ã", "A").strip() for c in t.columns]
                 dfs.append(t)
             except: continue
+        
+        if not dfs: return None
+
         df = pl.concat(dfs, how="diagonal")
         mapa = {"MUNICIPIO": ["NOME_MUNICIPIO", "CIDADE"], "LOGRADOURO": ["NOME_LOGRADOURO", "LOGRADOURO"], "BAIRRO": ["BAIRRO", "NOME_BAIRRO"]}
         for alvo, origens in mapa.items():
             col = next((o for o in origens if o in df.columns), None)
             if col: df = df.rename({col: alvo})
+            
         return df.with_columns(pl.col(pl.String).str.strip_chars().str.to_uppercase())
 
     def processar_ano_com_delta(self, ano, estado, force=False):
@@ -153,74 +149,46 @@ class ProcessamentoPrata:
 
         if not force and estado.get(str(ano)) == tamanho: return False
 
-        resp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
-        df_bronze = self._normalizar_bronze(resp['Body'].read())
-        total_raw = df_bronze.height
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=path_bronze)
+            df_bronze = self._normalizar_bronze(resp['Body'].read())
+            
+            if df_bronze is None: return None
 
-        df_curado, cura_malha, resgate_h3 = self._motor_recuperacao_cruzada(df_bronze)
+            total_raw = df_bronze.height
+            df_curado, cura_malha, resgate_h3 = self._motor_recuperacao_cruzada(df_bronze)
 
-        df_final = df_curado.group_by(["H3_INDEX"]).agg([
-            pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO")).count().alias("TOTAL_CRIMES"),
-            pl.col("BAIRRO_FINAL").first().alias("NM_BAIRRO"),
-            pl.col("NM_MUN").first().alias("NM_MUN"),
-            pl.col("DENSIDADE_FINAL").first().alias("DENSIDADE")
-        ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
+            df_final = df_curado.group_by(["H3_INDEX"]).agg([
+                pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO")).count().alias("TOTAL_CRIMES"),
+                pl.col("BAIRRO_FINAL").first().alias("NM_BAIRRO"),
+                pl.col("NM_MUN").first().alias("NM_MUN"),
+                pl.col("DENSIDADE_FINAL").first().alias("DENSIDADE"),
+                pl.col("POPULACAO_H3").first().alias("POPULACAO_H3")
+            ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
 
-        buffer = io.BytesIO()
-        df_final.write_parquet(buffer)
-        self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
+            buffer = io.BytesIO()
+            df_final.write_parquet(buffer)
+            self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
-        estado[str(ano)] = tamanho
-        return {
-            "ano": ano,
-            "total_raw": total_raw,
-            "bo_resgatados": resgate_h3,
-            "malha_curada": cura_malha,
-            "h3_unicos": df_final.height
-        }
+            estado[str(ano)] = tamanho
+            return {"ano": ano, "total_raw": total_raw, "bo_recuperados": resgate_h3, "malha_curada": cura_malha, "h3_unicos": df_final.height}
+        except: return None
 
     def executar_todos_os_anos(self, force=False):
-        ano_atual = datetime.now().year
         estado_atual = self._carregar_tracker()
         relatorio = []
-        
-        for ano in range(2022, ano_atual + 1):
+        metricas_globais = {"processados": 0, "bo_recuperados": 0, "malha_resgatada": 0}
+
+        for ano in range(2022, datetime.now().year + 1):
             res = self.processar_ano_com_delta(ano, estado_atual, force)
             if res:
                 self._salvar_tracker(estado_atual)
+                metricas_globais["processados"] += res["total_raw"]
+                metricas_globais["bo_recuperados"] += res["bo_recuperados"]
+                metricas_globais["malha_resgatada"] += res["malha_curada"]
                 relatorio.append(res)
         
-        return self._formatar_log_discord(relatorio)
-
-    def _formatar_log_discord(self, relatorio):
-        if not relatorio: return None
-        
-        total_bo = sum(r['total_raw'] for r in relatorio)
-        total_resgate = sum(r['bo_resgatados'] for r in relatorio)
-        total_cura = sum(r['malha_curada'] for r in relatorio)
-        
-        log = {
-            "content": "🚀 **SafeDriver - Consolidação Camada Prata Finalizada**",
-            "embeds": [{
-                "title": "📊 Relatório de Recuperação Cruzada e Enriquecimento",
-                "color": 5814783,
-                "fields": [
-                    {"name": "📂 Volume Processado", "value": f"{total_bo} Boletins de Ocorrência", "inline": True},
-                    {"name": "🩹 Resgate de Geometria", "value": f"{total_resgate} B.Os recuperados via Malha", "inline": True},
-                    {"name": "🏛️ Cura de Atributos", "value": f"{total_cura} Bairros injetados na Malha IBGE", "inline": False}
-                ],
-                "footer": {"text": "Integridade de Bases: SSP ↔ IBGE | Nível de Resolução: H3-L9"}
-            }]
-        }
-        
-        for r in relatorio:
-            log["embeds"][0]["fields"].append({
-                "name": f"📅 Safra {r['ano']}",
-                "value": f"Clusters: {r['h3_unicos']} | Resgates: {r['bo_resgatados']}",
-                "inline": True
-            })
-            
-        return log
+        return {"metricas": metricas_globais, "detalhes": relatorio}
 
     def _carregar_tracker(self):
         try:
