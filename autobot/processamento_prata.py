@@ -27,7 +27,6 @@ class ProcessamentoPrata:
             config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
         )
         
-        # Caminhos relativos à raiz do Bucket (Removido prefixo redundante)
         self.tracker_path = "datalake/prata/tracker_estado_bronze.json"
         self.malha_path = "datalake/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         self._inicializar_dependencias()
@@ -86,7 +85,7 @@ class ProcessamentoPrata:
 
         df_cross = df_unificado.join(
             self.df_malha.unique(subset=["H3_INDEX"]).select([
-                "H3_INDEX", "LOGRADOURO", "NM_BAIRRO", "NM_MUN", "NM_DIST", "DENSIDADE_DEMOGRAFICA", "POPULACAO_H3"
+                "H3_INDEX", "LOGRADOURO", "NM_BAIRRO", "NM_MUN", "NM_DIST", "DENSIDADE_DEMOGRAFICA"
             ]),
             on="H3_INDEX", how="left", suffix="_IBGE"
         ).join(self.dens_distrito, on=["NM_MUN", "NM_DIST"], how="left"
@@ -166,8 +165,7 @@ class ProcessamentoPrata:
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO")).count().alias("TOTAL_CRIMES"),
                 pl.col("BAIRRO_FINAL").first().alias("NM_BAIRRO"),
                 pl.col("NM_MUN").first().alias("NM_MUN"),
-                pl.col("DENSIDADE_FINAL").first().alias("DENSIDADE"),
-                pl.col("POPULACAO_H3").first().alias("POPULACAO_H3")
+                pl.col("DENSIDADE_FINAL").first().alias("DENSIDADE")
             ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
 
             buffer = io.BytesIO()
