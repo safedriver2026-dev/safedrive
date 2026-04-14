@@ -8,6 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from botocore.config import Config
 from google.cloud import bigquery
+from google.oauth2 import service_account
 
 # Importação dos módulos do ecossistema SafeDriver
 from autobot.ingestao_bronze import IngestaoBronze
@@ -17,7 +18,6 @@ from autobot.ia_sincronizacao_ouro import CamadaOuroSafeDriver
 from autobot.calendario_estrategico import CalendarioEstrategico
 from autobot.comunicador import ComunicadorSafeDriver
 
-# Configuração de Logging Profissional
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - [%(levelname)s] - %(message)s',
@@ -34,9 +34,9 @@ class SafeDriverMaestro:
 
     def _verificar_integridade_infra(self):
         """
-        Verifica se o ambiente está saudável ou se precisa de intervenção (Backfill).
+        Valida se o ambiente precisa de intervenção usando o JSON da Service Account.
         """
-        logger.info("AUDITORIA: Validando integridade do Data Lake e Data Warehouse...")
+        logger.info("AUDITORIA: Validando integridade da infraestrutura...")
         
         try:
             # 1. Check R2 (Cloudflare)
@@ -48,94 +48,78 @@ class SafeDriverMaestro:
                 config=Config(signature_version='s3v4')
             )
             bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-            # Verifica se o modelo 'latest' existe
             s3.head_object(Bucket=bucket, Key="safedriver/modelos_ml/latest_cat_motorista.pkl")
             
-            # 2. Check BigQuery (Google Cloud)
-            bq = bigquery.Client(project=os.getenv("BQ_PROJECT_ID"))
+            # 2. Check BigQuery (Google Cloud com JSON)
+            gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
+            cred_info = json.loads(gcp_json)
+            credentials = service_account.Credentials.from_service_account_info(cred_info)
+            
+            bq = bigquery.Client(credentials=credentials, project=os.getenv("BQ_PROJECT_ID"))
             tabela = f"{os.getenv('BQ_PROJECT_ID')}.{os.getenv('BQ_DATASET_ID')}.fato_risco_predicao_atual"
             bq.get_table(tabela)
             
-            return False # Tudo OK
+            return False 
         except Exception as e:
-            logger.warning(f"AUDITORIA: Anomalia detectada ou infraestrutura incompleta: {e}")
-            return True # Precisa rodar para consertar
+            logger.warning(f"AUDITORIA: Infraestrutura incompleta ou credenciais inválidas: {e}")
+            return True 
 
     def run(self, force=False):
         try:
-            logger.info("SafeDriver Maestro: Iniciando orquestração do ecossistema.")
+            logger.info("SafeDriver Maestro: Iniciando orquestração.")
 
-            # ETAPA 0: Ingestão e Monitoramento de Mudanças (CDC)
             bronze = IngestaoBronze()
             novos_dados_ssp = bronze.executar_ingestao_continua()
             
             deve_rodar_calendario = self.cal.deve_rodar_hoje()
             infra_quebrada = self._verificar_integridade_infra()
             
-            # Decisão de Execução
             executar_pipeline = novos_dados_ssp or deve_rodar_calendario or infra_quebrada or force
 
             if not executar_pipeline:
-                logger.info("Pipeline em repouso: Dados sincronizados e sem gatilhos estratégicos.")
+                logger.info("Pipeline em repouso: Tudo sincronizado.")
                 return
 
-            # Definindo o motivo para o relatório do Discord
             if force: gatilho = "Execução Manual Forçada"
             elif novos_dados_ssp: gatilho = "Novos Dados detectados na SSP-SP"
             elif infra_quebrada: gatilho = "Recuperação de Infraestrutura (Auto-Reparo)"
             else: gatilho = "Ciclo Estratégico (Calendário de Risco)"
 
-            logger.info(f"Gatilho acionado: {gatilho}")
-
-            # --- EXECUÇÃO DO FLUXO ---
-
-            # ETAPA 1: Camada Prata (Processamento e Malha H8)
-            # Espera-se que o método retorne um dicionário de métricas
+            # --- PROCESSAMENTO ---
             prata = ProcessamentoPrata()
             resumo_prata = prata.executar_todos_os_anos(force=force) or {}
 
-            # ETAPA 2: IA (Treinamento Evolutivo)
-            # Espera-se que o método retorne um dicionário com MAE/MAPE/R2
             treinador = TreinadorEvolutivo()
             if not treinador.treinar_modelo_mestre():
-                raise RuntimeError("Falha crítica no treinamento dos modelos de IA.")
+                raise RuntimeError("Falha no treinamento da IA.")
             resumo_ia = treinador.obter_metricas_finais() or {}
 
-            # ETAPA 3: Camada Ouro (Sincronização Final)
             ouro = CamadaOuroSafeDriver()
             if not ouro.executar_predicao_atual():
-                raise RuntimeError("Falha na sincronização dos scores com o BigQuery.")
+                raise RuntimeError("Falha na sincronização BigQuery.")
 
-            # --- FINALIZAÇÃO E RELATÓRIO ---
-            
+            # --- RELATÓRIO DISCORD ---
             fim = datetime.now(self.tz)
             tempo_total = str(fim - self.inicio).split(".")[0]
 
-            # Preparando dados para o Comunicador Rico
-            contexto = {
-                "gatilho": gatilho,
-                "tempo_total": tempo_total
-            }
-
-            metricas_executivas = {
-                "Crimes Processados": resumo_prata.get('total_linhas', 'N/A'),
-                "Municípios Cobertos": "Estado de São Paulo",
-                "Status da IA": "Modelos Evoluídos"
-            }
-
-            metricas_operacionais = {
-                "Recuperados via H8": f"{resumo_prata.get('recuperados', 0)} end.",
-                "Erro Médio (MAE)": f"{resumo_ia.get('mae', 0.0):.4f}",
-                "Sincronização BQ": "Sucesso (Upsert)"
-            }
-
-            self.comunicador.relatar_conclusao_rica(contexto, metricas_executivas, metricas_operacionais)
-            logger.info(f"✅ SafeDriver finalizado com sucesso em {tempo_total}.")
+            self.comunicador.relatar_conclusao_rica(
+                contexto={"gatilho": gatilho, "tempo_total": tempo_total},
+                metricas_executivas={
+                    "Crimes Processados": resumo_prata.get('total_linhas', 'N/A'),
+                    "Municípios Cobertos": "Estado de São Paulo",
+                    "Status da IA": "Modelos Evoluídos"
+                },
+                metricas_operacionais={
+                    "Recuperados via H8": f"{resumo_prata.get('recuperados', 0)} end.",
+                    "Erro Médio (MAE)": f"{resumo_ia.get('mae', 0.0):.4f}",
+                    "Sincronização BQ": "Sucesso (Upsert)"
+                }
+            )
+            logger.info(f"✅ SafeDriver finalizado em {tempo_total}.")
 
         except Exception as e:
             msg_erro = str(e)
-            logger.error(f"FALHA NO MAESTRO: {msg_erro}")
-            # Nome do módulo em português conforme solicitado
+            logger.error(f"FALHA: {msg_erro}")
             self.comunicador.relatar_alerta_critico(
                 modulo="Orquestrador Maestro", 
                 status="Interrupção do Fluxo", 
@@ -144,8 +128,7 @@ class SafeDriverMaestro:
             sys.exit(1)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SafeDriver Maestro - Orquestrador de Inteligência Geográfica")
-    parser.add_argument('--force', action='store_true', help="Força o reprocessamento total de todas as camadas.")
+    parser = argparse.ArgumentParser(description="SafeDriver Maestro")
+    parser.add_argument('--force', action='store_true', help="Força reprocessamento total.")
     args = parser.parse_args()
-
     SafeDriverMaestro().run(force=args.force)
