@@ -27,12 +27,13 @@ class CamadaOuroSafeDriver:
         self.project_id = os.getenv("BQ_PROJECT_ID", "").strip()
         self.dataset_id = os.getenv("BQ_DATASET_ID", "").strip()
 
+        # CORREÇÃO 1: addressing_style 'path' é obrigatório no Cloudflare R2
         self.s3 = boto3.client(
             's3',
             endpoint_url=self.endpoint,
             aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key,
-            config=Config(signature_version='s3v4')
+            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
         )
         
         self.cal = CalendarioEstrategico()
@@ -46,14 +47,16 @@ class CamadaOuroSafeDriver:
             credentials = service_account.Credentials.from_service_account_info(cred_info)
             self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
         except Exception as e:
-            logger.error(f"Erro na autenticação GCP: {e}")
+            logger.error(f"OURO: Erro na autenticação GCP: {e}")
 
     def executar_predicao_atual(self):
         try:
             modelos = self._carregar_modelos_producao()
             df_input = self._obter_contexto_datalake()
             
-            if df_input is None: return False
+            if df_input is None: 
+                logger.error("OURO: Não foi possível carregar os dados de contexto do R2.")
+                return False
 
             df_final = self._gerar_scores_ponderados(df_input, modelos)
             self._sincronizar_fato_risco(df_final)
@@ -72,7 +75,8 @@ class CamadaOuroSafeDriver:
             try:
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                 modelos["geral"][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-            except:
+            except Exception as e:
+                logger.warning(f"OURO: Não achou o modelo {alg}: {e}")
                 modelos["geral"][alg] = None
         return modelos
 
@@ -86,12 +90,14 @@ class CamadaOuroSafeDriver:
                 df['PERFIL_AREA'] = np.where(df['DENSIDADE'] > 5000, "RESIDENCIAL", 
                                     np.where(df['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
                 
-                # A CORREÇÃO ESTÁ AQUI: Convertendo para 'category' na inferência também!
                 for col in ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']:
                     df[col] = df[col].astype(str).fillna("DESCONHECIDO").astype('category')
                 
                 return df.fillna(0)
-            except: continue
+            except Exception as e:
+                # Fim do erro silencioso! Se falhar, vamos saber.
+                logger.warning(f"OURO: Ano {ano} não encontrado ou erro de leitura: {e}")
+                continue
         return None
 
     def _gerar_scores_ponderados(self, df, modelos):
@@ -122,6 +128,20 @@ class CamadaOuroSafeDriver:
         tabela_destino = f"{self.project_id}.{self.dataset_id}.fato_risco_h3_atual"
         tabela_staging = f"{tabela_destino}_staging"
         
+        # CORREÇÃO 2: Checar se a tabela existe. Se for a primeira vez, cria do zero.
+        try:
+            self.bq_client.get_table(tabela_destino)
+            tabela_existe = True
+        except NotFound:
+            tabela_existe = False
+
+        if not tabela_existe:
+            logger.info("OURO: Tabela destino não existe. Criando do zero no BigQuery...")
+            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+            self.bq_client.load_table_from_dataframe(df, tabela_destino, job_config=job_config).result()
+            return
+
+        logger.info("OURO: Tabela destino encontrada. Fazendo MERGE...")
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=job_config).result()
 
