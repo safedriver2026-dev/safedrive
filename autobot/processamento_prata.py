@@ -12,13 +12,13 @@ logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
-      
+        # Credenciais Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
-      
+        # Configuração de alta performance no boto3
         client_config = Config(
             signature_version='s3v4', 
             s3={'addressing_style': 'path'},
@@ -50,7 +50,6 @@ class ProcessamentoPrata:
     def _inicializar_dependencias(self):
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
-           
             self.df_malha_lazy = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
             logger.info("PRATA: Malha geográfica carregada no motor Lazy.")
         except Exception as e:
@@ -66,10 +65,7 @@ class ProcessamentoPrata:
             tamanho_atual = meta['ContentLength']
             if not force and estado.get(str(ano)) == tamanho_atual: return None
 
-           
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
-            
-           
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
             
            
@@ -84,14 +80,13 @@ class ProcessamentoPrata:
             if rename_dict:
                 lf = lf.rename(rename_dict)
 
-         
+           
             conduta_col = pl.col("CONDUTA").cast(pl.String).fill_null("") if "CONDUTA" in cols else pl.lit("")
             rubrica_col = pl.col("RUBRICA").cast(pl.String).fill_null("")
             hora_col = pl.col("HORA").cast(pl.String).fill_null("") if "HORA" in cols else pl.lit("")
             periodo_txt_col = pl.col("PERIODO_TEXTO").cast(pl.String).fill_null("").str.to_uppercase() if "PERIODO_TEXTO" in cols else pl.lit("")
             hora_int = hora_col.str.split(":").list.first().cast(pl.Int32, strict=False)
 
-         
             lf = lf.with_columns([
                 pl.when(conduta_col.str.to_uppercase().str.contains("TRANSEUNTE|PEDESTRE|PASSAGEIRO")).then(pl.lit("PEDESTRE"))
                   .when(rubrica_col.str.to_uppercase().str.contains("VEICULO|CARGA|AUTO|MOTO|CAMINHAO|CONDUZIR")).then(pl.lit("MOTORISTA"))
@@ -110,31 +105,28 @@ class ProcessamentoPrata:
                 pl.col("TIPO_LOCAL").fill_null("VIA PUBLICA").alias("TIPO_LOCAL") if "TIPO_LOCAL" in cols else pl.lit("VIA PUBLICA").alias("TIPO_LOCAL")
             ])
 
-           
             lf_enriquecido = lf.join(self.df_malha_lazy, on="H3_INDEX", how="left")
 
-     
+         
             lf_agg = lf_enriquecido.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"]).agg([
                 pl.when(pl.col("RUBRICA").str.contains("ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES"),
                 pl.col("MUNICIPIO").first().alias("NM_MUN"),
                 pl.col("NM_BAIRRO").first(),
-                pl.col("DENSIDADE_DEMOGRAFICA").first().alias("DENSIDADE"),
+                pl.col("DENSIDADE_AJUSTADA").first().alias("DENSIDADE"), 
                 pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA")
             ])
 
-          
             lf_final = lf_agg.with_columns([
                 (pl.col("TOTAL_CRIMES").rank(descending=False).over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).alias("RANKING_RISCO_LOCAL"),
                 (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE").fill_null(0) + 1)).alias("INDICE_EXPOSICAO"),
                 pl.lit(ano).alias("ANO_REFERENCIA")
             ])
 
-           
-            df_final = lf_final.collect(streaming=True)
+          
+            df_final = lf_final.collect(engine="streaming")
 
-            # Salvamento ultra rápido
             buffer = io.BytesIO()
-            df_final.write_parquet(buffer, compression="lz4") # LZ4 é o compressor mais rápido do mercado
+            df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = tamanho_atual
