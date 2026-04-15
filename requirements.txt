@@ -5,6 +5,7 @@ numpy
 pyarrow
 fastexcel
 python-calamine
+matplotlib
 
 # --- Infraestrutura e Nuvem ---
 boto3
@@ -17,6 +18,8 @@ scikit-learn
 catboost
 lightgbm
 joblib
+shap
+
 
 # --- Geo-análise e Datas ---
 h3
