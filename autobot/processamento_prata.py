@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
-        # Configurações Cloudflare R2
+        # Credenciais Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -23,7 +23,7 @@ class ProcessamentoPrata:
                               aws_secret_access_key=self.secret_key, 
                               config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
         
-        # Localização dinâmica do Data Lake (Resolve o problema de aninhamento)
+        # Localização dinâmica do Data Lake (Resolve aninhamentos safedriver/safedriver)
         self.base_path = self._localizar_datalake_real()
         logger.info(f"PRATA: Data Lake mestre detectado em: '{self.base_path}'")
 
@@ -34,6 +34,7 @@ class ProcessamentoPrata:
         self._inicializar_dependencias()
 
     def _localizar_datalake_real(self):
+        """Busca o prefixo correto da pasta datalake, ignorando aninhamentos."""
         try:
             paginator = self.s3.get_paginator('list_objects_v2')
             for page in paginator.paginate(Bucket=self.bucket, MaxKeys=100):
@@ -44,17 +45,17 @@ class ProcessamentoPrata:
         except: return "datalake"
 
     def _classificar_perfil_alvo(self, rubrica, conduta):
-        """Diferencia MOTORISTA de PEDESTRE com base na rubrica e conduta (2022-2026)."""
+        """Diferencia MOTORISTA de PEDESTRE (Rubrica + Conduta)."""
         rub = str(rubrica).upper()
         con = str(conduta).upper() if conduta else ""
-        if "TRANSEUNTE" in con or "PEDESTRE" in con or "PASSAGEIRO" in con:
+        if any(x in con for x in ["TRANSEUNTE", "PEDESTRE", "PASSAGEIRO"]):
             return "PEDESTRE"
         if any(x in rub for x in ["VEICULO", "CARGA", "AUTO", "MOTO", "CAMINHAO", "CONDUZIR"]):
             return "MOTORISTA"
         return "PEDESTRE"
 
     def _definir_periodo(self, hora, desc_periodo):
-        """Normaliza o período lidando com variações de colunas (2022-2026)."""
+        """Normaliza o período lidando com a hora ou o descritivo da SSP."""
         if hora and str(hora) != 'nan' and ":" in str(hora):
             try:
                 h = int(str(hora).split(':')[0])
@@ -92,19 +93,20 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             
-            # Normalização Dinâmica de Colunas (Resiliência 2022-2026)
+            # --- CORREÇÃO: MAPEAMENTO DINÂMICO DE COLUNAS ---
             cols = df.columns
-            df = df.rename({
-                "CIDADE": "MUNICIPIO" if "CIDADE" in cols else None,
-                "NOME_MUNICIPIO": "MUNICIPIO" if "NOME_MUNICIPIO" in cols else None,
-                "DESCR_PERIODO": "PERIODO_TEXTO" if "DESCR_PERIODO" in cols else None,
-                "DESC_PERIODO": "PERIODO_TEXTO" if "DESC_PERIODO" in cols else None,
-                "HORA_OCORRENCIA_BO": "HORA" if "HORA_OCORRENCIA_BO" in cols else None,
-                "DESCR_CONDUTA": "CONDUTA" if "DESCR_CONDUTA" in cols else None,
-                "DESCR_TIPOLOCAL": "TIPO_LOCAL" if "DESCR_TIPOLOCAL" in cols else None
-            })
+            mapeamento = {
+                "CIDADE": "MUNICIPIO", "NOME_MUNICIPIO": "MUNICIPIO",
+                "DESCR_PERIODO": "PERIODO_TEXTO", "DESC_PERIODO": "PERIODO_TEXTO",
+                "HORA_OCORRENCIA_BO": "HORA", "DESCR_CONDUTA": "CONDUTA",
+                "DESCR_TIPOLOCAL": "TIPO_LOCAL"
+            }
+            # Filtra apenas o que existe no arquivo para evitar Erro de NoneType
+            rename_dict = {old: new for old, new in mapeamento.items() if old in cols}
+            if rename_dict:
+                df = df.rename(rename_dict)
 
-            # 1. ENGENHARIA DE FEATURES (PERFIL, PERÍODO E TIPO DE LOCAL)
+            # 1. ENGENHARIA DE FEATURES
             df = df.with_columns([
                 pl.struct(["RUBRICA", "CONDUTA" if "CONDUTA" in df.columns else "RUBRICA"])
                   .map_elements(lambda x: self._classificar_perfil_alvo(x["RUBRICA"], x.get("CONDUTA")), return_dtype=pl.String)
@@ -118,10 +120,10 @@ class ProcessamentoPrata:
                 pl.col("TIPO_LOCAL").fill_null("VIA PUBLICA").alias("TIPO_LOCAL") if "TIPO_LOCAL" in df.columns else pl.lit("VIA PUBLICA").alias("TIPO_LOCAL")
             ])
 
-            # 2. ENRIQUECIMENTO (Join com Malha Demográfica)
+            # 2. JOIN COM MALHA (H3)
             df_enriquecido = df.join(self.df_malha, on="H3_INDEX", how="left")
 
-            # 3. AGREGAÇÃO PONDERADA (Severidade: Roubo=3, Furto=1)
+            # 3. AGREGAÇÃO PONDERADA (Roubo=3, Furto=1)
             df_agg = df_enriquecido.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"]).agg([
                 pl.when(pl.col("RUBRICA").str.contains("ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES"),
                 pl.col("MUNICIPIO").first().alias("NM_MUN"),
@@ -130,8 +132,7 @@ class ProcessamentoPrata:
                 pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA")
             ])
 
-            # 4. FEATURE STORE (PREPARAÇÃO PARA IA E OURO)
-            # Ranking de Risco Local (Percentil por Período) e Índice de Exposição
+            # 4. ANALYTICS (Ranking de Risco e Exposição)
             df_final = df_agg.with_columns([
                 (pl.col("TOTAL_CRIMES").rank(descending=False).over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).alias("RANKING_RISCO_LOCAL"),
                 (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE").fill_null(0) + 1)).alias("INDICE_EXPOSICAO"),
@@ -144,7 +145,7 @@ class ProcessamentoPrata:
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = tamanho_atual
-            logger.info(f"PRATA: [{ano}] Consolidado com Analytics: {df_final.height} linhas.")
+            logger.info(f"PRATA: [{ano}] Sucesso - {df_final.height} registros agregados.")
             return True
         except Exception as e:
             logger.error(f"PRATA: Falha no ano {ano}: {e}")
