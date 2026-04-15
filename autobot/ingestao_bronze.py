@@ -8,12 +8,13 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from datetime import datetime
 
+# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class IngestaoBronze:
     def __init__(self):
-        # Configurações do Cloudflare R2 / S3
+        # Credenciais e Endpoints (Cloudflare R2)
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -32,12 +33,11 @@ class IngestaoBronze:
         }
 
     def executar_ingestao_continua(self):
-        """Varre os anos de interesse e garante a sincronia das camadas Raw e Trusted."""
-        logger.info("BRONZE: Iniciando rotina de extração (Raw) e Padronização (Trusted).")
+        """Varre os anos de interesse, realiza o CDC e gera a camada Trusted limpa."""
+        logger.info("BRONZE: Iniciando extração com limpeza de metadados (Smart-Skip).")
         ano_atual = datetime.now().year
         novos_dados_ingeridos = False
 
-        # Processa de 2022 até o ano atual
         for ano in range(2022, ano_atual + 1):
             if self._verificar_e_baixar(ano):
                 novos_dados_ingeridos = True
@@ -49,94 +49,113 @@ class IngestaoBronze:
         path_trusted = f"datalake/bronze/trusted/ssp_trusted_{ano}.parquet"
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
 
-        # 1. Verificar se o Trusted (Parquet) já existe
-        trusted_existe = False
-        try:
-            self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
-            trusted_existe = True
-        except ClientError:
-            trusted_existe = False
-
-        # 2. Verificar o tamanho do Raw no R2 (se existir)
-        tamanho_r2_raw = 0
+        # 1. Validação de Mudança (CDC) e Existência
+        tamanho_r2 = 0
         try:
             meta_r2 = self.s3.head_object(Bucket=self.bucket, Key=path_raw)
-            tamanho_r2_raw = meta_r2.get('ContentLength', 0)
+            tamanho_r2 = meta_r2.get('ContentLength', 0)
         except ClientError:
-            tamanho_r2_raw = 0
+            tamanho_r2 = 0
 
-        # 3. Verificar o tamanho do arquivo no site da SSP (CDC)
         try:
             resp_head = requests.head(url, headers=self.headers, timeout=30)
             tamanho_ssp = int(resp_head.headers.get('Content-Length', -1)) if resp_head.status_code == 200 else -1
         except:
             tamanho_ssp = -1
 
-        # LÓGICA DE DECISÃO:
-        # Se o Parquet existe E o Excel no R2 tem o mesmo tamanho do site, não faz nada.
-        if trusted_existe and tamanho_ssp > 0 and tamanho_ssp == tamanho_r2_raw:
-            logger.info(f"BRONZE: [{ano}] Camadas Raw e Trusted já estão atualizadas. Pulando.")
+        # Check se o Trusted já existe para evitar re-conversão desnecessária
+        trusted_existe = False
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
+            trusted_existe = True
+        except:
+            trusted_existe = False
+
+        # Se o arquivo no R2 é igual ao da SSP e o Parquet já existe, não faz nada
+        if trusted_existe and tamanho_ssp > 0 and tamanho_ssp == tamanho_r2:
+            logger.info(f"BRONZE: [{ano}] Sincronizado. Pulando.")
             return False
 
-        logger.info(f"BRONZE: [{ano}] Necessário processar (Trusted_faltante={not trusted_existe} ou Mudança_detectada={tamanho_ssp != tamanho_r2_raw}).")
+        logger.info(f"BRONZE: [{ano}] Iniciando processamento de purificação...")
 
         try:
-            # 4. Obter o conteúdo do Excel (do R2 se for igual ao site, ou download se for novo)
-            if tamanho_ssp > 0 and tamanho_ssp == tamanho_r2_raw:
-                logger.info(f"BRONZE: [{ano}] Recuperando Excel do R2 para gerar Trusted...")
+            # 2. Obtenção do Binário (Download ou R2)
+            if tamanho_ssp > 0 and tamanho_ssp == tamanho_r2:
+                logger.info(f"BRONZE: [{ano}] Usando cache Raw do R2.")
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path_raw)
                 excel_bytes = obj['Body'].read()
             else:
-                logger.info(f"BRONZE: [{ano}] Baixando nova versão do Excel da SSP-SP...")
+                logger.info(f"BRONZE: [{ano}] Baixando nova versão da SSP-SP.")
                 response = requests.get(url, headers=self.headers, timeout=300)
                 response.raise_for_status()
                 excel_bytes = response.content
-                # Salva a nova "Fonte da Verdade" no Raw
                 self.s3.put_object(Bucket=self.bucket, Key=path_raw, Body=excel_bytes)
 
-            # 5. REFINAMENTO E PADRONIZAÇÃO (A "Cura" do Schema)
-            logger.info(f"BRONZE: [{ano}] Convertendo e normalizando colunas para Parquet...")
+            # 3. Extração e Limpeza de Cabeçalhos (A "Cura")
+            xlsx_io = io.BytesIO(excel_bytes)
             dfs = []
             
-            # Percorre as abas (o Polars com calamine é excelente para isso)
-            for i in range(1, 6):
+            # Varre até 6 abas (procurando dados reais)
+            for i in range(1, 7):
                 try:
-                    df = pl.read_excel(io.BytesIO(excel_bytes), sheet_id=i, engine="calamine")
-                    # Força tudo para String para evitar erros de tipo na concatenação
-                    df = df.with_columns(pl.all().cast(pl.String))
-                    # Limpeza básica de nomes de colunas
-                    df.columns = [c.upper().replace("Ç", "C").replace("Ã", "A").strip() for c in df.columns]
+                    # Leitura inicial para testar se o cabeçalho é lixo/capa
+                    df_check = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", n_rows=1)
+                    if df_check.is_empty(): continue
                     
-                    # --- MAPEAMENTO DE SINÔNIMOS (Resolve o erro de MUNICIPIO) ---
+                    primeira_col = str(df_check.columns[0]).upper()
+                    
+                    # Lógica Smart-Skip: Se a "coluna" for o texto de aviso do governo, pula a linha
+                    if "PRESENTE TABELA" in primeira_col or "FINALIDADE" in primeira_col or "__UNNAMED__" in primeira_col:
+                        logger.info(f"BRONZE: [{ano}] Lixo detectado na aba {i}. Aplicando skip_rows...")
+                        df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": 1})
+                    else:
+                        df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine")
+
+                    # Normalização de tipos e nomes
+                    df = df.with_columns(pl.all().cast(pl.String))
+                    df.columns = [c.upper().replace("Ç", "C").replace("Ã", "A").strip() for c in df.columns]
+
+                    # Mapeamento de sobrevivência para MUNICIPIO
                     mapeamento = {
                         "CIDADE": "MUNICIPIO",
-                        "NOME_MUNICIPIO": "MUNICIPIO"
+                        "NOME_MUNICIPIO": "MUNICIPIO",
+                        "NOME_MUNICIPIO_CIRCUNSCRICAO": "MUNICIPIO"
                     }
                     for original, novo in mapeamento.items():
                         if original in df.columns:
                             df = df.rename({original: novo})
-                            
-                    dfs.append(df)
+                    
+                    # Só aceita a aba se tiver as colunas mínimas de um BO
+                    if "MUNICIPIO" in df.columns or "LOGRADOURO" in df.columns:
+                        dfs.append(df)
+                        
                 except Exception:
-                    continue # Pula abas vazias ou com erro
-            
+                    continue
+
             if dfs:
-                # Une as abas e salva como Parquet Trusted
+                # Consolidação final
                 df_trusted = pl.concat(dfs, how="diagonal")
-                buffer = io.BytesIO()
-                df_trusted.write_parquet(buffer)
+                
+                # Double-check para colunas que podem ter vindo com nomes sujos
+                for col in df_trusted.columns:
+                    if "MUNICIPIO" in col and col != "MUNICIPIO":
+                         df_trusted = df_trusted.rename({col: "MUNICIPIO"})
+
+                # Persistência na camada Trusted
+                parquet_buffer = io.BytesIO()
+                df_trusted.write_parquet(parquet_buffer)
                 
                 self.s3.put_object(
                     Bucket=self.bucket, 
                     Key=path_trusted, 
-                    Body=buffer.getvalue()
+                    Body=parquet_buffer.getvalue()
                 )
                 
-                logger.info(f"BRONZE: [{ano}] Camada Trusted gerada com sucesso.")
+                logger.info(f"BRONZE: [{ano}] Camada Trusted Parquet gerada com sucesso.")
                 return True
             
             return False
 
         except Exception as e:
-            logger.error(f"BRONZE: [{ano}] Falha crítica no processamento: {e}")
+            logger.error(f"BRONZE: [{ano}] Erro crítico: {e}")
             return False
