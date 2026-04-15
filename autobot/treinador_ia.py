@@ -17,7 +17,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 logger = logging.getLogger(__name__)
 
 class TreinadorEvolutivo:
-    def __init__(self):
+    def __init__(self, dev_mode=True):
+        # MODO DE DESENVOLVIMENTO: Se True, treina apenas com 2026 para agilizar os testes.
+        self.dev_mode = dev_mode 
+        
         # Credenciais R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
@@ -29,13 +32,13 @@ class TreinadorEvolutivo:
                               aws_secret_access_key=self.secret_key,
                               config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
         
-        # Auto-Discovery Recursivo (Resolve o problema de pastas safedriver/safedriver)
+        # Localização Dinâmica do Datalake
         self.base_path = self._localizar_datalake_real()
         logger.info(f"IA: Datalake mestre localizado em: '{self.base_path}'")
         
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         
-        # Configuração de Features (Baseada na Prata completa)
+        # Configuração de Features (100% Sincronizado com a nova Camada Prata)
         self.target = "TOTAL_CRIMES"
         self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO']
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
@@ -57,18 +60,18 @@ class TreinadorEvolutivo:
     def treinar_modelo_mestre(self):
         df_treino = self._carregar_datalake_consolidado()
         
-        if df_treino is None or len(df_treino) < 100:
+        if df_treino is None or len(df_treino) < 50:
             logger.error(f"IA: Dados insuficientes para treino ({0 if df_treino is None else len(df_treino)} linhas).")
             return False
 
-        logger.info(f"IA: Iniciando Ciclo Evolutivo com {len(df_treino)} registros.")
+        logger.info(f"IA: Iniciando Treinamento com {len(df_treino)} registros (Dev Mode: {self.dev_mode}).")
 
         # Preparação de X e y
         colunas_ia = self.features_numericas + self.features_categoricas
         X = df_treino[colunas_ia].copy()
         y = df_treino[self.target]
 
-        # Tratamento rigoroso de tipos para os modelos
+        # Tratamento rigoroso de tipos para os modelos (Evita quebra no LightGBM/CatBoost)
         for col in self.features_categoricas:
             X[col] = X[col].astype(str).fillna("INDEFINIDO").astype('category')
         for col in self.features_numericas:
@@ -76,12 +79,14 @@ class TreinadorEvolutivo:
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # --- 1. CATBOOST (O Especialista em Categorias) ---
+        # --- 1. CATBOOST (O Especialista em Categorias Multimodais) ---
         logger.info("IA: [1/2] Treinando CatBoost Tweedie...")
         model_cat = CatBoostRegressor(
-            iterations=1000, depth=6, learning_rate=0.03,
+            iterations=500 if self.dev_mode else 1000, 
+            depth=6, 
+            learning_rate=0.03,
             cat_features=self.features_categoricas,
-            loss_function='Tweedie:variance_power=1.5', # Foco em dados de contagem
+            loss_function='Tweedie:variance_power=1.5',
             verbose=100
         )
         model_cat.fit(X_train, y_train)
@@ -89,8 +94,11 @@ class TreinadorEvolutivo:
         # --- 2. LIGHTGBM (O Especialista em Velocidade) ---
         logger.info("IA: [2/2] Treinando LightGBM Tweedie...")
         model_lgb = LGBMRegressor(
-            n_estimators=500, learning_rate=0.02, num_leaves=31,
-            objective='tweedie', tweedie_variance_power=1.5,
+            n_estimators=300 if self.dev_mode else 500, 
+            learning_rate=0.02, 
+            num_leaves=31,
+            objective='tweedie', 
+            tweedie_variance_power=1.5,
             verbosity=1
         )
         model_lgb.fit(X_train, y_train)
@@ -101,7 +109,7 @@ class TreinadorEvolutivo:
         
         logger.info(f"IA: MAE CatBoost: {mae_cat:.4f} | MAE LightGBM: {mae_lgb:.4f}")
 
-        # Exportação de Artefatos
+        # Exportação de Artefatos para a Camada Ouro
         self._exportar_modelo(model_cat, "cat_geral")
         self._exportar_modelo(model_lgb, "lgb_geral")
         
@@ -110,29 +118,37 @@ class TreinadorEvolutivo:
 
     def _carregar_datalake_consolidado(self):
         lista_dfs = []
-        for ano in range(2022, datetime.now().year + 1):
+        
+        # Lógica do Dev Mode para testes rápidos
+        anos_para_processar = [2026] if self.dev_mode else range(2022, datetime.now().year + 1)
+        
+        for ano in anos_para_processar:
             key = self._get_path("prata", f"ssp_consolidada_{ano}.parquet")
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 
-                # Normalização de tipos Polars para evitar conflito no concat
+                # Normalização de tipos Polars
                 df = df.with_columns([
-                    pl.col(c).cast(pl.Float64) for c in self.features_numericas if c in df.columns
+                    pl.col(c).cast(pl.Float64, strict=False).fill_null(0.0) 
+                    for c in self.features_numericas if c in df.columns
                 ])
                 lista_dfs.append(df)
-                logger.info(f"IA: {ano} carregado.")
-            except: continue
+                logger.info(f"IA: Prata de {ano} carregada com sucesso.")
+            except Exception as e:
+                logger.warning(f"IA: Arquivo de {ano} não encontrado ou inválido: {e}")
+                continue
         
-        if not lista_dfs: return None
+        if not lista_dfs: 
+            return None
         
-        # Concatenação e conversão para Pandas (CatBoost/LGBM preferem Pandas/Numpy)
-        df = pl.concat(lista_dfs, how="diagonal").to_pandas()
+        # Concatenação e conversão para Pandas
+        df_completo = pl.concat(lista_dfs, how="diagonal").to_pandas()
         
-        # Lógica de Negócio: Perfil da Área baseada em Densidade (TCC Strategy)
-        df['PERFIL_AREA'] = np.where(df['DENSIDADE'] > 5000, "RESIDENCIAL_DENSO",
-                            np.where(df['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
-        return df
+        # Regra de Negócio Dinâmica: Perfil da Área baseada em Densidade
+        df_completo['PERFIL_AREA'] = np.where(df_completo['DENSIDADE'] > 5000, "RESIDENCIAL_DENSO",
+                                     np.where(df_completo['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
+        return df_completo
 
     def _exportar_modelo(self, modelo, nome):
         key_ver = self._get_path("modelos_ml/versions", f"v{self.versao_modelo}_{nome}.pkl")
@@ -144,7 +160,11 @@ class TreinadorEvolutivo:
         
         self.s3.put_object(Bucket=self.bucket, Key=key_ver, Body=payload)
         self.s3.put_object(Bucket=self.bucket, Key=key_lat, Body=payload)
-        logger.info(f"IA: Modelo {nome} salvo.")
+        logger.info(f"IA: Modelo {nome} exportado para o R2.")
 
     def obter_metricas_finais(self):
         return self.metricas_detalhadas
+
+if __name__ == "__main__":
+    treinador = TreinadorEvolutivo(dev_mode=True) # Deixe True para testar o pipeline inteiro rápido!
+    treinador.treinar_modelo_mestre()
