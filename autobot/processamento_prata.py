@@ -36,18 +36,21 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             
-           
-            dist_col = "NM_DIST" if "NM_DIST" in self.df_malha.columns else "NM_MUN"
+            # --- CORRECAO DE BUG (Evita chave duplicada no Polars se NM_DIST faltar) ---
+            chaves_distrito = ["NM_MUN", "NM_DIST"] if "NM_DIST" in self.df_malha.columns else ["NM_MUN"]
             
-            self.dens_distrito = self.df_malha.group_by(["NM_MUN", dist_col]).agg(
-                pl.col("DENSIDADE_AJUSTADA").mean().alias("DENS_DIST")
+            # Fallback de DENSIDADE_AJUSTADA ou DENSIDADE_DEMOGRAFICA
+            col_densidade = "DENSIDADE_AJUSTADA" if "DENSIDADE_AJUSTADA" in self.df_malha.columns else "DENSIDADE_DEMOGRAFICA"
+
+            self.dens_distrito = self.df_malha.group_by(chaves_distrito).agg(
+                pl.col(col_densidade).mean().alias("DENS_DIST")
             )
             self.dens_cidade = self.df_malha.group_by(["NM_MUN"]).agg(
-                pl.col("DENSIDADE_AJUSTADA").mean().alias("DENS_CID")
+                pl.col(col_densidade).mean().alias("DENS_CID")
             )
-            logger.info("PRATA: Dependencias geográficas e densidades carregadas com sucesso.")
+            logger.info("PRATA: Dependencias geograficas e densidades carregadas com sucesso.")
         except Exception as e:
-            logger.error(f"PRATA: Falha crítica ao carregar malha no R2: {e}")
+            logger.error(f"PRATA: Falha critica ao carregar malha no R2: {e}")
             self.df_malha = None
 
     def _canonizar_texto(self, coluna):
@@ -68,7 +71,7 @@ class ProcessamentoPrata:
         )
 
     def _motor_recuperacao_cruzada(self, df_bronze):
-     
+        # 1. Padronizacao Absoluta da Base Policial (Bronze)
         df_ssp = df_bronze.with_columns([
             pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
@@ -77,7 +80,7 @@ class ProcessamentoPrata:
             self._canonizar_texto(pl.col("BAIRRO")).alias("BAIRRO_CANONICO")
         ])
 
-       
+        # 2. Separacao: BOs com Coordenadas (Sadios) e sem Coordenadas (Cegos)
         df_gps = df_ssp.filter((pl.col("LATITUDE") != 0.0) & (pl.col("LONGITUDE") != 0.0)).with_columns(
             pl.struct(["LATITUDE", "LONGITUDE"])
             .map_elements(lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], 9), return_dtype=pl.String)
@@ -85,7 +88,7 @@ class ProcessamentoPrata:
         )
         df_cegos = df_ssp.filter((pl.col("LATITUDE") == 0.0) | (pl.col("LONGITUDE") == 0.0))
 
-       
+        # 3. CURA 1: Malha recupera os BOs Cegos
         malha_lookup = self.df_malha.with_columns([
             self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO"),
             self._canonizar_texto(pl.col("NM_MUN")).alias("MUN_CANONICO")
@@ -101,7 +104,7 @@ class ProcessamentoPrata:
 
         df_unificado = pl.concat([df_gps, df_resgatados], how="diagonal")
 
-       
+        # 4. CURA 2: BOs com GPS recuperam a Malha Geografica
         curativos_bo = df_gps.group_by("H3_INDEX").agg([
             pl.col("LOGRADOURO").drop_nulls().first().alias("LOG_BO"),
             pl.col("BAIRRO").drop_nulls().first().alias("BAIRRO_BO"),
@@ -121,29 +124,30 @@ class ProcessamentoPrata:
         if malha_modificada.height > 0:
             self._persistir_enriquecimento_malha(malha_modificada)
 
-     
-        cols_inteligencia = ["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "MORADORES_POR_DOMICILIO"]
+        # 5. Consolidacao dos BOs para a Camada Prata
+        cols_inteligencia = ["H3_INDEX", "DENSIDADE_AJUSTADA", "DENSIDADE_DEMOGRAFICA", "TAXA_VACANCIA", "MORADORES_POR_DOMICILIO"]
         malha_features = self.df_malha.select([c for c in cols_inteligencia if c in self.df_malha.columns]).unique(subset=["H3_INDEX"])
         
         df_cross = df_unificado.join(malha_features, on="H3_INDEX", how="left")
 
+        # Fallback de Densidade
+        col_dens = "DENSIDADE_AJUSTADA" if "DENSIDADE_AJUSTADA" in df_cross.columns else "DENSIDADE_DEMOGRAFICA"
         
-        if "DENSIDADE_AJUSTADA" in df_cross.columns:
+        if col_dens in df_cross.columns:
             df_cross = df_cross.join(self.dens_cidade, left_on="MUN_CANONICO", right_on="NM_MUN", how="left")
             df_final = df_cross.with_columns(
-                pl.when(pl.col("DENSIDADE_AJUSTADA").is_not_null() & (pl.col("DENSIDADE_AJUSTADA") > 0))
-                .then(pl.col("DENSIDADE_AJUSTADA"))
+                pl.when(pl.col(col_dens).is_not_null() & (pl.col(col_dens) > 0))
+                .then(pl.col(col_dens))
                 .when(pl.col("DENS_CID").is_not_null())
                 .then(pl.col("DENS_CID"))
                 .otherwise(0.0).alias("DENSIDADE_FINAL")
             )
         else:
-            df_final = df_cross
+            df_final = df_cross.with_columns(pl.lit(0.0).alias("DENSIDADE_FINAL"))
 
         return df_final, malha_modificada.height, df_resgatados.height
 
     def _persistir_enriquecimento_malha(self, modificacoes):
-        """Aplica os curativos vindos dos BOs na Malha Original e salva no R2."""
         self.df_malha = self.df_malha.join(
             modificacoes.select(["H3_INDEX", "LOG_BO", "BAIRRO_BO", "MUN_BO"]),
             on="H3_INDEX", how="left"
@@ -159,7 +163,7 @@ class ProcessamentoPrata:
         buffer = io.BytesIO()
         self.df_malha.write_parquet(buffer)
         self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer.getvalue())
-        logger.info(f"PRATA: Malha geografica evoluida com {modificacoes.height} novos registros baseados nos relatorios policiais.")
+        logger.info(f"PRATA: Malha geografica evoluida com {modificacoes.height} curativos vindos de registros policiais.")
 
     def _normalizar_bronze(self, data):
         dfs = []
@@ -200,14 +204,11 @@ class ProcessamentoPrata:
             total_raw = df_bronze.height
             df_curado, cura_malha, resgate_h3 = self._motor_recuperacao_cruzada(df_bronze)
 
-            
-            dens_col = "DENSIDADE_FINAL" if "DENSIDADE_FINAL" in df_curado.columns else "DENSIDADE_AJUSTADA"
-            
             df_final = df_curado.group_by(["H3_INDEX"]).agg([
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO")).count().alias("TOTAL_CRIMES"),
-                pl.col("BAIRRO").first().alias("NM_BAIRRO"),
-                pl.col("MUNICIPIO").first().alias("NM_MUN"),
-                pl.col(dens_col).first().alias("DENSIDADE"),
+                pl.col("BAIRRO_CANONICO").first().alias("NM_BAIRRO"),
+                pl.col("MUN_CANONICO").first().alias("NM_MUN"),
+                pl.col("DENSIDADE_FINAL").first().alias("DENSIDADE"),
                 pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA") if "TAXA_VACANCIA" in df_curado.columns else pl.lit(0.0).alias("TAXA_VACANCIA")
             ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
 
