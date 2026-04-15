@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
-        # Configurações de conexão R2
+        # Configurações de conexão Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -39,37 +39,37 @@ class ProcessamentoPrata:
             return "datalake"
         except: return "datalake"
 
-    def _limpar_texto_standard(self, coluna):
-        """Aplica Uppercase e remove acentos de forma performática no Polars."""
+    def _limpar_texto_extremo(self, coluna):
+        """Converte para UPPERCASE e remove todos os acentos e caracteres especiais."""
         return (
             pl.col(coluna)
             .cast(pl.String)
             .str.to_uppercase()
-            .str.replace_all(r"[ÁÀÂÃ]", "A")
-            .str.replace_all(r"[ÉÈÊ]", "E")
-            .str.replace_all(r"[ÍÌÎ]", "I")
-            .str.replace_all(r"[ÓÒÔÕ]", "O")
-            .str.replace_all(r"[ÚÙÛ]", "U")
+            .str.replace_all(r"[ÁÀÂÃÄ]", "A")
+            .str.replace_all(r"[ÉÈÊË]", "E")
+            .str.replace_all(r"[ÍÌÎÏ]", "I")
+            .str.replace_all(r"[ÓÒÔÕÖ]", "O")
+            .str.replace_all(r"[ÚÙÛÜ]", "U")
             .str.replace_all(r"[Ç]", "C")
+            .str.replace_all(r"[Ñ]", "N")
             .str.strip_chars()
             .fill_null("INDEFINIDO")
         )
 
     def _inicializar_dependencias(self):
-        """Carrega a malha geográfica e já normaliza as colunas de cruzamento."""
+        """Carrega a malha geográfica aplicando a mesma limpeza para o cruzamento."""
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
-            # NORMALIZAÇÃO DA MALHA (O lado fixo do Join)
             self.df_malha_lazy = (
                 pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 .lazy()
                 .with_columns([
-                    self._limpar_texto_standard("NM_MUN").alias("NM_MUN"),
-                    self._limpar_texto_standard("NM_BAIRRO").alias("NM_BAIRRO"),
-                    self._limpar_texto_standard("LOGRADOURO").alias("LOGRADOURO_GRID")
+                    self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
+                    self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO"),
+                    self._limpar_texto_extremo("LOGRADOURO").alias("LOGRADOURO_GRID")
                 ])
             )
-            logger.info("PRATA: Malha geográfica normalizada e pronta para cruzamento.")
+            logger.info("PRATA: Malha geográfica normalizada (Sem Acentos/Upper).")
         except Exception as e:
             logger.error(f"PRATA: Erro ao carregar malha: {e}")
             self.df_malha_lazy = None
@@ -80,47 +80,61 @@ class ProcessamentoPrata:
         
         try:
             meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
-            if not force and estado.get(str(ano)) == meta['ContentLength']: return None
+            tamanho_atual = meta['ContentLength']
+            if not force and estado.get(str(ano)) == tamanho_atual: return None
 
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # --- 1. MAPEAMENTO DE SINÔNIMOS (Schema Drift) ---
-            cols_atuais = lf.collect_schema().names()
+            # --- 0. RESOLUÇÃO DE DUPLICATAS E SCHEMA DRIFT (O Corretor) ---
+            cols = lf.collect_schema().names()
+            
+            # Prioridade para TIPO_LOCAL (Subtipo ganha do Tipo comum)
+            if "DESCR_SUBTIPOLOCAL" in cols:
+                lf = lf.rename({"DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"})
+                if "DESCR_TIPOLOCAL" in cols: lf = lf.drop("DESCR_TIPOLOCAL")
+            elif "DESCR_TIPOLOCAL" in cols:
+                lf = lf.rename({"DESCR_TIPOLOCAL": "TIPO_LOCAL"})
+
+            # Mapeamento de nomes entre os anos
             mapeamento = {
-                "CIDADE": "MUNICIPIO", "NOME_MUNICIPIO": "MUNICIPIO",
+                "CIDADE": "NM_MUN_ORIGINAL",
+                "NOME_MUNICIPIO": "NM_MUN_ORIGINAL",
                 "HORA_OCORRENCIA_BO": "HORA",
-                "DESC_PERIODO": "PERIODO_TEXTO", "DESCR_PERIODO": "PERIODO_TEXTO",
-                "DESCR_TIPOLOCAL": "TIPO_LOCAL", "DESCR_SUBTIPOLOCAL": "TIPO_LOCAL",
-                "DESCR_CONDUTA": "CONDUTA"
+                "DESC_PERIODO": "PERIODO_TEXTO",
+                "DESCR_PERIODO": "PERIODO_TEXTO",
+                "DESCR_CONDUTA": "CONDUTA",
+                "BAIRRO": "NM_BAIRRO_ORIGINAL",
+                "LOGRADOURO": "LOGRADOURO_ORIGINAL"
             }
-            rename_dict = {old: new for old, new in mapeamento.items() if old in cols_atuais}
+            
+            rename_dict = {old: new for old, new in mapeamento.items() if old in cols}
             if rename_dict: lf = lf.rename(rename_dict)
 
-            total_entrada = lf.select(pl.len()).collect().item()
+            total_in = lf.select(pl.len()).collect().item()
 
-            # --- 2. NORMALIZAÇÃO DO B.O. (O lado variável do Join) ---
-            # Aplicamos a mesma régua de limpeza da Malha
-            colunas_para_limpar = ["MUNICIPIO", "BAIRRO", "LOGRADOURO", "RUBRICA", "CONDUTA", "TIPO_LOCAL", "PERIODO_TEXTO"]
-            lf = lf.with_columns([self._limpar_texto_standard(c) for c in colunas_para_limpar if c in lf.collect_schema().names()])
+            # --- 1. NORMALIZAÇÃO TOTAL (Sem Acentos / Upper) ---
+            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "LOGRADOURO_ORIGINAL", "RUBRICA", "CONDUTA", "TIPO_LOCAL", "PERIODO_TEXTO"]
+            lf = lf.with_columns([
+                self._limpar_texto_extremo(c) for c in campos_texto if c in lf.collect_schema().names()
+            ])
 
-            # --- 3. CRUZAMENTO E CURA ---
-            # O Join agora acontece entre colunas que foram limpas da mesma forma
+            # --- 2. CRUZAMENTO E CURA (Join com a Malha) ---
             lf_enriquecido = lf.join(self.df_malha_lazy, on="H3_INDEX", how="left")
             
             lf_enriquecido = lf_enriquecido.with_columns([
-                pl.coalesce([pl.col("NM_MUN"), pl.col("MUNICIPIO")]).alias("NM_MUN_FINAL"),
-                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("BAIRRO")]).alias("NM_BAIRRO_FINAL")
+                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN_FINAL"),
+                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO_FINAL")
             ])
 
-            # HIGIENE: Excluir se não tiver localização mínima
+            # Filtro de Higiene: Exclui registros sem localização recuperável
             lf_enriquecido = lf_enriquecido.filter(
                 (pl.col("H3_INDEX").is_not_null()) & 
                 (pl.col("NM_MUN_FINAL") != "INDEFINIDO") & 
                 (pl.col("NM_BAIRRO_FINAL") != "INDEFINIDO")
             )
 
-            # --- 4. LÓGICA DE NEGÓCIO (HORAS E PERÍODOS) ---
+            # --- 3. LÓGICA DE NEGÓCIO (Horas e Perfil) ---
             lf_enriquecido = lf_enriquecido.with_columns([
                 pl.col("HORA").str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT"),
                 pl.when(pl.col("CONDUTA").str.contains("TRANSEUNTE|PEDESTRE")).then(pl.lit("PEDESTRE"))
@@ -138,7 +152,7 @@ class ProcessamentoPrata:
                   .otherwise(pl.lit("MADRUGADA")).alias("PERIODO_DIA")
             ])
 
-            # --- 5. AGREGAÇÃO ---
+            # --- 4. AGREGAÇÃO ---
             lf_agg = lf_enriquecido.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"]).agg([
                 pl.when(pl.col("RUBRICA").str.contains("ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES"),
                 pl.col("NM_MUN_FINAL").first().alias("NM_MUN"),
@@ -159,11 +173,11 @@ class ProcessamentoPrata:
             df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
-            estado[str(ano)] = meta['ContentLength']
-            return {"linhas_in": total_entrada, "linhas_out": df_final.height}
+            estado[str(ano)] = tamanho_atual
+            return {"linhas_in": total_in, "linhas_out": df_final.height}
 
         except Exception as e:
-            logger.error(f"PRATA: Erro {ano}: {e}")
+            logger.error(f"PRATA: Erro no ano {ano}: {e}")
             return None
 
     def executar_todos_os_anos(self, force=False):
@@ -185,3 +199,7 @@ class ProcessamentoPrata:
 
     def _salvar_tracker(self, estado):
         self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
+
+if __name__ == "__main__":
+    prata = ProcessamentoPrata()
+    prata.executar_todos_os_anos(force=True)
