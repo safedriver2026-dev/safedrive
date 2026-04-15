@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 class CamadaOuroSafeDriver:
     def __init__(self, dev_mode=True):
-        # MODO DE DESENVOLVIMENTO: Se True, processa apenas 2026 para agilizar os testes
         self.dev_mode = dev_mode
         
         # Credenciais R2
@@ -41,7 +40,6 @@ class CamadaOuroSafeDriver:
         self.cal = CalendarioEstrategico()
         self.pesos = {"catboost": 0.85, "lightgbm": 0.15}
         
-        # Definição das Features (Sincronizado com o Treinador)
         self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO']
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
         self.features_full = self.features_numericas + self.features_categoricas
@@ -82,7 +80,7 @@ class CamadaOuroSafeDriver:
 
             df_final = self._gerar_scores_ponderados(df_input, modelos)
             
-            # Persistência no R2 e Sincronização no BigQuery
+            # Persistência Dupla: R2 (Parquet) e BigQuery (Tabela Fato)
             self._salvar_parquet_ouro(df_final)
             self._sincronizar_infraestrutura_bq(df_final)
             return True
@@ -98,8 +96,7 @@ class CamadaOuroSafeDriver:
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                 modelos["geral"][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
                 logger.info(f"OURO: Modelo {alg} carregado com sucesso.")
-            except Exception as e:
-                logger.warning(f"OURO: Modelo {alg} não encontrado: {e}")
+            except:
                 modelos["geral"][alg] = None
         return modelos
 
@@ -118,8 +115,6 @@ class CamadaOuroSafeDriver:
         if not lista_lfs: return None
         
         lf_full = pl.concat(lista_lfs, how="diagonal")
-        
-        # Feature Engineering final via Polars Lazy API
         lf_full = lf_full.with_columns([
             pl.when(pl.col('DENSIDADE') > 5000).then(pl.lit("RESIDENCIAL"))
               .when(pl.col('DENSIDADE') == 0).then(pl.lit("COMERCIAL_INDUSTRIAL"))
@@ -127,7 +122,6 @@ class CamadaOuroSafeDriver:
         ])
         
         df_pandas = lf_full.collect(engine="streaming").to_pandas()
-        
         for col in self.features_categoricas:
             df_pandas[col] = df_pandas[col].astype(str).fillna("DESCONHECIDO").astype('category')
         
@@ -150,17 +144,14 @@ class CamadaOuroSafeDriver:
         df['SCORE_RISCO_GERAL'] = (df['SCORE_RISCO_GERAL'] / (df['SCORE_RISCO_GERAL'].max() or 1) * 100).clip(0, 100).round(2)
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
 
-        # Explicabilidade SHAP
         if mods["cat"]:
             explainer = shap.TreeExplainer(mods["cat"])
             if len(df) > 5000:
-                logger.warning("OURO: Base muito grande. Calculando SHAP para o Top 5000 de maior risco.")
+                logger.warning("OURO: Base muito grande. Calculando SHAP para o Top 5000.")
                 df_shap = df.nlargest(5000, 'SCORE_RISCO_GERAL')
                 shap_matrix = explainer.shap_values(df_shap[self.features_full])
-                
                 for col in ['SHAP_MUNICIPIO', 'SHAP_PERIODO', 'SHAP_PERFIL_ALVO', 'SHAP_EXPOSICAO']:
                     df[col] = 0.0
-                    
                 df.loc[df_shap.index, 'SHAP_MUNICIPIO'] = shap_matrix[:, self.features_full.index('NM_MUN')]
                 df.loc[df_shap.index, 'SHAP_PERIODO'] = shap_matrix[:, self.features_full.index('PERIODO_DIA')]
                 df.loc[df_shap.index, 'SHAP_PERFIL_ALVO'] = shap_matrix[:, self.features_full.index('PERFIL_ALVO')]
@@ -171,69 +162,59 @@ class CamadaOuroSafeDriver:
                 df['SHAP_PERIODO'] = shap_values[:, self.features_full.index('PERIODO_DIA')]
                 df['SHAP_PERFIL_ALVO'] = shap_values[:, self.features_full.index('PERFIL_ALVO')]
                 df['SHAP_EXPOSICAO'] = shap_values[:, self.features_full.index('INDICE_EXPOSICAO')]
-            
             df['SHAP_BASE'] = float(explainer.expected_value)
-        else:
-            for c in ['SHAP_BASE', 'SHAP_MUNICIPIO', 'SHAP_PERIODO', 'SHAP_PERFIL_ALVO', 'SHAP_EXPOSICAO']:
-                df[c] = 0.0
-        
         return df
 
     def _salvar_parquet_ouro(self, df):
-        """Salva uma cópia física da predição final no Cloudflare R2."""
         try:
             caminho_ouro = self._get_path("ouro", "fato_risco_consolidada.parquet")
             buffer = io.BytesIO()
             pl.from_pandas(df).write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=caminho_ouro, Body=buffer.getvalue())
-            logger.info(f"OURO: Parquet de contingência salvo com sucesso em: {caminho_ouro}")
+            logger.info(f"OURO: Parquet salvo no R2: {caminho_ouro}")
         except Exception as e:
-            logger.error(f"OURO: Falha ao salvar Parquet no R2: {e}")
+            logger.error(f"OURO: Falha ao salvar Parquet: {e}")
 
     def _sincronizar_infraestrutura_bq(self, df):
         dataset_path = f"{self.project_id}.{self.dataset_id}"
         tabela_fato = f"{dataset_path}.fato_risco_h3_atual"
         tabela_staging = f"{tabela_fato}_staging"
         
+        # 1. Upload para Staging
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=job_config).result()
         
-        logger.info("OURO: Executando MERGE atómico no BigQuery...")
-        
-      
-        check_table_sql = f"SELECT size_bytes FROM `{dataset_path}.__TABLES__` WHERE table_id = 'fato_risco_h3_atual'"
-        table_exists = list(self.bq_client.query(check_table_sql).result())
+        logger.info("OURO: Sincronizando estrutura e executando MERGE...")
 
-        if not table_exists:
-            logger.info("OURO: Tabela destino não existe. Criando carga inicial...")
-            self.bq_client.query(f"CREATE TABLE `{tabela_fato}` AS SELECT * FROM `{tabela_staging}`").result()
-        else:
-         
-            self.bq_client.query(f"""
-                MERGE `{tabela_fato}` T USING `{tabela_staging}` S 
-                ON T.H3_INDEX = S.H3_INDEX 
-                   AND T.PERIODO_DIA = S.PERIODO_DIA 
-                   AND T.PERFIL_ALVO = S.PERFIL_ALVO
-                   AND T.TIPO_LOCAL = S.TIPO_LOCAL
-                WHEN MATCHED THEN UPDATE SET 
-                    T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL,
-                    T.RANKING_RISCO_LOCAL = S.RANKING_RISCO_LOCAL,
-                    T.SHAP_MUNICIPIO = S.SHAP_MUNICIPIO,
-                    T.SHAP_PERIODO = S.SHAP_PERIODO,
-                    T.SHAP_PERFIL_ALVO = S.SHAP_PERFIL_ALVO,
-                    T.SHAP_EXPOSICAO = S.SHAP_EXPOSICAO,
-                    T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
-                WHEN NOT MATCHED THEN INSERT ROW;
-            """).result()
+    
+        self.bq_client.query(f"""
+            CREATE TABLE IF NOT EXISTS `{tabela_fato}` 
+            AS SELECT * FROM `{tabela_staging}` WHERE 1=0
+        """).result()
+
+    
+        self.bq_client.query(f"""
+            MERGE `{tabela_fato}` T USING `{tabela_staging}` S 
+            ON T.H3_INDEX = S.H3_INDEX 
+               AND T.PERIODO_DIA = S.PERIODO_DIA 
+               AND T.PERFIL_ALVO = S.PERFIL_ALVO
+               AND T.TIPO_LOCAL = S.TIPO_LOCAL
+            WHEN MATCHED THEN UPDATE SET 
+                T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL,
+                T.RANKING_RISCO_LOCAL = S.RANKING_RISCO_LOCAL,
+                T.SHAP_MUNICIPIO = S.SHAP_MUNICIPIO,
+                T.SHAP_PERIODO = S.SHAP_PERIODO,
+                T.SHAP_PERFIL_ALVO = S.SHAP_PERFIL_ALVO,
+                T.SHAP_EXPOSICAO = S.SHAP_EXPOSICAO,
+                T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
+            WHEN NOT MATCHED THEN INSERT ROW;
+        """).result()
 
         self._build_semantic_views(dataset_path, tabela_fato)
 
     def _build_semantic_views(self, dataset, fato):
-        self.bq_client.query(f"""
-            CREATE OR REPLACE VIEW `{dataset}.v_safedriver_dashboard` AS
-            SELECT * FROM `{fato}`
-        """).result()
-        logger.info("OURO: Camada Semântica atualizada e pronta para o Looker Studio.")
+        self.bq_client.query(f"CREATE OR REPLACE VIEW `{dataset}.v_safedriver_dashboard` AS SELECT * FROM `{fato}`").result()
+        logger.info("OURO: Camada Semântica atualizada.")
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver(dev_mode=True)
