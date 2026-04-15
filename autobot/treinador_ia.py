@@ -6,7 +6,6 @@ from botocore.exceptions import ClientError
 import joblib
 import io
 import os
-import json
 import logging
 import numpy as np
 from datetime import datetime
@@ -35,7 +34,9 @@ class TreinadorEvolutivo:
         
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         self.personas = {"geral": "TOTAL_CRIMES"}
-        self.features_numericas = ['DENSIDADE']
+        
+        # Features atualizadas baseadas na Camada Ouro
+        self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA']
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
         self.metricas_detalhadas = []
 
@@ -53,13 +54,16 @@ class TreinadorEvolutivo:
                 X = df_treino[colunas_ia].copy()
                 y = df_treino[target]
                 
-                # Conversão para categorias para compatibilidade LightGBM
+                # Conversao de categorias exigida pelo LightGBM e CatBoost
                 for col in self.features_categoricas:
                     X[col] = X[col].astype(str).fillna("DESCONHECIDO").astype('category')
+                
+                for col in self.features_numericas:
+                    X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0.0)
 
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-                # Treino CatBoost com Distribuição Tweedie (Mitigação de Zero-Inflated)
+                # Treino CatBoost - Distribuicao Tweedie
                 model_cat = CatBoostRegressor(
                     iterations=1000, 
                     depth=8, 
@@ -70,7 +74,7 @@ class TreinadorEvolutivo:
                 )
                 model_cat.fit(X_train, y_train)
                 
-                # Treino LightGBM com Distribuição Tweedie
+                # Treino LightGBM - Distribuicao Tweedie
                 model_lgb = LGBMRegressor(
                     n_estimators=500, 
                     learning_rate=0.02, 
@@ -81,7 +85,7 @@ class TreinadorEvolutivo:
                 )
                 model_lgb.fit(X_train, y_train)
 
-                # Auditoria de Erro
+                # Auditoria de Erro Absoluto Medio (MAE)
                 mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
                 mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
                 
@@ -97,9 +101,10 @@ class TreinadorEvolutivo:
                 self._exportar_artefactos(model_lgb, f"lgb_{persona}")
                 
             except Exception as e:
-                logger.error(f"Erro no treinamento evolutivo: {e}")
+                logger.error(f"IA: Erro no treinamento evolutivo ({persona}): {e}")
                 return False
 
+        logger.info("IA: Processamento de treinamento e exportacao de artefatos concluido.")
         return True
 
     def obter_metricas_finais(self):
@@ -108,20 +113,46 @@ class TreinadorEvolutivo:
 
     def _carregar_datalake_consolidado(self):
         lista_dfs = []
+        
+        # Colunas esperadas para tipagem estrita
+        cols_num = ["TOTAL_CRIMES", "DENSIDADE", "TAXA_VACANCIA"]
+        cols_cat = ["NM_BAIRRO", "NM_MUN", "H3_INDEX"]
+
         for ano in range(2022, datetime.now().year + 1):
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/prata/ssp_consolidada_{ano}.parquet")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
-                # Garante cast numérico e preenchimento de nulos para evitar erros no Tweedie
-                lista_dfs.append(df.with_columns([pl.all().cast(pl.Float64, strict=False).fill_null(0.0)]))
+                
+                # Tipagem segura (evita cast de String para Float)
+                df = df.with_columns([
+                    pl.col(c).cast(pl.Float64, strict=False).fill_null(0.0) for c in cols_num if c in df.columns
+                ]).with_columns([
+                    pl.col(c).cast(pl.String).fill_null("DESCONHECIDO") for c in cols_cat if c in df.columns
+                ])
+                
+                # Garante que a coluna TAXA_VACANCIA exista mesmo em arquivos antigos
+                if "TAXA_VACANCIA" not in df.columns:
+                    df = df.with_columns(pl.lit(0.0).alias("TAXA_VACANCIA"))
+
+                lista_dfs.append(df)
             except Exception: 
                 continue
         
-        if not lista_dfs: return None
+        if not lista_dfs: 
+            return None
+            
         df = pl.concat(lista_dfs, how="diagonal").to_pandas()
         
-        df['PERFIL_AREA'] = np.where(df['DENSIDADE'] > 5000, "RESIDENCIAL", 
-                            np.where(df['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
+        # Feature Engineering Contextual
+        condicoes = [
+            (df['TAXA_VACANCIA'] > 0.3),
+            (df['DENSIDADE'] > 5000),
+            (df['DENSIDADE'] == 0)
+        ]
+        classes = ["ALTA_VACANCIA", "RESIDENCIAL_DENSO", "COMERCIAL_INDUSTRIAL"]
+        
+        df['PERFIL_AREA'] = np.select(condicoes, classes, default="MISTO")
+        
         return df
 
     def _exportar_artefactos(self, modelo, nome):
@@ -130,3 +161,8 @@ class TreinadorEvolutivo:
         payload = buffer.getvalue()
         self.s3.put_object(Bucket=self.bucket, Key=f"datalake/modelos_ml/versions/v{self.versao_modelo}_{nome}.pkl", Body=payload)
         self.s3.put_object(Bucket=self.bucket, Key=f"datalake/modelos_ml/latest_{nome}.pkl", Body=payload)
+
+if __name__ == "__main__":
+    treinador = TreinadorEvolutivo()
+    treinador.treinar_modelo_mestre()
+    print(treinador.obter_metricas_finais())
