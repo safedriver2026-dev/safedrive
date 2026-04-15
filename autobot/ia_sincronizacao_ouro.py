@@ -19,20 +19,20 @@ logger = logging.getLogger(__name__)
 
 class CamadaOuroSafeDriver:
     def __init__(self, dev_mode=True):
-     
+        # 🔥 MODO DE DESENVOLVIMENTO: Se True, processa apenas 2026. Para o histórico, use False.
         self.dev_mode = dev_mode
         
-       
+        # Credenciais R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-    
+        # Configurações BigQuery
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9").strip()
         self.dataset_id = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip()
 
-     
+        # Conexão otimizada S3
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
                               aws_access_key_id=self.access_key,
                               aws_secret_access_key=self.secret_key, 
@@ -42,7 +42,7 @@ class CamadaOuroSafeDriver:
         self.cal = CalendarioEstrategico()
         self.pesos = {"catboost": 0.85, "lightgbm": 0.15}
         
-      
+        # Definição das Features (Sincronizado)
         self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO']
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
         self.features_full = self.features_numericas + self.features_categoricas
@@ -110,7 +110,6 @@ class CamadaOuroSafeDriver:
             key = self._get_path("prata", f"ssp_consolidada_{ano}.parquet")
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
-                # 🔥 Lê como LazyFrame (Plano de Execução)
                 lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
                 lista_lfs.append(lf)
             except: continue
@@ -120,7 +119,7 @@ class CamadaOuroSafeDriver:
         # Concatena os grafos de execução
         lf_full = pl.concat(lista_lfs, how="diagonal")
         
-        # 🔥 Feature Engineering feita nativamente em Rust (Milissegundos)
+        # Engenharia feita nativamente em Rust (Milissegundos)
         lf_full = lf_full.with_columns([
             pl.when(pl.col('DENSIDADE') > 5000).then(pl.lit("RESIDENCIAL"))
               .when(pl.col('DENSIDADE') == 0).then(pl.lit("COMERCIAL_INDUSTRIAL"))
@@ -129,7 +128,7 @@ class CamadaOuroSafeDriver:
         
         # Executa todo o grafo em modo Streaming e converte para Pandas
         logger.info("OURO: Avaliando motor Lazy e convertendo para DataFrame ML...")
-        df_pandas = lf_full.collect(streaming=True).to_pandas()
+        df_pandas = lf_full.collect(engine="streaming").to_pandas()
         
         # Ajuste de Categorias obrigatório para os Modelos
         for col in self.features_categoricas:
@@ -157,12 +156,12 @@ class CamadaOuroSafeDriver:
         df['SCORE_RISCO_GERAL'] = (df['SCORE_RISCO_GERAL'] / (df['SCORE_RISCO_GERAL'].max() or 1) * 100).clip(0, 100).round(2)
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
 
-        # Explicabilidade SHAP (Otimizada com Trava de CPU)
+        # Explicabilidade SHAP (Otimizada e com Foco no Município)
         if mods["cat"]:
             logger.info("OURO: Calculando SHAP Values (Nível Município)...")
             explainer = shap.TreeExplainer(mods["cat"])
             
-            # 🔥 Trava de Performance Sênior: Evita travar a máquina calculando SHAP para 5 milhões de linhas
+            # Trava de Performance: Evita travar a máquina calculando SHAP para 5 milhões de linhas
             if len(df) > 5000:
                 logger.warning(f"OURO: Base com {len(df)} linhas. Calculando SHAP apenas para o Top 5000 de maior risco.")
                 df_shap = df.nlargest(5000, 'SCORE_RISCO_GERAL')
@@ -194,13 +193,13 @@ class CamadaOuroSafeDriver:
         tabela_fato = f"{dataset_path}.fato_risco_h3_atual"
         tabela_staging = f"{tabela_fato}_staging"
         
-     
+        # Upload em Lote para o Staging do BigQuery
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=job_config).result()
         
         logger.info("OURO: Executando MERGE atômico e inserindo novos scores no BigQuery...")
         
-       
+        # O MERGE Corrigido (Standard SQL)
         self.bq_client.query(f"""
             CREATE TABLE IF NOT EXISTS `{tabela_fato}` AS SELECT * FROM `{tabela_staging}` WHERE 1=0;
             
@@ -214,7 +213,7 @@ class CamadaOuroSafeDriver:
                 T.SHAP_PERFIL_ALVO = S.SHAP_PERFIL_ALVO,
                 T.SHAP_EXPOSICAO = S.SHAP_EXPOSICAO,
                 T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
-            WHEN NOT MATCHED THEN INSERT ROW LIKE S;
+            WHEN NOT MATCHED THEN INSERT ROW;
         """).result()
 
         self._build_semantic_views(dataset_path, tabela_fato)
@@ -227,6 +226,6 @@ class CamadaOuroSafeDriver:
         logger.info("OURO: Camada Semântica atualizada! Base pronta para consumo no Looker Studio.")
 
 if __name__ == "__main__":
-    
+    # Dev Mode = True por padrão para testes rápidos.
     ouro = CamadaOuroSafeDriver(dev_mode=True)
     ouro.executar_predicao_atual()
