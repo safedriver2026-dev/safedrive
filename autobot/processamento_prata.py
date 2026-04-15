@@ -30,6 +30,7 @@ class ProcessamentoPrata:
         self._inicializar_dependencias()
 
     def _localizar_datalake_real(self):
+        """Busca dinâmica para garantir o prefixo correto no R2."""
         try:
             paginator = self.s3.get_paginator('list_objects_v2')
             for page in paginator.paginate(Bucket=self.bucket, MaxKeys=100):
@@ -40,7 +41,7 @@ class ProcessamentoPrata:
         except: return "datalake"
 
     def _limpar_texto_extremo(self, coluna):
-        """Converte para UPPERCASE e remove todos os acentos e caracteres especiais."""
+        """Normalização total: Uppercase, Sem Acentos e Trim."""
         return (
             pl.col(coluna)
             .cast(pl.String)
@@ -57,7 +58,7 @@ class ProcessamentoPrata:
         )
 
     def _inicializar_dependencias(self):
-        """Carrega a malha geográfica aplicando a mesma limpeza para o cruzamento."""
+        """Carrega e normaliza a malha para garantir que as chaves de join batam."""
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             self.df_malha_lazy = (
@@ -69,7 +70,7 @@ class ProcessamentoPrata:
                     self._limpar_texto_extremo("LOGRADOURO").alias("LOGRADOURO_GRID")
                 ])
             )
-            logger.info("PRATA: Malha geográfica normalizada (Sem Acentos/Upper).")
+            logger.info("PRATA: Malha geográfica normalizada e pronta.")
         except Exception as e:
             logger.error(f"PRATA: Erro ao carregar malha: {e}")
             self.df_malha_lazy = None
@@ -80,46 +81,47 @@ class ProcessamentoPrata:
         
         try:
             meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
-            tamanho_atual = meta['ContentLength']
-            if not force and estado.get(str(ano)) == tamanho_atual: return None
+            if not force and estado.get(str(ano)) == meta['ContentLength']: return None
 
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # --- 0. RESOLUÇÃO DE DUPLICATAS E SCHEMA DRIFT (O Corretor) ---
+            # --- 0. RESOLUÇÃO DE DUPLICATAS E SCHEMA DRIFT ---
             cols = lf.collect_schema().names()
             
-            # Prioridade para TIPO_LOCAL (Subtipo ganha do Tipo comum)
+            # Lógica para TIPO_LOCAL (Prioriza Subtipo sobre Tipo)
             if "DESCR_SUBTIPOLOCAL" in cols:
                 lf = lf.rename({"DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"})
                 if "DESCR_TIPOLOCAL" in cols: lf = lf.drop("DESCR_TIPOLOCAL")
             elif "DESCR_TIPOLOCAL" in cols:
                 lf = lf.rename({"DESCR_TIPOLOCAL": "TIPO_LOCAL"})
 
-            # Mapeamento de nomes entre os anos
+            # Dicionário Elástico para Município, Bairro e outros
             mapeamento = {
                 "CIDADE": "NM_MUN_ORIGINAL",
                 "NOME_MUNICIPIO": "NM_MUN_ORIGINAL",
+                "MUNICIPIO": "NM_MUN_ORIGINAL",
+                "BAIRRO": "NM_BAIRRO_ORIGINAL",
+                "LOGRADOURO": "LOGRADOURO_ORIGINAL",
                 "HORA_OCORRENCIA_BO": "HORA",
                 "DESC_PERIODO": "PERIODO_TEXTO",
                 "DESCR_PERIODO": "PERIODO_TEXTO",
-                "DESCR_CONDUTA": "CONDUTA",
-                "BAIRRO": "NM_BAIRRO_ORIGINAL",
-                "LOGRADOURO": "LOGRADOURO_ORIGINAL"
+                "DESCR_CONDUTA": "CONDUTA"
             }
             
             rename_dict = {old: new for old, new in mapeamento.items() if old in cols}
             if rename_dict: lf = lf.rename(rename_dict)
 
-            total_in = lf.select(pl.len()).collect().item()
-
             # --- 1. NORMALIZAÇÃO TOTAL (Sem Acentos / Upper) ---
-            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "LOGRADOURO_ORIGINAL", "RUBRICA", "CONDUTA", "TIPO_LOCAL", "PERIODO_TEXTO"]
+            total_in = lf.select(pl.len()).collect().item()
+            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "LOGRADOURO_ORIGINAL", 
+                           "RUBRICA", "CONDUTA", "TIPO_LOCAL", "PERIODO_TEXTO"]
+            
             lf = lf.with_columns([
                 self._limpar_texto_extremo(c) for c in campos_texto if c in lf.collect_schema().names()
             ])
 
-            # --- 2. CRUZAMENTO E CURA (Join com a Malha) ---
+            # --- 2. CRUZAMENTO E CURA ---
             lf_enriquecido = lf.join(self.df_malha_lazy, on="H3_INDEX", how="left")
             
             lf_enriquecido = lf_enriquecido.with_columns([
@@ -127,14 +129,14 @@ class ProcessamentoPrata:
                 pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO_FINAL")
             ])
 
-            # Filtro de Higiene: Exclui registros sem localização recuperável
+            # Filtro de Higiene: Se após a cura ainda for INDEFINIDO, descarta.
             lf_enriquecido = lf_enriquecido.filter(
                 (pl.col("H3_INDEX").is_not_null()) & 
                 (pl.col("NM_MUN_FINAL") != "INDEFINIDO") & 
                 (pl.col("NM_BAIRRO_FINAL") != "INDEFINIDO")
             )
 
-            # --- 3. LÓGICA DE NEGÓCIO (Horas e Perfil) ---
+            # --- 3. LÓGICA DE NEGÓCIO ---
             lf_enriquecido = lf_enriquecido.with_columns([
                 pl.col("HORA").str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT"),
                 pl.when(pl.col("CONDUTA").str.contains("TRANSEUNTE|PEDESTRE")).then(pl.lit("PEDESTRE"))
@@ -152,7 +154,7 @@ class ProcessamentoPrata:
                   .otherwise(pl.lit("MADRUGADA")).alias("PERIODO_DIA")
             ])
 
-            # --- 4. AGREGAÇÃO ---
+            # --- 4. AGREGAÇÃO E MÉTRICAS ---
             lf_agg = lf_enriquecido.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"]).agg([
                 pl.when(pl.col("RUBRICA").str.contains("ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES"),
                 pl.col("NM_MUN_FINAL").first().alias("NM_MUN"),
@@ -177,7 +179,7 @@ class ProcessamentoPrata:
             return {"linhas_in": total_in, "linhas_out": df_final.height}
 
         except Exception as e:
-            logger.error(f"PRATA: Erro no ano {ano}: {e}")
+            logger.error(f"PRATA: Falha no ano {ano}: {e}")
             return None
 
     def executar_todos_os_anos(self, force=False):
@@ -199,7 +201,3 @@ class ProcessamentoPrata:
 
     def _salvar_tracker(self, estado):
         self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
-
-if __name__ == "__main__":
-    prata = ProcessamentoPrata()
-    prata.executar_todos_os_anos(force=True)
