@@ -36,91 +36,130 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             
-            self.dens_distrito = self.df_malha.group_by(["NM_MUN", "NM_DIST"]).agg(
-                pl.col("DENSIDADE_DEMOGRAFICA").mean().alias("DENS_DIST")
+           
+            dist_col = "NM_DIST" if "NM_DIST" in self.df_malha.columns else "NM_MUN"
+            
+            self.dens_distrito = self.df_malha.group_by(["NM_MUN", dist_col]).agg(
+                pl.col("DENSIDADE_AJUSTADA").mean().alias("DENS_DIST")
             )
             self.dens_cidade = self.df_malha.group_by(["NM_MUN"]).agg(
-                pl.col("DENSIDADE_DEMOGRAFICA").mean().alias("DENS_CID")
+                pl.col("DENSIDADE_AJUSTADA").mean().alias("DENS_CID")
             )
-            logger.info("PRATA: Malha geográfica e dicionários de densidade carregados.")
+            logger.info("PRATA: Dependencias geográficas e densidades carregadas com sucesso.")
         except Exception as e:
             logger.error(f"PRATA: Falha crítica ao carregar malha no R2: {e}")
             self.df_malha = None
 
     def _canonizar_texto(self, coluna):
+        """Padroniza textos para garantir match exato entre fontes distintas."""
         return (
-            coluna.str.replace(r"^(RUA|R|AVENIDA|AV|ALAMEDA|AL|PRACA|PRC|ESTRADA|EST|VIELA|VL)\.?\s+", "")
-            .str.replace_all(r"[ÁÀÂÃÄ]", "A").str.replace_all(r"[ÉÈÊË]", "E")
-            .str.replace_all(r"[ÍÌÎÏ]", "I").str.replace_all(r"[ÓÒÔÕÖ]", "O")
-            .str.replace_all(r"[ÚÙÛÜ]", "U").str.replace_all(r"[Ç]", "C")
-            .str.replace_all(r"[^A-Z0-9 ]", "").str.replace_all(r"\s+", " ").str.strip_chars()
+            pl.when(coluna.is_not_null())
+            .then(
+                coluna.cast(pl.String).str.to_uppercase()
+                .str.replace(r"^(RUA|R|AVENIDA|AV|ALAMEDA|AL|PRACA|PRC|ESTRADA|EST|VIELA|VL)\.?\s+", "")
+                .str.replace_all(r"[ÁÀÂÃÄ]", "A").str.replace_all(r"[ÉÈÊË]", "E")
+                .str.replace_all(r"[ÍÌÎÏ]", "I").str.replace_all(r"[ÓÒÔÕÖ]", "O")
+                .str.replace_all(r"[ÚÙÛÜ]", "U").str.replace_all(r"[Ç]", "C")
+                .str.replace_all(r"[^A-Z0-9 ]", "")
+                .str.replace_all(r"\s+", " ")
+                .str.strip_chars()
+            )
+            .otherwise(pl.lit("DESCONHECIDO"))
         )
 
     def _motor_recuperacao_cruzada(self, df_bronze):
+     
         df_ssp = df_bronze.with_columns([
             pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
-            self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO")
+            self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO"),
+            self._canonizar_texto(pl.col("MUNICIPIO")).alias("MUN_CANONICO"),
+            self._canonizar_texto(pl.col("BAIRRO")).alias("BAIRRO_CANONICO")
         ])
 
-        df_gps = df_ssp.filter(pl.col("LATITUDE") != 0).with_columns(
+       
+        df_gps = df_ssp.filter((pl.col("LATITUDE") != 0.0) & (pl.col("LONGITUDE") != 0.0)).with_columns(
             pl.struct(["LATITUDE", "LONGITUDE"])
             .map_elements(lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], 9), return_dtype=pl.String)
             .alias("H3_INDEX")
         )
+        df_cegos = df_ssp.filter((pl.col("LATITUDE") == 0.0) | (pl.col("LONGITUDE") == 0.0))
 
-        df_cegos = df_ssp.filter(pl.col("LATITUDE") == 0)
-        malha_lookup = self.df_malha.with_columns(
-            self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO")
-        ).unique(subset=["NM_MUN", "LOG_CANONICO"]).select(["NM_MUN", "LOG_CANONICO", "H3_INDEX"])
+       
+        malha_lookup = self.df_malha.with_columns([
+            self._canonizar_texto(pl.col("LOGRADOURO")).alias("LOG_CANONICO"),
+            self._canonizar_texto(pl.col("NM_MUN")).alias("MUN_CANONICO")
+        ]).unique(subset=["MUN_CANONICO", "LOG_CANONICO"]).select(
+            ["MUN_CANONICO", "LOG_CANONICO", "H3_INDEX"]
+        )
 
         df_resgatados = df_cegos.join(
             malha_lookup, 
-            left_on=["MUNICIPIO", "LOG_CANONICO"], 
-            right_on=["NM_MUN", "LOG_CANONICO"], 
+            on=["MUN_CANONICO", "LOG_CANONICO"], 
             how="inner"
         )
 
         df_unificado = pl.concat([df_gps, df_resgatados], how="diagonal")
 
-        df_cross = df_unificado.join(
-            self.df_malha.unique(subset=["H3_INDEX"]).select([
-                "H3_INDEX", "LOGRADOURO", "NM_BAIRRO", "NM_MUN", "NM_DIST", "DENSIDADE_DEMOGRAFICA"
-            ]),
-            on="H3_INDEX", how="left", suffix="_IBGE"
-        ).join(self.dens_distrito, on=["NM_MUN", "NM_DIST"], how="left"
-        ).join(self.dens_cidade, on=["NM_MUN"], how="left")
-
-        novos_bairros = df_cross.filter(
-            (pl.col("NM_BAIRRO") == "BAIRRO_PENDENTE") & (pl.col("BAIRRO").is_not_null())
-        ).group_by("H3_INDEX").agg(pl.col("BAIRRO").first().alias("BAIRRO_CURADO"))
-
-        if not novos_bairros.is_empty():
-            self._persistir_enriquecimento_malha(novos_bairros)
-
-        df_final = df_cross.with_columns([
-            pl.when(pl.col("NM_BAIRRO") == "BAIRRO_PENDENTE").then(pl.col("BAIRRO")).otherwise(pl.col("NM_BAIRRO")).alias("BAIRRO_FINAL"),
-            pl.when(pl.col("DENSIDADE_DEMOGRAFICA") > 0).then(pl.col("DENSIDADE_DEMOGRAFICA"))
-            .when(pl.col("DENS_DIST") > 0).then(pl.col("DENS_DIST"))
-            .when(pl.col("DENS_CID") > 0).then(pl.col("DENS_CID"))
-            .otherwise(0.0).alias("DENSIDADE_FINAL")
+       
+        curativos_bo = df_gps.group_by("H3_INDEX").agg([
+            pl.col("LOGRADOURO").drop_nulls().first().alias("LOG_BO"),
+            pl.col("BAIRRO").drop_nulls().first().alias("BAIRRO_BO"),
+            pl.col("MUNICIPIO").drop_nulls().first().alias("MUN_BO")
         ])
 
-        return df_final, novos_bairros.height, df_resgatados.height
+        malha_atualizada = self.df_malha.join(curativos_bo, on="H3_INDEX", how="left")
+        
+        condicao_cura_malha = (
+            ((pl.col("LOGRADOURO").is_null() | pl.col("LOGRADOURO").str.contains("PENDENTE|DESCONHECIDO")) & pl.col("LOG_BO").is_not_null()) |
+            ((pl.col("NM_BAIRRO").is_null() | pl.col("NM_BAIRRO").str.contains("PENDENTE|DESCONHECIDO")) & pl.col("BAIRRO_BO").is_not_null()) |
+            ((pl.col("NM_MUN").is_null() | pl.col("NM_MUN").str.contains("PENDENTE|DESCONHECIDO")) & pl.col("MUN_BO").is_not_null())
+        )
 
-    def _persistir_enriquecimento_malha(self, novos_dados):
-        self.df_malha = self.df_malha.join(novos_dados, on="H3_INDEX", how="left")
-        self.df_malha = self.df_malha.with_columns(
-            pl.when(pl.col("BAIRRO_CURADO").is_not_null())
-            .then(pl.col("BAIRRO_CURADO"))
-            .otherwise(pl.col("NM_BAIRRO"))
-            .alias("NM_BAIRRO")
-        ).drop("BAIRRO_CURADO")
+        malha_modificada = malha_atualizada.filter(condicao_cura_malha)
+        
+        if malha_modificada.height > 0:
+            self._persistir_enriquecimento_malha(malha_modificada)
+
+     
+        cols_inteligencia = ["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "MORADORES_POR_DOMICILIO"]
+        malha_features = self.df_malha.select([c for c in cols_inteligencia if c in self.df_malha.columns]).unique(subset=["H3_INDEX"])
+        
+        df_cross = df_unificado.join(malha_features, on="H3_INDEX", how="left")
+
+        
+        if "DENSIDADE_AJUSTADA" in df_cross.columns:
+            df_cross = df_cross.join(self.dens_cidade, left_on="MUN_CANONICO", right_on="NM_MUN", how="left")
+            df_final = df_cross.with_columns(
+                pl.when(pl.col("DENSIDADE_AJUSTADA").is_not_null() & (pl.col("DENSIDADE_AJUSTADA") > 0))
+                .then(pl.col("DENSIDADE_AJUSTADA"))
+                .when(pl.col("DENS_CID").is_not_null())
+                .then(pl.col("DENS_CID"))
+                .otherwise(0.0).alias("DENSIDADE_FINAL")
+            )
+        else:
+            df_final = df_cross
+
+        return df_final, malha_modificada.height, df_resgatados.height
+
+    def _persistir_enriquecimento_malha(self, modificacoes):
+        """Aplica os curativos vindos dos BOs na Malha Original e salva no R2."""
+        self.df_malha = self.df_malha.join(
+            modificacoes.select(["H3_INDEX", "LOG_BO", "BAIRRO_BO", "MUN_BO"]),
+            on="H3_INDEX", how="left"
+        ).with_columns([
+            pl.when(pl.col("LOG_BO").is_not_null() & (pl.col("LOGRADOURO").is_null() | pl.col("LOGRADOURO").str.contains("PENDENTE|DESCONHECIDO")))
+              .then(pl.col("LOG_BO")).otherwise(pl.col("LOGRADOURO")).alias("LOGRADOURO"),
+            pl.when(pl.col("BAIRRO_BO").is_not_null() & (pl.col("NM_BAIRRO").is_null() | pl.col("NM_BAIRRO").str.contains("PENDENTE|DESCONHECIDO")))
+              .then(pl.col("BAIRRO_BO")).otherwise(pl.col("NM_BAIRRO")).alias("NM_BAIRRO"),
+            pl.when(pl.col("MUN_BO").is_not_null() & (pl.col("NM_MUN").is_null() | pl.col("NM_MUN").str.contains("PENDENTE|DESCONHECIDO")))
+              .then(pl.col("MUN_BO")).otherwise(pl.col("NM_MUN")).alias("NM_MUN")
+        ]).drop(["LOG_BO", "BAIRRO_BO", "MUN_BO"])
         
         buffer = io.BytesIO()
         self.df_malha.write_parquet(buffer)
         self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer.getvalue())
-        logger.info(f"PRATA: Malha geográfica enriquecida com {novos_dados.height} novos registros.")
+        logger.info(f"PRATA: Malha geografica evoluida com {modificacoes.height} novos registros baseados nos relatorios policiais.")
 
     def _normalizar_bronze(self, data):
         dfs = []
@@ -161,11 +200,15 @@ class ProcessamentoPrata:
             total_raw = df_bronze.height
             df_curado, cura_malha, resgate_h3 = self._motor_recuperacao_cruzada(df_bronze)
 
+            
+            dens_col = "DENSIDADE_FINAL" if "DENSIDADE_FINAL" in df_curado.columns else "DENSIDADE_AJUSTADA"
+            
             df_final = df_curado.group_by(["H3_INDEX"]).agg([
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO")).count().alias("TOTAL_CRIMES"),
-                pl.col("BAIRRO_FINAL").first().alias("NM_BAIRRO"),
-                pl.col("NM_MUN").first().alias("NM_MUN"),
-                pl.col("DENSIDADE_FINAL").first().alias("DENSIDADE")
+                pl.col("BAIRRO").first().alias("NM_BAIRRO"),
+                pl.col("MUNICIPIO").first().alias("NM_MUN"),
+                pl.col(dens_col).first().alias("DENSIDADE"),
+                pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA") if "TAXA_VACANCIA" in df_curado.columns else pl.lit(0.0).alias("TAXA_VACANCIA")
             ]).with_columns(pl.lit(ano).cast(pl.Int32).alias("ANO_REFERENCIA"))
 
             buffer = io.BytesIO()
@@ -180,7 +223,7 @@ class ProcessamentoPrata:
 
     def executar_todos_os_anos(self, force=False):
         if self.df_malha is None:
-            raise RuntimeError("Execução abortada: Malha geográfica não disponível no R2.")
+            raise RuntimeError("Execução abortada: Malha geografica nao disponivel no R2.")
 
         estado_atual = self._carregar_tracker()
         relatorio = []
