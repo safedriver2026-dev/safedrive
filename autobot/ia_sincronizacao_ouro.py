@@ -10,11 +10,8 @@ import logging
 import numpy as np
 from datetime import datetime
 from google.cloud import bigquery
-from google.cloud.exceptions import NotFound
 from google.oauth2 import service_account
 from autobot.calendario_estrategico import CalendarioEstrategico
-
-# Otimizacao: carrega a explicabilidade pesada apenas sob demanda
 import shap
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -35,26 +32,26 @@ class CamadaOuroSafeDriver:
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
                               aws_access_key_id=self.access_key,
                               aws_secret_access_key=self.secret_key, 
-                              config=Config(signature_version='s3v4', s={'addressing_style': 'path'}))
+                              config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
         
-        # --- LÓGICA DE LOCALIZAÇÃO AUTOMÁTICA RECURSIVA ---
         self.base_path = self._localizar_datalake_real()
-        logger.info(f"OURO: Caminho mestre identificado: '{self.base_path}'")
-        
         self.cal = CalendarioEstrategico()
         self.pesos = {"catboost": 0.85, "lightgbm": 0.15}
+        
+        # Definição das Features (Sincronizado com o Treinador)
+        self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO']
+        self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
+        self.features_full = self.features_numericas + self.features_categoricas
+
         self._conectar_bigquery()
 
     def _localizar_datalake_real(self):
-        """Busca o caminho exato da pasta datalake no bucket."""
         try:
             paginator = self.s3.get_paginator('list_objects_v2')
             for page in paginator.paginate(Bucket=self.bucket, MaxKeys=100):
                 for obj in page.get('Contents', []):
-                    key = obj['Key']
-                    if "datalake/prata/" in key:
-                        prefixo = key.split("datalake/")[0]
-                        return f"{prefixo}datalake".strip("/")
+                    if "datalake/prata/" in obj['Key']:
+                        return obj['Key'].split("datalake/")[0] + "datalake"
             return "datalake"
         except: return "datalake"
 
@@ -96,11 +93,12 @@ class CamadaOuroSafeDriver:
                 modelos["geral"][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
                 logger.info(f"OURO: Modelo {alg} carregado com sucesso.")
             except Exception as e:
-                logger.warning(f"OURO: Modelo {alg} não encontrado em {path}: {e}")
+                logger.warning(f"OURO: Modelo {alg} não encontrado: {e}")
                 modelos["geral"][alg] = None
         return modelos
 
     def _obter_contexto_datalake(self):
+        """Carrega os dados da Prata mantendo todas as dimensões de perfil e tempo."""
         lista_dfs = []
         for ano in range(2022, datetime.now().year + 1):
             key = self._get_path("prata", f"ssp_consolidada_{ano}.parquet")
@@ -111,55 +109,49 @@ class CamadaOuroSafeDriver:
             except: continue
         
         if not lista_dfs: return None
-        df_full = pl.concat(lista_dfs, how="diagonal")
         
-        df_agg = df_full.group_by("H3_INDEX").agg([
-            pl.col("TOTAL_CRIMES").sum().alias("TOTAL_CRIMES_HISTORICO"),
-            pl.col("NM_BAIRRO").first(),
-            pl.col("NM_MUN").first(),
-            pl.col("DENSIDADE").first().fill_null(0.0),
-            pl.col("TAXA_VACANCIA").first().fill_null(0.0) if "TAXA_VACANCIA" in df_full.columns else pl.lit(0.0).alias("TAXA_VACANCIA")
-        ]).to_pandas()
-
-        df_agg['PERFIL_AREA'] = np.where(df_agg['DENSIDADE'] > 5000, "RESIDENCIAL", 
-                                np.where(df_agg['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
+        # Concatenamos mantendo a granularidade [H3 + PERIODO + PERFIL]
+        df_full = pl.concat(lista_dfs, how="diagonal").to_pandas()
         
-        for col in ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']:
-            df_agg[col] = df_agg[col].astype(str).fillna("DESCONHECIDO").astype('category')
+        # Feature Engineering final (Sincronizado)
+        df_full['PERFIL_AREA'] = np.where(df_full['DENSIDADE'] > 5000, "RESIDENCIAL", 
+                                 np.where(df_full['DENSIDADE'] == 0, "COMERCIAL_INDUSTRIAL", "MISTO"))
         
-        return df_agg
+        for col in self.features_categoricas:
+            df_full[col] = df_full[col].astype(str).fillna("DESCONHECIDO").astype('category')
+        
+        return df_full
 
     def _gerar_scores_ponderados(self, df, modelos):
-        logger.info("OURO: Computando predicacao espacial e decomposicao SHAP...")
-        features = ['DENSIDADE', 'TAXA_VACANCIA', 'NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
+        logger.info("OURO: Gerando predições multi-modais e SHAP...")
         mults = self.cal.obter_multiplicadores()
         mods = modelos["geral"]
         
-        p_cat = mods["cat"].predict(df[features]) if mods["cat"] else 0
-        p_lgb = mods["lgb"].predict(df[features]) if mods["lgb"] else 0
+        # Predição usando TODAS as features preparadas na Prata
+        p_cat = mods["cat"].predict(df[self.features_full]) if mods["cat"] else 0
+        p_lgb = mods["lgb"].predict(df[self.features_full]) if mods["lgb"] else 0
         
         score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
         df['SCORE_RISCO_GERAL'] = score_base * mults.get("geral", 1.0)
         
+        # Ajustes Estratégicos (Ex: Feriados ou áreas comerciais)
         mask_comercial = df['PERFIL_AREA'] == "COMERCIAL_INDUSTRIAL"
         df.loc[mask_comercial, 'SCORE_RISCO_GERAL'] *= mults.get("comercial", 1.0)
-        df.loc[~mask_comercial, 'SCORE_RISCO_GERAL'] *= mults.get("residencial", 1.0)
         
+        # Normalização 0-100 para o Dashboard
         df['SCORE_RISCO_GERAL'] = (df['SCORE_RISCO_GERAL'] / (df['SCORE_RISCO_GERAL'].max() or 1) * 100).clip(0, 100).round(2)
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
 
+        # Explicabilidade SHAP (Agora para todas as novas dimensões)
         if mods["cat"]:
             explainer = shap.TreeExplainer(mods["cat"])
-            shap_values = explainer.shap_values(df[features])
+            shap_values = explainer.shap_values(df[self.features_full])
             df['SHAP_BASE'] = float(explainer.expected_value)
-            df['SHAP_DENSIDADE'] = shap_values[:, 0].astype(float)
-            df['SHAP_VACANCIA'] = shap_values[:, 1].astype(float)
-            df['SHAP_BAIRRO'] = shap_values[:, 2].astype(float)
-            df['SHAP_MUN'] = shap_values[:, 3].astype(float)
-            df['SHAP_PERFIL'] = shap_values[:, 4].astype(float)
-        else:
-            for c in ['SHAP_BASE', 'SHAP_DENSIDADE', 'SHAP_VACANCIA', 'SHAP_BAIRRO', 'SHAP_MUN', 'SHAP_PERFIL']:
-                df[c] = 0.0
+            # Mapeia SHAP para as features principais para o Looker
+            df['SHAP_LOCALIDADE'] = shap_values[:, self.features_full.index('NM_BAIRRO')]
+            df['SHAP_PERIODO'] = shap_values[:, self.features_full.index('PERIODO_DIA')]
+            df['SHAP_PERFIL_ALVO'] = shap_values[:, self.features_full.index('PERFIL_ALVO')]
+            df['SHAP_EXPOSICAO'] = shap_values[:, self.features_full.index('INDICE_EXPOSICAO')]
         
         return df
 
@@ -168,40 +160,36 @@ class CamadaOuroSafeDriver:
         tabela_fato = f"{dataset_path}.fato_risco_h3_atual"
         tabela_staging = f"{tabela_fato}_staging"
         
+        # Upload para o Staging do BigQuery
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=job_config).result()
-        logger.info("OURO: Sincronizando tabelas no BigQuery...")
-
-        # SQL de MERGE e Setup de Tabelas
+        
+        logger.info("OURO: Executando MERGE atômico no BigQuery...")
+        
+        # O MERGE agora usa H3_INDEX + PERIODO + PERFIL como chave composta
         self.bq_client.query(f"""
-            CREATE TABLE IF NOT EXISTS `{tabela_fato}` AS 
-            SELECT * FROM `{tabela_staging}` WHERE 1=0;
+            CREATE TABLE IF NOT EXISTS `{tabela_fato}` AS SELECT * FROM `{tabela_staging}` WHERE 1=0;
             
-            MERGE `{tabela_fato}` T USING `{tabela_staging}` S ON T.H3_INDEX = S.H3_INDEX
+            MERGE `{tabela_fato}` T USING `{tabela_staging}` S 
+            ON T.H3_INDEX = S.H3_INDEX AND T.PERIODO_DIA = S.PERIODO_DIA AND T.PERFIL_ALVO = S.PERFIL_ALVO
             WHEN MATCHED THEN UPDATE SET 
-                T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL, T.TOTAL_CRIMES_HISTORICO = S.TOTAL_CRIMES_HISTORICO,
-                T.SHAP_DENSIDADE = S.SHAP_DENSIDADE, T.SHAP_VACANCIA = S.SHAP_VACANCIA,
+                T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL,
+                T.RANKING_RISCO_LOCAL = S.RANKING_RISCO_LOCAL,
+                T.SHAP_LOCALIDADE = S.SHAP_LOCALIDADE,
+                T.SHAP_PERIODO = S.SHAP_PERIODO,
                 T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
             WHEN NOT MATCHED THEN INSERT ROW LIKE S;
         """).result()
 
-        # Criação das Views para o Looker
-        self._build_semantic_views(dataset_path, tabela_fato, tabela_staging)
+        self._build_semantic_views(dataset_path, tabela_fato)
 
-    def _build_semantic_views(self, dataset, fato, staging):
-        # Dimensão H3 (Geográfica)
+    def _build_semantic_views(self, dataset, fato):
+        # View Final para o Looker Studio
         self.bq_client.query(f"""
-            CREATE OR REPLACE TABLE `{dataset}.dim_h3` AS
-            SELECT DISTINCT H3_INDEX, NM_BAIRRO, NM_MUN, PERFIL_AREA, DENSIDADE, TAXA_VACANCIA FROM `{staging}`
+            CREATE OR REPLACE VIEW `{dataset}.v_safedriver_dashboard` AS
+            SELECT * FROM `{fato}`
         """).result()
-
-        # View Analítica Final
-        self.bq_client.query(f"""
-            CREATE OR REPLACE VIEW `{dataset}.v_safedriver_analitico` AS
-            SELECT f.*, d.NM_BAIRRO, d.NM_MUN, d.PERFIL_AREA 
-            FROM `{fato}` f JOIN `{dataset}.dim_h3` d ON f.H3_INDEX = d.H3_INDEX
-        """).result()
-        logger.info("OURO: DW Sincronizado com Sucesso.")
+        logger.info("OURO: Camada Semântica atualizada.")
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver()
