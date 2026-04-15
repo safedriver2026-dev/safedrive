@@ -35,31 +35,31 @@ class CamadaOuroSafeDriver:
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
                               aws_access_key_id=self.access_key,
                               aws_secret_access_key=self.secret_key, 
-                              config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
+                              config=Config(signature_version='s3v4', s={'addressing_style': 'path'}))
         
-        # --- LÓGICA DE LOCALIZAÇÃO AUTOMÁTICA ---
-        self.base_path = self._descobrir_prefixo_datalake()
-        logger.info(f"OURO: Raiz do Data Lake detectada em: '{self.base_path}'")
+        # --- LÓGICA DE LOCALIZAÇÃO AUTOMÁTICA RECURSIVA ---
+        self.base_path = self._localizar_datalake_real()
+        logger.info(f"OURO: Caminho mestre identificado: '{self.base_path}'")
         
         self.cal = CalendarioEstrategico()
         self.pesos = {"catboost": 0.85, "lightgbm": 0.15}
         self._conectar_bigquery()
 
-    def _descobrir_prefixo_datalake(self):
-        """Localiza dinamicamente a pasta raiz dos dados no R2."""
+    def _localizar_datalake_real(self):
+        """Busca o caminho exato da pasta datalake no bucket."""
         try:
-            response = self.s3.list_objects_v2(Bucket=self.bucket, MaxKeys=15)
-            if 'Contents' in response:
-                keys = [obj['Key'] for obj in response['Contents']]
-                for key in keys:
-                    if "safedriver/datalake" in key: return "safedriver/datalake"
-                    if "datalake" in key: return "datalake"
+            paginator = self.s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket, MaxKeys=100):
+                for obj in page.get('Contents', []):
+                    key = obj['Key']
+                    if "datalake/prata/" in key:
+                        prefixo = key.split("datalake/")[0]
+                        return f"{prefixo}datalake".strip("/")
             return "datalake"
         except: return "datalake"
 
-    def _get_path(self, camada, subpasta, filename):
-        """Helper para caminhos consistentes."""
-        return f"{self.base_path}/{camada}/{subpasta}/{filename}".replace("//", "/")
+    def _get_path(self, camada, filename):
+        return f"{self.base_path}/{camada}/{filename}".replace("//", "/")
 
     def _conectar_bigquery(self):
         gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
@@ -80,10 +80,7 @@ class CamadaOuroSafeDriver:
                 logger.error("OURO: Falha ao carregar dados de contexto.")
                 return False
 
-            # Gera predições e explicabilidade SHAP
             df_final = self._gerar_scores_ponderados(df_input, modelos)
-            
-            # Sincroniza DW no BigQuery
             self._sincronizar_infraestrutura_bq(df_final)
             return True
         except Exception as e:
@@ -93,8 +90,7 @@ class CamadaOuroSafeDriver:
     def _carregar_modelos_producao(self):
         modelos = {"geral": {}}
         for alg in ["cat", "lgb"]:
-            # Localiza o modelo usando o caminho dinâmico
-            path = self._get_path("modelos_ml", "", f"latest_{alg}_geral.pkl")
+            path = self._get_path("modelos_ml", f"latest_{alg}_geral.pkl")
             try:
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                 modelos["geral"][alg] = joblib.load(io.BytesIO(obj['Body'].read()))
@@ -107,7 +103,7 @@ class CamadaOuroSafeDriver:
     def _obter_contexto_datalake(self):
         lista_dfs = []
         for ano in range(2022, datetime.now().year + 1):
-            key = self._get_path("prata", "", f"ssp_consolidada_{ano}.parquet")
+            key = self._get_path("prata", f"ssp_consolidada_{ano}.parquet")
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
@@ -115,10 +111,8 @@ class CamadaOuroSafeDriver:
             except: continue
         
         if not lista_dfs: return None
-
         df_full = pl.concat(lista_dfs, how="diagonal")
         
-        # Agregacao historica para Prova Real
         df_agg = df_full.group_by("H3_INDEX").agg([
             pl.col("TOTAL_CRIMES").sum().alias("TOTAL_CRIMES_HISTORICO"),
             pl.col("NM_BAIRRO").first(),
@@ -147,7 +141,6 @@ class CamadaOuroSafeDriver:
         score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
         df['SCORE_RISCO_GERAL'] = score_base * mults.get("geral", 1.0)
         
-        # Sazonalidade
         mask_comercial = df['PERFIL_AREA'] == "COMERCIAL_INDUSTRIAL"
         df.loc[mask_comercial, 'SCORE_RISCO_GERAL'] *= mults.get("comercial", 1.0)
         df.loc[~mask_comercial, 'SCORE_RISCO_GERAL'] *= mults.get("residencial", 1.0)
@@ -155,7 +148,6 @@ class CamadaOuroSafeDriver:
         df['SCORE_RISCO_GERAL'] = (df['SCORE_RISCO_GERAL'] / (df['SCORE_RISCO_GERAL'].max() or 1) * 100).clip(0, 100).round(2)
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
 
-        # SHAP Explainability
         if mods["cat"]:
             explainer = shap.TreeExplainer(mods["cat"])
             shap_values = explainer.shap_values(df[features])
@@ -172,13 +164,45 @@ class CamadaOuroSafeDriver:
         return df
 
     def _sincronizar_infraestrutura_bq(self, df):
-        # ... [Mesma lógica de MERGE e Star Schema que você já tinha] ...
-        # (Apenas certifique-se de que as colunas SHAP batem com o seu DataFrame)
         dataset_path = f"{self.project_id}.{self.dataset_id}"
         tabela_fato = f"{dataset_path}.fato_risco_h3_atual"
         tabela_staging = f"{tabela_fato}_staging"
         
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=job_config).result()
-        logger.info("OURO: Sincronizando tabelas fato e dimensões no BigQuery...")
-        # ... (Resto da lógica de SQL que você já possui) ...
+        logger.info("OURO: Sincronizando tabelas no BigQuery...")
+
+        # SQL de MERGE e Setup de Tabelas
+        self.bq_client.query(f"""
+            CREATE TABLE IF NOT EXISTS `{tabela_fato}` AS 
+            SELECT * FROM `{tabela_staging}` WHERE 1=0;
+            
+            MERGE `{tabela_fato}` T USING `{tabela_staging}` S ON T.H3_INDEX = S.H3_INDEX
+            WHEN MATCHED THEN UPDATE SET 
+                T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL, T.TOTAL_CRIMES_HISTORICO = S.TOTAL_CRIMES_HISTORICO,
+                T.SHAP_DENSIDADE = S.SHAP_DENSIDADE, T.SHAP_VACANCIA = S.SHAP_VACANCIA,
+                T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
+            WHEN NOT MATCHED THEN INSERT ROW LIKE S;
+        """).result()
+
+        # Criação das Views para o Looker
+        self._build_semantic_views(dataset_path, tabela_fato, tabela_staging)
+
+    def _build_semantic_views(self, dataset, fato, staging):
+        # Dimensão H3 (Geográfica)
+        self.bq_client.query(f"""
+            CREATE OR REPLACE TABLE `{dataset}.dim_h3` AS
+            SELECT DISTINCT H3_INDEX, NM_BAIRRO, NM_MUN, PERFIL_AREA, DENSIDADE, TAXA_VACANCIA FROM `{staging}`
+        """).result()
+
+        # View Analítica Final
+        self.bq_client.query(f"""
+            CREATE OR REPLACE VIEW `{dataset}.v_safedriver_analitico` AS
+            SELECT f.*, d.NM_BAIRRO, d.NM_MUN, d.PERFIL_AREA 
+            FROM `{fato}` f JOIN `{dataset}.dim_h3` d ON f.H3_INDEX = d.H3_INDEX
+        """).result()
+        logger.info("OURO: DW Sincronizado com Sucesso.")
+
+if __name__ == "__main__":
+    ouro = CamadaOuroSafeDriver()
+    ouro.executar_predicao_atual()
