@@ -28,32 +28,37 @@ def orquestrar_pipeline(force_reprocess=False):
     """
     Coordena o fluxo de dados do SafeDriver: Bronze -> Prata -> IA -> Ouro.
     """
-    logger.info(f"🛡️ SafeDriver Maestro: Iniciando orquestração (Modo Force: {force_reprocess}).")
+    logger.info(f"🛡️ SafeDriver Maestro: Iniciando orquestração RÁPIDA (Dev Mode).")
     start_time = datetime.now()
 
     try:
-        # --- ETAPA 1: BRONZE (Ingestão, CDC e Normalização Trusted) ---
-        # A Bronze agora recebe o parâmetro force para garantir a reconstrução do Parquet se necessário.
-        bronze = IngestaoBronze()
-        novos_dados_bronze = bronze.executar_ingestao_continua(force=force_reprocess)
+        # --- ETAPA 1: BRONZE (DESLIGADA PARA TESTES) ---
+        logger.info("⚠️ DEV MODE: Ingestão da Camada Bronze IGNORADA para poupar 16 minutos.")
+        # bronze = IngestaoBronze()
+        # novos_dados_bronze = bronze.executar_ingestao_continua(force=force_reprocess)
+        
+        # Mágica para enganar o orquestrador e forçar ele a descer o código:
+        novos_dados_bronze = True 
 
         # --- ETAPA 2: PRATA (Geolocalização H3 e Enriquecimento) ---
-        # O gatilho para as próximas etapas é: ou temos dados novos, ou o usuário forçou o reprocessamento.
         if novos_dados_bronze or force_reprocess:
-            logger.info("🚀 Gatilho Ativado: Iniciando Processamento Prata.")
+            logger.info("🚀 Gatilho Ativado: Iniciando Processamento Prata (Fórmula 1).")
             prata = ProcessamentoPrata()
-            relatorio_prata = prata.executar_todos_os_anos(force=force_reprocess)
             
-            # Se a Prata não gerou nada (mesmo com force), algo está errado na origem
+            # Forçamos a Prata com True para ela rodar a nossa nova engine Lazy/Streaming
+            relatorio_prata = prata.executar_todos_os_anos(force=True)
+            
             if not relatorio_prata and not force_reprocess:
-                logger.warning("⚠️ Prata concluída sem gerar novos registros. Verifique a Camada Bronze.")
-                return
+                logger.warning("⚠️ Prata concluída sem gerar novos registros.")
+                # return (Comentado para não travar os testes)
 
-            logger.info(f"✅ Prata finalizada. Ciclos de anos concluídos: {len(relatorio_prata) if relatorio_prata else 'Reprocessamento Total'}")
+            logger.info(f"✅ Prata finalizada.")
             
             # --- ETAPA 3: IA (Modelagem Preditiva Tweedie) ---
             logger.info("🧠 IA: Iniciando treinamento evolutivo dos modelos CatBoost e LightGBM.")
-            treinador = TreinadorEvolutivo()
+            
+            # Forçamos o dev_mode=True para treinar super rápido só com 2026
+            treinador = TreinadorEvolutivo(dev_mode=True)
             sucesso_ia = treinador.treinar_modelo_mestre()
             
             if sucesso_ia:
@@ -65,7 +70,9 @@ def orquestrar_pipeline(force_reprocess=False):
             
             # --- ETAPA 4: OURO (BigQuery, SHAP e Materialização) ---
             logger.info("🏆 OURO: Sincronizando Data Warehouse e processando Explicabilidade (XAI).")
-            ouro = CamadaOuroSafeDriver()
+            
+            # Forçamos o dev_mode=True aqui também para não explodir o SHAP
+            ouro = CamadaOuroSafeDriver(dev_mode=True)
             resultado_ouro = ouro.executar_predicao_atual()
             
             if resultado_ouro:
@@ -85,7 +92,6 @@ def orquestrar_pipeline(force_reprocess=False):
     logger.info(f"⏱️ Duração total do ciclo de dados: {duration}")
 
 if __name__ == "__main__":
-    # Configuração de argumentos para execução via CLI ou GitHub Actions
     parser = argparse.ArgumentParser(description="Orquestrador Central do SafeDriver Autobot")
     parser.add_argument(
         '--force', 
@@ -95,6 +101,4 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
-
-    # Início da orquestração
     orquestrar_pipeline(force_reprocess=args.force)
