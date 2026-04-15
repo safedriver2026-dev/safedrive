@@ -35,7 +35,7 @@ class TreinadorEvolutivo:
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         self.personas = {"geral": "TOTAL_CRIMES"}
         
-        # Features atualizadas baseadas na Camada Ouro
+        # Features atualizadas baseadas na Camada Ouro (Censo 2022)
         self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA']
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA']
         self.metricas_detalhadas = []
@@ -58,12 +58,14 @@ class TreinadorEvolutivo:
                 for col in self.features_categoricas:
                     X[col] = X[col].astype(str).fillna("DESCONHECIDO").astype('category')
                 
+                # Tipagem de seguranca para features matematicas
                 for col in self.features_numericas:
                     X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0.0)
 
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-                # Treino CatBoost - Distribuicao Tweedie
+                logger.info(f"IA: Iniciando treinamento CatBoost ({persona})...")
+                # Treino CatBoost - Distribuicao Tweedie (Zero-Inflated)
                 model_cat = CatBoostRegressor(
                     iterations=1000, 
                     depth=8, 
@@ -74,7 +76,8 @@ class TreinadorEvolutivo:
                 )
                 model_cat.fit(X_train, y_train)
                 
-                # Treino LightGBM - Distribuicao Tweedie
+                logger.info(f"IA: Iniciando treinamento LightGBM ({persona})...")
+                # Treino LightGBM - Distribuicao Tweedie (Zero-Inflated)
                 model_lgb = LGBMRegressor(
                     n_estimators=500, 
                     learning_rate=0.02, 
@@ -104,7 +107,7 @@ class TreinadorEvolutivo:
                 logger.error(f"IA: Erro no treinamento evolutivo ({persona}): {e}")
                 return False
 
-        logger.info("IA: Processamento de treinamento e exportacao de artefatos concluido.")
+        logger.info("IA: Processamento de treinamento e exportacao de artefatos concluido com sucesso.")
         return True
 
     def obter_metricas_finais(self):
@@ -114,7 +117,7 @@ class TreinadorEvolutivo:
     def _carregar_datalake_consolidado(self):
         lista_dfs = []
         
-        # Colunas esperadas para tipagem estrita
+        # Colunas esperadas para tipagem estrita no Polars
         cols_num = ["TOTAL_CRIMES", "DENSIDADE", "TAXA_VACANCIA"]
         cols_cat = ["NM_BAIRRO", "NM_MUN", "H3_INDEX"]
 
@@ -123,14 +126,14 @@ class TreinadorEvolutivo:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=f"datalake/prata/ssp_consolidada_{ano}.parquet")
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 
-                # Tipagem segura (evita cast de String para Float)
+                # Tipagem segura nativa em Rust (Polars)
                 df = df.with_columns([
                     pl.col(c).cast(pl.Float64, strict=False).fill_null(0.0) for c in cols_num if c in df.columns
                 ]).with_columns([
                     pl.col(c).cast(pl.String).fill_null("DESCONHECIDO") for c in cols_cat if c in df.columns
                 ])
                 
-                # Garante que a coluna TAXA_VACANCIA exista mesmo em arquivos antigos
+                # Garante que a coluna TAXA_VACANCIA exista mesmo em processamentos antigos
                 if "TAXA_VACANCIA" not in df.columns:
                     df = df.with_columns(pl.lit(0.0).alias("TAXA_VACANCIA"))
 
@@ -141,6 +144,7 @@ class TreinadorEvolutivo:
         if not lista_dfs: 
             return None
             
+        # Converte para Pandas apenas no limite do Scikit-Learn/CatBoost
         df = pl.concat(lista_dfs, how="diagonal").to_pandas()
         
         # Feature Engineering Contextual
