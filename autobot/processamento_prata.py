@@ -44,35 +44,8 @@ class ProcessamentoPrata:
             return "datalake"
         except: return "datalake"
 
-    def _classificar_perfil_alvo(self, rubrica, conduta):
-        """Diferencia MOTORISTA de PEDESTRE (Rubrica + Conduta)."""
-        rub = str(rubrica).upper()
-        con = str(conduta).upper() if conduta else ""
-        if any(x in con for x in ["TRANSEUNTE", "PEDESTRE", "PASSAGEIRO"]):
-            return "PEDESTRE"
-        if any(x in rub for x in ["VEICULO", "CARGA", "AUTO", "MOTO", "CAMINHAO", "CONDUZIR"]):
-            return "MOTORISTA"
-        return "PEDESTRE"
-
-    def _definir_periodo(self, hora, desc_periodo):
-        """Normaliza o período lidando com a hora ou o descritivo da SSP."""
-        if hora and str(hora) != 'nan' and ":" in str(hora):
-            try:
-                h = int(str(hora).split(':')[0])
-                if 0 <= h < 6: return "MADRUGADA"
-                if 6 <= h < 12: return "MANHA"
-                if 12 <= h < 18: return "TARDE"
-                return "NOITE"
-            except: pass
-        
-        desc = str(desc_periodo).upper() if desc_periodo else ""
-        if "MADRUGADA" in desc: return "MADRUGADA"
-        if "MANHÃ" in desc or "MANHA" in desc: return "MANHA"
-        if "TARDE" in desc: return "TARDE"
-        if "NOITE" in desc: return "NOITE"
-        return "INDEFINIDO"
-
     def _inicializar_dependencias(self):
+        """Carrega a malha geográfica H3 (Censo)."""
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
@@ -93,7 +66,7 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             
-            # --- CORREÇÃO: MAPEAMENTO DINÂMICO DE COLUNAS ---
+            # --- 1. MAPEAMENTO DINÂMICO DE COLUNAS (Evita Erro NoneType) ---
             cols = df.columns
             mapeamento = {
                 "CIDADE": "MUNICIPIO", "NOME_MUNICIPIO": "MUNICIPIO",
@@ -101,29 +74,50 @@ class ProcessamentoPrata:
                 "HORA_OCORRENCIA_BO": "HORA", "DESCR_CONDUTA": "CONDUTA",
                 "DESCR_TIPOLOCAL": "TIPO_LOCAL"
             }
-            # Filtra apenas o que existe no arquivo para evitar Erro de NoneType
             rename_dict = {old: new for old, new in mapeamento.items() if old in cols}
             if rename_dict:
                 df = df.rename(rename_dict)
 
-            # 1. ENGENHARIA DE FEATURES
+            # --- 2. ENGENHARIA DE FEATURES (100% NATIVA POLARS - ULTRAVELOZ) ---
+            # Prepara as colunas para evitar erros caso o ano não as possua
+            conduta_col = pl.col("CONDUTA").cast(pl.String).fill_null("") if "CONDUTA" in df.columns else pl.lit("")
+            rubrica_col = pl.col("RUBRICA").cast(pl.String).fill_null("")
+            hora_col = pl.col("HORA").cast(pl.String).fill_null("") if "HORA" in df.columns else pl.lit("")
+            periodo_txt_col = pl.col("PERIODO_TEXTO").cast(pl.String).fill_null("").str.to_uppercase() if "PERIODO_TEXTO" in df.columns else pl.lit("")
+
+            # Tenta extrair a hora como número inteiro nativamente
+            hora_int = hora_col.str.split(":").list.first().cast(pl.Int32, strict=False)
+
             df = df.with_columns([
-                pl.struct(["RUBRICA", "CONDUTA" if "CONDUTA" in df.columns else "RUBRICA"])
-                  .map_elements(lambda x: self._classificar_perfil_alvo(x["RUBRICA"], x.get("CONDUTA")), return_dtype=pl.String)
+                # Inteligência: Perfil do Alvo (Vetorizado)
+                pl.when(conduta_col.str.to_uppercase().str.contains("TRANSEUNTE|PEDESTRE|PASSAGEIRO"))
+                  .then(pl.lit("PEDESTRE"))
+                  .when(rubrica_col.str.to_uppercase().str.contains("VEICULO|CARGA|AUTO|MOTO|CAMINHAO|CONDUZIR"))
+                  .then(pl.lit("MOTORISTA"))
+                  .otherwise(pl.lit("PEDESTRE"))
                   .alias("PERFIL_ALVO"),
                 
-                pl.struct(["HORA" if "HORA" in df.columns else "RUBRICA", 
-                           "PERIODO_TEXTO" if "PERIODO_TEXTO" in df.columns else "RUBRICA"])
-                  .map_elements(lambda x: self._definir_periodo(x.get("HORA"), x.get("PERIODO_TEXTO")), return_dtype=pl.String)
+                # Inteligência: Período do Dia (Vetorizado)
+                pl.when((hora_int >= 0) & (hora_int < 6)).then(pl.lit("MADRUGADA"))
+                  .when((hora_int >= 6) & (hora_int < 12)).then(pl.lit("MANHA"))
+                  .when((hora_int >= 12) & (hora_int < 18)).then(pl.lit("TARDE"))
+                  .when(hora_int >= 18).then(pl.lit("NOITE"))
+                  # Fallback para a coluna de texto caso a hora seja nula
+                  .when(periodo_txt_col.str.contains("MADRUGADA")).then(pl.lit("MADRUGADA"))
+                  .when(periodo_txt_col.str.contains("MANHÃ|MANHA")).then(pl.lit("MANHA"))
+                  .when(periodo_txt_col.str.contains("TARDE")).then(pl.lit("TARDE"))
+                  .when(periodo_txt_col.str.contains("NOITE")).then(pl.lit("NOITE"))
+                  .otherwise(pl.lit("INDEFINIDO"))
                   .alias("PERIODO_DIA"),
                 
+                # Inteligência: Tipo de Local
                 pl.col("TIPO_LOCAL").fill_null("VIA PUBLICA").alias("TIPO_LOCAL") if "TIPO_LOCAL" in df.columns else pl.lit("VIA PUBLICA").alias("TIPO_LOCAL")
             ])
 
-            # 2. JOIN COM MALHA (H3)
+            # --- 3. JOIN COM MALHA (H3 Geográfico) ---
             df_enriquecido = df.join(self.df_malha, on="H3_INDEX", how="left")
 
-            # 3. AGREGAÇÃO PONDERADA (Roubo=3, Furto=1)
+            # --- 4. AGREGAÇÃO PONDERADA (Matriz de Severidade: Roubo=3, Furto=1) ---
             df_agg = df_enriquecido.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"]).agg([
                 pl.when(pl.col("RUBRICA").str.contains("ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES"),
                 pl.col("MUNICIPIO").first().alias("NM_MUN"),
@@ -132,20 +126,20 @@ class ProcessamentoPrata:
                 pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA")
             ])
 
-            # 4. ANALYTICS (Ranking de Risco e Exposição)
+            # --- 5. ANALYTICS (Feature Store para a IA e Ouro) ---
             df_final = df_agg.with_columns([
                 (pl.col("TOTAL_CRIMES").rank(descending=False).over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).alias("RANKING_RISCO_LOCAL"),
                 (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE").fill_null(0) + 1)).alias("INDICE_EXPOSICAO"),
                 pl.lit(ano).alias("ANO_REFERENCIA")
             ])
 
-            # 5. SALVAMENTO
+            # --- 6. SALVAMENTO ---
             buffer = io.BytesIO()
             df_final.write_parquet(buffer)
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = tamanho_atual
-            logger.info(f"PRATA: [{ano}] Sucesso - {df_final.height} registros agregados.")
+            logger.info(f"PRATA: [{ano}] Sucesso - {df_final.height} registros (Processamento 100% Nativo).")
             return True
         except Exception as e:
             logger.error(f"PRATA: Falha no ano {ano}: {e}")
