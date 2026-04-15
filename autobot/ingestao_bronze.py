@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class IngestaoBronze:
     def __init__(self):
+        # Configurações do Cloudflare R2 / S3
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -31,11 +32,12 @@ class IngestaoBronze:
         }
 
     def executar_ingestao_continua(self):
-        """Varre os anos de interesse e realiza o CDC e a conversão Trusted."""
-        logger.info("BRONZE: Iniciando rotina de extração (Raw) e Refinamento (Trusted).")
+        """Varre os anos de interesse e garante a sincronia das camadas Raw e Trusted."""
+        logger.info("BRONZE: Iniciando rotina de extração (Raw) e Padronização (Trusted).")
         ano_atual = datetime.now().year
         novos_dados_ingeridos = False
 
+        # Processa de 2022 até o ano atual
         for ano in range(2022, ano_atual + 1):
             if self._verificar_e_baixar(ano):
                 novos_dados_ingeridos = True
@@ -43,77 +45,98 @@ class IngestaoBronze:
         return novos_dados_ingeridos
 
     def _verificar_e_baixar(self, ano):
-        # Definindo as duas subcamadas
-        path_raw_excel = f"datalake/bronze/raw/ssp_raw_{ano}.xlsx"
-        path_trusted_parquet = f"datalake/bronze/trusted/ssp_trusted_{ano}.parquet"
+        path_raw = f"datalake/bronze/raw/ssp_raw_{ano}.xlsx"
+        path_trusted = f"datalake/bronze/trusted/ssp_trusted_{ano}.parquet"
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
 
-        # 1. CDC (Change Data Capture) via HEAD Request
-        tamanho_r2 = 0
+        # 1. Verificar se o Trusted (Parquet) já existe
+        trusted_existe = False
         try:
-            meta_r2 = self.s3.head_object(Bucket=self.bucket, Key=path_raw_excel)
-            tamanho_r2 = meta_r2.get('ContentLength', 0)
+            self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
+            trusted_existe = True
         except ClientError:
-            tamanho_r2 = 0
+            trusted_existe = False
 
+        # 2. Verificar o tamanho do Raw no R2 (se existir)
+        tamanho_r2_raw = 0
+        try:
+            meta_r2 = self.s3.head_object(Bucket=self.bucket, Key=path_raw)
+            tamanho_r2_raw = meta_r2.get('ContentLength', 0)
+        except ClientError:
+            tamanho_r2_raw = 0
+
+        # 3. Verificar o tamanho do arquivo no site da SSP (CDC)
         try:
             resp_head = requests.head(url, headers=self.headers, timeout=30)
-            if resp_head.status_code == 200:
-                tamanho_ssp = int(resp_head.headers.get('Content-Length', -1))
-                if tamanho_ssp > 0 and tamanho_ssp == tamanho_r2:
-                    logger.info(f"BRONZE: [{ano}] Excel Raw em sincronia. Ignorando download.")
-                    return False
-            else:
-                logger.warning(f"BRONZE: [{ano}] Servidor SSP indisponível (Status {resp_head.status_code}).")
-                return False
-        except Exception as e:
-            logger.error(f"BRONZE: Erro ao validar cabeçalhos na SSP ({ano}): {e}")
+            tamanho_ssp = int(resp_head.headers.get('Content-Length', -1)) if resp_head.status_code == 200 else -1
+        except:
+            tamanho_ssp = -1
+
+        # LÓGICA DE DECISÃO:
+        # Se o Parquet existe E o Excel no R2 tem o mesmo tamanho do site, não faz nada.
+        if trusted_existe and tamanho_ssp > 0 and tamanho_ssp == tamanho_r2_raw:
+            logger.info(f"BRONZE: [{ano}] Camadas Raw e Trusted já estão atualizadas. Pulando.")
             return False
 
-        # 2. Ingestão da Fonte de Verdade (Raw Excel)
-        logger.info(f"BRONZE: Atualização detectada para {ano}. Baixando fonte da verdade...")
-        try:
-            response = requests.get(url, headers=self.headers, timeout=300)
-            response.raise_for_status()
-            excel_bytes = response.content
-            
-            # Salva o Excel Original (Garantia de Auditoria)
-            logger.info(f"BRONZE: Salvando Excel Original ({ano}) na camada Raw...")
-            self.s3.put_object(
-                Bucket=self.bucket,
-                Key=path_raw_excel,
-                Body=excel_bytes
-            )
+        logger.info(f"BRONZE: [{ano}] Necessário processar (Trusted_faltante={not trusted_existe} ou Mudança_detectada={tamanho_ssp != tamanho_r2_raw}).")
 
-            # 3. Refinamento para a Camada Prata (Trusted Parquet)
-            logger.info(f"BRONZE: Convertendo {ano} para formato Colunar (Trusted)...")
+        try:
+            # 4. Obter o conteúdo do Excel (do R2 se for igual ao site, ou download se for novo)
+            if tamanho_ssp > 0 and tamanho_ssp == tamanho_r2_raw:
+                logger.info(f"BRONZE: [{ano}] Recuperando Excel do R2 para gerar Trusted...")
+                obj = self.s3.get_object(Bucket=self.bucket, Key=path_raw)
+                excel_bytes = obj['Body'].read()
+            else:
+                logger.info(f"BRONZE: [{ano}] Baixando nova versão do Excel da SSP-SP...")
+                response = requests.get(url, headers=self.headers, timeout=300)
+                response.raise_for_status()
+                excel_bytes = response.content
+                # Salva a nova "Fonte da Verdade" no Raw
+                self.s3.put_object(Bucket=self.bucket, Key=path_raw, Body=excel_bytes)
+
+            # 5. REFINAMENTO E PADRONIZAÇÃO (A "Cura" do Schema)
+            logger.info(f"BRONZE: [{ano}] Convertendo e normalizando colunas para Parquet...")
             dfs = []
             
+            # Percorre as abas (o Polars com calamine é excelente para isso)
             for i in range(1, 6):
                 try:
                     df = pl.read_excel(io.BytesIO(excel_bytes), sheet_id=i, engine="calamine")
+                    # Força tudo para String para evitar erros de tipo na concatenação
                     df = df.with_columns(pl.all().cast(pl.String))
+                    # Limpeza básica de nomes de colunas
                     df.columns = [c.upper().replace("Ç", "C").replace("Ã", "A").strip() for c in df.columns]
+                    
+                    # --- MAPEAMENTO DE SINÔNIMOS (Resolve o erro de MUNICIPIO) ---
+                    mapeamento = {
+                        "CIDADE": "MUNICIPIO",
+                        "NOME_MUNICIPIO": "MUNICIPIO"
+                    }
+                    for original, novo in mapeamento.items():
+                        if original in df.columns:
+                            df = df.rename({original: novo})
+                            
                     dfs.append(df)
                 except Exception:
-                    continue
+                    continue # Pula abas vazias ou com erro
             
             if dfs:
-                df_consolidado = pl.concat(dfs, how="diagonal")
-                parquet_buffer = io.BytesIO()
-                df_consolidado.write_parquet(parquet_buffer)
-                parquet_buffer.seek(0)
+                # Une as abas e salva como Parquet Trusted
+                df_trusted = pl.concat(dfs, how="diagonal")
+                buffer = io.BytesIO()
+                df_trusted.write_parquet(buffer)
                 
-                logger.info(f"BRONZE: Salvando Parquet Refinado ({ano}) na camada Trusted...")
-                self.s3.upload_fileobj(
-                    Fileobj=parquet_buffer,
-                    Bucket=self.bucket,
-                    Key=path_trusted_parquet
+                self.s3.put_object(
+                    Bucket=self.bucket, 
+                    Key=path_trusted, 
+                    Body=buffer.getvalue()
                 )
+                
+                logger.info(f"BRONZE: [{ano}] Camada Trusted gerada com sucesso.")
+                return True
             
-            logger.info(f"BRONZE: Ciclo completo para {ano} (Raw -> Trusted).")
-            return True
+            return False
 
         except Exception as e:
-            logger.error(f"BRONZE: Falha crítica no processamento do ano {ano}: {e}")
+            logger.error(f"BRONZE: [{ano}] Falha crítica no processamento: {e}")
             return False
