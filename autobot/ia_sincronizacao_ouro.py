@@ -18,7 +18,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 logger = logging.getLogger(__name__)
 
 class CamadaOuroSafeDriver:
-    def __init__(self):
+    def __init__(self, dev_mode=True):
+        # MODO DE DESENVOLVIMENTO: Se True, processa apenas 2026 para agilizar os testes
+        self.dev_mode = dev_mode
+        
         # Credenciais R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
@@ -68,7 +71,7 @@ class CamadaOuroSafeDriver:
             logger.error(f"OURO: Erro na autenticacao GCP: {e}")
 
     def executar_predicao_atual(self):
-        logger.info("OURO: Iniciando materializacao do Data Warehouse.")
+        logger.info(f"OURO: Iniciando materializacao do Data Warehouse (Dev Mode: {self.dev_mode}).")
         try:
             modelos = self._carregar_modelos_producao()
             df_input = self._obter_contexto_datalake()
@@ -97,10 +100,12 @@ class CamadaOuroSafeDriver:
                 modelos["geral"][alg] = None
         return modelos
 
-    def _obter_contexto_datalake(self):
-        """Carrega os dados da Prata mantendo todas as dimensões de perfil e tempo."""
+    def _obter_contexto_datalake(self, ano_teste=2026):
+        """Carrega os dados da Prata. Em dev, foca apenas no ano atual para agilidade."""
         lista_dfs = []
-        for ano in range(2022, datetime.now().year + 1):
+        anos_para_processar = [ano_teste] if self.dev_mode else range(2022, datetime.now().year + 1)
+        
+        for ano in anos_para_processar:
             key = self._get_path("prata", f"ssp_consolidada_{ano}.parquet")
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -142,16 +147,35 @@ class CamadaOuroSafeDriver:
         df['SCORE_RISCO_GERAL'] = (df['SCORE_RISCO_GERAL'] / (df['SCORE_RISCO_GERAL'].max() or 1) * 100).clip(0, 100).round(2)
         df['DT_ULTIMA_SINCRONIZACAO'] = datetime.now()
 
-        # Explicabilidade SHAP (Agora para todas as novas dimensões)
+        # Explicabilidade SHAP (Otimizada para Performance e Nível Município)
         if mods["cat"]:
+            logger.info("OURO: Calculando SHAP Values (Nível Município)...")
             explainer = shap.TreeExplainer(mods["cat"])
-            shap_values = explainer.shap_values(df[self.features_full])
+            
+            # Trava de performance: se for muito grande, processa apenas o Top 5000
+            if len(df) > 5000:
+                logger.warning("OURO: Base muito grande. Calculando SHAP para o Top 5000 de maior risco.")
+                df_shap = df.nlargest(5000, 'SCORE_RISCO_GERAL')
+                shap_matrix = explainer.shap_values(df_shap[self.features_full])
+                
+                for col in ['SHAP_MUNICIPIO', 'SHAP_PERIODO', 'SHAP_PERFIL_ALVO', 'SHAP_EXPOSICAO']:
+                    df[col] = 0.0
+                    
+                df.loc[df_shap.index, 'SHAP_MUNICIPIO'] = shap_matrix[:, self.features_full.index('NM_MUN')]
+                df.loc[df_shap.index, 'SHAP_PERIODO'] = shap_matrix[:, self.features_full.index('PERIODO_DIA')]
+                df.loc[df_shap.index, 'SHAP_PERFIL_ALVO'] = shap_matrix[:, self.features_full.index('PERFIL_ALVO')]
+                df.loc[df_shap.index, 'SHAP_EXPOSICAO'] = shap_matrix[:, self.features_full.index('INDICE_EXPOSICAO')]
+            else:
+                shap_values = explainer.shap_values(df[self.features_full])
+                df['SHAP_MUNICIPIO'] = shap_values[:, self.features_full.index('NM_MUN')]
+                df['SHAP_PERIODO'] = shap_values[:, self.features_full.index('PERIODO_DIA')]
+                df['SHAP_PERFIL_ALVO'] = shap_values[:, self.features_full.index('PERFIL_ALVO')]
+                df['SHAP_EXPOSICAO'] = shap_values[:, self.features_full.index('INDICE_EXPOSICAO')]
+            
             df['SHAP_BASE'] = float(explainer.expected_value)
-            # Mapeia SHAP para as features principais para o Looker
-            df['SHAP_LOCALIDADE'] = shap_values[:, self.features_full.index('NM_BAIRRO')]
-            df['SHAP_PERIODO'] = shap_values[:, self.features_full.index('PERIODO_DIA')]
-            df['SHAP_PERFIL_ALVO'] = shap_values[:, self.features_full.index('PERFIL_ALVO')]
-            df['SHAP_EXPOSICAO'] = shap_values[:, self.features_full.index('INDICE_EXPOSICAO')]
+        else:
+            for c in ['SHAP_BASE', 'SHAP_MUNICIPIO', 'SHAP_PERIODO', 'SHAP_PERFIL_ALVO', 'SHAP_EXPOSICAO']:
+                df[c] = 0.0
         
         return df
 
@@ -166,7 +190,7 @@ class CamadaOuroSafeDriver:
         
         logger.info("OURO: Executando MERGE atômico no BigQuery...")
         
-        # O MERGE agora usa H3_INDEX + PERIODO + PERFIL como chave composta
+        # O MERGE agora usa H3_INDEX + PERIODO + PERFIL como chave composta e inclui SHAP_MUNICIPIO
         self.bq_client.query(f"""
             CREATE TABLE IF NOT EXISTS `{tabela_fato}` AS SELECT * FROM `{tabela_staging}` WHERE 1=0;
             
@@ -175,8 +199,10 @@ class CamadaOuroSafeDriver:
             WHEN MATCHED THEN UPDATE SET 
                 T.SCORE_RISCO_GERAL = S.SCORE_RISCO_GERAL,
                 T.RANKING_RISCO_LOCAL = S.RANKING_RISCO_LOCAL,
-                T.SHAP_LOCALIDADE = S.SHAP_LOCALIDADE,
+                T.SHAP_MUNICIPIO = S.SHAP_MUNICIPIO,
                 T.SHAP_PERIODO = S.SHAP_PERIODO,
+                T.SHAP_PERFIL_ALVO = S.SHAP_PERFIL_ALVO,
+                T.SHAP_EXPOSICAO = S.SHAP_EXPOSICAO,
                 T.DT_ULTIMA_SINCRONIZACAO = S.DT_ULTIMA_SINCRONIZACAO
             WHEN NOT MATCHED THEN INSERT ROW LIKE S;
         """).result()
@@ -189,8 +215,9 @@ class CamadaOuroSafeDriver:
             CREATE OR REPLACE VIEW `{dataset}.v_safedriver_dashboard` AS
             SELECT * FROM `{fato}`
         """).result()
-        logger.info("OURO: Camada Semântica atualizada.")
+        logger.info("OURO: Camada Semântica atualizada e pronta para o Looker Studio.")
 
 if __name__ == "__main__":
-    ouro = CamadaOuroSafeDriver()
+    # Dev Mode ativado por padrão para testes rápidos.
+    ouro = CamadaOuroSafeDriver(dev_mode=True)
     ouro.executar_predicao_atual()
