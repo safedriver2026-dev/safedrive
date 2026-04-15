@@ -1,5 +1,4 @@
 import polars as pl
-import h3
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -25,7 +24,7 @@ class ProcessamentoPrata:
                               aws_secret_access_key=self.secret_key, 
                               config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
         
-        # --- LÓGICA DE LOCALIZAÇÃO AUTOMÁTICA (Igual à Bronze) ---
+        # --- LÓGICA DE LOCALIZAÇÃO AUTOMÁTICA ---
         self.base_path = self._descobrir_prefixo_datalake()
         logger.info(f"PRATA: Raiz do Data Lake detectada em: '{self.base_path}'")
 
@@ -36,7 +35,6 @@ class ProcessamentoPrata:
         self._inicializar_dependencias()
 
     def _descobrir_prefixo_datalake(self):
-        """Procura dinamicamente se a pasta 'datalake' está na raiz ou dentro de 'safedriver/'."""
         try:
             response = self.s3.list_objects_v2(Bucket=self.bucket, MaxKeys=15)
             if 'Contents' in response:
@@ -45,17 +43,14 @@ class ProcessamentoPrata:
                     if "safedriver/datalake" in key: return "safedriver/datalake"
                     if "datalake" in key: return "datalake"
             return "datalake"
-        except:
-            return "datalake"
+        except: return "datalake"
 
     def _inicializar_dependencias(self):
-        """Carrega a malha geográfica e prepara métricas de densidade."""
         try:
             logger.info(f"PRATA: Carregando malha geográfica de {self.malha_path}...")
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             
-            # Garantia de Bairro e Densidade
             if "NM_BAIRRO" not in self.df_malha.columns:
                 self.df_malha = self.df_malha.with_columns(pl.lit("DESCONHECIDO").alias("NM_BAIRRO"))
             
@@ -64,16 +59,8 @@ class ProcessamentoPrata:
             logger.error(f"PRATA: Erro ao carregar malha no R2: {e}")
             self.df_malha = None
 
-    def _motor_h3(self, lat, lng):
-        """Converte coordenadas para H3 Resolução 9."""
-        try:
-            if lat == 0.0 or lng == 0.0: return None
-            return h3.latlng_to_cell(float(lat), float(lng), 9)
-        except:
-            return None
-
     def processar_ano_com_delta(self, ano, estado, force=False):
-        """Processa um ano específico se houver mudança no Trusted."""
+        """Processa o enriquecimento sem recalcular o H3 (já vem da Bronze)."""
         path_trusted = f"{self.base_path}/bronze/trusted/ssp_trusted_{ano}.parquet".replace("//", "/")
         path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet".replace("//", "/")
         
@@ -84,27 +71,18 @@ class ProcessamentoPrata:
             logger.warning(f"PRATA: Arquivo Trusted de {ano} não encontrado. Pulando.")
             return None
 
-        # Verificação de Delta (Idempotência)
         if not force and estado.get(str(ano)) == tamanho_atual:
             return None
 
-        logger.info(f"PRATA: Consolidando {ano} (H3 + Georeferenciamento)...")
+        logger.info(f"PRATA: Consolidando {ano} (Enriquecimento Geográfico)...")
         
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
+            # Lê o Parquet que já contém a coluna H3_INDEX
             df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
 
-            # 1. Limpeza e H3
-            df = df.with_columns([
-                pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
-                pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0)
-            ]).with_columns(
-                pl.struct(["LATITUDE", "LONGITUDE"])
-                .map_elements(lambda x: self._motor_h3(x["LATITUDE"], x["LONGITUDE"]), return_dtype=pl.String)
-                .alias("H3_INDEX")
-            ).filter(pl.col("H3_INDEX").is_not_null())
-
-            # 2. Enriquecimento com Malha (Bairro, Densidade, Vacância)
+            # 1. Enriquecimento (Join com Malha Demográfica)
+            # Como o H3 já está pronto, o join é instantâneo
             cols_malha = ["H3_INDEX", "DENSIDADE_DEMOGRAFICA", "TAXA_VACANCIA", "NM_BAIRRO"]
             df_enriquecido = df.join(
                 self.df_malha.select([c for c in cols_malha if c in self.df_malha.columns]),
@@ -112,7 +90,7 @@ class ProcessamentoPrata:
                 how="left"
             )
 
-            # 3. Agregação por Hexágono (Foco em Roubo e Furto)
+            # 2. Agregação por Hexágono
             df_final = df_enriquecido.group_by(["H3_INDEX"]).agg([
                 pl.col("RUBRICA").filter(pl.col("RUBRICA").str.contains("ROUBO|FURTO")).count().alias("TOTAL_CRIMES"),
                 pl.col("NM_BAIRRO").first(),
@@ -121,7 +99,7 @@ class ProcessamentoPrata:
                 pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA")
             ]).with_columns(pl.lit(ano).alias("ANO_REFERENCIA"))
 
-            # 4. Salvamento
+            # 3. Salvamento
             buffer = io.BytesIO()
             df_final.write_parquet(buffer)
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
@@ -130,21 +108,21 @@ class ProcessamentoPrata:
             return {"ano": ano, "rows": df_final.height}
 
         except Exception as e:
-            logger.error(f"PRATA: Falha no ano {ano}: {e}")
+            logger.error(f"PRATA: Falha no processamento de {ano}: {e}")
             return None
 
     def executar_todos_os_anos(self, force=False):
-        if self.df_malha is None: return []
+        if self.df_malha is None: 
+            logger.error("PRATA: Malha não carregada. Abortando.")
+            return []
         
         estado = self._carregar_tracker()
         relatorio = []
-        
         for ano in range(2022, datetime.now().year + 1):
             res = self.processar_ano_com_delta(ano, estado, force)
             if res:
                 relatorio.append(res)
                 self._salvar_tracker(estado)
-        
         return relatorio
 
     def _carregar_tracker(self):
