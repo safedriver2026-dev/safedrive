@@ -61,18 +61,17 @@ class ProcessamentoPrata:
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             
-            # 🛡️ A CURA ESTÁ AQUI: .unique(subset=["H3_INDEX"]) adicionado!
+            # 🛡️ DATA CONTRACT: A CURA DA EXPLOSÃO CARTESIANA (DEDUPLICAÇÃO H3)
             # Downcasting na malha: Float64 para Float32 (50% menos RAM)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).unique(subset=["H3_INDEX"]).with_columns([
                 pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32),
                 pl.col("TAXA_VACANCIA").cast(pl.Float32)
             ])
-            
             self.df_malha_lazy = self.df_malha.lazy().with_columns([
                 self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
                 self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-            logger.info("PRATA: Malha geográfica carregada, DEDUPLICADA e comprimida.")
+            logger.info("PRATA: Malha geográfica base carregada, deduplicada e comprimida.")
         except Exception as e:
             logger.error(f"PRATA: Falha crítica na malha: {e}")
             self.df_malha_lazy = None
@@ -127,45 +126,62 @@ class ProcessamentoPrata:
                   .otherwise(pl.lit("NOITE")).alias("PERIODO_DIA"),
                 pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA"))
                   .otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO"),
+                # Tags temporais históricas para a IA aprender:
                 pl.when(pl.col("DATA").dt.day().is_between(5, 10)).then(1).otherwise(0).cast(pl.Int8).alias("IS_PAGAMENTO"),
-                pl.when(pl.col("DATA").dt.weekday() >= 6).then(1).otherwise(0).cast(pl.Int8).alias("IS_FDS")
+                pl.when(pl.col("DATA").dt.weekday() >= 6).then(1).otherwise(0).cast(pl.Int8).alias("IS_FDS"),
+                
+                # ⚖️ A MATRIZ DE GRAVIDADE (CRIME WEIGHTING)
+                pl.when(pl.col("RUBRICA").str.contains("(?i)HOMICIDIO|LATROCINIO|ESTUPRO|SEQUESTRO|MORTE"))
+                  .then(pl.lit(10.0)) # Risco Máximo à Vida
+                  .when(pl.col("RUBRICA").str.contains("(?i)ROUBO"))
+                  .then(pl.lit(5.0))  # Risco com Violência/Ameaça
+                  .when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO"))
+                  .then(pl.lit(3.0))  # Risco Patrimonial Elevado
+                  .otherwise(pl.lit(1.0)) # Furto simples e outras ocorrências menores
+                  .alias("PESO_CRIME")
             ])
 
-            
+            # 3. Agregação com Foco no Dano (Gravidade)
             lf_agg = lf.group_by([
                 "H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", 
                 "MES_OCORRENCIA", "DIA_SEMANA", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
                 "IS_PAGAMENTO", "IS_FDS"
             ]).agg([
-                pl.len().cast(pl.Int32).alias("TOTAL_CRIMES")
+                pl.len().cast(pl.Int32).alias("TOTAL_CRIMES"),
+                pl.col("PESO_CRIME").sum().cast(pl.Float32).alias("INDICE_GRAVIDADE") # O Novo Target da IA
             ])
 
-        
+            # 4. Enriquecimento Geográfico
             lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
                 pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
                 pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
                 pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32).alias("DENSIDADE"),
-                pl.lit(ano).cast(pl.Int16).alias("ANO_REF")
+                pl.lit(ano).cast(pl.Int16).alias("ANO_REF") # Prevenção de Data Leakage
             ])
 
-         
+            # 5. Cálculo Final de Exposição ao Risco (Baseado na Gravidade)
             df_final = lf_enriquecido.with_columns([
-                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).cast(pl.Float32).alias("INDICE_EXPOSICAO"),
-                (pl.col("TOTAL_CRIMES").rank().over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).cast(pl.Float32).alias("RANKING_RISCO_LOCAL")
+                # O índice de exposição agora mede o impacto real (Gravidade) vs Densidade
+                (pl.col("INDICE_GRAVIDADE") / (pl.col("DENSIDADE") + 1)).cast(pl.Float32).alias("INDICE_EXPOSICAO"),
+                (pl.col("INDICE_GRAVIDADE").rank().over("PERIODO_DIA") / pl.col("INDICE_GRAVIDADE").count().over("PERIODO_DIA")).cast(pl.Float32).alias("RANKING_RISCO_LOCAL")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"])
 
-          
+            # 6. Gravação Otimizada
             buffer = io.BytesIO()
             df_final.collect().write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = tamanho_atual 
+            logger.info(f"PRATA: [{ano}] Consolidado com sucesso. Peso processado para Matriz de Gravidade.")
             return True
         except Exception as e:
             logger.error(f"PRATA: Erro no ano {ano}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def executar_todos_os_anos(self, force=False):
+        logger.info(f"PRATA: Iniciando consolidação Heavy Silver (Force={force}).")
         estado = self._carregar_tracker()
         for ano in range(2022, datetime.now().year + 1):
             if self.processar_ano_com_delta(ano, estado, force):
@@ -182,4 +198,4 @@ class ProcessamentoPrata:
 
 if __name__ == "__main__":
     prata = ProcessamentoPrata()
-    prata.executar_todos_os_anos(force=True)
+    prata.executar_todos_os_anos(force=True) # Force=True para reprocessar a Matriz de Gravidade
