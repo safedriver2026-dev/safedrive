@@ -29,7 +29,6 @@ class ProcessamentoPrata:
         self.tracker_path = f"{self.base_path}/prata/tracker_estado_bronze.json"
         self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         
-        self.campos_recuperados_grade = 0
         self._inicializar_dependencias()
 
     def _localizar_datalake_real(self):
@@ -61,7 +60,7 @@ class ProcessamentoPrata:
     def _inicializar_dependencias(self):
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
-            # Downcasting na malha para economizar RAM
+            # Downcasting na malha: Float64 para Float32 (50% menos RAM)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).with_columns([
                 pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32),
                 pl.col("TAXA_VACANCIA").cast(pl.Float32)
@@ -70,9 +69,9 @@ class ProcessamentoPrata:
                 self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
                 self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-            logger.info("PRATA: Malha geográfica carregada e otimizada.")
+            logger.info("PRATA: Malha geográfica carregada e comprimida.")
         except Exception as e:
-            logger.error(f"PRATA: Falha ao carregar malha H3: {e}")
+            logger.error(f"PRATA: Falha crítica na malha: {e}")
             self.df_malha_lazy = None
 
     def processar_ano_com_delta(self, ano, estado, force=False):
@@ -87,7 +86,7 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # 1. Alias Machine (Resolve a bagunça de nomes da SSP 2022-2026)
+            # 1. Alias Machine (Busca dinâmica de colunas para 2022-2026)
             cols = lf.collect_schema().names()
             rename_map = {}
             drop_cols = []
@@ -103,7 +102,6 @@ class ProcessamentoPrata:
             hora_col = next((c for c in cols if c in ["HORA_OCORRENCIA_BO", "HORA"]), None)
             if hora_col: rename_map[hora_col] = "HORA"
 
-            # Resolução de Duplicidade do Tipo Local
             if "DESCR_SUBTIPOLOCAL" in cols: 
                 rename_map["DESCR_SUBTIPOLOCAL"] = "TIPO_LOCAL"
                 if "DESCR_TIPOLOCAL" in cols: drop_cols.append("DESCR_TIPOLOCAL")
@@ -113,7 +111,7 @@ class ProcessamentoPrata:
             lf = lf.rename(rename_map).filter(pl.col("H3_INDEX").is_not_null())
             if drop_cols: lf = lf.drop(drop_cols)
 
-            # 2. Engenharia de Contexto (Temporal e Perfil)
+            # 2. Engenharia de Contexto
             lf = lf.with_columns([
                 pl.col("DATA_BRUTA").str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
                 pl.col("HORA").str.split(":").list.first().cast(pl.Int8, strict=False).alias("HORA_INT")
@@ -126,12 +124,11 @@ class ProcessamentoPrata:
                   .otherwise(pl.lit("NOITE")).alias("PERIODO_DIA"),
                 pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA"))
                   .otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO"),
-                # Inteligência: Dia de Pagamento (5 ao 10) e Fim de Semana
                 pl.when(pl.col("DATA").dt.day().is_between(5, 10)).then(1).otherwise(0).cast(pl.Int8).alias("IS_PAGAMENTO"),
                 pl.when(pl.col("DATA").dt.weekday() >= 6).then(1).otherwise(0).cast(pl.Int8).alias("IS_FDS")
             ])
 
-            # 3. Agregação Inteligente
+           
             lf_agg = lf.group_by([
                 "H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", 
                 "MES_OCORRENCIA", "DIA_SEMANA", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
@@ -140,7 +137,7 @@ class ProcessamentoPrata:
                 pl.len().cast(pl.Int32).alias("TOTAL_CRIMES")
             ])
 
-            # 4. Join com Malha e Cálculos de Ranking (O que a Ouro estava sentindo falta)
+        
             lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
                 pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
                 pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
@@ -148,13 +145,13 @@ class ProcessamentoPrata:
                 pl.lit(ano).cast(pl.Int16).alias("ANO_REF")
             ])
 
-            # Adicionando os cálculos de Ranking e Exposição
+         
             df_final = lf_enriquecido.with_columns([
                 (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).cast(pl.Float32).alias("INDICE_EXPOSICAO"),
                 (pl.col("TOTAL_CRIMES").rank().over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).cast(pl.Float32).alias("RANKING_RISCO_LOCAL")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"])
 
-            # 5. Persistência de Alta Performance
+          
             buffer = io.BytesIO()
             df_final.collect().write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
@@ -162,7 +159,7 @@ class ProcessamentoPrata:
             estado[str(ano)] = tamanho_atual 
             return True
         except Exception as e:
-            logger.error(f"PRATA: Erro no processamento do ano {ano}: {e}")
+            logger.error(f"PRATA: Erro no ano {ano}: {e}")
             return False
 
     def executar_todos_os_anos(self, force=False):
@@ -170,7 +167,7 @@ class ProcessamentoPrata:
         for ano in range(2022, datetime.now().year + 1):
             if self.processar_ano_com_delta(ano, estado, force):
                 self._salvar_tracker(estado)
-        return {"status": "✅ Prata Otimizada e Completa"}
+        return {"status": "Prata Completa"}
 
     def _carregar_tracker(self):
         try:
