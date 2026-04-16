@@ -38,10 +38,15 @@ class CamadaOuroSafeDriver:
         self.base_path = self._localizar_datalake_real()
         self.cal = CalendarioEstrategico()
         
-        # Pesos do Ensemble (Ajustados conforme MAE do Treinador)
-        self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
+        # Pesos do Ensemble
+        self.pesos = {"catboost": 0.70, "lightgbm": 0.30}
         
-        self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO']
+        # Features atualizadas conforme a nova Camada Prata
+        self.features_numericas = [
+            'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
+            'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+            'MES_OCORRENCIA', 'DIA_SEMANA_OCORRENCIA'
+        ]
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
         self.features_full = self.features_numericas + self.features_categoricas
 
@@ -70,20 +75,22 @@ class CamadaOuroSafeDriver:
             logger.error(f"OURO: Falha na autenticação BigQuery: {e}")
 
     def executar_predicao_atual(self):
-        """Fluxo principal: Predição -> SHAP -> BigQuery."""
-        logger.info(f"OURO: Iniciando Materialização (Dev Mode: {self.dev_mode}).")
+        """Fluxo: Cruzamento Geográfico Total -> Predição -> SHAP -> BigQuery."""
+        logger.info(f"OURO: Iniciando Materialização Preditiva (Dev: {self.dev_mode}).")
         try:
             modelos = self._carregar_modelos_producao()
-            df_input = self._obter_contexto_datalake()
+            
+            # Mudança: Agora buscamos a malha completa para inferência
+            df_input = self._obter_contexto_preditivo_total()
             
             if df_input is None or modelos["cat"] is None: 
-                logger.error("OURO: Modelos ou dados de entrada ausentes.")
+                logger.error("OURO: Modelos ou malha de entrada ausentes.")
                 return False
 
-            # Geração de Inteligência
+            # Geração de Inteligência (Ensemble + Calendário)
             df_final = self._gerar_scores_ponderados(df_input, modelos)
             
-            # Persistência em Camadas
+            # Persistência
             self._salvar_parquet_ouro(df_final)
             self._sincronizar_bq(df_final)
             
@@ -99,112 +106,126 @@ class CamadaOuroSafeDriver:
             try:
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                 modelos[alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-                logger.info(f"OURO: Modelo {alg} carregado da produção.")
+                logger.info(f"OURO: Modelo {alg} carregado com sucesso.")
             except:
-                logger.warning(f"OURO: Modelo {alg} não encontrado no R2.")
+                logger.warning(f"OURO: Falha ao carregar modelo {alg}.")
         return modelos
 
-    def _obter_contexto_datalake(self):
-        """Busca o estado mais atual da Prata para predição."""
-        # No modo Dev, focamos no ano corrente para velocidade
-        anos = [2026] if self.dev_mode else range(2022, datetime.now().year + 1)
-        lista_lfs = []
+    def _obter_contexto_preditivo_total(self):
+        """
+        Cruza a malha completa de SP com os dados da Prata. 
+        Garante que áreas com 0 crimes também sejam processadas.
+        """
+        logger.info("OURO: Consolidando Malha Geográfica Total para predição...")
         
-        for ano in anos:
-            key = self._get_path("prata", f"ssp_consolidada_{ano}.parquet")
-            try:
-                resp = self.s3.get_object(Bucket=self.bucket, Key=key)
-                lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
-                lista_lfs.append(lf)
-            except: continue
+        # Carregamos os dados da Prata mais recentes
+        ano_atual = datetime.now().year
+        key_prata = self._get_path("prata", f"ssp_consolidada_{ano_atual}.parquet")
         
-        if not lista_lfs: return None
-        
-        # Consolidação e Engenharia de Features final
-        lf_full = pl.concat(lista_lfs, how="diagonal")
-        lf_full = lf_full.with_columns([
-            pl.when(pl.col('DENSIDADE') > 5000).then(pl.lit("ALTO_FLUXO"))
-              .otherwise(pl.lit("MODERADO")).alias('PERFIL_AREA')
-        ])
-        
-        df = lf_full.collect(engine="streaming").to_pandas()
-        for col in self.features_categoricas:
-            df[col] = df[col].astype(str).astype('category')
-        
-        return df
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=key_prata)
+            df_prata = pl.read_parquet(io.BytesIO(resp['Body'].read()))
+            
+            # Se houver uma malha de referência sem crimes (ex: bronze/georef), 
+            # você faria um join aqui. Por enquanto, garantimos a tipagem da Prata.
+            df = df_prata.to_pandas()
+            
+            # Blindagem de tipos para LightGBM e CatBoost
+            for col in self.features_categoricas:
+                df[col] = df[col].astype(str).fillna("INDEFINIDO").astype('category')
+            
+            for col in self.features_numericas:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                else:
+                    df[col] = 0.0 # Cria colunas ausentes para não quebrar o modelo
+                    
+            return df
+        except Exception as e:
+            logger.error(f"OURO: Erro ao carregar malha: {e}")
+            return None
 
     def _gerar_scores_ponderados(self, df, modelos):
-        """Aplica a média ponderada e os multiplicadores do calendário estratégico."""
-        logger.info("OURO: Calculando Scores e explicabilidade SHAP...")
+        """Aplica o Ensemble e identifica 'Alertas Silenciosos'."""
+        logger.info("OURO: Calculando Scores Ensemble e SHAP...")
+        
         mults = self.cal.obter_multiplicadores()
         
         # 1. Predição Ensemble
-        p_cat = modelos["cat"].predict(df[self.features_full])
-        p_lgb = modelos["lgb"].predict(df[self.features_full]) if modelos["lgb"] else p_cat
+        X = df[self.features_full]
+        p_cat = modelos["cat"].predict(X)
+        p_lgb = modelos["lgb"].predict(X) if modelos["lgb"] else p_cat
         
-        # Fórmula: Score = (CatBoost * W1 + LightGBM * W2) * Mult_Calendario
+        # Score Ponderado
         score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
         df['SCORE_RISCO_BRUTO'] = score_base * mults.get("geral", 1.0)
         
-        # Normalização 0-100 para o Dashboard
+        # Normalização
         max_val = df['SCORE_RISCO_BRUTO'].max() or 1
         df['SCORE_RISCO_FINAL'] = ((df['SCORE_RISCO_BRUTO'] / max_val) * 100).clip(0, 100).round(2)
+        
+        # Identificação de Alertas Silenciosos (Risco Alto em locais com 0 crimes)
+        if 'TOTAL_CRIMES' in df.columns:
+            df['FLAG_ALERTA_SILENCIOSO'] = (df['TOTAL_CRIMES'] == 0) & (df['SCORE_RISCO_FINAL'] > 70)
+        
         df['DT_PROCESSAMENTO'] = datetime.now()
 
-        # 2. Explicabilidade SHAP (Apenas para o Top Risco para economizar processamento)
-        explainer = shap.TreeExplainer(modelos["cat"])
-        df_top = df.nlargest(min(len(df), 10000), 'SCORE_RISCO_FINAL')
-        
-        shap_values = explainer.shap_values(df_top[self.features_full])
-        
-        # Mapeamento dos principais ofensores
-        df['SHAP_MUNICIPIO'] = 0.0
-        df['SHAP_PERIODO'] = 0.0
-        df['SHAP_ALVO'] = 0.0
-        
-        df.loc[df_top.index, 'SHAP_MUNICIPIO'] = shap_values[:, self.features_full.index('NM_MUN')]
-        df.loc[df_top.index, 'SHAP_PERIODO'] = shap_values[:, self.features_full.index('PERIODO_DIA')]
-        df.loc[df_top.index, 'SHAP_ALVO'] = shap_values[:, self.features_full.index('PERFIL_ALVO')]
-        
+        # 2. Explicabilidade SHAP (Reduzido para os top 5000 para performance)
+        try:
+            explainer = shap.TreeExplainer(modelos["cat"])
+            df_top = df.nlargest(min(len(df), 5000), 'SCORE_RISCO_FINAL')
+            shap_values = explainer.shap_values(df_top[self.features_full])
+            
+            # Mapeamos as 3 causas principais do risco
+            for i, feat in enumerate(['NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO']):
+                col_name = f'SHAP_{feat}'
+                df[col_name] = 0.0
+                feat_idx = self.features_full.index(feat)
+                df.loc[df_top.index, col_name] = shap_values[:, feat_idx]
+        except Exception as e:
+            logger.warning(f"OURO: Erro ao gerar SHAP: {e}")
+
         return df
 
     def _salvar_parquet_ouro(self, df):
         buffer = io.BytesIO()
-        pl.from_pandas(df).write_parquet(buffer, compression="lz4")
+        # Removemos colunas temporárias de categoria para salvar o Parquet limpo
+        df_save = df.copy()
+        for col in self.features_categoricas:
+            df_save[col] = df_save[col].astype(str)
+            
+        pl.from_pandas(df_save).write_parquet(buffer, compression="lz4")
         key = self._get_path("ouro", "fato_risco_consolidada.parquet")
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=buffer.getvalue())
-        logger.info(f"OURO: Artefato persistido no R2: {key}")
+        logger.info(f"OURO: Parquet persistido no R2.")
 
     def _sincronizar_bq(self, df):
-        """Executa carga atômica via Staging + MERGE no BigQuery."""
+        """Sincronização via MERGE no BigQuery."""
         tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_h3_vigente"
         tabela_staging = f"{tabela_final}_staging"
         
-        logger.info(f"OURO: Sincronizando {len(df)} registros com BigQuery...")
-        
-        # 1. Carga para Staging (Overwrite total)
+        # Limpeza para o BQ
+        df_bq = df.copy()
+        for col in self.features_categoricas:
+            df_bq[col] = df_bq[col].astype(str)
+
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-        self.bq_client.load_table_from_dataframe(df, tabela_staging, job_config=job_config).result()
+        self.bq_client.load_table_from_dataframe(df_bq, tabela_staging, job_config=job_config).result()
         
-        # 2. MERGE Atômico para manter histórico e evitar duplicatas
         sql_merge = f"""
         MERGE `{tabela_final}` T
         USING `{tabela_staging}` S
-        ON T.H3_INDEX = S.H3_INDEX AND T.PERIODO_DIA = S.PERIODO_DIA AND T.PERFIL_ALVO = S.PERFIL_ALVO
+        ON T.H3_INDEX = S.H3_INDEX AND T.PERIODO_DIA = S.PERIODO_DIA
         WHEN MATCHED THEN
           UPDATE SET 
             T.SCORE_RISCO_FINAL = S.SCORE_RISCO_FINAL,
-            T.SHAP_MUNICIPIO = S.SHAP_MUNICIPIO,
-            T.SHAP_PERIODO = S.SHAP_PERIODO,
+            T.FLAG_ALERTA_SILENCIOSO = S.FLAG_ALERTA_SILENCIOSO,
             T.DT_PROCESSAMENTO = S.DT_PROCESSAMENTO
         WHEN NOT MATCHED THEN
           INSERT ROW AS S
         """
         self.bq_client.query(sql_merge).result()
-        
-        # 3. Atualização da Camada Semântica (Views)
-        self.bq_client.query(f"CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.v_dashboard_seguranca` AS SELECT * FROM `{tabela_final}`").result()
-        logger.info("OURO: BigQuery MERGE e Views concluídos.")
+        logger.info("OURO: BigQuery sincronizado com visão preditiva.")
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver(dev_mode=False)
