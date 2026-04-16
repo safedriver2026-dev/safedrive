@@ -4,35 +4,41 @@ on:
   push:
     branches:
       - main
-  # Gatilho de Agendamento: Roda todos os dias as 03:00 AM (Horario de Brasilia)
+  # Gatilho de Agendamento: Roda todos os dias às 03:00 AM (Horário de Brasília)
+  # 06:00 UTC = 03:00 BRT (sem horário de verão)
   schedule:
     - cron: '0 6 * * *'
+  
+  # Gatilho Manual: Permite rodar via interface do GitHub
   workflow_dispatch:
     inputs:
       force_execution:
-        description: 'Forcar reprocessamento total'
+        description: 'Forçar reprocessamento total (Ignorar Cache)'
         required: false
         default: 'false'
 
 jobs:
   safedriver-pipeline:
+    name: "Execução Ciclo SafeDriver"
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # Proteção contra loops infinitos
 
     steps:
-      - name: Checkout do codigo
+      - name: Checkout do código
         uses: actions/checkout@v3
 
-      - name: Configurar Python
+      - name: Configurar Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+          cache: 'pip' # Ativa o cache automático para o pip
 
-      - name: Instalar dependencias do sistema
+      - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgomp1
+          sudo apt-get install -y libgomp1 # Essencial para CatBoost/LightGBM
 
-      - name: Instalar dependencias do projeto
+      - name: Instalar dependências do projeto
         run: |
           python -m pip install --upgrade pip
           pip install polars pandas numpy pyarrow fastexcel python-calamine matplotlib
@@ -41,37 +47,37 @@ jobs:
           pip install h3 holidays pytz tzdata
           pip install requests python-dotenv pytest folium
 
-      - name: Execucao de Testes de Seguranca
+      - name: 🛡️ Execução de Testes de Qualidade e Seguranca
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-          LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
+          # O pipeline só prossegue se os testes de segurança passarem
           python -m pytest tests/test_seguranca.py --maxfail=1 --disable-warnings
 
-      - name: Orquestracao Mestre
+      - name: 🛡️ Ciclo de Dados
         env:
-          # Infraestrutura Cloudflare R2
+          # Infraestrutura Cloudflare R2 (Storage)
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           
-          # Infraestrutura Google BigQuery
+          # Infraestrutura Google BigQuery (Analytics)
           BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
           BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
           
-          # Seguranca e Comunicacao
-          LGPD_SALT: ${{ secrets.LGPD_SALT }}
+          # Comunicação (Discord)
           DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
         run: |
+          # Lógica para detetar se o gatilho é manual com flag --force
           if [ "${{ github.event.inputs.force_execution }}" == "true" ]; then
-            echo "INICIANDO MODO: REPROCESSAMENTO TOTAL (FORCE)"
+            echo "MODO: REPROCESSAMENTO TOTAL ATIVADO"
             python main.py --force
           else
-            echo "INICIANDO MODO: CARGA INTELIGENTE (IDEMPOTENTE)"
+            echo "MODO: CARGA INCREMENTAL INTELIGENTE"
             python main.py
           fi
