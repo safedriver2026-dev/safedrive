@@ -61,8 +61,7 @@ class ProcessamentoPrata:
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             
-            # 🛡️ DATA CONTRACT: A CURA DA EXPLOSÃO CARTESIANA (DEDUPLICAÇÃO H3)
-            # Downcasting na malha: Float64 para Float32 (50% menos RAM)
+            # 🛡️ DATA CONTRACT: DEDUPLICAÇÃO H3 E COMPRESSÃO DE MEMÓRIA
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).unique(subset=["H3_INDEX"]).with_columns([
                 pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32),
                 pl.col("TAXA_VACANCIA").cast(pl.Float32)
@@ -71,7 +70,7 @@ class ProcessamentoPrata:
                 self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
                 self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-            logger.info("PRATA: Malha geográfica base carregada, deduplicada e comprimida.")
+            logger.info("PRATA: Malha geográfica base carregada e otimizada.")
         except Exception as e:
             logger.error(f"PRATA: Falha crítica na malha: {e}")
             self.df_malha_lazy = None
@@ -104,6 +103,9 @@ class ProcessamentoPrata:
             hora_col = next((c for c in cols if c in ["HORA_OCORRENCIA_BO", "HORA"]), None)
             if hora_col: rename_map[hora_col] = "HORA"
 
+            # 🎯 NOVIDADE: Captura o período textual da SSP
+            if "DESC_PERIODO" in cols: rename_map["DESC_PERIODO"] = "PERIODO_SSP"
+
             if "DESCR_SUBTIPOLOCAL" in cols: 
                 rename_map["DESCR_SUBTIPOLOCAL"] = "TIPO_LOCAL"
                 if "DESCR_TIPOLOCAL" in cols: drop_cols.append("DESCR_TIPOLOCAL")
@@ -113,31 +115,44 @@ class ProcessamentoPrata:
             lf = lf.rename(rename_map).filter(pl.col("H3_INDEX").is_not_null())
             if drop_cols: lf = lf.drop(drop_cols)
 
-            # 2. Engenharia de Contexto
+            # 2. Engenharia de Contexto com Mapeamento Híbrido de Período
             lf = lf.with_columns([
                 pl.col("DATA_BRUTA").str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
-                pl.col("HORA").str.split(":").list.first().cast(pl.Int8, strict=False).alias("HORA_INT")
+                pl.col("HORA").str.split(":").list.first().cast(pl.Int8, strict=False).alias("HORA_INT"),
+                pl.col("PERIODO_SSP").str.to_uppercase().fill_null("INDEFINIDO").alias("PERIODO_RAW")
             ]).with_columns([
                 pl.col("DATA").dt.month().cast(pl.Int8).alias("MES_OCORRENCIA"),
                 pl.col("DATA").dt.weekday().cast(pl.Int8).alias("DIA_SEMANA"),
-                pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
-                  .when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA"))
-                  .when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE"))
-                  .otherwise(pl.lit("NOITE")).alias("PERIODO_DIA"),
+                
+                # 🚀 LÓGICA HÍBRIDA: Hora exata > Descrição SSP > Fallback NOITE
+                pl.when(pl.col("HORA_INT").is_not_null())
+                  .then(
+                      pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
+                        .when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA"))
+                        .when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE"))
+                        .otherwise(pl.lit("NOITE"))
+                  )
+                  .otherwise(
+                      pl.when(pl.col("PERIODO_RAW").str.contains("MADRUGADA")).then(pl.lit("MADRUGADA"))
+                        .when(pl.col("PERIODO_RAW").str.contains("MANHA")).then(pl.lit("MANHA"))
+                        .when(pl.col("PERIODO_RAW").str.contains("TARDE")).then(pl.lit("TARDE"))
+                        .otherwise(pl.lit("NOITE"))
+                  ).alias("PERIODO_DIA"),
+
                 pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA"))
                   .otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO"),
-                # Tags temporais históricas para a IA aprender:
+                
                 pl.when(pl.col("DATA").dt.day().is_between(5, 10)).then(1).otherwise(0).cast(pl.Int8).alias("IS_PAGAMENTO"),
                 pl.when(pl.col("DATA").dt.weekday() >= 6).then(1).otherwise(0).cast(pl.Int8).alias("IS_FDS"),
                 
-                # ⚖️ A MATRIZ DE GRAVIDADE (CRIME WEIGHTING)
+                # ⚖️ MATRIZ DE GRAVIDADE (CRIME WEIGHTING)
                 pl.when(pl.col("RUBRICA").str.contains("(?i)HOMICIDIO|LATROCINIO|ESTUPRO|SEQUESTRO|MORTE"))
-                  .then(pl.lit(10.0)) # Risco Máximo à Vida
+                  .then(pl.lit(10.0))
                   .when(pl.col("RUBRICA").str.contains("(?i)ROUBO"))
-                  .then(pl.lit(5.0))  # Risco com Violência/Ameaça
+                  .then(pl.lit(5.0))
                   .when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO"))
-                  .then(pl.lit(3.0))  # Risco Patrimonial Elevado
-                  .otherwise(pl.lit(1.0)) # Furto simples e outras ocorrências menores
+                  .then(pl.lit(3.0))
+                  .otherwise(pl.lit(1.0))
                   .alias("PESO_CRIME")
             ])
 
@@ -148,7 +163,7 @@ class ProcessamentoPrata:
                 "IS_PAGAMENTO", "IS_FDS"
             ]).agg([
                 pl.len().cast(pl.Int32).alias("TOTAL_CRIMES"),
-                pl.col("PESO_CRIME").sum().cast(pl.Float32).alias("INDICE_GRAVIDADE") # O Novo Target da IA
+                pl.col("PESO_CRIME").sum().cast(pl.Float32).alias("INDICE_GRAVIDADE")
             ])
 
             # 4. Enriquecimento Geográfico
@@ -156,12 +171,11 @@ class ProcessamentoPrata:
                 pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
                 pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
                 pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32).alias("DENSIDADE"),
-                pl.lit(ano).cast(pl.Int16).alias("ANO_REF") # Prevenção de Data Leakage
+                pl.lit(ano).cast(pl.Int16).alias("ANO_REF")
             ])
 
-            # 5. Cálculo Final de Exposição ao Risco (Baseado na Gravidade)
+            # 5. Cálculo Final de Exposição ao Risco
             df_final = lf_enriquecido.with_columns([
-                # O índice de exposição agora mede o impacto real (Gravidade) vs Densidade
                 (pl.col("INDICE_GRAVIDADE") / (pl.col("DENSIDADE") + 1)).cast(pl.Float32).alias("INDICE_EXPOSICAO"),
                 (pl.col("INDICE_GRAVIDADE").rank().over("PERIODO_DIA") / pl.col("INDICE_GRAVIDADE").count().over("PERIODO_DIA")).cast(pl.Float32).alias("RANKING_RISCO_LOCAL")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"])
@@ -172,16 +186,14 @@ class ProcessamentoPrata:
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = tamanho_atual 
-            logger.info(f"PRATA: [{ano}] Consolidado com sucesso. Peso processado para Matriz de Gravidade.")
+            logger.info(f"PRATA: [{ano}] Consolidado. Gap de períodos resolvido via mapeamento híbrido.")
             return True
         except Exception as e:
             logger.error(f"PRATA: Erro no ano {ano}: {e}")
-            import traceback
-            traceback.print_exc()
             return False
 
     def executar_todos_os_anos(self, force=False):
-        logger.info(f"PRATA: Iniciando consolidação Heavy Silver (Force={force}).")
+        logger.info(f"PRATA: Iniciando consolidação Heavy Silver.")
         estado = self._carregar_tracker()
         for ano in range(2022, datetime.now().year + 1):
             if self.processar_ano_com_delta(ano, estado, force):
@@ -198,4 +210,4 @@ class ProcessamentoPrata:
 
 if __name__ == "__main__":
     prata = ProcessamentoPrata()
-    prata.executar_todos_os_anos(force=True) # Force=True para reprocessar a Matriz de Gravidade
+    prata.executar_todos_os_anos(force=True)
