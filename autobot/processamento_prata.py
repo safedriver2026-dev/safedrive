@@ -16,13 +16,11 @@ logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
-        # Credenciais Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
-        # Configuração de Conexão S3 de Alta Performance
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
                               aws_access_key_id=self.access_key,
                               aws_secret_access_key=self.secret_key, 
@@ -126,35 +124,63 @@ class ProcessamentoPrata:
             lf = lf.filter((pl.col("H3_INDEX").is_not_null()))
             total_in = lf.select(pl.len()).collect().item()
 
+            # Recuperando os mapeamentos de Tipo de Local que a IA ama
             mapeamento = {
                 "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL", "BAIRRO": "NM_BAIRRO_ORIGINAL",
-                "HORA_OCORRENCIA_BO": "HORA", "DATA_OCORRENCIA_BO": "DATA_BRUTA", "DATA_OCORRENCIA": "DATA_BRUTA"
+                "HORA_OCORRENCIA_BO": "HORA", "DATA_OCORRENCIA_BO": "DATA_BRUTA", "DATA_OCORRENCIA": "DATA_BRUTA",
+                "DESCR_TIPOLOCAL": "TIPO_LOCAL", "DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"
             }
             lf = lf.rename({old: new for old, new in mapeamento.items() if old in lf.collect_schema().names()})
 
+            if "TIPO_LOCAL" not in lf.collect_schema().names():
+                lf = lf.with_columns(pl.lit("INDEFINIDO").alias("TIPO_LOCAL"))
+
             if "DATA_BRUTA" in lf.collect_schema().names():
-                lf = lf.with_columns(pl.col("DATA_BRUTA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"))
+                lf = lf.with_columns([
+                    pl.col("DATA_BRUTA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
+                    pl.col("HORA").cast(pl.String).str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT")
+                ])
                 lf = lf.with_columns([
                     pl.col("DATA").dt.month().fill_null(1).alias("MES_OCORRENCIA"),
-                    pl.col("DATA").dt.weekday().fill_null(1).alias("DIA_SEMANA_OCORRENCIA")
+                    pl.col("DATA").dt.weekday().fill_null(1).alias("DIA_SEMANA_OCORRENCIA"),
+                    pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
+                      .when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA"))
+                      .when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE"))
+                      .otherwise(pl.lit("NOITE")).alias("PERIODO_DIA"),
+                    pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA"))
+                      .otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
+                ])
+            else:
+                lf = lf.with_columns([
+                    pl.lit(1).alias("MES_OCORRENCIA"), pl.lit(1).alias("DIA_SEMANA_OCORRENCIA"),
+                    pl.lit("NOITE").alias("PERIODO_DIA"), pl.lit("PEDESTRE").alias("PERFIL_ALVO")
                 ])
             
-            lf_agg = lf.group_by(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA"]).agg([
+            # Agregando com toda a inteligência junta
+            lf_agg = lf.group_by([
+                "H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", 
+                "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"
+            ]).agg([
                 pl.when(pl.col("RUBRICA").str.contains("(?i)ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES")
             ])
 
-            lf_agg = lf_agg.with_columns([self._limpar_texto_extremo(c) for c in ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]])
+            lf_agg = lf_agg.with_columns([self._limpar_texto_extremo(c) for c in ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "TIPO_LOCAL"]])
             self._curar_malha_referencia(lf_agg.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect())
 
+            # Trazendo a DENSIDADE e TAXA_VACANCIA da malha, e cravando o nome final exato
             lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
-                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN_FINAL"),
-                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO_FINAL"),
-                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float64).fill_null(0.0).alias("DENSIDADE")
-            ])
+                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
+                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
+                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float64).fill_null(0.0).alias("DENSIDADE"),
+                pl.col("TAXA_VACANCIA").cast(pl.Float64, strict=False).fill_null(0.0).alias("TAXA_VACANCIA")
+            ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"])
 
             df_final_pd = self._gerar_features_espaciais_ia(lf_enriquecido.collect().to_pandas())
+            
+            # Gerando Exposicao e o Ranking
             df_final = pl.from_pandas(df_final_pd).with_columns([
                 (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).alias("INDICE_EXPOSICAO"),
+                (pl.col("TOTAL_CRIMES").rank().over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).alias("RANKING_RISCO_LOCAL"),
                 pl.lit(ano).alias("ANO_REFERENCIA")
             ])
 
@@ -169,7 +195,6 @@ class ProcessamentoPrata:
             return None
 
     def executar_todos_os_anos(self, force=False):
-        """Metodo de entrada para o Maestro."""
         stats = {"linhas_in": 0, "linhas_out": 0}
         estado = self._carregar_tracker()
         for ano in range(2022, datetime.now().year + 1):
