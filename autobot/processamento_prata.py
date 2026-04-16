@@ -1,48 +1,185 @@
-# ... (mantenha os imports e o __init__ que você já tem)
+import polars as pl
+import pandas as pd
+import h3
+import boto3
+from botocore.config import Config
+import io
+import os
+import json
+import logging
+from datetime import datetime
 
-    def _obter_contexto_preditivo_total(self):
+# Configuração de Logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logger = logging.getLogger(__name__)
+
+class ProcessamentoPrata:
+    def __init__(self):
+        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
+        self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+        self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+        self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
+
+        self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
+                              aws_access_key_id=self.access_key,
+                              aws_secret_access_key=self.secret_key, 
+                              config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}, max_pool_connections=50))
+        
+        self.base_path = self._localizar_datalake_real()
+        self.tracker_path = f"{self.base_path}/prata/tracker_estado_bronze.json"
+        self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
+        
+        self.campos_recuperados_grade = 0
+        self._inicializar_dependencias()
+
+    def _localizar_datalake_real(self):
         try:
-            resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
-            df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read()))
+            paginator = self.s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket, MaxKeys=100):
+                for obj in page.get('Contents', []):
+                    if "datalake/bronze/trusted/" in obj['Key']:
+                        return obj['Key'].split("datalake/")[0] + "datalake"
+            return "datalake"
+        except: return "datalake"
 
-            ano_atual = datetime.now().year
-            path_prata = self._get_path("prata", f"ssp_consolidada_{ano_atual}.parquet")
-            df_prata = pl.read_parquet(io.BytesIO(self.s3.get_object(Bucket=self.bucket, Key=path_prata)['Body'].read()))
+    def _limpar_texto_extremo(self, coluna):
+        return (
+            pl.col(coluna)
+            .cast(pl.String)
+            .str.to_uppercase()
+            .str.replace_all(r"[ÁÀÂÃÄ]", "A")
+            .str.replace_all(r"[ÉÈÊË]", "E")
+            .str.replace_all(r"[ÍÌÎÏ]", "I")
+            .str.replace_all(r"[ÓÒÔÕÖ]", "O")
+            .str.replace_all(r"[ÚÙÛÜ]", "U")
+            .str.replace_all(r"[Ç]", "C")
+            .str.replace_all(r"[Ñ]", "N")
+            .str.strip_chars()
+            .fill_null("INDEFINIDO")
+        )
 
-            # AGORA AS COLUNAS EXISTEM NA PRATA
-            df_prata_agg = df_prata.group_by("H3_INDEX").agg([
-                pl.col("TOTAL_CRIMES").sum().alias("TOTAL_CRIMES"),
-                pl.col("RANKING_RISCO_LOCAL").mean().alias("RANKING_PRATA"),
-                pl.col("INDICE_EXPOSICAO").mean().alias("EXPOSICAO_PRATA")
+    def _inicializar_dependencias(self):
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
+            # Downcasting na malha para economizar RAM
+            self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).with_columns([
+                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32),
+                pl.col("TAXA_VACANCIA").cast(pl.Float32)
             ])
-
-            df_enriquecida = self._gerar_contagio_na_malha_total(df_malha, df_prata_agg)
-
-            hoje = datetime.now()
-            df_final = df_enriquecida.with_columns([
-                pl.col("NM_MUN").fill_null("SAO PAULO"),
-                pl.col("NM_BAIRRO").fill_null("INDEFINIDO"),
-                pl.lit("TARDE").alias("PERIODO_DIA"), 
-                pl.lit("PEDESTRE").alias("PERFIL_ALVO"),
-                pl.lit("VIA PUBLICA").alias("TIPO_LOCAL"),
-                pl.lit(hoje.month).alias("MES_OCORRENCIA"),
-                pl.lit(hoje.weekday()).alias("DIA_SEMANA"), # Alinhado com a Prata
-                pl.lit(1 if 5 <= hoje.day <= 10 else 0).alias("IS_PAGAMENTO"),
-                pl.lit(1 if hoje.weekday() >= 6 else 0).alias("IS_FDS"),
-                pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE"),
-                pl.col("RANKING_PRATA").fill_null(0.5).alias("RANKING_RISCO_LOCAL"),
-                pl.col("EXPOSICAO_PRATA").fill_null(0.1).alias("INDICE_EXPOSICAO")
+            self.df_malha_lazy = self.df_malha.lazy().with_columns([
+                self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
+                self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-
-            df_pd = df_final.to_pandas()
-            # Tipagem forçada para o CatBoost não reclamar
-            for col in self.features_categoricas:
-                df_pd[col] = df_pd[col].astype(str).astype('category')
-            for col in self.features_numericas:
-                df_pd[col] = pd.to_numeric(df_pd[col], errors='coerce').fillna(0.0)
-            
-            return df_pd
+            logger.info("PRATA: Malha geográfica carregada e otimizada.")
         except Exception as e:
-            logger.error(f"OURO: Erro ao consolidar contexto: {e}")
-            return None
-# ... (mantenha o restante do arquivo)
+            logger.error(f"PRATA: Falha ao carregar malha H3: {e}")
+            self.df_malha_lazy = None
+
+    def processar_ano_com_delta(self, ano, estado, force=False):
+        path_trusted = f"{self.base_path}/bronze/trusted/ssp_trusted_{ano}.parquet"
+        path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
+        
+        try:
+            meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
+            tamanho_atual = meta['ContentLength']
+            if not force and estado.get(str(ano)) == tamanho_atual: return None
+
+            resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
+            lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
+
+            # 1. Alias Machine (Resolve a bagunça de nomes da SSP 2022-2026)
+            cols = lf.collect_schema().names()
+            rename_map = {}
+            drop_cols = []
+
+            mun_col = next((c for c in cols if c in ["CIDADE", "MUNICIPIO", "NOME_MUNICIPIO"]), None)
+            if mun_col: rename_map[mun_col] = "NM_MUN_ORIGINAL"
+
+            data_col = next((c for c in cols if c in ["DATA_OCORRENCIA_BO", "DATA_OCORRENCIA"]), None)
+            if data_col: rename_map[data_col] = "DATA_BRUTA"
+
+            if "BAIRRO" in cols: rename_map["BAIRRO"] = "NM_BAIRRO_ORIGINAL"
+            
+            hora_col = next((c for c in cols if c in ["HORA_OCORRENCIA_BO", "HORA"]), None)
+            if hora_col: rename_map[hora_col] = "HORA"
+
+            # Resolução de Duplicidade do Tipo Local
+            if "DESCR_SUBTIPOLOCAL" in cols: 
+                rename_map["DESCR_SUBTIPOLOCAL"] = "TIPO_LOCAL"
+                if "DESCR_TIPOLOCAL" in cols: drop_cols.append("DESCR_TIPOLOCAL")
+            elif "DESCR_TIPOLOCAL" in cols: 
+                rename_map["DESCR_TIPOLOCAL"] = "TIPO_LOCAL"
+
+            lf = lf.rename(rename_map).filter(pl.col("H3_INDEX").is_not_null())
+            if drop_cols: lf = lf.drop(drop_cols)
+
+            # 2. Engenharia de Contexto (Temporal e Perfil)
+            lf = lf.with_columns([
+                pl.col("DATA_BRUTA").str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
+                pl.col("HORA").str.split(":").list.first().cast(pl.Int8, strict=False).alias("HORA_INT")
+            ]).with_columns([
+                pl.col("DATA").dt.month().cast(pl.Int8).alias("MES_OCORRENCIA"),
+                pl.col("DATA").dt.weekday().cast(pl.Int8).alias("DIA_SEMANA"),
+                pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
+                  .when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA"))
+                  .when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE"))
+                  .otherwise(pl.lit("NOITE")).alias("PERIODO_DIA"),
+                pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA"))
+                  .otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO"),
+                # Inteligência: Dia de Pagamento (5 ao 10) e Fim de Semana
+                pl.when(pl.col("DATA").dt.day().is_between(5, 10)).then(1).otherwise(0).cast(pl.Int8).alias("IS_PAGAMENTO"),
+                pl.when(pl.col("DATA").dt.weekday() >= 6).then(1).otherwise(0).cast(pl.Int8).alias("IS_FDS")
+            ])
+
+            # 3. Agregação Inteligente
+            lf_agg = lf.group_by([
+                "H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", 
+                "MES_OCORRENCIA", "DIA_SEMANA", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
+                "IS_PAGAMENTO", "IS_FDS"
+            ]).agg([
+                pl.len().cast(pl.Int32).alias("TOTAL_CRIMES")
+            ])
+
+            # 4. Join com Malha e Cálculos de Ranking (O que a Ouro estava sentindo falta)
+            lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
+                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
+                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
+                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32).alias("DENSIDADE"),
+                pl.lit(ano).cast(pl.Int16).alias("ANO_REF")
+            ])
+
+            # Adicionando os cálculos de Ranking e Exposição
+            df_final = lf_enriquecido.with_columns([
+                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).cast(pl.Float32).alias("INDICE_EXPOSICAO"),
+                (pl.col("TOTAL_CRIMES").rank().over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).cast(pl.Float32).alias("RANKING_RISCO_LOCAL")
+            ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"])
+
+            # 5. Persistência de Alta Performance
+            buffer = io.BytesIO()
+            df_final.collect().write_parquet(buffer, compression="lz4")
+            self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
+
+            estado[str(ano)] = tamanho_atual 
+            return True
+        except Exception as e:
+            logger.error(f"PRATA: Erro no processamento do ano {ano}: {e}")
+            return False
+
+    def executar_todos_os_anos(self, force=False):
+        estado = self._carregar_tracker()
+        for ano in range(2022, datetime.now().year + 1):
+            if self.processar_ano_com_delta(ano, estado, force):
+                self._salvar_tracker(estado)
+        return {"status": "✅ Prata Otimizada e Completa"}
+
+    def _carregar_tracker(self):
+        try:
+            return json.loads(self.s3.get_object(Bucket=self.bucket, Key=self.tracker_path)['Body'].read())
+        except: return {}
+
+    def _salvar_tracker(self, estado):
+        self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
+
+if __name__ == "__main__":
+    prata = ProcessamentoPrata()
+    prata.executar_todos_os_anos(force=True)
