@@ -5,7 +5,7 @@ from botocore.config import Config
 import joblib
 import io
 import os
-import gc  # Garbage Collector para limpar a memória RAM
+import gc  # Garbage Collector
 import logging
 from datetime import datetime
 from catboost import CatBoostRegressor
@@ -35,10 +35,12 @@ class TreinadorEvolutivo:
         
         self.target = "TOTAL_CRIMES"
         
+        # --- ALINHAMENTO HEAVY SILVER ---
+        # Recebendo as novas colunas temporais de alta inteligência da Prata
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
             'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
-            'MES_OCORRENCIA', 'DIA_SEMANA_OCORRENCIA'
+            'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
         ]
         
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
@@ -64,13 +66,12 @@ class TreinadorEvolutivo:
             logger.error("IA: Massa de dados insuficiente para o ciclo evolutivo.")
             return False
 
-        logger.info(f"IA: Iniciando Treinamento Ensemble com {len(df_treino)} registros.")
+        logger.info(f"IA: Iniciando Treinamento Ensemble Otimizado com {len(df_treino)} registros.")
 
         X = df_treino[self.features_numericas + self.features_categoricas].copy()
-        # Garantindo que o alvo é numérico para não quebrar a Tweedie Loss
-        y = df_treino[self.target].fillna(0).astype(float) 
+        y = df_treino[self.target].fillna(0).astype('float32') 
 
-        # --- GESTÃO DE MEMÓRIA (Evita Timeout/OOM no GitHub Actions) ---
+        # Elimina o dataframe original pesado da memória RAM
         del df_treino 
         gc.collect()
 
@@ -78,33 +79,35 @@ class TreinadorEvolutivo:
             X[col] = X[col].astype(str).fillna("INDEFINIDO").astype('category')
             
         for col in self.features_numericas:
-            X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0.0)
+            X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0.0).astype('float32')
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # 1. CatBoost Tweedie (Dieta de Performance)
-        logger.info("IA: [1/2] Lapidando CatBoost...")
+        # 1. CatBoost (Tuned para Amostragem)
+        logger.info("IA: [1/2] Lapidando CatBoost (Hyper-Tuned)...")
         model_cat = CatBoostRegressor(
-            iterations=600,         # Reduzido de 1500 para não estourar a RAM
+            iterations=600, 
             depth=6, 
-            learning_rate=0.05,     # Aumentado um pouco para aprender mais rápido
+            learning_rate=0.06, 
+            l2_leaf_reg=5,             # TUNING: Impede Overfitting na amostra de 600k
             cat_features=self.features_categoricas,
             loss_function='Tweedie:variance_power=1.5',
             early_stopping_rounds=30, 
             verbose=100,
-            thread_count=2          # Trava em 2 núcleos (Limite do GitHub Actions)
+            thread_count=2
         )
         model_cat.fit(X_train, y_train, eval_set=(X_test, y_test))
 
-        # 2. LightGBM Tweedie (Dieta de Performance)
-        logger.info("IA: [2/2] Lapidando LightGBM...")
+        # 2. LightGBM (Tuned para Extração de Features)
+        logger.info("IA: [2/2] Lapidando LightGBM (Hyper-Tuned)...")
         model_lgb = LGBMRegressor(
-            n_estimators=400,       # Reduzido de 800
-            learning_rate=0.05, 
+            n_estimators=400, 
+            learning_rate=0.06, 
             objective='tweedie', 
             tweedie_variance_power=1.5,
+            feature_fraction=0.8,      # TUNING: Obriga a IA a usar as features novas e não focar só na densidade
             importance_type='gain',
-            n_jobs=2,               # Trava em 2 núcleos
+            n_jobs=2,
             verbosity=-1 
         )
         model_lgb.fit(X_train, y_train)
@@ -143,8 +146,6 @@ class TreinadorEvolutivo:
         
         df_pl = pl.concat(lista_dfs, how="diagonal")
         
-        # --- GESTÃO DE MEMÓRIA ---
-        # Deleta as planilhas intermediárias que o Polars guardou
         del lista_dfs
         gc.collect()
         
@@ -156,11 +157,19 @@ class TreinadorEvolutivo:
                 df_pl = df_pl.with_columns(pl.lit("INDEFINIDO").alias(col))
 
         for col in self.features_numericas:
-            if col not in df_pl.columns:
-                df_pl = df_pl.with_columns(pl.lit(0.0).alias(col))
+            if col in df_pl.columns:
+                df_pl = df_pl.with_columns(pl.col(col).cast(pl.Float32, strict=False).fill_null(0.0))
+            else:
+                df_pl = df_pl.with_columns(pl.lit(0.0, dtype=pl.Float32).alias(col))
 
         if self.target not in df_pl.columns:
-            df_pl = df_pl.with_columns(pl.lit(0.0).alias(self.target))
+            df_pl = df_pl.with_columns(pl.lit(0.0, dtype=pl.Float32).alias(self.target))
+
+        # SALVAÇÃO DO OOM KILLER (Mantido)
+        LIMITE_LINHAS = 600000 
+        if df_pl.height > LIMITE_LINHAS:
+            logger.warning(f"IA: Amostrando dataset de {df_pl.height} para {LIMITE_LINHAS} registros para proteger a memória.")
+            df_pl = df_pl.sample(n=LIMITE_LINHAS, seed=42)
 
         return df_pl.to_pandas()
 
