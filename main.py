@@ -5,6 +5,7 @@ import sys
 import boto3
 from botocore.config import Config
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Importação dos motores do ecossistema SafeDriver
 try:
@@ -17,7 +18,7 @@ except ImportError as e:
     print(f"Erro ao importar módulos do diretório 'autobot': {e}")
     sys.exit(1)
 
-# Configuração de Log de Alta Visibilidade
+# Configuração de Log de Alta Visibilidade (Sincronizado com Brasília)
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - [%(levelname)s] - %(message)s', 
@@ -48,7 +49,7 @@ def orquestrar_pipeline(force_reprocess=False):
     start_time = datetime.now()
     comunicador = ComunicadorSafeDriver()
 
-    # Dicionário de telemetria para o Relatório Executivo
+    # Dicionário de telemetria alinhado com as novas features da Prata
     stats = {
         "status_camadas": {
             "bronze": "⏭️ (Cache)", 
@@ -60,9 +61,10 @@ def orquestrar_pipeline(force_reprocess=False):
             "linhas_in": 0, 
             "linhas_out": 0, 
             "taxa_recuperacao": 100, 
-            "linhas_ouro": 0
+            "linhas_ouro": 0,
+            "recuperado_grade": 0  # <--- NOVO: Preparado para receber a cura da malha
         },
-        "metrics_ia": {"mae": "17.56"}, # MAE de referência
+        "metrics_ia": {"mae": "Aguardando..."},
         "duracao": "0s"
     }
 
@@ -74,8 +76,6 @@ def orquestrar_pipeline(force_reprocess=False):
             stats["status_camadas"]["bronze"] = "✅ (Novo)"
 
         # --- ANÁLISE DE ESTADO FÍSICO (Correção de Gatilho) ---
-        # Verificamos se os arquivos da Prata e IA existem de fato no R2
-        # Checagem dupla para lidar com variações de prefixo (safedriver/datalake vs datalake)
         prata_existe = (
             verificar_estado_remoto("datalake/prata/ssp_consolidada_2022.parquet") or
             verificar_estado_remoto("safedriver/datalake/prata/ssp_consolidada_2022.parquet")
@@ -96,15 +96,19 @@ def orquestrar_pipeline(force_reprocess=False):
         gatilho_ia = gatilho_prata or not modelos_existem
         gatilho_ouro = gatilho_ia or not ouro_existe
 
-        # --- ETAPA 2: PRATA (Higiene e Normalização) ---
+        # --- ETAPA 2: PRATA (Higiene, Sazonalidade e Cura da Malha) ---
         prata = ProcessamentoPrata()
         if gatilho_prata:
             logger.info("🚀 Prata: Iniciando processamento e filtragem de qualidade...")
             metricas_prata = prata.executar_todos_os_anos(force=force_reprocess)
             
+            # Alinhamento do dicionário: Evita sobreescrever estruturas aninhadas
             if metricas_prata and isinstance(metricas_prata, dict):
-                stats["status_camadas"]["prata"] = "✅ (Processado)"
-                stats["hygiene"].update(metricas_prata)
+                stats["status_camadas"]["prata"] = metricas_prata.get("status_camadas", {}).get("prata", "✅ (Processado)")
+                stats["hygiene"]["linhas_in"] = metricas_prata.get("linhas_in", 0)
+                stats["hygiene"]["linhas_out"] = metricas_prata.get("linhas_out", 0)
+                stats["hygiene"]["taxa_recuperacao"] = metricas_prata.get("taxa_recuperacao", 100)
+                stats["hygiene"]["recuperado_grade"] = metricas_prata.get("recuperado_grade", 0) # <--- Captura a cura
             else:
                 stats["status_camadas"]["prata"] = "⚠️ (Vazio/Erro)"
         else:
