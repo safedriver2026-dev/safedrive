@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  # Gatilho de Agendamento: Roda todos os dias as 03:00 AM (Horario de Brasilia)
+  schedule:
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       force_execution:
