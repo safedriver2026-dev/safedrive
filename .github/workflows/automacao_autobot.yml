@@ -22,7 +22,6 @@ permissions:
 jobs:
   motor_safedriver:
     name: Processamento e Treinamento IA
-    # ALTERAÇÃO: Agora ele procura o seu PC
     runs-on: self-hosted
     
     env:
@@ -33,32 +32,32 @@ jobs:
       - name: Checkout do Código
         uses: actions/checkout@v4
 
-      # No self-hosted, o Python já deve estar instalado no seu PC.
-      # Este passo garante que a versão correta seja usada se você tiver várias.
       - name: Configuração do Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Instalação de Dependências
-        shell: bash
+        # Mudamos para PowerShell (pwsh)
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
           pip install pytz tzdata pytest boto3 polars pandas joblib catboost lightgbm scikit-learn shap google-cloud-bigquery
 
       - name: 🛡️ Execução de Testes de Segurança
-        shell: bash
+        shell: pwsh
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
-          pytest tests/test_seguranca.py --maxfail=1 --disable-warnings || true
+          pytest tests/test_seguranca.py --maxfail=1 --disable-warnings
+          exit 0
 
       - name: Orquestração Mestre
-        shell: bash
+        shell: pwsh
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -71,15 +70,15 @@ jobs:
           DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
           LGPD_SALT: ${{ secrets.LGPD_SALT }}
         run: |
-          if [ "${{ github.event.inputs.force_execution }}" == "true" ]; then
-            echo "🔔 INICIANDO MODO: REPROCESSAMENTO TOTAL (FORCE)"
+          if ("${{ github.event.inputs.force_execution }}" -eq "true") {
+            Write-Host "🔔 INICIANDO MODO: REPROCESSAMENTO TOTAL (FORCE)"
             python main.py --force
-          else
-            echo "⚡ INICIANDO MODO: CARGA INTELIGENTE (IDEMPOTENTE)"
+          } else {
+            Write-Host "⚡ INICIANDO MODO: CARGA INTELIGENTE (IDEMPOTENTE)"
             python main.py
-          fi
+          }
 
       - name: 🏁 Encerramento do Ciclo
         if: always()
-        shell: bash
-        run: echo "Pipeline SafeDriver concluído com status ${{ job.status }}."
+        shell: pwsh
+        run: Write-Host "Pipeline SafeDriver concluído com status ${{ job.status }}."
