@@ -6,80 +6,72 @@ import logging
 logger = logging.getLogger(__name__)
 
 class CalendarioEstrategico:
-    def __init__(self):
-        self.hoje = datetime.now()
-        # Feriados oficiais de São Paulo Estaduais e Nacionais
+    def __init__(self, data_ref=None):
+        # Permitir injeção de data é essencial para fazer Backtesting (testar o passado)
+        self.hoje = data_ref if data_ref else datetime.now()
+        
+        # Feriados oficiais do Estado de São Paulo
         self.feriados_sp = holidays.BR(state='SP')
 
-    def eh_semana_de_pagamento(self):
+    def is_pagamento(self):
         """
-        Identifica os períodos de maior circulação de dinheiro:
-        - Início do mês (1 ao 7): Salários do 5º dia útil.
-        - Meio do mês (19 ao 22): Adiantamentos e vales.
+        Feature ML (0 ou 1). Identifica períodos de injeção de liquidez:
+        - 5º dia útil (geralmente entre o dia 5 e 10).
+        - Vales e Adiantamentos (dias 19 a 22).
         """
         dia = self.hoje.day
-        return (1 <= dia <= 7) or (19 <= dia <= 22)
+        if (5 <= dia <= 10) or (19 <= dia <= 22):
+            return 1
+        return 0
 
-    def eh_vespera_de_feriado(self):
+    def is_vespera_feriado(self):
         """
-        Verifica se amanhã ou depois de amanhã é feriado.
-        Essencial para antecipar o aumento de risco em rotas de saída e áreas residenciais.
+        Feature ML (0 ou 1). Identifica a proximidade de feriados.
+        Crucial para o modelo detetar esvaziamento residencial e fluxo em autoestradas.
         """
         amanha = self.hoje + timedelta(days=1)
         depois_amanha = self.hoje + timedelta(days=2)
         
-     
-        return (self.hoje in self.feriados_sp) or \
-               (amanha in self.feriados_sp) or \
-               (depois_amanha in self.feriados_sp)
-
-    def obter_multiplicadores(self):
-        """
-        Retorna dicionário com pesos de ajuste para a Predição de Risco.
-        Estes valores multiplicam o score bruto da IA na Camada Ouro.
-        """
-        pesos = {
-            "comercial": 1.0,     # Impacto em TOTAL_NAO_RES_H3
-            "residencial": 1.0,   # Impacto em INDICE_RESIDENCIAL
-            "geral": 1.0          # Multiplicador final do Score
-        }
+        tem_feriado = (self.hoje in self.feriados_sp) or \
+                      (amanha in self.feriados_sp) or \
+                      (depois_amanha in self.feriados_sp)
         
+        return 1 if tem_feriado else 0
 
-        if self.eh_semana_de_pagamento():
-            pesos["comercial"] = 1.25  # +25% de risco em áreas comerciais
-            pesos["geral"] = 1.10      # +10% de elevação basal
-            logger.info("Contexto: Semana de Pagamento detectada.")
+    def is_fds(self):
+        """Feature ML (0 ou 1). Identifica fins de semana."""
+        return 1 if self.hoje.weekday() >= 5 else 0 # 5 = Sábado, 6 = Domingo
 
-        # Ajuste para Vésperas de Feriado (Foco em residências vazias e movimento geral)
-        if self.eh_vespera_de_feriado():
-            pesos["residencial"] = 1.20 # +20% de risco em áreas residenciais
-            pesos["geral"] = 1.15       # +15% de elevação basal
-            logger.info("Contexto: Proximidade de Feriado detectada.")
-            
-        return pesos
+    def obter_contexto_ia(self):
+        """
+        Substitui os antigos 'Multiplicadores'.
+        Retorna um dicionário de features puras para injetar diretamente no DataFrame da Camada Ouro.
+        """
+        contexto = {
+            "IS_PAGAMENTO": self.is_pagamento(),
+            "IS_FERIADO": self.is_vespera_feriado(),
+            "IS_FDS": self.is_fds()
+        }
+        return contexto
 
     def deve_rodar_hoje(self):
         """
-        Lógica de decisão para o GitHub Actions (Batedor).
-        Retorna True se for Domingo OU se houver contexto estratégico.
+        Gatilho de DevOps para o GitHub Actions (O Batedor).
+        Retorna True se for Domingo OU se houver contexto de alta tensão.
         """
-     
         if self.hoje.weekday() == 6:
-            logger.info("Decisão: Domingo detectado. Execução semanal obrigatória.")
+            logger.info("DevOps: Domingo detetado. Execução de rotina autorizada.")
             return True
         
-       
-        if self.eh_semana_de_pagamento() or self.eh_vespera_de_feriado():
-            logger.info("Decisão: Contexto estratégico detectado. Execução antecipada autorizada.")
+        if self.is_pagamento() or self.is_vespera_feriado():
+            logger.info("DevOps: Contexto de tensão detetado (Pagamento/Feriado). Execução tática autorizada.")
             return True
         
-    
-        logger.info("Decisão: Sem gatilhos estratégicos para hoje. Pipeline em repouso.")
+        logger.info("DevOps: Sem gatilhos estratégicos. Pipeline em repouso.")
         return False
 
 if __name__ == "__main__":
-   
     cal = CalendarioEstrategico()
-    print(f"Data: {cal.hoje.strftime('%d/%m/%Y')}")
-    print(f"Deve rodar hoje? {cal.deve_rodar_hoje()}")
-    print(f"Multiplicadores: {cal.obter_multiplicadores()}")
+    print(f"Data Base: {cal.hoje.strftime('%d/%m/%Y')}")
+    print(f"Gatilho GitHub Actions: {cal.deve_rodar_hoje()}")
+    print(f"Features Injetadas na IA: {cal.obter_contexto_ia()}")
