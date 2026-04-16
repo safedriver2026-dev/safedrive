@@ -6,18 +6,18 @@ import boto3
 from botocore.config import Config
 from datetime import datetime
 
-# Importação dos motores do ecossistema SafeDriver
+# Importação dos motores SafeDriver
 try:
     from autobot.ingestao_bronze import IngestaoBronze
     from autobot.processamento_prata import ProcessamentoPrata
     from autobot.treinador_ia import TreinadorEvolutivo
     from autobot.ia_sincronizacao_ouro import CamadaOuroSafeDriver
     from autobot.comunicador import ComunicadorSafeDriver
+    from autobot.calendario_estrategico import CalendarioEstrategico
 except ImportError as e:
-    print(f"Erro ao importar módulos do diretório 'autobot': {e}")
+    print(f"❌ Erro de dependência: {e}")
     sys.exit(1)
 
-# Configuração de Log de Alta Visibilidade
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - [%(levelname)s] - %(message)s', 
@@ -25,19 +25,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def _descobrir_prefixo_datalake(s3, bucket):
-    """Localiza o datalake dinamicamente para evitar erro de caminho."""
-    try:
-        paginator = s3.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=bucket, MaxKeys=100):
-            for obj in page.get('Contents', []):
-                if "datalake/prata/" in obj['Key']:
-                    return obj['Key'].split("datalake/")[0] + "datalake"
-        return "datalake"
-    except: return "datalake"
+def validar_ambiente():
+    """Verifica se todas as chaves de acesso estão presentes antes de iniciar."""
+    keys = ["R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "BQ_SERVICE_ACCOUNT_JSON", "DISCORD_SUCESSO"]
+    missing = [k for k in keys if not os.getenv(k)]
+    if missing:
+        logger.error(f"🚫 Variáveis de ambiente ausentes: {missing}")
+        sys.exit(1)
+    logger.info("✅ Validação de ambiente concluída.")
 
-def verificar_estado_remoto(camada_arquivo):
-    """Verifica a existência física de artefatos no Cloudflare R2 com caminho inteligente."""
+def verificar_existencia_r2(caminho_relativo):
+    """Verifica fisicamente se um arquivo existe no storage R2."""
     try:
         s3 = boto3.client('s3', 
             endpoint_url=os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/'),
@@ -46,111 +44,79 @@ def verificar_estado_remoto(camada_arquivo):
             config=Config(signature_version='s3v4')
         )
         bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-        base_path = _descobrir_prefixo_datalake(s3, bucket)
-        
-        full_key = f"{base_path}/{camada_arquivo}".replace("//", "/")
-        s3.head_object(Bucket=bucket, Key=full_key)
+        # Assume 'datalake/' como base padrão se não detectar dinamicamente
+        s3.head_object(Bucket=bucket, Key=f"datalake/{caminho_relativo}".replace("//", "/"))
         return True
     except:
         return False
 
 def orquestrar_pipeline(force_reprocess=False):
-    """
-    Coordena o ciclo de vida dos dados com Observabilidade e Retomada Inteligente.
-    """
-    logger.info(f"🛡️ SafeDriver Maestro: Iniciando ciclo (Modo Force: {force_reprocess}).")
+    validar_ambiente()
     start_time = datetime.now()
     comunicador = ComunicadorSafeDriver()
-
-    # Telemetria adaptada para a era "Heavy Silver"
+    cal = CalendarioEstrategico()
+    
+    # Telemetria de Ciclo
     stats = {
-        "status_camadas": {
-            "bronze": "⏭️ (Cache)", 
-            "prata": "⏭️ (Cache)", 
-            "ia": "⏭️ (Cache)", 
-            "ouro": "⏭️ (Cache)"
-        },
-        "hygiene": {
-            "linhas_in": "N/A (Otimizado)", 
-            "linhas_out": "N/A (Otimizado)", 
-            "taxa_recuperacao": 100, 
-            "linhas_ouro": 0,
-            "recuperado_grade": "N/A"
-        },
-        "metrics_ia": {"mae": "Aguardando..."},
-        "duracao": "0s"
+        "status_camadas": {"bronze": "⏭️", "prata": "⏭️", "ia": "⏭️", "ouro": "⏭️"},
+        "metrics_ia": {"mae": "N/A"},
+        "duracao": "0s",
+        "severidade_total": 0
     }
 
     try:
-        # --- ETAPA 1: BRONZE (Ingestão) ---
+        # 1. GATILHOS DE EXECUÇÃO
+        # Se o Calendário Estratégico diz que 'deve_rodar_hoje', forçamos a Ouro pelo menos
+        deve_rodar_estrategico = cal.deve_rodar_hoje()
+        
+        # --- ETAPA 1: BRONZE ---
         bronze = IngestaoBronze()
         novos_dados_bronze = bronze.executar_ingestao_continua(force=force_reprocess)
-        if novos_dados_bronze: 
-            stats["status_camadas"]["bronze"] = "✅ (Novo)"
+        if novos_dados_bronze: stats["status_camadas"]["bronze"] = "✅ Novo"
 
-        # --- ANÁLISE DE ESTADO FÍSICO COM GATILHOS BLINDADOS ---
-        prata_existe = verificar_estado_remoto("prata/ssp_consolidada_2022.parquet")
-        modelos_existem = verificar_estado_remoto("modelos_ml/latest_cat_geral.pkl")
-        ouro_existe = verificar_estado_remoto("ouro/fato_risco_consolidada.parquet")
+        # --- VERIFICAÇÃO DE ESTADO ---
+        ano_atual = datetime.now().year
+        prata_existe = verificar_existencia_r2(f"prata/ssp_consolidada_{ano_atual}.parquet")
+        modelos_existem = verificar_existencia_r2("modelos_ml/latest_cat_geral.pkl")
         
-        gatilho_prata = novos_dados_bronze or force_reprocess or not prata_existe
-        gatilho_ia = gatilho_prata or not modelos_existem
-        gatilho_ouro = gatilho_ia or not ouro_existe
-
-        # --- ETAPA 2: PRATA (Heavy Silver) ---
-        if gatilho_prata:
-            logger.info("🚀 Prata: Iniciando processamento e engenharia de features...")
+        # --- ETAPA 2: PRATA ---
+        if novos_dados_bronze or force_reprocess or not prata_existe:
+            logger.info("🚀 Iniciando Camada Prata (Matriz de Gravidade)...")
             prata = ProcessamentoPrata()
-            metricas_prata = prata.executar_todos_os_anos(force=force_reprocess)
-            
-            if metricas_prata:
-                stats["status_camadas"]["prata"] = "✅ (Processado)"
-            else:
-                stats["status_camadas"]["prata"] = "⚠️ (Vazio/Erro)"
-        else:
-            logger.info("⏭️ Prata: Cache geográfico validado.")
-
-        # --- ETAPA 3: IA (Treinamento Evolutivo) ---
-        if gatilho_ia:
-            logger.info("🧠 IA: Iniciando treinamento dos modelos Tweedie...")
-            treinador = TreinadorEvolutivo(dev_mode=False) 
-            if treinador.treinar_modelo_mestre():
-                stats["status_camadas"]["ia"] = "✅ (Treinado)"
-                stats["metrics_ia"].update(treinador.obter_stats())
-            else:
-                comunicador.relatar_erro_critico("Treinador IA", "Falha no treinamento.")
-                return
-        else:
-            logger.info("⏭️ IA: Modelos de produção validados.")
-
-        # --- ETAPA 4: OURO (Predição e BigQuery) ---
-        if gatilho_ouro:
-            logger.info("🏆 OURO: Sincronizando Data Warehouse e SHAP...")
-            ouro = CamadaOuroSafeDriver(dev_mode=False) 
-            if ouro.executar_predicao_atual():
-                stats["status_camadas"]["ouro"] = "✅ (Sincronizado)"
-                # Como a Ouro processa a malha total enriquecida, podemos usar o height da malha como métrica de sucesso
-                stats["hygiene"]["linhas_ouro"] = "Toda a Malha (H9)"
-            else:
-                comunicador.relatar_erro_critico("Camada Ouro", "Erro na sincronização com BigQuery.")
-                return
-        else:
-            logger.info("⏭️ Ouro: Data Warehouse atualizado.")
+            if prata.executar_todos_os_anos(force=force_reprocess):
+                stats["status_camadas"]["prata"] = "✅ Atualizada"
+            else: raise Exception("Falha no processamento da Prata.")
         
-        # --- FINALIZAÇÃO E RELATÓRIO ---
-        stats["duracao"] = str(datetime.now() - start_time).split(".")[0]
+        # --- ETAPA 3: IA ---
+        if stats["status_camadas"]["prata"] == "✅ Atualizada" or not modelos_existem:
+            logger.info("🧠 Iniciando Treinamento IA (Corte Cronológico)...")
+            treinador = TreinadorEvolutivo()
+            if treinador.treinar_modelo_mestre():
+                stats["status_camadas"]["ia"] = "✅ Treinado"
+                stats["metrics_ia"].update(treinador.obter_stats())
+            else: raise Exception("Falha no treinamento da IA.")
 
-        logger.info(f"✨ SafeDriver finalizado. Enviando telemetria para o Discord...")
+        # --- ETAPA 4: OURO ---
+        # A Ouro roda se houver novos dados, novos modelos ou se for um dia estratégico (Pagamento/Feriado)
+        if stats["status_camadas"]["ia"] == "✅ Treinado" or deve_rodar_estrategico or force_reprocess:
+            logger.info("🏆 Iniciando Camada Ouro (Star Schema BigQuery)...")
+            ouro = CamadaOuroSafeDriver()
+            if ouro.executar_predicao_atual():
+                stats["status_camadas"]["ouro"] = "✅ Sincronizado"
+            else: raise Exception("Falha na sincronização da Ouro.")
+
+        # Finalização
+        stats["duracao"] = str(datetime.now() - start_time).split(".")[0]
         comunicador.enviar_relatorio_executivo(stats)
+        logger.info(f"✨ Ciclo concluído com sucesso em {stats['duracao']}.")
 
     except Exception as e:
-        logger.error(f"💥 FALHA CRÍTICA NO ORQUESTRADOR: {e}", exc_info=True)
-        comunicador.relatar_erro_critico("Maestro Central", str(e))
+        logger.error(f"💥 FALHA NO MAESTRO: {e}", exc_info=True)
+        comunicador.relatar_erro_critico("Orquestrador Central", str(e))
         sys.exit(1)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Maestro SafeDriver")
-    parser.add_argument('--force', action='store_true', default=False, help="Forçar reprocessamento total")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--force', action='store_true', help="Forçar reprocessamento")
     args = parser.parse_args()
-    
     orquestrar_pipeline(force_reprocess=args.force)
