@@ -106,27 +106,34 @@ class IngestaoBronze:
                     if real_header_idx is not None:
                         df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": real_header_idx})
                         
-                        # Padroniza os nomes das colunas
-                        df.columns = [c.upper().strip() for c in df.columns]
+                        # --- 1. A SOLUÇÃO NUCLEAR DO CABEÇALHO ---
+                        # Se a SSP fundiu a capa com a coluna A, nós interceptamos e renomeamos
+                        colunas_limpas = []
+                        for idx_col, col_name in enumerate(df.columns):
+                            c_str = str(col_name).upper().strip()
+                            # Se a coluna tiver o texto da capa ou for gigante, neutralizamos
+                            if "PRESENTE TABELA" in c_str or "FINALIDADE" in c_str or len(c_str) > 70:
+                                colunas_limpas.append(f"INFO_RECUPERADA_{idx_col}")
+                            else:
+                                colunas_limpas.append(c_str)
+                        df.columns = colunas_limpas
                         
-                        # --- A BALA DE PRATA PARA O VSTACK ERROR ---
-                        # Converte TODAS as colunas para String imediatamente.
-                        # Isso garante que Date e Datetime, ou Int e Float, sejam empilhados sem erro.
+                        # Converte tudo para string para evitar crashes no concat
                         df = df.with_columns(pl.all().cast(pl.String))
                         
-                        # Remove linhas onde a primeira coluna (ex: NUM_BO ou ANO_BO) é nula
-                        df = df.filter(pl.col(df.columns[0]).is_not_null())
+                        # --- 2. A SOLUÇÃO NUCLEAR DAS LINHAS ---
+                        # Filtra qualquer linha que contenha esse texto maldito em *QUALQUER* coluna
+                        regex_capa = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
+                        df = df.filter(~pl.any_horizontal(pl.all().str.contains(regex_capa)))
+                        
+                        # Removemos linhas que por ventura ficaram vazias após a limpeza
+                        df = df.filter(pl.any_horizontal(pl.all().is_not_null()))
+                        
                         dfs.append(df)
                 except: continue
 
             if dfs:
-                # O concat agora é 100% seguro porque tudo é String
                 df_trusted = pl.concat(dfs, how="diagonal")
-                
-                # Filtro Anti-Capa
-                df_trusted = df_trusted.filter(
-                    ~pl.col(df_trusted.columns[0]).str.contains(r"(?i)PRESENTE|TABELA|FINALIDADE|CONTEÚDO")
-                )
 
                 logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros...")
                 
@@ -145,7 +152,7 @@ class IngestaoBronze:
                 df_trusted.write_parquet(buffer)
                 self.s3.put_object(Bucket=self.bucket, Key=path_trusted, Body=buffer.getvalue())
                 
-                logger.info(f"BRONZE: [{ano}] Trusted sincronizada com sucesso.")
+                logger.info(f"BRONZE: [{ano}] Trusted sincronizada sem a capa da SSP.")
                 return True
                 
         except Exception as e:
