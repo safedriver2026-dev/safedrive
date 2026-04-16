@@ -10,16 +10,19 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
+        # Credenciais Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
+        # Configuração de Conexão S3 de Alta Performance
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
                               aws_access_key_id=self.access_key,
                               aws_secret_access_key=self.secret_key, 
@@ -64,92 +67,136 @@ class ProcessamentoPrata:
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             self.df_malha_lazy = self.df_malha.lazy().with_columns([
                 self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
-                self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO"),
-                self._limpar_texto_extremo("LOGRADOURO").alias("LOGRADOURO_GRID")
+                self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-            
-            self.lookup_endereco = (
-                self.df_malha_lazy
-                .filter(pl.col("LOGRADOURO_GRID") != "INDEFINIDO")
-                .group_by(["LOGRADOURO_GRID", "NM_BAIRRO", "NM_MUN"])
-                .agg(pl.col("H3_INDEX").first())
-            ).collect()
-            
-            logger.info("PRATA: Dependências e Tipagem de Malha inicializadas.")
+            logger.info("PRATA: Malha geográfica mestre carregada.")
         except Exception as e:
-            logger.error(f"PRATA: Falha crítica na inicialização: {e}")
+            logger.error(f"PRATA: Falha ao carregar malha H3: {e}")
             self.df_malha_lazy = None
 
+    def _curar_malha_referencia(self, df_bo_limpo):
+        if self.df_malha is None: return
+        df_conhecimento = (
+            df_bo_limpo.filter((pl.col("H3_INDEX").is_not_null()) & (pl.col("NM_MUN_ORIGINAL") != "INDEFINIDO"))
+            .group_by("H3_INDEX").agg([
+                pl.col("NM_MUN_ORIGINAL").first().alias("MUN_NOVO"),
+                pl.col("NM_BAIRRO_ORIGINAL").first().alias("BAIRRO_NOVO")
+            ])
+        )
+        malha_antes = self.df_malha.filter((pl.col("NM_MUN") != "INDEFINIDO") & (pl.col("NM_MUN").is_not_null())).height
+        self.df_malha = self.df_malha.join(df_conhecimento, on="H3_INDEX", how="left").with_columns([
+            pl.coalesce([pl.col("MUN_NOVO"), pl.col("NM_MUN")]).fill_null("INDEFINIDO").alias("NM_MUN"),
+            pl.coalesce([pl.col("BAIRRO_NOVO"), pl.col("NM_BAIRRO")]).fill_null("INDEFINIDO").alias("NM_BAIRRO")
+        ]).drop(["MUN_NOVO", "BAIRRO_NOVO"])
+        
+        malha_depois = self.df_malha.filter((pl.col("NM_MUN") != "INDEFINIDO") & (pl.col("NM_MUN").is_not_null())).height
+        self.campos_recuperados_grade += (malha_depois - malha_antes)
+        self.df_malha_lazy = self.df_malha.lazy()
+
+    def _gerar_features_espaciais_ia(self, df_pd):
+        usar_grid_disk = hasattr(h3, 'grid_disk')
+        df_unique = df_pd.groupby('H3_INDEX', as_index=False)['TOTAL_CRIMES'].sum()
+        crimes_dit = dict(zip(df_unique['H3_INDEX'], df_unique['TOTAL_CRIMES']))
+        contagio_dit = {}
+        for h3_index in df_unique['H3_INDEX']:
+            try:
+                v1 = set(h3.grid_disk(h3_index, 1) if usar_grid_disk else h3.k_ring(h3_index, 1))
+                v1.discard(h3_index)
+                c1 = sum(crimes_dit.get(v, 0) for v in v1)
+                v_total = set(h3.grid_disk(h3_index, 2) if usar_grid_disk else h3.k_ring(h3_index, 2))
+                v2 = v_total - v1
+                contagio_dit[h3_index] = (c1 * 1.0) + (sum(crimes_dit.get(v, 0) for v in v2) * 0.5)
+            except: contagio_dit[h3_index] = 0.0
+        df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_dit)
+        df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
+        return df_pd
+
     def processar_ano_com_delta(self, ano, estado, force=False):
-        path_trusted_bronze = f"{self.base_path}/bronze/trusted/ssp_trusted_{ano}.parquet"
+        path_trusted = f"{self.base_path}/bronze/trusted/ssp_trusted_{ano}.parquet"
         path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
         
         try:
-            # 1. Carregamento dos dados "Texto" da Bronze
-            resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted_bronze)
+            meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
+            tamanho_atual = meta['ContentLength']
+            if not force and estado.get(str(ano)) == tamanho_atual: return None
+
+            resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # --- 2. CONVERSÃO DE TIPOS (O CORAÇÃO DA PRATA) ---
-            # Aqui transformamos o texto em dados matemáticos e temporais
-            
+            lf = lf.filter((pl.col("H3_INDEX").is_not_null()))
+            total_in = lf.select(pl.len()).collect().item()
+
             mapeamento = {
-                "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL",
-                "BAIRRO": "NM_BAIRRO_ORIGINAL", "LOGRADOURO": "LOGRADOURO_ORIGINAL",
-                "DATA_OCORRENCIA_BO": "DATA_BRUTA", "DATA_OCORRENCIA": "DATA_BRUTA"
+                "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL", "BAIRRO": "NM_BAIRRO_ORIGINAL",
+                "HORA_OCORRENCIA_BO": "HORA", "DATA_OCORRENCIA_BO": "DATA_BRUTA", "DATA_OCORRENCIA": "DATA_BRUTA"
             }
             lf = lf.rename({old: new for old, new in mapeamento.items() if old in lf.collect_schema().names()})
 
-            # Casting de Datas, Horas e Coordenadas
-            lf = lf.with_columns([
-                # Datas: de Texto para Date
-                pl.col("DATA_BRUTA").str.to_date(format="%d/%m/%Y", strict=False).alias("DATA_PARSED"),
-                
-                # Coordenadas: de Texto para Float (Tratando a vírgula do Excel)
-                pl.col("LATITUDE").cast(pl.String).str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
-                pl.col("LONGITUDE").cast(pl.String).str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
-                
-                # Horas: Pegando apenas o Inteiro da hora para Sazonalidade
-                pl.col("HORA_OCORRENCIA_BO").cast(pl.String).str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT")
+            if "DATA_BRUTA" in lf.collect_schema().names():
+                lf = lf.with_columns(pl.col("DATA_BRUTA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"))
+                lf = lf.with_columns([
+                    pl.col("DATA").dt.month().fill_null(1).alias("MES_OCORRENCIA"),
+                    pl.col("DATA").dt.weekday().fill_null(1).alias("DIA_SEMANA_OCORRENCIA")
+                ])
+            
+            lf_agg = lf.group_by(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA"]).agg([
+                pl.when(pl.col("RUBRICA").str.contains("(?i)ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES")
             ])
 
-            # Criação de colunas de Sazonalidade (Úteis para IA)
-            lf = lf.with_columns([
-                pl.col("DATA_PARSED").dt.month().fill_null(1).alias("MES"),
-                pl.col("DATA_PARSED").dt.weekday().fill_null(1).alias("DIA_SEMANA"),
-                pl.col("DATA_PARSED").dt.year().fill_null(ano).alias("ANO_REF")
+            lf_agg = lf_agg.with_columns([self._limpar_texto_extremo(c) for c in ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]])
+            self._curar_malha_referencia(lf_agg.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect())
+
+            lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
+                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN_FINAL"),
+                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO_FINAL"),
+                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float64).fill_null(0.0).alias("DENSIDADE")
             ])
 
-            # --- 3. LIMPEZA DE TEXTO E RECUPERAÇÃO H3 ---
-            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "LOGRADOURO_ORIGINAL", "RUBRICA"]
-            lf = lf.with_columns([self._limpar_texto_extremo(c) for c in campos_texto if c in lf.collect_schema().names()])
-
-            # Resgate por endereço (Mão Dupla)
-            lf = lf.join(
-                self.lookup_endereco.lazy(),
-                left_on=["LOGRADOURO_ORIGINAL", "NM_BAIRRO_ORIGINAL", "NM_MUN_ORIGINAL"],
-                right_on=["LOGRADOURO_GRID", "NM_BAIRRO", "NM_MUN"],
-                how="left"
-            ).with_columns(
-                pl.coalesce([pl.col("H3_INDEX"), pl.col("H3_INDEX_right")]).alias("H3_INDEX")
-            ).drop("H3_INDEX_right")
-
-            # Filtramos quem não tem H3 após o resgate
-            lf = lf.filter(pl.col("H3_INDEX").is_not_null())
-
-            # --- 4. AGREGAÇÃO FINAL (TRIPADA) ---
-            # Agora que temos tipos (Int, Date), podemos somar e agrupar
-            lf_final = lf.group_by(["H3_INDEX", "ANO_REF", "MES", "DIA_SEMANA", "HORA_INT", "RUBRICA"]).agg([
-                pl.len().alias("QTD_CRIMES")
+            df_final_pd = self._gerar_features_espaciais_ia(lf_enriquecido.collect().to_pandas())
+            df_final = pl.from_pandas(df_final_pd).with_columns([
+                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).alias("INDICE_EXPOSICAO"),
+                pl.lit(ano).alias("ANO_REFERENCIA")
             ])
 
-            # Persistência
             buffer = io.BytesIO()
-            lf_final.collect().write_parquet(buffer, compression="lz4")
+            df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
-            logger.info(f"PRATA: [{ano}] Tipagem concluída e dados consolidados.")
-            return True
-
+            estado[str(ano)] = tamanho_atual 
+            return {"linhas_in": total_in, "linhas_out": df_final.height}
         except Exception as e:
-            logger.error(f"PRATA: Falha no casting/processamento de {ano}: {e}")
-            return False
+            logger.error(f"PRATA: Erro no ano {ano}: {e}")
+            return None
+
+    def executar_todos_os_anos(self, force=False):
+        """Metodo de entrada para o Maestro."""
+        stats = {"linhas_in": 0, "linhas_out": 0}
+        estado = self._carregar_tracker()
+        for ano in range(2022, datetime.now().year + 1):
+            res = self.processar_ano_com_delta(ano, estado, force)
+            if res:
+                stats["linhas_in"] += res["linhas_in"]
+                stats["linhas_out"] += res["linhas_out"]
+                self._salvar_tracker(estado)
+        
+        if self.campos_recuperados_grade > 0:
+            buffer_malha = io.BytesIO()
+            self.df_malha.write_parquet(buffer_malha, compression="lz4")
+            self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer_malha.getvalue())
+
+        stats["recuperado_grade"] = self.campos_recuperados_grade
+        stats["taxa_recuperacao"] = round((stats["linhas_out"] / stats["linhas_in"] * 100), 2) if stats["linhas_in"] > 0 else 100
+        stats["status_camadas"] = {"prata": "✅ Concluido"}
+        return stats
+
+    def _carregar_tracker(self):
+        try:
+            return json.loads(self.s3.get_object(Bucket=self.bucket, Key=self.tracker_path)['Body'].read())
+        except: return {}
+
+    def _salvar_tracker(self, estado):
+        self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
+
+if __name__ == "__main__":
+    prata = ProcessamentoPrata()
+    prata.executar_todos_os_anos(force=True)
