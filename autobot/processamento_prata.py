@@ -4,7 +4,7 @@ import h3, boto3, io, os, json, logging, gc
 from botocore.config import Config
 from datetime import datetime
 
-# Auditoria de Processamento
+# Auditoria de Processamento de Alta Fidelidade
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -39,9 +39,9 @@ class ProcessamentoPrata:
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).unique(subset=["H3_INDEX"])
-            logger.info("PRATA: Malha geográfica H3-9 carregada com sucesso.")
+            logger.info("PRATA: Malha geográfica H3-9 carregada.")
         except Exception as e:
-            logger.error(f"PRATA: Erro ao carregar malha base: {e}")
+            logger.error(f"PRATA: Erro na malha base: {e}")
             self.df_malha = None
 
     def processar_ano_com_delta(self, ano, estado, force=False):
@@ -51,17 +51,15 @@ class ProcessamentoPrata:
         try:
             meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
             if not force and estado.get(str(ano)) == meta['ContentLength']: 
-                logger.info(f"PRATA: [{ano}] Sem alterações detectadas. Ignorando.")
                 return False
 
-            logger.info(f"PRATA: [{ano}] Iniciando consolidação resiliente...")
+            logger.info(f"PRATA: [{ano}] Iniciando processamento de alta resolução...")
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # 1. MOTOR DE COMPATIBILIDADE (Tratamento de Esquemas 2022-2026)
+            # 1. MOTOR DE COMPATIBILIDADE (2022-2026)
             cols = lf.collect_schema().names()
             rename_map = {}
-            
             mapa_fontes = {
                 "NM_MUN_ORIGINAL": ["NOME_MUNICIPIO", "CIDADE"],
                 "DATA_BRUTA": ["DATA_OCORRENCIA_BO", "DATA_OCORRENCIA"],
@@ -76,16 +74,14 @@ class ProcessamentoPrata:
                 if match: rename_map[match] = target
 
             lf = lf.rename(rename_map).filter(pl.col("H3_INDEX").is_not_null())
-            
-            # 2. ENGENHARIA DE CONTEXTO (Temporal e Gravidade)
             cols_atuais = lf.collect_schema().names()
             
+            # 2. ENGENHARIA DE CONTEXTO HÍBRIDA
             lf = lf.with_columns([
                 pl.col("DATA_BRUTA").str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
                 pl.col("HORA").str.split(":").list.first().cast(pl.Int8, strict=False).alias("HORA_INT"),
                 (pl.col("PERIODO_SSP").str.to_uppercase() if "PERIODO_SSP" in cols_atuais else pl.lit("INDEFINIDO")).alias("PERIODO_RAW")
             ]).with_columns([
-                # Lógica de Período Híbrida (Hora > Descrição > Noite)
                 pl.when(pl.col("HORA_INT").is_not_null())
                   .then(
                       pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
@@ -100,7 +96,6 @@ class ProcessamentoPrata:
                         .otherwise(pl.lit("NOITE"))
                   ).alias("PERIODO_DIA"),
 
-                # Matriz de Gravidade (Target da IA)
                 pl.when(pl.col("RUBRICA").str.contains("(?i)HOMICIDIO|LATROCINIO|ESTUPRO|SEQUESTRO|MORTE")).then(pl.lit(10.0))
                   .when(pl.col("RUBRICA").str.contains("(?i)ROUBO")).then(pl.lit(5.0))
                   .when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit(3.0))
@@ -109,8 +104,7 @@ class ProcessamentoPrata:
                 pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA")).otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
             ])
 
-            # 3. AGREGAÇÃO E CONSOLIDAÇÃO (Foco no Dano)
-            # TIPO_LOCAL é incluído para evitar o erro de contrato na IA
+            # 3. CONSOLIDAÇÃO DIMENSIONAL
             df_agg = lf.group_by([
                 "H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
                 "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"
@@ -121,28 +115,33 @@ class ProcessamentoPrata:
                 pl.col("DATA").dt.weekday().first().alias("DIA_SEMANA")
             ]).collect()
 
-            # 🚀 INTELIGÊNCIA ESPACIAL ANTECIPADA (Cálculo de Contágio)
-            # Calculamos aqui para que a IA já receba a feature pronta no treino
-            logger.info(f"PRATA: [{ano}] Gerando Contágio Espacial (K-Ring 1)...")
+            # 🚀 RESOLUÇÃO: Memória Temporal e Espacial
             df_pd = df_agg.to_pandas()
-            gravidade_map = df_pd.groupby("H3_INDEX")["INDICE_GRAVIDADE"].sum().to_dict()
             
+            # Mapas de Memória (Agregados por H3 para contexto de vizinhança)
+            gravidade_por_h3 = df_pd.groupby("H3_INDEX")["INDICE_GRAVIDADE"].sum().to_dict()
+            volume_por_h3 = df_pd.groupby("H3_INDEX")["TOTAL_CRIMES"].sum().to_dict()
+
             contagio_map = {}
             for hx in df_pd['H3_INDEX'].unique():
                 try:
                     v1 = h3.k_ring(hx, 1)
-                    contagio_map[hx] = sum(gravidade_map.get(v, 0) for v in v1 if v != hx)
+                    # Soma da gravidade dos vizinhos (Contágio)
+                    contagio_map[hx] = sum(gravidade_por_h3.get(v, 0) for v in v1 if v != hx)
                 except: contagio_map[hx] = 0.0
-            
-            df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
-            df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] 
-            df_pd['ANO_REF'] = ano
-            
-            # Placeholders temporais para compatibilidade com o Treinador
-            df_pd['IS_PAGAMENTO'] = 0 
-            df_pd['IS_FDS'] = (df_pd['DIA_SEMANA'] >= 5).astype(int)
 
-            # 4. ENRIQUECIMENTO GEOGRÁFICO FINAL
+            # --- INJEÇÃO DE FEATURES DISCRIMINANTES ---
+            df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
+            df_pd['GRAVIDADE_HISTORICA'] = df_pd['INDICE_GRAVIDADE'] # Memória do grão (H3+Periodo+Perfil)
+            df_pd['VOLUME_HISTORICO'] = df_pd['TOTAL_CRIMES']       # Densidade de eventos do grão
+            df_pd['PESO_TOTAL_H3'] = df_pd['H3_INDEX'].map(gravidade_por_h3) # Memória do local (Todos os turnos)
+            
+            df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO']
+            df_pd['ANO_REF'] = ano
+            df_pd['IS_FDS'] = (df_pd['DIA_SEMANA'] >= 5).astype(int)
+            df_pd['IS_PAGAMENTO'] = 0 # Placeholder a ser populado no Treinador/Ouro
+
+            # 4. JOIN GEOGRÁFICO FINAL
             df_final = pl.from_pandas(df_pd).join(
                 self.df_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]), 
                 on="H3_INDEX", how="left"
@@ -153,28 +152,25 @@ class ProcessamentoPrata:
                 pl.col("TIPO_LOCAL").fill_null("VIA PUBLICA")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "DENSIDADE_AJUSTADA"])
 
-            # 5. GRAVAÇÃO EM PARQUET LZ4
+            # 5. PERSISTÊNCIA LZ4
             buffer = io.BytesIO()
             df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = meta['ContentLength']
-            logger.info(f"PRATA: [{ano}] Ciclo finalizado com sucesso.")
             return True
             
         except Exception as e:
-            logger.error(f"PRATA: Falha crítica no processamento de {ano}: {e}")
+            logger.error(f"PRATA: Erro crítico em {ano}: {e}")
             return False
 
     def executar_todos_os_anos(self, force=False):
-        logger.info("PRATA: Iniciando consolidação multi-safra.")
+        logger.info("PRATA: Iniciando consolidação com Memória Temporal.")
         estado = self._carregar_tracker()
-        processou_algo = False
         for ano in range(2022, datetime.now().year + 1):
             if self.processar_ano_com_delta(ano, estado, force):
-                processou_algo = True
                 self._salvar_tracker(estado)
-        return processou_algo
+        return True
 
     def _carregar_tracker(self):
         try:
