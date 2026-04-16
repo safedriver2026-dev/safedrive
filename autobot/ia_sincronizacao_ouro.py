@@ -14,7 +14,6 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 from autobot.calendario_estrategico import CalendarioEstrategico
 
-# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -22,13 +21,11 @@ class CamadaOuroSafeDriver:
     def __init__(self, dev_mode=False):
         self.dev_mode = dev_mode
         
-        # Conectividade Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        # Conectividade Google BigQuery
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9").strip()
         self.dataset_id = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip()
 
@@ -41,10 +38,8 @@ class CamadaOuroSafeDriver:
         self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         self.cal = CalendarioEstrategico()
         
-        # Pesos do Ensemble (CatBoost domina pela estabilidade Tweedie)
         self.pesos = {"catboost": 0.70, "lightgbm": 0.30}
         
-        # SCHEMA ALINHADO: Exatamente o que o Treinador IA gerou
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
             'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
@@ -79,7 +74,6 @@ class CamadaOuroSafeDriver:
             logger.error(f"OURO: Falha na autenticação BigQuery: {e}")
 
     def executar_predicao_atual(self):
-        """Fluxo principal: Predição -> SHAP -> BigQuery."""
         logger.info(f"OURO: Iniciando Ciclo de Inteligência Preditiva.")
         try:
             modelos = self._carregar_modelos_producao()
@@ -89,10 +83,8 @@ class CamadaOuroSafeDriver:
                 logger.error("OURO: Insumos (modelos ou dados) não encontrados.")
                 return False
 
-            # Geração dos Scores de Risco
             df_final = self._gerar_scores_ponderados(df_input, modelos)
             
-            # Dupla Persistência (R2 para histórico e BigQuery para consumo)
             self._salvar_parquet_ouro(df_final)
             self._sincronizar_bq(df_final)
             
@@ -114,10 +106,11 @@ class CamadaOuroSafeDriver:
         return modelos
 
     def _gerar_contagio_na_malha_total(self, df_malha, df_crimes_prata):
-        """Projeta a pressão dos crimes vizinhos sobre a malha geográfica total."""
         logger.info("OURO: Projetando contágio espacial sobre a malha mestre...")
+        
+        # AGORA a Ouro puxa não apenas TOTAL_CRIMES, mas a inteligência da Prata
         df_full = df_malha.join(
-            df_crimes_prata.select(["H3_INDEX", "TOTAL_CRIMES"]), 
+            df_crimes_prata.select(["H3_INDEX", "TOTAL_CRIMES", "RANKING_PRATA", "EXPOSICAO_PRATA"]), 
             on="H3_INDEX", 
             how="left"
         ).with_columns(pl.col("TOTAL_CRIMES").fill_null(0))
@@ -129,12 +122,10 @@ class CamadaOuroSafeDriver:
         contagio = []
         for h3_index in df_pd['H3_INDEX']:
             try:
-                # Vizinhos Raio 1
                 v1 = set(h3.grid_disk(h3_index, 1) if usar_grid_disk else h3.k_ring(h3_index, 1))
                 v1.discard(h3_index)
                 c1 = sum(crimes_dit.get(v, 0) for v in v1)
                 
-                # Vizinhos Raio 2 (Peso menor)
                 v_total = set(h3.grid_disk(h3_index, 2) if usar_grid_disk else h3.k_ring(h3_index, 2))
                 v2 = v_total - v1
                 v2.discard(h3_index)
@@ -149,36 +140,45 @@ class CamadaOuroSafeDriver:
         return pl.from_pandas(df_pd)
 
     def _obter_contexto_preditivo_total(self):
-        """Une a malha curada com os crimes da prata para criar o input da IA."""
         try:
-            # Carrega a malha (que já foi curada pela Prata)
             resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read()))
 
-            # Carrega os crimes consolidados do ano atual
             ano_atual = datetime.now().year
             path_prata = self._get_path("prata", f"ssp_consolidada_{ano_atual}.parquet")
             resp_p = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
             df_prata = pl.read_parquet(io.BytesIO(resp_p['Body'].read()))
 
-            df_enriquecida = self._gerar_contagio_na_malha_total(df_malha, df_prata)
+            # Resumo da Prata: Agrupamos para extrair as médias reais de Ranking e Exposição
+            df_prata_agg = df_prata.group_by("H3_INDEX").agg([
+                pl.col("TOTAL_CRIMES").sum().alias("TOTAL_CRIMES"),
+                pl.col("RANKING_RISCO_LOCAL").mean().alias("RANKING_PRATA"),
+                pl.col("INDICE_EXPOSICAO").mean().alias("EXPOSICAO_PRATA")
+            ])
 
-            # Preenchimento de atributos para o cenário de predição atual
+            df_enriquecida = self._gerar_contagio_na_malha_total(df_malha, df_prata_agg)
+
             df_final = df_enriquecida.with_columns([
                 pl.col("NM_MUN").fill_null("SAO PAULO"),
                 pl.col("NM_BAIRRO").fill_null("INDEFINIDO"),
+                
+                # Contexto de Predição Padrão
                 pl.lit("TARDE").alias("PERIODO_DIA"), 
                 pl.lit("PEDESTRE").alias("PERFIL_ALVO"),
                 pl.lit("VIA PUBLICA").alias("TIPO_LOCAL"),
                 pl.lit(datetime.now().month).alias("MES_OCORRENCIA"),
                 pl.lit(datetime.now().weekday()).alias("DIA_SEMANA_OCORRENCIA"),
+                
+                # Aproveitando as Features Reais
                 pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE"),
-                pl.lit(0.5).alias("RANKING_RISCO_LOCAL"),
-                pl.lit(0.1).alias("INDICE_EXPOSICAO")
+                pl.col("TAXA_VACANCIA").fill_null(0.0),
+                
+                # O Pulo do Gato: Puxa o valor histórico da Prata. Se for lugar virgem, aí sim usa o default.
+                pl.col("RANKING_PRATA").fill_null(0.5).alias("RANKING_RISCO_LOCAL"),
+                pl.col("EXPOSICAO_PRATA").fill_null(0.1).alias("INDICE_EXPOSICAO")
             ])
 
             df_pd = df_final.to_pandas()
-            # Tipagem rigorosa para evitar que o modelo quebre
             for col in self.features_categoricas:
                 df_pd[col] = df_pd[col].astype(str).astype('category')
             for col in self.features_numericas:
@@ -190,28 +190,23 @@ class CamadaOuroSafeDriver:
             return None
 
     def _gerar_scores_ponderados(self, df, modelos):
-        """Calcula o risco final e extrai a explicabilidade (SHAP)."""
         logger.info("OURO: Gerando scores e SHAP explainability...")
         mults = self.cal.obter_multiplicadores()
         
-        # Predição via Ensemble
         p_cat = modelos["cat"].predict(df[self.features_full])
         p_lgb = modelos["lgb"].predict(df[self.features_full]) if modelos["lgb"] else p_cat
         
         score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
         df['SCORE_RISCO_BRUTO'] = score_base * mults.get("geral", 1.0)
         
-        # Normalização para escala 0-100
         max_val = df['SCORE_RISCO_BRUTO'].max() or 1
         df['SCORE_RISCO_FINAL'] = ((df['SCORE_RISCO_BRUTO'] / max_val) * 100).clip(0, 100).round(2)
         
-        # Alerta de transbordamento (Local vazio mas vizinhança perigosa)
         if 'TOTAL_CRIMES' in df.columns:
             df['FLAG_ALERTA_SILENCIOSO'] = (df['TOTAL_CRIMES'] == 0) & (df['SCORE_RISCO_FINAL'] > 75)
         
         df['DT_PROCESSAMENTO'] = datetime.now()
 
-        # SHAP para os top 3000 registros (otimização de tempo)
         try:
             explainer = shap.TreeExplainer(modelos["cat"])
             df_top = df.nlargest(min(len(df), 3000), 'SCORE_RISCO_FINAL')
@@ -239,7 +234,6 @@ class CamadaOuroSafeDriver:
         logger.info("OURO: Persistido no R2 (Format: Parquet).")
 
     def _sincronizar_bq(self, df):
-        """Sincroniza os dados com o BigQuery via Merge Atômico."""
         tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_h3_vigente"
         tabela_staging = f"{tabela_final}_staging"
         
@@ -247,11 +241,9 @@ class CamadaOuroSafeDriver:
         for col in self.features_categoricas:
             df_bq[col] = df_bq[col].astype(str)
 
-        # Upload para staging
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         self.bq_client.load_table_from_dataframe(df_bq, tabela_staging, job_config=job_config).result()
         
-        # Merge para evitar duplicatas e manter o estado atual
         sql_merge = f"""
         MERGE `{tabela_final}` T
         USING `{tabela_staging}` S
