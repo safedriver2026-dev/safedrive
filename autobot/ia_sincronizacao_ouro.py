@@ -40,10 +40,11 @@ class CamadaOuroSafeDriver:
         
         self.pesos = {"catboost": 0.70, "lightgbm": 0.30}
         
+        # --- SCHEMA ALINHADO COM A HEAVY SILVER E O TREINADOR ---
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
             'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
-            'MES_OCORRENCIA', 'DIA_SEMANA_OCORRENCIA'
+            'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS' # <-- Ajuste vital
         ]
         
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
@@ -108,7 +109,6 @@ class CamadaOuroSafeDriver:
     def _gerar_contagio_na_malha_total(self, df_malha, df_crimes_prata):
         logger.info("OURO: Projetando contágio espacial sobre a malha mestre...")
         
-        # AGORA a Ouro puxa não apenas TOTAL_CRIMES, mas a inteligência da Prata
         df_full = df_malha.join(
             df_crimes_prata.select(["H3_INDEX", "TOTAL_CRIMES", "RANKING_PRATA", "EXPOSICAO_PRATA"]), 
             on="H3_INDEX", 
@@ -149,7 +149,7 @@ class CamadaOuroSafeDriver:
             resp_p = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
             df_prata = pl.read_parquet(io.BytesIO(resp_p['Body'].read()))
 
-            # Resumo da Prata: Agrupamos para extrair as médias reais de Ranking e Exposição
+            # Resumo da Prata: Médias Históricas
             df_prata_agg = df_prata.group_by("H3_INDEX").agg([
                 pl.col("TOTAL_CRIMES").sum().alias("TOTAL_CRIMES"),
                 pl.col("RANKING_RISCO_LOCAL").mean().alias("RANKING_PRATA"),
@@ -158,22 +158,28 @@ class CamadaOuroSafeDriver:
 
             df_enriquecida = self._gerar_contagio_na_malha_total(df_malha, df_prata_agg)
 
+            hoje = datetime.now()
+            dia_atual = hoje.day
+            
+            # --- CONSTRUÇÃO DO CONTEXTO ATUAL PARA O MODELO ---
             df_final = df_enriquecida.with_columns([
                 pl.col("NM_MUN").fill_null("SAO PAULO"),
                 pl.col("NM_BAIRRO").fill_null("INDEFINIDO"),
                 
-                # Contexto de Predição Padrão
                 pl.lit("TARDE").alias("PERIODO_DIA"), 
                 pl.lit("PEDESTRE").alias("PERFIL_ALVO"),
                 pl.lit("VIA PUBLICA").alias("TIPO_LOCAL"),
-                pl.lit(datetime.now().month).alias("MES_OCORRENCIA"),
-                pl.lit(datetime.now().weekday()).alias("DIA_SEMANA_OCORRENCIA"),
                 
-                # Aproveitando as Features Reais
+                pl.lit(hoje.month).alias("MES_OCORRENCIA"),
+                pl.lit(hoje.weekday()).alias("DIA_SEMANA"),
+                
+                # Inteligência de Negócio: Dia de Pagamento e Fim de Semana (injetados em tempo real)
+                pl.lit(1 if 5 <= dia_atual <= 10 else 0).alias("IS_PAGAMENTO"),
+                pl.lit(1 if hoje.weekday() >= 6 else 0).alias("IS_FDS"),
+                
                 pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE"),
                 pl.col("TAXA_VACANCIA").fill_null(0.0),
                 
-                # O Pulo do Gato: Puxa o valor histórico da Prata. Se for lugar virgem, aí sim usa o default.
                 pl.col("RANKING_PRATA").fill_null(0.5).alias("RANKING_RISCO_LOCAL"),
                 pl.col("EXPOSICAO_PRATA").fill_null(0.1).alias("INDICE_EXPOSICAO")
             ])
