@@ -9,7 +9,7 @@ import gc
 import logging
 from datetime import datetime
 from catboost import CatBoostRegressor
-from lightgbm import LGBMRegressor
+from lightgbm import LGBMRegressor, early_stopping, log_evaluation
 from sklearn.metrics import mean_absolute_error
 
 # Auditoria de Performance
@@ -34,16 +34,17 @@ class TreinadorEvolutivo:
         self.base_path = self._localizar_datalake_real()
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         
-        # 🎯 A MUDANÇA DE PARADIGMA: IA agora prevê Gravidade (Dano Real) em vez de Volume
+        # 🎯 ALVO: IA prevê Gravidade (Matriz de Pesos)
         self.target = "INDICE_GRAVIDADE"
         
-        # --- SCHEMA DE TREINAMENTO LIMPO (SEM DATA LEAKAGE) ---
+        # --- SCHEMA DE TREINAMENTO (Garantia de Não-Vazamento) ---
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
             'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
         ]
         
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
+        self.features_full = self.features_numericas + self.features_categoricas
         self.stats_treino = {}
 
     def _localizar_datalake_real(self):
@@ -60,110 +61,95 @@ class TreinadorEvolutivo:
         return f"{self.base_path}/{camada}/{filename}".replace("//", "/")
 
     def treinar_modelo_mestre(self):
-        """Ciclo de aprendizado supervisionado com Corte Cronológico Contínuo."""
-        df_treino_full = self._carregar_datalake_consolidado()
+        """Ciclo de aprendizado supervisionado com Split Temporal 80/20."""
+        df_full = self._carregar_datalake_consolidado()
         
-        if df_treino_full is None or len(df_treino_full) < 10:
-            logger.error("IA: Insumos insuficientes para o treinamento.")
+        if df_full is None or len(df_full) < 100:
+            logger.error("IA: Massa de dados insuficiente para o treinamento.")
             return False
 
-        logger.info(f"IA: Iniciando preparação cronológica com {len(df_treino_full)} registros. Target: {self.target}")
-
-        # Tipagem Otimizada (Evita erros do CatBoost e LightGBM)
+        # --- PREPARAÇÃO DE TIPOS (Rigorosa para CatBoost/LGBM) ---
         for col in self.features_categoricas:
-            df_treino_full[col] = df_treino_full[col].astype(str).fillna("INDEFINIDO").astype('category')
+            df_full[col] = df_full[col].astype(str).fillna("INDEFINIDO").astype('category')
             
         for col in self.features_numericas:
-            df_treino_full[col] = pd.to_numeric(df_treino_full[col], errors='coerce').fillna(0.0).astype('float32')
+            df_full[col] = pd.to_numeric(df_full[col], errors='coerce').fillna(0.0).astype('float32')
             
-        df_treino_full[self.target] = df_treino_full[self.target].fillna(0).astype('float32')
+        df_full[self.target] = df_full[self.target].astype('float32')
 
-        # ---------------------------------------------------------
-        # 🛡️ DATA LEAKAGE PREVENTION: CORTE CRONOLÓGICO CONTÍNUO
-        # ---------------------------------------------------------
-        logger.info("IA: Ordenando a base de dados temporalmente (Passado -> Presente)...")
-        
-        # Ordenamos do crime mais velho para o mais novo
-        if 'MES_OCORRENCIA' in df_treino_full.columns:
-            df_treino_full = df_treino_full.sort_values(by=['ANO_REF', 'MES_OCORRENCIA'], ascending=[True, True])
-        else:
-            df_treino_full = df_treino_full.sort_values(by=['ANO_REF'], ascending=[True])
+        # 🛡️ CORTE CRONOLÓGICO: O passado treina o futuro
+        df_full = df_full.sort_values(by=['ANO_REF', 'MES_OCORRENCIA'], ascending=[True, True])
+        corte_idx = int(len(df_full) * 0.8)
 
-        # Encontramos o ponto de corte exato (80% para treino, 20% para teste)
-        corte_idx = int(len(df_treino_full) * 0.8)
+        df_train = df_full.iloc[:corte_idx]
+        df_test = df_full.iloc[corte_idx:]
 
-        # Fatiamos o dataframe (O passado treina, o futuro testa)
-        df_train = df_treino_full.iloc[:corte_idx]
-        df_test = df_treino_full.iloc[corte_idx:]
-
-        logger.info(f"IA: Split Cronológico Concluído. Treino: {len(df_train)} | Teste: {len(df_test)}")
-
-        # Limpeza de memória agressiva
-        del df_treino_full
-        gc.collect()
-
-        X_train = df_train[self.features_numericas + self.features_categoricas]
+        X_train = df_train[self.features_full]
         y_train = df_train[self.target]
-        X_test = df_test[self.features_numericas + self.features_categoricas]
+        X_test = df_test[self.features_full]
         y_test = df_test[self.target]
 
-        del df_train, df_test
+        logger.info(f"IA: Dataset Preparado. Treino: {len(X_train)} | Teste: {len(X_test)}")
+        del df_full, df_train, df_test
         gc.collect()
 
-        # 1. CatBoost (Ajustado para base limpa e Previsão de Gravidade)
-        logger.info(f"IA: [1/2] Lapidando CatBoost (Tweedie). Aguarde...")
+        # 1. CatBoost (Tweedie para Zero-Inflated Data)
+        logger.info("IA: [1/2] Treinando CatBoost...")
         model_cat = CatBoostRegressor(
-            iterations=800, 
-            depth=5,                 
-            learning_rate=0.05, 
-            l2_leaf_reg=10,          
+            iterations=1000,
+            depth=6,
+            learning_rate=0.03,
+            l2_leaf_reg=5,
             cat_features=self.features_categoricas,
             loss_function='Tweedie:variance_power=1.5',
-            early_stopping_rounds=50, 
-            verbose=100,
-            thread_count=2
+            early_stopping_rounds=50,
+            verbose=100
         )
         model_cat.fit(X_train, y_train, eval_set=(X_test, y_test))
 
-        # 2. LightGBM (O Especialista em Velocidade)
-        logger.info("IA: [2/2] Lapidando LightGBM (Feature Fractioning)...")
+        # 2. LightGBM (Otimizado com Callbacks)
+        logger.info("IA: [2/2] Treinando LightGBM...")
         model_lgb = LGBMRegressor(
-            n_estimators=600, 
-            learning_rate=0.04, 
-            objective='tweedie', 
+            n_estimators=1000,
+            learning_rate=0.03,
+            objective='tweedie',
             tweedie_variance_power=1.5,
-            feature_fraction=0.8,    
             importance_type='gain',
-            n_jobs=2,
-            verbosity=-1,
-            min_child_samples=50     
+            n_jobs=-1,
+            verbosity=-1
         )
-        model_lgb.fit(X_train, y_train)
+        
+        model_lgb.fit(
+            X_train, y_train,
+            eval_set=[(X_test, y_test)],
+            eval_metric='mae',
+            callbacks=[
+                early_stopping(stopping_rounds=50),
+                log_evaluation(period=100)
+            ]
+        )
 
-        # Avaliação de Precisão Realista
+        # Avaliação Final
         p_cat = model_cat.predict(X_test)
         p_lgb = model_lgb.predict(X_test)
-        
         mae_cat = mean_absolute_error(y_test, p_cat)
         mae_lgb = mean_absolute_error(y_test, p_lgb)
-        
-        logger.info(f"IA: MAE (Gravidade) CatBoost: {mae_cat:.4f} | MAE (Gravidade) LightGBM: {mae_lgb:.4f}")
 
-        # Persistência no Datalake (Cloudflare R2)
+        logger.info(f"IA: Performance - CatBoost MAE: {mae_cat:.4f} | LightGBM MAE: {mae_lgb:.4f}")
+
+        # Persistência
         self._exportar_modelo(model_cat, "cat_geral")
         self._exportar_modelo(model_lgb, "lgb_geral")
         
         self.stats_treino = {
             "mae": round(min(mae_cat, mae_lgb), 4),
             "modelo_vencedor": "CatBoost" if mae_cat < mae_lgb else "LightGBM",
-            "volume_treino": len(X_train),
-            "volume_teste": len(X_test),
             "data_versao": self.versao_modelo
         }
         return True
 
     def _carregar_datalake_consolidado(self):
-        """Reúne a Camada Prata, aplica amostragem de memória e garante os dados temporais."""
+        """Reúne e limpa a Camada Prata via Polars (Alta Velocidade)."""
         lista_dfs = []
         anos = [datetime.now().year] if self.dev_mode else range(2022, datetime.now().year + 1)
         
@@ -173,40 +159,23 @@ class TreinadorEvolutivo:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 
-                # Garantia da existência da coluna de Ano para o particionamento temporal
                 if "ANO_REF" not in df.columns:
                     df = df.with_columns(pl.lit(ano).cast(pl.Int16).alias("ANO_REF"))
-                    
+                
                 lista_dfs.append(df)
             except:
-                logger.warning(f"IA: Dados de {ano} ausentes na Prata.")
                 continue
         
         if not lista_dfs: return None
         
         df_pl = pl.concat(lista_dfs, how="diagonal")
-        del lista_dfs
-        gc.collect()
-
-        # Preenchimento de invariantes para evitar quebra de schema no fit()
-        for col in self.features_categoricas:
-            if col not in df_pl.columns:
-                df_pl = df_pl.with_columns(pl.lit("INDEFINIDO").alias(col))
-
-        for col in self.features_numericas:
-            if col in df_pl.columns:
-                df_pl = df_pl.with_columns(pl.col(col).cast(pl.Float32).fill_null(0.0))
-            else:
-                df_pl = df_pl.with_columns(pl.lit(0.0, dtype=pl.Float32).alias(col))
-
-        if self.target not in df_pl.columns:
-            df_pl = df_pl.with_columns(pl.lit(0.0, dtype=pl.Float32).alias(self.target))
-
-        # --- PROTEÇÃO NUCLEAR CONTRA OOM ---
-        LIMITE_LINHAS = 600000 
-        if df_pl.height > LIMITE_LINHAS:
-            logger.warning(f"IA: Dataset original ({df_pl.height} linhas) muito pesado. Aplicando amostragem estrutural para {LIMITE_LINHAS}.")
-            df_pl = df_pl.sample(n=LIMITE_LINHAS, seed=42)
+        
+        # 🛡️ PROTEÇÃO OOM: Amostragem que prioriza dados recentes
+        LIMITE = 800000
+        if df_pl.height > LIMITE:
+            logger.warning(f"IA: Dataset ({df_pl.height}) excede limite. Amostrando {LIMITE} registros.")
+            # Sorteamos mas mantemos a proporção temporal
+            df_pl = df_pl.sample(n=LIMITE, seed=42)
 
         return df_pl.to_pandas()
 
@@ -220,11 +189,10 @@ class TreinadorEvolutivo:
         
         self.s3.put_object(Bucket=self.bucket, Key=key_ver, Body=payload)
         self.s3.put_object(Bucket=self.bucket, Key=key_lat, Body=payload)
-        logger.info(f"IA: Modelo {nome} persistido (Versão: {self.versao_modelo}).")
 
     def obter_stats(self):
         return self.stats_treino
 
 if __name__ == "__main__":
-    treinador = TreinadorEvolutivo(dev_mode=False) 
+    treinador = TreinadorEvolutivo(dev_mode=False)
     treinador.treinar_modelo_mestre()
