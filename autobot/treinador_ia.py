@@ -34,7 +34,8 @@ class TreinadorEvolutivo:
         self.base_path = self._localizar_datalake_real()
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         
-        self.target = "TOTAL_CRIMES"
+        # 🎯 A MUDANÇA DE PARADIGMA: IA agora prevê Gravidade (Dano Real) em vez de Volume
+        self.target = "INDICE_GRAVIDADE"
         
         # --- SCHEMA DE TREINAMENTO LIMPO (SEM DATA LEAKAGE) ---
         self.features_numericas = [
@@ -66,7 +67,7 @@ class TreinadorEvolutivo:
             logger.error("IA: Insumos insuficientes para o treinamento.")
             return False
 
-        logger.info(f"IA: Iniciando preparação cronológica com {len(df_treino_full)} registros.")
+        logger.info(f"IA: Iniciando preparação cronológica com {len(df_treino_full)} registros. Target: {self.target}")
 
         # Tipagem Otimizada (Evita erros do CatBoost e LightGBM)
         for col in self.features_categoricas:
@@ -109,13 +110,13 @@ class TreinadorEvolutivo:
         del df_train, df_test
         gc.collect()
 
-        # 1. CatBoost (Ajustado para base limpa)
+        # 1. CatBoost (Ajustado para base limpa e Previsão de Gravidade)
         logger.info(f"IA: [1/2] Lapidando CatBoost (Tweedie). Aguarde...")
         model_cat = CatBoostRegressor(
             iterations=800, 
-            depth=5,                 # Profundidade moderada para focar em generalização
+            depth=5,                 
             learning_rate=0.05, 
-            l2_leaf_reg=10,          # Cepticismo alto contra outliers eventuais
+            l2_leaf_reg=10,          
             cat_features=self.features_categoricas,
             loss_function='Tweedie:variance_power=1.5',
             early_stopping_rounds=50, 
@@ -135,7 +136,7 @@ class TreinadorEvolutivo:
             importance_type='gain',
             n_jobs=2,
             verbosity=-1,
-            min_child_samples=50     # Proteção contra overfitting em hexágonos isolados
+            min_child_samples=50     
         )
         model_lgb.fit(X_train, y_train)
 
@@ -146,7 +147,7 @@ class TreinadorEvolutivo:
         mae_cat = mean_absolute_error(y_test, p_cat)
         mae_lgb = mean_absolute_error(y_test, p_lgb)
         
-        logger.info(f"IA: MAE CatBoost: {mae_cat:.4f} | MAE LightGBM: {mae_lgb:.4f}")
+        logger.info(f"IA: MAE (Gravidade) CatBoost: {mae_cat:.4f} | MAE (Gravidade) LightGBM: {mae_lgb:.4f}")
 
         # Persistência no Datalake (Cloudflare R2)
         self._exportar_modelo(model_cat, "cat_geral")
@@ -202,7 +203,6 @@ class TreinadorEvolutivo:
             df_pl = df_pl.with_columns(pl.lit(0.0, dtype=pl.Float32).alias(self.target))
 
         # --- PROTEÇÃO NUCLEAR CONTRA OOM ---
-        # Fazemos o sample ANTES da ordenação temporal para a amostra manter dados de todos os anos
         LIMITE_LINHAS = 600000 
         if df_pl.height > LIMITE_LINHAS:
             logger.warning(f"IA: Dataset original ({df_pl.height} linhas) muito pesado. Aplicando amostragem estrutural para {LIMITE_LINHAS}.")
