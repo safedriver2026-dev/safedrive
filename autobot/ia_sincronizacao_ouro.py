@@ -7,6 +7,9 @@ from google.cloud import bigquery
 from google.api_core import exceptions
 from google.oauth2 import service_account
 
+# Importa o Calendário Estratégico refatorado
+from autobot.calendario_estrategico import CalendarioEstrategico
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,6 @@ class CamadaOuroSafeDriver:
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9").strip()
-        # NOTA: Confirme se o seu dataset é 'safedriver_gold' ou 'SAFE_DRIVER_DW' como no print anterior
         self.dataset_id = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip() 
 
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
@@ -30,11 +32,17 @@ class CamadaOuroSafeDriver:
         self.base_path = self._localizar_datalake_real()
         self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         
+        # Instancia o Calendário Inteligente
+        self.cal = CalendarioEstrategico()
+        
         # Pesos Ensemble baseados no Treinador IA
         self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
         
-        # SCHEMA DE TREINAMENTO EXACTO (13 features)
-        self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS']
+        # SCHEMA DE TREINAMENTO EXACTO (Garantia de consistência com o Treinador)
+        self.features_numericas = [
+            'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+            'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
+        ]
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
         self.features_full = self.features_numericas + self.features_categoricas
 
@@ -74,7 +82,9 @@ class CamadaOuroSafeDriver:
             modelos = self._carregar_modelos_producao()
             df_input = self._obter_contexto_preditivo_total()
             
-            if df_input is None: return False
+            if df_input is None or df_input.empty: 
+                logger.error("OURO: Falha ao gerar contexto. Abortando predição.")
+                return False
 
             # --- PREPARAÇÃO PARA IA ---
             X = df_input[self.features_full].copy()
@@ -90,15 +100,15 @@ class CamadaOuroSafeDriver:
                 logger.warning("OURO: LightGBM falhou tipos. A usar apenas CatBoost.")
                 p_lgb = p_cat
 
-            # 🛡️ CÁLCULO DE RISCO PURO (Sem dupla penalização manual)
+            # 🛡️ CÁLCULO DE RISCO PURO (Sem multiplicadores manuais - A IA decide o peso)
             score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
             
-            # --- SCHEMA STAR: FATO DE RISCO ---
+            # --- SCHEMA STAR: Tabela de Factos ---
             df_input['SCORE_RISCO_BRUTO'] = score_base
             max_val = df_input['SCORE_RISCO_BRUTO'].max() or 1
             df_input['SCORE_RISCO_FINAL'] = ((df_input['SCORE_RISCO_BRUTO'] / max_val) * 100).clip(0, 100).round(2)
             
-            # Data de Referência do Snapshot
+            # Data de Referência do Snapshot (Partição)
             df_input['DT_REF'] = datetime.now() 
             
             # SHAP (Explicabilidade para os Top Riscos)
@@ -118,26 +128,30 @@ class CamadaOuroSafeDriver:
             return True
         except Exception as e:
             logger.error(f"OURO: Erro Crítico Pipeline: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _sincronizar_star_schema(self, df):
-        """Cria e alimenta a Tabela de Fatos no BigQuery com clustering geográfico e dimensional."""
+        """Cria e alimenta a Tabela de Factos no BigQuery com clustering dimensional."""
         table_id = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidada"
         
         df_bq = df.copy()
+        
+        # Limpeza para BigQuery
         for col in self.features_categoricas: df_bq[col] = df_bq[col].astype(str)
         df_bq['DT_REF'] = pd.to_datetime(df_bq['DT_REF'])
 
-        # Clustering perfeito para filtros de Dashboard (Onde, Quando, Quem)
+        # Clustering perfeito para filtros do Power BI (Onde, Quando, Quem)
         job_config = bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE", # Atualiza a foto diária do risco
+            write_disposition="WRITE_TRUNCATE", # Atualiza a foto do risco atual
             time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
             clustering_fields=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"] 
         )
 
         job = self.bq_client.load_table_from_dataframe(df_bq, table_id, job_config=job_config)
         job.result()
-        logger.info(f"OURO: Tabela de Fatos sincronizada: {table_id}")
+        logger.info(f"OURO: Tabela de Factos sincronizada: {table_id}")
 
     def _carregar_modelos_producao(self):
         modelos = {"cat": None, "lgb": None}
@@ -154,7 +168,7 @@ class CamadaOuroSafeDriver:
             # 1. Carrega Malha (com Programação Defensiva .unique())
             resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read())).unique(subset=["H3_INDEX"]).select(
-                ["H3_INDEX", "TAXA_VACANCIA"] # A densidade e o munícipio já vêm da Prata
+                ["H3_INDEX", "TAXA_VACANCIA"] # DENSIDADE, NM_MUN, NM_BAIRRO já vêm da Prata
             )
             
             # 2. Carrega Prata (Ano Atual) - MANTENDO A GRANULARIDADE INTACTA
@@ -162,14 +176,14 @@ class CamadaOuroSafeDriver:
             path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
             df_prata = pl.read_parquet(io.BytesIO(self.s3.get_object(Bucket=self.bucket, Key=path_prata)['Body'].read()))
             
-            # 3. Join limpo: Mantém todas as linhas (Noite, Tarde, Pedestre, etc.)
+            # 3. Join limpo: Mantém todas as linhas e perfis originais da SSP
             df_full = df_prata.join(df_malha, on="H3_INDEX", how="left")
             df_pd = df_full.to_pandas()
             
             # 4. Cálculo de Contágio Espacial Global
-            logger.info("OURO: A calcular pressão espacial H3...")
-            # Precisamos do total de crimes agregados APENAS para calcular a pressão, 
-            # sem destruir as linhas granulares do dataframe principal
+            logger.info("OURO: A calcular pressão espacial H3 (K-Ring)...")
+            # Agregamos os crimes apenas num dicionário para ver a "foto" da cidade, 
+            # sem destruir as linhas granulares do df_pd
             crimes_agregados = df_pd.groupby("H3_INDEX")["TOTAL_CRIMES"].sum().to_dict()
             
             contagio_map = {}
@@ -185,22 +199,32 @@ class CamadaOuroSafeDriver:
             df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
             df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
 
-            # 5. Inteligência de Calendário Atual
-            hoje = datetime.now()
-            df_pd['MES_OCORRENCIA'] = hoje.month
-            df_pd['DIA_SEMANA'] = hoje.weekday()
-            df_pd['IS_PAGAMENTO'] = 1 if 5 <= hoje.day <= 10 else 0
-            df_pd['IS_FDS'] = 1 if hoje.weekday() >= 6 else 0
+            # 5. Injeção Dinâmica do Calendário Estratégico (O Orquestrador)
+            contexto_cal = self.cal.obter_contexto_ia()
+            df_pd['MES_OCORRENCIA'] = self.cal.hoje.month
+            df_pd['DIA_SEMANA'] = self.cal.hoje.weekday()
+            df_pd['IS_PAGAMENTO'] = contexto_cal['IS_PAGAMENTO']
+            df_pd['IS_FDS'] = contexto_cal['IS_FDS']
             
-            # Preenchimento de Nulos para o modelo
+            # Preenchimento de Nulos para evitar que o modelo quebre
             for col in self.features_categoricas:
-                df_pd[col] = df_pd[col].astype(str).fillna("INDEFINIDO")
+                if col in df_pd.columns:
+                    df_pd[col] = df_pd[col].astype(str).fillna("INDEFINIDO")
+                else:
+                    df_pd[col] = "INDEFINIDO"
+                    
             for col in self.features_numericas:
-                df_pd[col] = pd.to_numeric(df_pd[col], errors='coerce').fillna(0.0).astype('float32')
+                if col in df_pd.columns:
+                    df_pd[col] = pd.to_numeric(df_pd[col], errors='coerce').fillna(0.0).astype('float32')
+                else:
+                    df_pd[col] = 0.0
             
             return df_pd
         except Exception as e:
-            logger.error(f"OURO: Erro Contexto: {e}"); return None
+            logger.error(f"OURO: Erro Contexto: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 if __name__ == "__main__":
     ouro = CamadaOuroSafeDriver(dev_mode=False)
