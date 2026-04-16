@@ -32,13 +32,9 @@ class CamadaOuroSafeDriver:
         self.base_path = self._localizar_datalake_real()
         self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         
-        # Instancia o Calendário Inteligente
         self.cal = CalendarioEstrategico()
-        
-        # Pesos Ensemble baseados no Treinador IA
         self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
         
-        # SCHEMA DE TREINAMENTO EXACTO
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
             'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
@@ -72,73 +68,55 @@ class CamadaOuroSafeDriver:
                 dataset.location = "US"
                 dataset.description = "Camada Ouro SafeDriver - Star Schema Granular"
                 self.bq_client.create_dataset(dataset)
-                logger.info(f"OURO: Dataset {self.dataset_id} criado.")
         except Exception as e:
             logger.error(f"OURO: Erro de Infra BQ: {e}")
 
     def executar_predicao_atual(self):
-        logger.info(f"OURO: Iniciando ciclo de inteligência preditiva (Star Schema Granular).")
+        logger.info(f"OURO: Iniciando ciclo de inteligência preditiva (Scaffold Mode).")
         try:
             modelos = self._carregar_modelos_producao()
             df_input = self._obter_contexto_preditivo_total()
             
             if df_input is None or df_input.empty: 
-                logger.error("OURO: Falha ao gerar contexto. Abortando predição.")
                 return False
 
-            # --- PREPARAÇÃO PARA IA ---
             X = df_input[self.features_full].copy()
             for col in self.features_categoricas: X[col] = X[col].astype('category')
             for col in self.features_numericas: X[col] = X[col].astype('float32')
 
-            logger.info("OURO: A gerar Scores IA para todos os cenários...")
+            logger.info("OURO: A gerar Scores IA para a malha total...")
             p_cat = modelos["cat"].predict(X) if modelos["cat"] else None
-            
-            try:
-                p_lgb = modelos["lgb"].predict(X) if modelos["lgb"] else p_cat
-            except:
-                logger.warning("OURO: LightGBM falhou tipos. A usar apenas CatBoost.")
-                p_lgb = p_cat
+            p_lgb = modelos["lgb"].predict(X) if modelos["lgb"] else p_cat
 
-            # 🛡️ CÁLCULO DE RISCO PURO (A IA projeta o peso final)
+            # Cálculo de Risco Ponderado
             score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
             
-            # --- SCHEMA STAR: Tabela de Factos ---
             df_input['SCORE_RISCO_BRUTO'] = score_base
             max_val = df_input['SCORE_RISCO_BRUTO'].max() or 1
             df_input['SCORE_RISCO_FINAL'] = ((df_input['SCORE_RISCO_BRUTO'] / max_val) * 100).clip(0, 100).round(2)
-            
-            # Data de Referência do Snapshot (Partição)
             df_input['DT_REF'] = datetime.now() 
             
-            # SHAP (Explicabilidade para os Top Riscos)
+            # SHAP para Explicabilidade
             try:
                 explainer = shap.TreeExplainer(modelos["cat"])
-                df_top = df_input.nlargest(min(len(df_input), 1500), 'SCORE_RISCO_FINAL')
+                df_top = df_input.nlargest(1000, 'SCORE_RISCO_FINAL')
                 shap_values = explainer.shap_values(df_top[self.features_full])
                 for i, feat in enumerate(['NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO']):
                     col_name = f'SHAP_{feat}'
                     df_input[col_name] = 0.0
                     feat_idx = self.features_full.index(feat)
                     df_input.loc[df_top.index, col_name] = shap_values[:, feat_idx]
-            except Exception as e: 
-                logger.warning(f"OURO: SHAP ignorado. {e}")
+            except: pass
 
             self._sincronizar_star_schema(df_input)
             return True
         except Exception as e:
-            logger.error(f"OURO: Erro Crítico Pipeline: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"OURO: Erro Crítico: {e}")
             return False
 
     def _sincronizar_star_schema(self, df):
-        """Cria e alimenta a Tabela de Factos no BigQuery com clustering dimensional."""
         table_id = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidada"
-        
         df_bq = df.copy()
-        
-        # Limpeza para BigQuery
         for col in self.features_categoricas: df_bq[col] = df_bq[col].astype(str)
         df_bq['DT_REF'] = pd.to_datetime(df_bq['DT_REF'])
 
@@ -147,10 +125,7 @@ class CamadaOuroSafeDriver:
             time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
             clustering_fields=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"] 
         )
-
-        job = self.bq_client.load_table_from_dataframe(df_bq, table_id, job_config=job_config)
-        job.result()
-        logger.info(f"OURO: Tabela de Factos sincronizada: {table_id}")
+        self.bq_client.load_table_from_dataframe(df_bq, table_id, job_config=job_config).result()
 
     def _carregar_modelos_producao(self):
         modelos = {"cat": None, "lgb": None}
@@ -163,65 +138,75 @@ class CamadaOuroSafeDriver:
         return modelos
 
     def _obter_contexto_preditivo_total(self):
+        """
+        Gera um Scaffold (Produto Cartesiano) de todos os hexágonos x todos os turnos.
+        Isso garante predições para Manhã/Tarde/Noite/Madrugada e elimina duplicatas.
+        """
         try:
+            # 1. Carrega Malha (O esqueleto geográfico)
             resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
-            df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read())).unique(subset=["H3_INDEX"]).select(
-                ["H3_INDEX", "TAXA_VACANCIA"] 
-            )
+            df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read())).unique(subset=["H3_INDEX"])
             
+            # 2. Carrega e Agrega a Prata (Elimina os 13 registos duplicados)
             ano = datetime.now().year
             path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
             df_prata = pl.read_parquet(io.BytesIO(self.s3.get_object(Bucket=self.bucket, Key=path_prata)['Body'].read()))
             
-            df_full = df_prata.join(df_malha, on="H3_INDEX", how="left")
+            # Agregação crucial para limpar a base histórica antes da predição
+            df_prata_agg = df_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).agg([
+                pl.col("INDICE_GRAVIDADE").sum().alias("GRAVIDADE_HISTORICA"),
+                pl.col("TOTAL_CRIMES").sum().alias("VOLUME_HISTORICO")
+            ])
+
+            # 3. Criação do SCAFFOLD (A cura do "Só Noite")
+            # Criamos todas as combinações de tempo e perfil para CADA hexágono da cidade
+            periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
+            perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
+            scaffold = periodos.join(perfis, how="cross")
+            
+            # Malha x (Periodo x Perfil)
+            df_base = df_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
+                scaffold, how="cross"
+            )
+
+            # 4. Join do Passado no Scaffold (Left Join)
+            df_full = df_base.join(
+                df_prata_agg, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"], how="left"
+            ).with_columns([
+                pl.col("GRAVIDADE_HISTORICA").fill_null(0.0),
+                pl.col("VOLUME_HISTORICO").fill_null(0.0),
+                pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE")
+            ])
+
             df_pd = df_full.to_pandas()
-            
-            # 🚀 A CORREÇÃO: O Contágio agora irradia a GRAVIDADE dos crimes vizinhos, e não apenas o Volume
-            logger.info("OURO: A calcular pressão espacial H3 baseada na Gravidade (K-Ring)...")
-            
-            # Agregamos o INDICE_GRAVIDADE (que já vem calculado e pesado da Prata)
-            crimes_agregados = df_pd.groupby("H3_INDEX")["INDICE_GRAVIDADE"].sum().to_dict()
+
+            # 5. Contágio Espacial (K-Ring) sobre a Gravidade Agregada
+            logger.info("OURO: Calculando pressão espacial sobre a malha consolidada...")
+            gravidade_map = df_pd.groupby("H3_INDEX")["GRAVIDADE_HISTORICA"].sum().to_dict()
             
             contagio_map = {}
-            for h3_idx in df_pd['H3_INDEX'].unique():
+            for hx in df_pd['H3_INDEX'].unique():
                 try:
-                    v1 = set(h3.k_ring(h3_idx, 1)); v1.discard(h3_idx)
-                    c1 = sum(crimes_agregados.get(v, 0) for v in v1)
-                    v2 = set(h3.k_ring(h3_idx, 2)) - v1; v2.discard(h3_idx)
-                    # Vizinhança imediata (K=1) passa 100% da gravidade. Vizinhança K=2 passa 50%.
-                    contagio_map[h3_idx] = (c1 * 1.0) + (sum(crimes_agregados.get(v, 0) for v in v2) * 0.5)
-                except: contagio_map[h3_idx] = 0.0
+                    v1 = set(h3.k_ring(hx, 1)); v1.discard(hx)
+                    contagio_map[hx] = sum(gravidade_map.get(v, 0) for v in v1)
+                except: contagio_map[hx] = 0.0
             
             df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
             df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
 
-            # Injeção Dinâmica do Calendário
+            # 6. Injeção do Calendário
             contexto_cal = self.cal.obter_contexto_ia()
             df_pd['MES_OCORRENCIA'] = self.cal.hoje.month
             df_pd['DIA_SEMANA'] = self.cal.hoje.weekday()
             df_pd['IS_PAGAMENTO'] = contexto_cal['IS_PAGAMENTO']
             df_pd['IS_FDS'] = contexto_cal['IS_FDS']
-            
-            # Preenchimento de Nulos
-            for col in self.features_categoricas:
-                if col in df_pd.columns:
-                    df_pd[col] = df_pd[col].astype(str).fillna("INDEFINIDO")
-                else:
-                    df_pd[col] = "INDEFINIDO"
-                    
-            for col in self.features_numericas:
-                if col in df_pd.columns:
-                    df_pd[col] = pd.to_numeric(df_pd[col], errors='coerce').fillna(0.0).astype('float32')
-                else:
-                    df_pd[col] = 0.0
+            df_pd['TIPO_LOCAL'] = "VIA PUBLICA" 
             
             return df_pd
         except Exception as e:
-            logger.error(f"OURO: Erro Contexto: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"OURO Erro: {e}")
             return None
 
 if __name__ == "__main__":
-    ouro = CamadaOuroSafeDriver(dev_mode=False)
+    ouro = CamadaOuroSafeDriver()
     ouro.executar_predicao_atual()
