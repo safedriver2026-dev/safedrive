@@ -4,11 +4,13 @@ import h3, boto3, io, os, json, logging, gc
 from botocore.config import Config
 from datetime import datetime
 
+# Auditoria de Processamento
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
+        # Conectividade Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -37,9 +39,9 @@ class ProcessamentoPrata:
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).unique(subset=["H3_INDEX"])
-            logger.info("PRATA: Malha geográfica carregada.")
+            logger.info("PRATA: Malha geográfica H3-9 carregada com sucesso.")
         except Exception as e:
-            logger.error(f"PRATA: Erro na malha: {e}")
+            logger.error(f"PRATA: Erro ao carregar malha base: {e}")
             self.df_malha = None
 
     def processar_ano_com_delta(self, ano, estado, force=False):
@@ -48,16 +50,18 @@ class ProcessamentoPrata:
         
         try:
             meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
-            if not force and estado.get(str(ano)) == meta['ContentLength']: return None
+            if not force and estado.get(str(ano)) == meta['ContentLength']: 
+                logger.info(f"PRATA: [{ano}] Sem alterações detectadas. Ignorando.")
+                return False
 
+            logger.info(f"PRATA: [{ano}] Iniciando consolidação resiliente...")
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # 🎯 MOTOR DE COMPATIBILIDADE (MAPA DE ALIASES 2022-2026)
+            # 1. MOTOR DE COMPATIBILIDADE (Tratamento de Esquemas 2022-2026)
             cols = lf.collect_schema().names()
             rename_map = {}
             
-            # Mapeamento dinâmico baseado no seu histórico fornecido
             mapa_fontes = {
                 "NM_MUN_ORIGINAL": ["NOME_MUNICIPIO", "CIDADE"],
                 "DATA_BRUTA": ["DATA_OCORRENCIA_BO", "DATA_OCORRENCIA"],
@@ -73,7 +77,7 @@ class ProcessamentoPrata:
 
             lf = lf.rename(rename_map).filter(pl.col("H3_INDEX").is_not_null())
             
-            # 2. Engenharia de Contexto Resiliente
+            # 2. ENGENHARIA DE CONTEXTO (Temporal e Gravidade)
             cols_atuais = lf.collect_schema().names()
             
             lf = lf.with_columns([
@@ -81,7 +85,7 @@ class ProcessamentoPrata:
                 pl.col("HORA").str.split(":").list.first().cast(pl.Int8, strict=False).alias("HORA_INT"),
                 (pl.col("PERIODO_SSP").str.to_uppercase() if "PERIODO_SSP" in cols_atuais else pl.lit("INDEFINIDO")).alias("PERIODO_RAW")
             ]).with_columns([
-                # Lógica Híbrida de Período
+                # Lógica de Período Híbrida (Hora > Descrição > Noite)
                 pl.when(pl.col("HORA_INT").is_not_null())
                   .then(
                       pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
@@ -96,7 +100,7 @@ class ProcessamentoPrata:
                         .otherwise(pl.lit("NOITE"))
                   ).alias("PERIODO_DIA"),
 
-                # Matriz de Gravidade
+                # Matriz de Gravidade (Target da IA)
                 pl.when(pl.col("RUBRICA").str.contains("(?i)HOMICIDIO|LATROCINIO|ESTUPRO|SEQUESTRO|MORTE")).then(pl.lit(10.0))
                   .when(pl.col("RUBRICA").str.contains("(?i)ROUBO")).then(pl.lit(5.0))
                   .when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit(3.0))
@@ -105,61 +109,72 @@ class ProcessamentoPrata:
                 pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA")).otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
             ])
 
-            # 3. Agregação e Inteligência Espacial (Insumo para a IA)
-            df_agg = lf.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).agg([
+            # 3. AGREGAÇÃO E CONSOLIDAÇÃO (Foco no Dano)
+            # TIPO_LOCAL é incluído para evitar o erro de contrato na IA
+            df_agg = lf.group_by([
+                "H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
+                "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"
+            ]).agg([
                 pl.len().alias("TOTAL_CRIMES"),
                 pl.col("PESO_CRIME").sum().alias("INDICE_GRAVIDADE"),
                 pl.col("DATA").dt.month().first().alias("MES_OCORRENCIA"),
                 pl.col("DATA").dt.weekday().first().alias("DIA_SEMANA")
             ]).collect()
 
-            # 🚀 CÁLCULO DE CONTÁGIO (Necessário para o Treinador IA)
-            logger.info(f"PRATA: [{ano}] Gerando Contágio Espacial para IA...")
+            # 🚀 INTELIGÊNCIA ESPACIAL ANTECIPADA (Cálculo de Contágio)
+            # Calculamos aqui para que a IA já receba a feature pronta no treino
+            logger.info(f"PRATA: [{ano}] Gerando Contágio Espacial (K-Ring 1)...")
             df_pd = df_agg.to_pandas()
             gravidade_map = df_pd.groupby("H3_INDEX")["INDICE_GRAVIDADE"].sum().to_dict()
             
             contagio_map = {}
-            unique_h3 = df_pd['H3_INDEX'].unique()
-            for hx in unique_h3:
+            for hx in df_pd['H3_INDEX'].unique():
                 try:
                     v1 = h3.k_ring(hx, 1)
                     contagio_map[hx] = sum(gravidade_map.get(v, 0) for v in v1 if v != hx)
                 except: contagio_map[hx] = 0.0
             
             df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
-            df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] # Densidade entra na Ouro
+            df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] 
             df_pd['ANO_REF'] = ano
-            df_pd['IS_PAGAMENTO'] = 0 # Placeholder para o treinador
-            df_pd['IS_FDS'] = 0 # Placeholder para o treinador
+            
+            # Placeholders temporais para compatibilidade com o Treinador
+            df_pd['IS_PAGAMENTO'] = 0 
+            df_pd['IS_FDS'] = (df_pd['DIA_SEMANA'] >= 5).astype(int)
 
-            # Join com Malha para Densidade
+            # 4. ENRIQUECIMENTO GEOGRÁFICO FINAL
             df_final = pl.from_pandas(df_pd).join(
                 self.df_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]), 
                 on="H3_INDEX", how="left"
             ).with_columns([
                 pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE"),
                 pl.coalesce(["NM_MUN", "NM_MUN_ORIGINAL"]).alias("NM_MUN"),
-                pl.coalesce(["NM_BAIRRO", "NM_BAIRRO_ORIGINAL"]).alias("NM_BAIRRO")
+                pl.coalesce(["NM_BAIRRO", "NM_BAIRRO_ORIGINAL"]).alias("NM_BAIRRO"),
+                pl.col("TIPO_LOCAL").fill_null("VIA PUBLICA")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "DENSIDADE_AJUSTADA"])
 
-            # Gravação
+            # 5. GRAVAÇÃO EM PARQUET LZ4
             buffer = io.BytesIO()
             df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = meta['ContentLength']
+            logger.info(f"PRATA: [{ano}] Ciclo finalizado com sucesso.")
             return True
+            
         except Exception as e:
-            logger.error(f"PRATA: Falha em {ano}: {e}")
+            logger.error(f"PRATA: Falha crítica no processamento de {ano}: {e}")
             return False
 
     def executar_todos_os_anos(self, force=False):
-        logger.info("PRATA: Iniciando consolidação resiliente.")
+        logger.info("PRATA: Iniciando consolidação multi-safra.")
         estado = self._carregar_tracker()
+        processou_algo = False
         for ano in range(2022, datetime.now().year + 1):
             if self.processar_ano_com_delta(ano, estado, force):
+                processou_algo = True
                 self._salvar_tracker(estado)
-        return True
+        return processou_algo
 
     def _carregar_tracker(self):
         try:
@@ -168,3 +183,7 @@ class ProcessamentoPrata:
 
     def _salvar_tracker(self, estado):
         self.s3.put_object(Bucket=self.bucket, Key=f"{self.base_path}/prata/tracker.json", Body=json.dumps(estado))
+
+if __name__ == "__main__":
+    prata = ProcessamentoPrata()
+    prata.executar_todos_os_anos(force=True)
