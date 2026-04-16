@@ -35,9 +35,7 @@ class IngestaoBronze:
         return f"{self.base_path}/{camada}/{subpasta}/{filename}".replace("//", "/")
 
     def _motor_h3(self, lat, lng):
-        """Conversão segura para H3 Resolução 9."""
         try:
-            # Força a conversão para float aqui para garantir que o motor H3 receba o tipo certo
             l1, l2 = float(lat), float(lng)
             if l1 == 0 or l2 == 0 or abs(l1) > 90 or abs(l2) > 180:
                 return None
@@ -108,34 +106,34 @@ class IngestaoBronze:
                     if real_header_idx is not None:
                         df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": real_header_idx})
                         
-                        # --- SOLUÇÃO DO ERRO: CASTING PREVENTIVO ---
-                        # Antes de colocar na lista dfs, garantimos que Latitude/Longitude são strings ou Floats
-                        # Isso evita o erro de incompatibilidade no pl.concat
+                        # Padroniza os nomes das colunas
                         df.columns = [c.upper().strip() for c in df.columns]
                         
-                        if "LATITUDE" in df.columns:
-                            df = df.with_columns(pl.col("LATITUDE").cast(pl.String).str.replace(",", ".").cast(pl.Float64, strict=False))
-                        if "LONGITUDE" in df.columns:
-                            df = df.with_columns(pl.col("LONGITUDE").cast(pl.String).str.replace(",", ".").cast(pl.Float64, strict=False))
+                        # --- A BALA DE PRATA PARA O VSTACK ERROR ---
+                        # Converte TODAS as colunas para String imediatamente.
+                        # Isso garante que Date e Datetime, ou Int e Float, sejam empilhados sem erro.
+                        df = df.with_columns(pl.all().cast(pl.String))
                         
+                        # Remove linhas onde a primeira coluna (ex: NUM_BO ou ANO_BO) é nula
                         df = df.filter(pl.col(df.columns[0]).is_not_null())
                         dfs.append(df)
                 except: continue
 
             if dfs:
+                # O concat agora é 100% seguro porque tudo é String
                 df_trusted = pl.concat(dfs, how="diagonal")
                 
                 # Filtro Anti-Capa
                 df_trusted = df_trusted.filter(
-                    ~pl.col(df_trusted.columns[0]).cast(pl.String).str.contains(r"(?i)PRESENTE|TABELA|FINALIDADE|CONTEÚDO")
+                    ~pl.col(df_trusted.columns[0]).str.contains(r"(?i)PRESENTE|TABELA|FINALIDADE|CONTEÚDO")
                 )
 
                 logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros...")
                 
-                # Garante Float64 final e preenche nulos para o motor H3
+                # Prepara coordenadas para o H3 e calcula
                 df_trusted = df_trusted.with_columns([
-                    pl.col("LATITUDE").fill_null(0.0),
-                    pl.col("LONGITUDE").fill_null(0.0)
+                    pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
+                    pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
                 ]).with_columns(
                     pl.struct(["LATITUDE", "LONGITUDE"])
                     .map_elements(lambda x: self._motor_h3(x["LATITUDE"], x["LONGITUDE"]), return_dtype=pl.String)
