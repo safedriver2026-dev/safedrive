@@ -5,7 +5,7 @@ from botocore.config import Config
 import joblib
 import io
 import os
-import gc  # Garbage Collector
+import gc
 import logging
 from datetime import datetime
 from catboost import CatBoostRegressor
@@ -13,6 +13,7 @@ from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 
+# Auditoria de Performance
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ class TreinadorEvolutivo:
     def __init__(self, dev_mode=False):
         self.dev_mode = dev_mode 
         
+        # Conectividade Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -35,11 +37,10 @@ class TreinadorEvolutivo:
         
         self.target = "TOTAL_CRIMES"
         
-        # --- ALINHAMENTO HEAVY SILVER ---
-        # Recebendo as novas colunas temporais de alta inteligência da Prata
+        # --- SCHEMA DE TREINAMENTO REALISTA (SEM VAZAMENTO) ---
+        # Removidos: RANKING_RISCO_LOCAL e INDICE_EXPOSICAO (evita o MAE irreal de 8.21)
         self.features_numericas = [
-            'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
-            'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+            'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
             'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
         ]
         
@@ -60,21 +61,24 @@ class TreinadorEvolutivo:
         return f"{self.base_path}/{camada}/{filename}".replace("//", "/")
 
     def treinar_modelo_mestre(self):
+        """Ciclo de aprendizado supervisionado de alta fidelidade."""
         df_treino = self._carregar_datalake_consolidado()
         
         if df_treino is None or len(df_treino) < 10:
-            logger.error("IA: Massa de dados insuficiente para o ciclo evolutivo.")
+            logger.error("IA: Insumos insuficientes para o treinamento.")
             return False
 
-        logger.info(f"IA: Iniciando Treinamento Ensemble Otimizado com {len(df_treino)} registros.")
+        logger.info(f"IA: Iniciando Treinamento Ensemble com {len(df_treino)} registros.")
 
+        # Matrizes de Treino
         X = df_treino[self.features_numericas + self.features_categoricas].copy()
         y = df_treino[self.target].fillna(0).astype('float32') 
 
-        # Elimina o dataframe original pesado da memória RAM
+        # Liberação de RAM imediata
         del df_treino 
         gc.collect()
 
+        # Tipagem Otimizada para o motor de ML
         for col in self.features_categoricas:
             X[col] = X[col].astype(str).fillna("INDEFINIDO").astype('category')
             
@@ -83,40 +87,42 @@ class TreinadorEvolutivo:
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # 1. CatBoost (Tuned para Amostragem)
-        logger.info("IA: [1/2] Lapidando CatBoost (Hyper-Tuned)...")
+        # 1. CatBoost (O Especialista em Contexto e Tweedie)
+        logger.info("IA: [1/2] Lapidando CatBoost (Tweedie Optimized)...")
         model_cat = CatBoostRegressor(
-            iterations=600, 
+            iterations=700, 
             depth=6, 
-            learning_rate=0.06, 
-            l2_leaf_reg=5,             # TUNING: Impede Overfitting na amostra de 600k
+            learning_rate=0.05, 
+            l2_leaf_reg=7,           # Regularização forte para evitar decorar a amostra
             cat_features=self.features_categoricas,
             loss_function='Tweedie:variance_power=1.5',
-            early_stopping_rounds=30, 
+            early_stopping_rounds=40, 
             verbose=100,
-            thread_count=2
+            thread_count=2           # Otimizado para 2 vCPUs do GitHub
         )
         model_cat.fit(X_train, y_train, eval_set=(X_test, y_test))
 
-        # 2. LightGBM (Tuned para Extração de Features)
-        logger.info("IA: [2/2] Lapidando LightGBM (Hyper-Tuned)...")
+        # 2. LightGBM (O Especialista em Velocidade)
+        logger.info("IA: [2/2] Lapidando LightGBM (Feature Fractioning)...")
         model_lgb = LGBMRegressor(
-            n_estimators=400, 
-            learning_rate=0.06, 
+            n_estimators=500, 
+            learning_rate=0.05, 
             objective='tweedie', 
             tweedie_variance_power=1.5,
-            feature_fraction=0.8,      # TUNING: Obriga a IA a usar as features novas e não focar só na densidade
+            feature_fraction=0.8,     # Força o modelo a olhar para features temporais
             importance_type='gain',
             n_jobs=2,
             verbosity=-1 
         )
         model_lgb.fit(X_train, y_train)
 
+        # Avaliação Realista
         mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
         mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
         
         logger.info(f"IA: MAE CatBoost: {mae_cat:.4f} | MAE LightGBM: {mae_lgb:.4f}")
 
+        # Persistência no R2
         self._exportar_modelo(model_cat, "cat_geral")
         self._exportar_modelo(model_lgb, "lgb_geral")
         
@@ -129,6 +135,7 @@ class TreinadorEvolutivo:
         return True
 
     def _carregar_datalake_consolidado(self):
+        """Reúne a Prata e garante integridade do Schema."""
         lista_dfs = []
         anos = [datetime.now().year] if self.dev_mode else range(2022, datetime.now().year + 1)
         
@@ -139,36 +146,38 @@ class TreinadorEvolutivo:
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 lista_dfs.append(df)
             except:
-                logger.warning(f"IA: Dados de {ano} não encontrados na Prata.")
+                logger.warning(f"IA: Dados de {ano} ausentes na Prata.")
                 continue
         
         if not lista_dfs: return None
         
         df_pl = pl.concat(lista_dfs, how="diagonal")
-        
         del lista_dfs
         gc.collect()
         
-        mapeamento = {"NM_MUN_FINAL": "NM_MUN", "NM_BAIRRO_FINAL": "NM_BAIRRO"}
+        # Alinhamento de nomes da Heavy Silver
+        mapeamento = {"NM_MUN_FINAL": "NM_MUN", "NM_BAIRRO_FINAL": "NM_BAIRRO", "DIA_SEMANA_OCORRENCIA": "DIA_SEMANA"}
         df_pl = df_pl.rename({old: new for old, new in mapeamento.items() if old in df_pl.columns})
 
+        # Preenchimento de invariantes para evitar quebra no treino
         for col in self.features_categoricas:
             if col not in df_pl.columns:
                 df_pl = df_pl.with_columns(pl.lit("INDEFINIDO").alias(col))
 
         for col in self.features_numericas:
             if col in df_pl.columns:
-                df_pl = df_pl.with_columns(pl.col(col).cast(pl.Float32, strict=False).fill_null(0.0))
+                df_pl = df_pl.with_columns(pl.col(col).cast(pl.Float32).fill_null(0.0))
             else:
                 df_pl = df_pl.with_columns(pl.lit(0.0, dtype=pl.Float32).alias(col))
 
         if self.target not in df_pl.columns:
             df_pl = df_pl.with_columns(pl.lit(0.0, dtype=pl.Float32).alias(self.target))
 
-        # SALVAÇÃO DO OOM KILLER (Mantido)
+        # --- PROTEÇÃO NUCLEAR CONTRA OOM ---
+        # 600k registros é o "ponto doce" para 7GB de RAM e CatBoost Tweedie
         LIMITE_LINHAS = 600000 
         if df_pl.height > LIMITE_LINHAS:
-            logger.warning(f"IA: Amostrando dataset de {df_pl.height} para {LIMITE_LINHAS} registros para proteger a memória.")
+            logger.warning(f"IA: Dataset de {df_pl.height} amostrado para {LIMITE_LINHAS} para viabilidade técnica.")
             df_pl = df_pl.sample(n=LIMITE_LINHAS, seed=42)
 
         return df_pl.to_pandas()
@@ -183,7 +192,7 @@ class TreinadorEvolutivo:
         
         self.s3.put_object(Bucket=self.bucket, Key=key_ver, Body=payload)
         self.s3.put_object(Bucket=self.bucket, Key=key_lat, Body=payload)
-        logger.info(f"IA: Modelo {nome} persistido no R2 (Versão: {self.versao_modelo}).")
+        logger.info(f"IA: Modelo {nome} persistido (Versão: {self.versao_modelo}).")
 
     def obter_stats(self):
         return self.stats_treino
