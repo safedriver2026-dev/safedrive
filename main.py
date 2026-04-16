@@ -5,7 +5,6 @@ import sys
 import boto3
 from botocore.config import Config
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 # Importação dos motores do ecossistema SafeDriver
 try:
@@ -18,7 +17,7 @@ except ImportError as e:
     print(f"Erro ao importar módulos do diretório 'autobot': {e}")
     sys.exit(1)
 
-# Configuração de Log de Alta Visibilidade (Sincronizado com Brasília)
+# Configuração de Log de Alta Visibilidade
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - [%(levelname)s] - %(message)s', 
@@ -49,7 +48,7 @@ def orquestrar_pipeline(force_reprocess=False):
     start_time = datetime.now()
     comunicador = ComunicadorSafeDriver()
 
-    # Dicionário de telemetria alinhado com as novas features da Prata
+    # Telemetria centralizada para o Relatório Executivo
     stats = {
         "status_camadas": {
             "bronze": "⏭️ (Cache)", 
@@ -62,7 +61,7 @@ def orquestrar_pipeline(force_reprocess=False):
             "linhas_out": 0, 
             "taxa_recuperacao": 100, 
             "linhas_ouro": 0,
-            "recuperado_grade": 0  # <--- NOVO: Preparado para receber a cura da malha
+            "recuperado_grade": 0
         },
         "metrics_ia": {"mae": "Aguardando..."},
         "duracao": "0s"
@@ -71,48 +70,34 @@ def orquestrar_pipeline(force_reprocess=False):
     try:
         # --- ETAPA 1: BRONZE (Ingestão) ---
         bronze = IngestaoBronze()
+        # novos_dados_bronze indica se houve download ou mudança de tamanho na SSP
         novos_dados_bronze = bronze.executar_ingestao_continua(force=force_reprocess)
         if novos_dados_bronze: 
             stats["status_camadas"]["bronze"] = "✅ (Novo)"
 
-        # --- ANÁLISE DE ESTADO FÍSICO (Correção de Gatilho) ---
-        prata_existe = (
-            verificar_estado_remoto("datalake/prata/ssp_consolidada_2022.parquet") or
-            verificar_estado_remoto("safedriver/datalake/prata/ssp_consolidada_2022.parquet")
-        )
+        # --- ANÁLISE DE ESTADO FÍSICO (Verificação de Integridade no R2) ---
+        prata_existe = verificar_estado_remoto("datalake/prata/ssp_consolidada_2022.parquet")
+        modelos_existem = verificar_estado_remoto("datalake/modelos_ml/latest_cat_geral.pkl")
+        ouro_existe = verificar_estado_remoto("datalake/ouro/fato_risco_consolidada.parquet")
         
-        modelos_existem = (
-            verificar_estado_remoto("datalake/modelos_ml/latest_cat_geral.pkl") or
-            verificar_estado_remoto("safedriver/datalake/modelos_ml/latest_cat_geral.pkl")
-        )
-        
-        ouro_existe = (
-            verificar_estado_remoto("datalake/ouro/fato_risco_consolidada.parquet") or
-            verificar_estado_remoto("safedriver/datalake/ouro/fato_risco_consolidada.parquet")
-        )
-        
-        # Lógica de Gatilhos em Cascata
+        # Lógica de Gatilhos: Só reprocessa se houver dado novo, se for forçado ou se o arquivo sumiu
         gatilho_prata = novos_dados_bronze or force_reprocess or not prata_existe
         gatilho_ia = gatilho_prata or not modelos_existem
         gatilho_ouro = gatilho_ia or not ouro_existe
 
-        # --- ETAPA 2: PRATA (Higiene, Sazonalidade e Cura da Malha) ---
+        # --- ETAPA 2: PRATA (Higiene e Normalização) ---
         prata = ProcessamentoPrata()
         if gatilho_prata:
             logger.info("🚀 Prata: Iniciando processamento e filtragem de qualidade...")
             metricas_prata = prata.executar_todos_os_anos(force=force_reprocess)
             
-            # Alinhamento do dicionário: Evita sobreescrever estruturas aninhadas
             if metricas_prata and isinstance(metricas_prata, dict):
-                stats["status_camadas"]["prata"] = metricas_prata.get("status_camadas", {}).get("prata", "✅ (Processado)")
-                stats["hygiene"]["linhas_in"] = metricas_prata.get("linhas_in", 0)
-                stats["hygiene"]["linhas_out"] = metricas_prata.get("linhas_out", 0)
-                stats["hygiene"]["taxa_recuperacao"] = metricas_prata.get("taxa_recuperacao", 100)
-                stats["hygiene"]["recuperado_grade"] = metricas_prata.get("recuperado_grade", 0) # <--- Captura a cura
+                stats["status_camadas"]["prata"] = "✅ (Processado)"
+                stats["hygiene"].update(metricas_prata)
             else:
                 stats["status_camadas"]["prata"] = "⚠️ (Vazio/Erro)"
         else:
-            logger.info("⏭️ Prata: Cache geográfico validado fisicamente.")
+            logger.info("⏭️ Prata: Cache geográfico validado.")
 
         # --- ETAPA 3: IA (Treinamento Evolutivo) ---
         if gatilho_ia:
@@ -120,11 +105,12 @@ def orquestrar_pipeline(force_reprocess=False):
             treinador = TreinadorEvolutivo(dev_mode=False) 
             if treinador.treinar_modelo_mestre():
                 stats["status_camadas"]["ia"] = "✅ (Treinado)"
+                stats["metrics_ia"].update(treinador.obter_stats())
             else:
-                comunicador.relatar_erro_critico("Treinador IA", "Falha no treinamento dos modelos.")
+                comunicador.relatar_erro_critico("Treinador IA", "Falha no treinamento.")
                 return
         else:
-            logger.info("⏭️ IA: Modelos de produção validados fisicamente.")
+            logger.info("⏭️ IA: Modelos de produção validados.")
 
         # --- ETAPA 4: OURO (Predição e BigQuery) ---
         if gatilho_ouro:
@@ -132,20 +118,24 @@ def orquestrar_pipeline(force_reprocess=False):
             ouro = CamadaOuroSafeDriver(dev_mode=False) 
             if ouro.executar_predicao_atual():
                 stats["status_camadas"]["ouro"] = "✅ (Sincronizado)"
-                stats["hygiene"]["linhas_ouro"] = stats["hygiene"]["linhas_out"]
+                # Aqui a Ouro poderia retornar a contagem real de predições
+                stats["hygiene"]["linhas_ouro"] = stats["hygiene"].get("linhas_out", 0)
             else:
-                comunicador.relatar_erro_critico("Camada Ouro", "Erro na sincronização atômica com BigQuery.")
+                comunicador.relatar_erro_critico("Camada Ouro", "Erro na sincronização com BigQuery.")
                 return
+        else:
+            logger.info("⏭️ Ouro: Data Warehouse atualizado.")
         
-        # --- FINALIZAÇÃO E RELATÓRIO EXECUTIVO ---
+        # --- FINALIZAÇÃO E RELATÓRIO ---
         stats["duracao"] = str(datetime.now() - start_time).split(".")[0]
         
+        # Recalcula a taxa de recuperação final para o relatório
         if stats["hygiene"]["linhas_in"] > 0:
             stats["hygiene"]["taxa_recuperacao"] = round(
                 (stats["hygiene"]["linhas_out"] / stats["hygiene"]["linhas_in"]) * 100, 1
             )
 
-        logger.info(f"✨ SafeDriver finalizado com sucesso. Enviando relatório...")
+        logger.info(f"✨ SafeDriver finalizado. Enviando telemetria para o Discord...")
         comunicador.enviar_relatorio_executivo(stats)
 
     except Exception as e:
@@ -155,7 +145,7 @@ def orquestrar_pipeline(force_reprocess=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Maestro SafeDriver")
-    parser.add_argument('--force', action='store_true', default=False, help="Forçar reprocessamento")
+    parser.add_argument('--force', action='store_true', default=False, help="Forçar reprocessamento total")
     args = parser.parse_args()
     
     orquestrar_pipeline(force_reprocess=args.force)
