@@ -117,7 +117,7 @@ class ProcessamentoPrata:
             buffer = io.BytesIO()
             self.df_malha.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer.getvalue())
-        except Exception: pass
+        except: pass
 
     def processar_ano_com_delta(self, ano, estado, force=False):
         path_trusted = f"{self.base_path}/bronze/trusted/ssp_trusted_{ano}.parquet"
@@ -126,23 +126,20 @@ class ProcessamentoPrata:
         try:
             meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
             tamanho_atual = meta['ContentLength']
-            if not force and estado.get(str(ano)) == tamanho_atual: 
-                logger.info(f"PRATA: Ano {ano} em cache.")
-                return None
+            if not force and estado.get(str(ano)) == tamanho_atual: return None
 
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
             # --- 1. REMOÇÃO DA CAPA (SKIP INTRO) ---
-            # Filtra apenas linhas que possuem um Número de B.O. válido e remove as explicações da SSP
+            # Flag (?i) injetada no regex para ignorar case sem usar keyword argument proibido
             lf = lf.filter(
                 (pl.col("NUM_BO").is_not_null()) & 
                 (pl.col("NUM_BO").cast(pl.String).str.contains(r"[0-9]")) &
-                (~pl.col("NUM_BO").cast(pl.String).str.contains("A PRESENTE TABELA|CONTEUDO", ignore_case=True))
+                (~pl.col("NUM_BO").cast(pl.String).str.contains(r"(?i)A PRESENTE TABELA|CONTEUDO"))
             )
 
             # --- 2. CONVERSÃO DE TIPOS (BRONZE STRING -> PRATA TYPED) ---
-            # Resolve o problema de tudo ser String na Bronze
             lf = lf.with_columns([
                 pl.col("DATA_OCORRENCIA_BO").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA_PARSED"),
                 pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
@@ -150,16 +147,20 @@ class ProcessamentoPrata:
             ])
 
             # --- 3. RESOLUÇÃO DE SCHEMA DRIFT ---
-            cols = lf.collect_schema().names()
+            cols_originais = lf.collect_schema().names()
             mapeamento = {
                 "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL", "BAIRRO": "NM_BAIRRO_ORIGINAL",
-                "LOGRADOURO": "LOGRADOURO_ORIGINAL", "HORA_OCORRENCIA_BO": "HORA", "DESCR_PERIODO": "PERIODO_TEXTO", 
-                "DESCR_SUBTIPOLOCAL": "TIPO_LOCAL", "DESCR_TIPOLOCAL": "TIPO_LOCAL"
+                "LOGRADOURO": "LOGRADOURO_ORIGINAL", "HORA_OCORRENCIA_BO": "HORA", "DATA_OCORRENCIA_BO": "DATA_BRUTA",
+                "DESCR_PERIODO": "PERIODO_TEXTO", "DESC_PERIODO": "PERIODO_TEXTO"
             }
-            # Remove colunas explicativas remanescentes
-            cols_remover = [c for c in cols if "UNNAMED" in c.upper() or "TABELA" in c.upper()]
-            if cols_remover: lf = lf.drop(cols_remover)
             
+            if "DESCR_SUBTIPOLOCAL" in cols_originais:
+                if "TIPO_LOCAL" in cols_originais: lf = lf.drop("TIPO_LOCAL")
+                lf = lf.rename({"DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"})
+                if "DESCR_TIPOLOCAL" in cols_originais: lf = lf.drop("DESCR_TIPOLOCAL")
+            elif "DESCR_TIPOLOCAL" in cols_originais:
+                lf = lf.rename({"DESCR_TIPOLOCAL": "TIPO_LOCAL"})
+
             lf = lf.rename({old: new for old, new in mapeamento.items() if old in lf.collect_schema().names()})
 
             # --- 4. INTELIGÊNCIA TEMPORAL ---
@@ -167,7 +168,7 @@ class ProcessamentoPrata:
                 pl.col("DATA_PARSED").dt.month().alias("MES_OCORRENCIA"),
                 pl.col("DATA_PARSED").dt.weekday().alias("DIA_SEMANA_OCORRENCIA"),
                 pl.col("HORA").cast(pl.String).str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT"),
-                pl.when(pl.col("RUBRICA").str.contains("VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA")).otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
+                pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA")).otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
             ]).with_columns([
                 pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA")).when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA")).when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE")).otherwise(pl.lit("NOITE")).alias("PERIODO_DIA")
             ]).with_columns([
