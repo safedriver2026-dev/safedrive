@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -37,14 +38,18 @@ class ComunicadorSafeDriver:
 
         agora = self._obter_agora_br()
         
-        # Busca robusta: procura a métrica dentro de 'hygiene' ou na raiz do dicionário
+        # Extração Robusta de Métricas
         higiene_stats = stats.get('hygiene', {})
         taxa = higiene_stats.get('taxa_recuperacao', stats.get('taxa_recuperacao', 100))
         cura_grade = higiene_stats.get('recuperado_grade', stats.get('recuperado_grade', 0))
+        # Captura o volume da Ouro (Predições geradas)
+        linhas_ouro = higiene_stats.get('linhas_ouro', stats.get('linhas_ouro', 0)) 
         
         cor = self.COR_SUCESSO if taxa > 80 else self.COR_ALERTA
 
-        em_repouso = all(v == "⏭️ (Cache)" for v in stats.get('status_camadas', {}).values())
+        # Verifica se o pipeline rodou ou se apenas usou o cache
+        status_camadas = stats.get('status_camadas', {})
+        em_repouso = all(v == "⏭️ (Cache)" for v in status_camadas.values())
         titulo = "😴 Ciclo SafeDriver: Sem Alterações" if em_repouso else "🛡️ Ciclo SafeDriver: Atualização Concluída"
 
         data_formatada = agora.strftime("%d/%m/%Y %H:%M:%S")
@@ -58,10 +63,10 @@ class ComunicadorSafeDriver:
                 {
                     "name": "⛓️ Status do Pipeline",
                     "value": (
-                        f"**Bronze:** {stats.get('status_camadas', {}).get('bronze', 'N/A')}\n"
-                        f"**Prata:** {stats.get('status_camadas', {}).get('prata', 'N/A')}\n"
-                        f"**IA (Treino):** {stats.get('status_camadas', {}).get('ia', 'N/A')}\n"
-                        f"**Ouro (DW):** {stats.get('status_camadas', {}).get('ouro', 'N/A')}"
+                        f"**Bronze:** {status_camadas.get('bronze', 'N/A')}\n"
+                        f"**Prata:** {status_camadas.get('prata', 'N/A')}\n"
+                        f"**IA (Treino):** {status_camadas.get('ia', 'N/A')}\n"
+                        f"**Ouro (DW):** {status_camadas.get('ouro', 'N/A')}"
                     ),
                     "inline": False
                 },
@@ -73,6 +78,11 @@ class ComunicadorSafeDriver:
                 {
                     "name": "🛠️ Cura Geográfica", 
                     "value": f"`{cura_grade}` hexágonos",
+                    "inline": True
+                },
+                {
+                    "name": "🏆 Destino Ouro", # <--- NOVO CAMPO ALINHADO
+                    "value": f"`{linhas_ouro}` predições",
                     "inline": True
                 },
                 {
@@ -95,13 +105,14 @@ class ComunicadorSafeDriver:
 
     def relatar_erro_critico(self, modulo, erro):
         if not self.webhook_erro:
+            logger.warning("Webhook de erro não configurado.")
             return False
 
         agora = self._obter_agora_br()
 
         embed_erro = {
             "title": f"🚨 Falha Crítica: {modulo}",
-            "description": f"Erro no módulo **{modulo}** às {agora.strftime('%H:%M:%S')}.\n\n```python\n{erro}\n```",
+            "description": f"Erro detectado no módulo **{modulo}** às {agora.strftime('%H:%M:%S')}.\n\n```python\n{erro}\n```",
             "color": self.COR_ERRO,
             "timestamp": agora.isoformat(),
             "footer": {"text": self.rodape_padrao}
