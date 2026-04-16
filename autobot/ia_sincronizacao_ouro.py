@@ -33,10 +33,12 @@ class CamadaOuroSafeDriver:
         self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         
         self.cal = CalendarioEstrategico()
-        self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
+        self.pesos = {"catboost": 0.85, "lightgbm": 0.15} # CatBoost lidera pela precisão em Tweedie
         
+        # --- 🚀 ALINHAMENTO COM O TREINADOR V3: Inclusão de Memória como Feature ---
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+            'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', # <-- Memória Local para curar a surdez temporal
             'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
         ]
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
@@ -66,13 +68,13 @@ class CamadaOuroSafeDriver:
             except exceptions.NotFound:
                 dataset = bigquery.Dataset(dataset_ref)
                 dataset.location = "US"
-                dataset.description = "Camada Ouro SafeDriver - Star Schema Granular"
+                dataset.description = "Camada Ouro SafeDriver - IA Preditiva Granular"
                 self.bq_client.create_dataset(dataset)
         except Exception as e:
             logger.error(f"OURO: Erro de Infra BQ: {e}")
 
     def executar_predicao_atual(self):
-        logger.info(f"OURO: Iniciando ciclo de inteligência preditiva (Scaffold Mode).")
+        logger.info(f"OURO: Iniciando inferência dinâmica com Memória Histórica.")
         try:
             modelos = self._carregar_modelos_producao()
             df_input = self._obter_contexto_preditivo_total()
@@ -80,23 +82,29 @@ class CamadaOuroSafeDriver:
             if df_input is None or df_input.empty: 
                 return False
 
+            # --- PREPARAÇÃO DE ENTRADA PARA OS MODELOS ---
             X = df_input[self.features_full].copy()
             for col in self.features_categoricas: X[col] = X[col].astype('category')
             for col in self.features_numericas: X[col] = X[col].astype('float32')
 
-            logger.info("OURO: A gerar Scores IA para a malha total...")
+            logger.info("OURO: Gerando Scores IA para Malha Total (Scaffold Mode)...")
             p_cat = modelos["cat"].predict(X) if modelos["cat"] else None
             p_lgb = modelos["lgb"].predict(X) if modelos["lgb"] else p_cat
 
-            # Cálculo de Risco Ponderado
-            score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
-            
-            df_input['SCORE_RISCO_BRUTO'] = score_base
-            max_val = df_input['SCORE_RISCO_BRUTO'].max() or 1
-            df_input['SCORE_RISCO_FINAL'] = ((df_input['SCORE_RISCO_BRUTO'] / max_val) * 100).clip(0, 100).round(2)
+            # Cálculo de Risco Baseado em Ensemble Tweedie
+            score_raw = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
+            df_input['SCORE_RISCO_BRUTO'] = score_raw
+
+            # --- 🚀 RESOLUÇÃO DO VIÉS: Normalização Intra-Perfil ---
+            # Isso garante que a variação de horário apareça no mapa, não sendo esmagada pelo peso do motorista
+            logger.info("OURO: Aplicando Normalização de Contraste por Perfil...")
+            df_input['SCORE_RISCO_FINAL'] = df_input.groupby('PERFIL_ALVO')['SCORE_RISCO_BRUTO'].transform(
+                lambda x: ((x - x.min()) / (x.max() - x.min() + 0.001) * 100)
+            ).clip(0, 100).round(2)
+
             df_input['DT_REF'] = datetime.now() 
             
-            # SHAP para Explicabilidade
+            # SHAP para Explicabilidade (Auditoria de Decisão da IA)
             try:
                 explainer = shap.TreeExplainer(modelos["cat"])
                 df_top = df_input.nlargest(1000, 'SCORE_RISCO_FINAL')
@@ -111,10 +119,13 @@ class CamadaOuroSafeDriver:
             self._sincronizar_star_schema(df_input)
             return True
         except Exception as e:
-            logger.error(f"OURO: Erro Crítico: {e}")
+            logger.error(f"OURO Erro Crítico: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _sincronizar_star_schema(self, df):
+        """Alimenta a Tabela de Fatos com Clustering para Alta Performance no Dashboard."""
         table_id = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidada"
         df_bq = df.copy()
         for col in self.features_categoricas: df_bq[col] = df_bq[col].astype(str)
@@ -134,67 +145,54 @@ class CamadaOuroSafeDriver:
             try:
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                 modelos[alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-            except: pass
+            except: logger.warning(f"OURO: Modelo {alg} não encontrado no Datalake.")
         return modelos
 
     def _obter_contexto_preditivo_total(self):
-        """
-        Gera um Scaffold (Produto Cartesiano) de todos os hexágonos x todos os turnos.
-        Isso garante predições para Manhã/Tarde/Noite/Madrugada e elimina duplicatas.
-        """
+        """Gera o Scaffold de predição integrando a Memória da Camada Prata."""
         try:
-            # 1. Carrega Malha (O esqueleto geográfico)
+            # 1. Malha Geográfica Base
             resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read())).unique(subset=["H3_INDEX"])
             
-            # 2. Carrega e Agrega a Prata (Elimina os 13 registos duplicados)
+            # 2. Carrega Memória da Prata (Histórico Real)
             ano = datetime.now().year
             path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
             df_prata = pl.read_parquet(io.BytesIO(self.s3.get_object(Bucket=self.bucket, Key=path_prata)['Body'].read()))
             
-            # Agregação crucial para limpar a base histórica antes da predição
+            # Agregação para consolidar o histórico por cenário
             df_prata_agg = df_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).agg([
-                pl.col("INDICE_GRAVIDADE").sum().alias("GRAVIDADE_HISTORICA"),
-                pl.col("TOTAL_CRIMES").sum().alias("VOLUME_HISTORICO")
+                pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
+                pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
+                pl.col("CONTAGIO_PONDERADO").max().alias("CONTAGIO_PONDERADO")
             ])
 
-            # 3. Criação do SCAFFOLD (A cura do "Só Noite")
-            # Criamos todas as combinações de tempo e perfil para CADA hexágono da cidade
+            # 3. SCAFFOLD: Criação da Malha Total de Predição (24h)
             periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
             perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
             scaffold = periodos.join(perfis, how="cross")
             
-            # Malha x (Periodo x Perfil)
             df_base = df_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
                 scaffold, how="cross"
             )
 
-            # 4. Join do Passado no Scaffold (Left Join)
+            # 4. Join: Injecão de Memória no Scaffold
+            # Onde não há histórico, a IA usará as features vizinhas e densidade
             df_full = df_base.join(
                 df_prata_agg, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"], how="left"
             ).with_columns([
                 pl.col("GRAVIDADE_HISTORICA").fill_null(0.0),
                 pl.col("VOLUME_HISTORICO").fill_null(0.0),
+                pl.col("CONTAGIO_PONDERADO").fill_null(0.0),
                 pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE")
             ])
 
             df_pd = df_full.to_pandas()
 
-            # 5. Contágio Espacial (K-Ring) sobre a Gravidade Agregada
-            logger.info("OURO: Calculando pressão espacial sobre a malha consolidada...")
-            gravidade_map = df_pd.groupby("H3_INDEX")["GRAVIDADE_HISTORICA"].sum().to_dict()
-            
-            contagio_map = {}
-            for hx in df_pd['H3_INDEX'].unique():
-                try:
-                    v1 = set(h3.k_ring(hx, 1)); v1.discard(hx)
-                    contagio_map[hx] = sum(gravidade_map.get(v, 0) for v in v1)
-                except: contagio_map[hx] = 0.0
-            
-            df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
+            # 5. Cálculo Dinâmico de Pressão de Risco
             df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
 
-            # 6. Injeção do Calendário
+            # 6. Contexto Temporal do Calendário Inteligente
             contexto_cal = self.cal.obter_contexto_ia()
             df_pd['MES_OCORRENCIA'] = self.cal.hoje.month
             df_pd['DIA_SEMANA'] = self.cal.hoje.weekday()
@@ -204,7 +202,7 @@ class CamadaOuroSafeDriver:
             
             return df_pd
         except Exception as e:
-            logger.error(f"OURO Erro: {e}")
+            logger.error(f"OURO Erro Contexto: {e}")
             return None
 
 if __name__ == "__main__":
