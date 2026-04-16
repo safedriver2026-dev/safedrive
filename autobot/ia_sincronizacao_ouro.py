@@ -38,7 +38,7 @@ class CamadaOuroSafeDriver:
         # Pesos Ensemble baseados no Treinador IA
         self.pesos = {"catboost": 0.80, "lightgbm": 0.20}
         
-        # SCHEMA DE TREINAMENTO EXACTO (Garantia de consistência com o Treinador)
+        # SCHEMA DE TREINAMENTO EXACTO
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
             'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
@@ -100,7 +100,7 @@ class CamadaOuroSafeDriver:
                 logger.warning("OURO: LightGBM falhou tipos. A usar apenas CatBoost.")
                 p_lgb = p_cat
 
-            # 🛡️ CÁLCULO DE RISCO PURO (Sem multiplicadores manuais - A IA decide o peso)
+            # 🛡️ CÁLCULO DE RISCO PURO (A IA projeta o peso final)
             score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
             
             # --- SCHEMA STAR: Tabela de Factos ---
@@ -142,9 +142,8 @@ class CamadaOuroSafeDriver:
         for col in self.features_categoricas: df_bq[col] = df_bq[col].astype(str)
         df_bq['DT_REF'] = pd.to_datetime(df_bq['DT_REF'])
 
-        # Clustering perfeito para filtros do Power BI (Onde, Quando, Quem)
         job_config = bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE", # Atualiza a foto do risco atual
+            write_disposition="WRITE_TRUNCATE",
             time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
             clustering_fields=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"] 
         )
@@ -165,26 +164,23 @@ class CamadaOuroSafeDriver:
 
     def _obter_contexto_preditivo_total(self):
         try:
-            # 1. Carrega Malha (com Programação Defensiva .unique())
             resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
             df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read())).unique(subset=["H3_INDEX"]).select(
-                ["H3_INDEX", "TAXA_VACANCIA"] # DENSIDADE, NM_MUN, NM_BAIRRO já vêm da Prata
+                ["H3_INDEX", "TAXA_VACANCIA"] 
             )
             
-            # 2. Carrega Prata (Ano Atual) - MANTENDO A GRANULARIDADE INTACTA
             ano = datetime.now().year
             path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
             df_prata = pl.read_parquet(io.BytesIO(self.s3.get_object(Bucket=self.bucket, Key=path_prata)['Body'].read()))
             
-            # 3. Join limpo: Mantém todas as linhas e perfis originais da SSP
             df_full = df_prata.join(df_malha, on="H3_INDEX", how="left")
             df_pd = df_full.to_pandas()
             
-            # 4. Cálculo de Contágio Espacial Global
-            logger.info("OURO: A calcular pressão espacial H3 (K-Ring)...")
-            # Agregamos os crimes apenas num dicionário para ver a "foto" da cidade, 
-            # sem destruir as linhas granulares do df_pd
-            crimes_agregados = df_pd.groupby("H3_INDEX")["TOTAL_CRIMES"].sum().to_dict()
+            # 🚀 A CORREÇÃO: O Contágio agora irradia a GRAVIDADE dos crimes vizinhos, e não apenas o Volume
+            logger.info("OURO: A calcular pressão espacial H3 baseada na Gravidade (K-Ring)...")
+            
+            # Agregamos o INDICE_GRAVIDADE (que já vem calculado e pesado da Prata)
+            crimes_agregados = df_pd.groupby("H3_INDEX")["INDICE_GRAVIDADE"].sum().to_dict()
             
             contagio_map = {}
             for h3_idx in df_pd['H3_INDEX'].unique():
@@ -192,21 +188,21 @@ class CamadaOuroSafeDriver:
                     v1 = set(h3.k_ring(h3_idx, 1)); v1.discard(h3_idx)
                     c1 = sum(crimes_agregados.get(v, 0) for v in v1)
                     v2 = set(h3.k_ring(h3_idx, 2)) - v1; v2.discard(h3_idx)
+                    # Vizinhança imediata (K=1) passa 100% da gravidade. Vizinhança K=2 passa 50%.
                     contagio_map[h3_idx] = (c1 * 1.0) + (sum(crimes_agregados.get(v, 0) for v in v2) * 0.5)
                 except: contagio_map[h3_idx] = 0.0
             
-            # Mapeia de volta para as linhas individuais
             df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
             df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
 
-            # 5. Injeção Dinâmica do Calendário Estratégico (O Orquestrador)
+            # Injeção Dinâmica do Calendário
             contexto_cal = self.cal.obter_contexto_ia()
             df_pd['MES_OCORRENCIA'] = self.cal.hoje.month
             df_pd['DIA_SEMANA'] = self.cal.hoje.weekday()
             df_pd['IS_PAGAMENTO'] = contexto_cal['IS_PAGAMENTO']
             df_pd['IS_FDS'] = contexto_cal['IS_FDS']
             
-            # Preenchimento de Nulos para evitar que o modelo quebre
+            # Preenchimento de Nulos
             for col in self.features_categoricas:
                 if col in df_pd.columns:
                     df_pd[col] = df_pd[col].astype(str).fillna("INDEFINIDO")
