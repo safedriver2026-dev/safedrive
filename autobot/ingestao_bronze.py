@@ -79,7 +79,7 @@ class IngestaoBronze:
 
         try:
             if tamanho_remoto != tamanho_local:
-                logger.info(f"BRONZE: [{ano}] Baixando novo arquivo (Tamanho alterado)...")
+                logger.info(f"BRONZE: [{ano}] Baixando novo arquivo (Delta detected)...")
                 resp = requests.get(url, headers=self.headers, timeout=300)
                 excel_bytes = resp.content
                 self.s3.put_object(Bucket=self.bucket, Key=path_raw, Body=excel_bytes)
@@ -89,11 +89,19 @@ class IngestaoBronze:
 
             xlsx_io = io.BytesIO(excel_bytes)
             dfs = []
-            ancoras = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "ANO_BO", "LATITUDE"}
             
-            # --- OTIMIZAÇÃO SEMESTRAL ---
-            # Vai ler a aba 1, a aba 2, e tenta a 3 só por segurança.
-            for i in range(1, 4):
+            # --- COLUNAS QUE REALMENTE IMPORTAM PARA O SAFEDRIVER ---
+            # Ao ler apenas estas, economizamos ~60% de RAM
+            colunas_alvo = [
+                "MUNICIPIO", "CIDADE", "NOME_MUNICIPIO", "BAIRRO", "LOGRADOURO",
+                "DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "HORA_OCORRENCIA_BO", 
+                "RUBRICA", "LATITUDE", "LONGITUDE", "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"
+            ]
+            
+            # Buscas estruturais (âncoras) para achar o cabeçalho real
+            ancoras = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "LATITUDE"}
+            
+            for i in range(1, 4): # Otimização semestral (1º sem, 2º sem e reserva)
                 try:
                     df_scan = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", has_header=False, read_options={"n_rows": 50})
                     
@@ -106,35 +114,33 @@ class IngestaoBronze:
                             break
                     
                     if real_header_idx is not None:
+                        # Lemos a aba partindo do cabeçalho real
                         df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": real_header_idx})
+                        df.columns = [c.upper().strip() for c in df.columns]
                         
-                        # Solução Nuclear do Cabeçalho
-                        colunas_limpas = []
-                        for idx_col, col_name in enumerate(df.columns):
-                            c_str = str(col_name).upper().strip()
-                            if "PRESENTE TABELA" in c_str or "FINALIDADE" in c_str or len(c_str) > 70:
-                                colunas_limpas.append(f"INFO_RECUPERADA_{idx_col}")
-                            else:
-                                colunas_limpas.append(c_str)
-                        df.columns = colunas_limpas
+                        # --- FILTRO NUCLEAR DE COLUNAS ---
+                        # Mantemos apenas o que a IA vai usar. O resto é descartado na hora.
+                        cols_to_keep = [c for c in df.columns if c in colunas_alvo or c == "H3_INDEX"]
+                        df = df.select(cols_to_keep)
                         
+                        # Converte tudo para String (Regra da Bronze)
                         df = df.with_columns(pl.all().cast(pl.String))
                         
-                        # Solução Nuclear das Linhas
+                        # Filtro Nuclear de Capa/Lixo
                         regex_capa = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
                         df = df.filter(~pl.any_horizontal(pl.all().str.contains(regex_capa)))
                         df = df.filter(pl.any_horizontal(pl.all().is_not_null()))
                         
                         dfs.append(df)
-                except: 
-                    # Acabaram as abas, segue o jogo.
-                    continue
+                except: continue
 
             if dfs:
+                # Concatenação Diagonal Segura (trata nomes de colunas variando entre anos)
                 df_trusted = pl.concat(dfs, how="diagonal")
 
-                logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros (Abas lidas: {len(dfs)})...")
+                logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros...")
                 
+                # Geocodificação H3 interna
                 df_trusted = df_trusted.with_columns([
                     pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
                     pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
@@ -144,13 +150,14 @@ class IngestaoBronze:
                     .alias("H3_INDEX")
                 )
 
+                # Persistência final em Parquet (Compactado com LZ4 para velocidade)
                 buffer = io.BytesIO()
-                df_trusted.write_parquet(buffer)
+                df_trusted.write_parquet(buffer, compression="lz4")
                 self.s3.put_object(Bucket=self.bucket, Key=path_trusted, Body=buffer.getvalue())
                 
-                logger.info(f"BRONZE: [{ano}] Trusted sincronizada sem a capa da SSP.")
+                logger.info(f"BRONZE: [{ano}] Sincronizada com sucesso.")
                 return True
                 
         except Exception as e:
-            logger.error(f"BRONZE: Erro no processamento do ano {ano}: {e}")
+            logger.error(f"BRONZE: Erro no ano {ano}: {e}")
         return False
