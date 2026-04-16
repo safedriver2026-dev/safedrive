@@ -1,117 +1,259 @@
+import polars as pl
+import pandas as pd
+import h3
+import boto3
+from botocore.config import Config
+import joblib
+import io
 import os
-import requests
+import json
 import logging
+import shap
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from google.cloud import bigquery
+from google.oauth2 import service_account
+from autobot.calendario_estrategico import CalendarioEstrategico
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
-class ComunicadorSafeDriver:
-    def __init__(self):
-        self.webhook_sucesso = os.getenv("DISCORD_SUCESSO")
-        self.webhook_erro = os.getenv("DISCORD_ERRO")
-        self.COR_SUCESSO = 3066993  # Verde
-        self.COR_ALERTA = 16776960 # Amarelo
-        self.COR_ERRO = 15158332    # Vermelho
-        self.rodape_padrao = "SafeDriver Autobot • Monitoramento de Ciclo de Dados"
-        self.fuso_br = ZoneInfo("America/Sao_Paulo")
+class CamadaOuroSafeDriver:
+    def __init__(self, dev_mode=False):
+        self.dev_mode = dev_mode
+        
+        # Conectividade Cloudflare R2
+        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
+        self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+        self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+        self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
+        
+        # Conectividade Google BigQuery
+        self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9").strip()
+        self.dataset_id = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip()
 
-    def _obter_agora_br(self):
-        """Retorna o objeto datetime atualizado para o horário de Brasília."""
-        return datetime.now(self.fuso_br)
+        self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
+                              aws_access_key_id=self.access_key,
+                              aws_secret_access_key=self.secret_key, 
+                              config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}, max_pool_connections=50))
+        
+        self.base_path = self._localizar_datalake_real()
+        self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
+        self.cal = CalendarioEstrategico()
+        
+        # Pesos do Ensemble (Ajustados para a IA)
+        self.pesos = {"catboost": 0.70, "lightgbm": 0.30}
+        
+        self.features_numericas = [
+            'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
+            'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+            'MES_OCORRENCIA', 'DIA_SEMANA_OCORRENCIA'
+        ]
+        
+        # PERFIL_AREA removido da Prata, então removemos daqui também para não dar erro
+        self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
+        self.features_full = self.features_numericas + self.features_categoricas
 
-    def _disparar(self, url, payload):
+        self._conectar_bigquery()
+
+    def _localizar_datalake_real(self):
         try:
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()
+            paginator = self.s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket, MaxKeys=100):
+                for obj in page.get('Contents', []):
+                    if "datalake/prata/" in obj['Key']:
+                        return obj['Key'].split("datalake/")[0] + "datalake"
+            return "datalake"
+        except: return "datalake"
+
+    def _get_path(self, camada, filename):
+        return f"{self.base_path}/{camada}/{filename}".replace("//", "/")
+
+    def _conectar_bigquery(self):
+        gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
+        try:
+            cred_info = json.loads(gcp_json)
+            credentials = service_account.Credentials.from_service_account_info(cred_info)
+            self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
+        except Exception as e:
+            logger.error(f"OURO: Falha na autenticação BigQuery: {e}")
+
+    def executar_predicao_atual(self):
+        """Fluxo principal: Predição -> SHAP -> BigQuery."""
+        logger.info(f"OURO: Iniciando Materializacao Preditiva (Dev Mode: {self.dev_mode}).")
+        try:
+            modelos = self._carregar_modelos_producao()
+            df_input = self._obter_contexto_preditivo_total()
+            
+            if df_input is None or modelos["cat"] is None: 
+                logger.error("OURO: Modelos ou dados de entrada ausentes.")
+                return False
+
+            # Geração de Inteligência
+            df_final = self._gerar_scores_ponderados(df_input, modelos)
+            
+            # Persistência em Camadas
+            self._salvar_parquet_ouro(df_final)
+            self._sincronizar_bq(df_final)
+            
             return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Falha ao enviar webhook para {url}: {e}")
+        except Exception as e:
+            logger.error(f"OURO: Erro critico no pipeline Ouro: {e}")
             return False
 
-    def enviar_relatorio_executivo(self, stats):
-        if not self.webhook_sucesso:
-            logger.warning("Webhook de sucesso não configurado.")
-            return False
+    def _carregar_modelos_producao(self):
+        modelos = {"cat": None, "lgb": None}
+        for alg in ["cat", "lgb"]:
+            path = self._get_path("modelos_ml", f"latest_{alg}_geral.pkl")
+            try:
+                obj = self.s3.get_object(Bucket=self.bucket, Key=path)
+                modelos[alg] = joblib.load(io.BytesIO(obj['Body'].read()))
+                logger.info(f"OURO: Modelo {alg} carregado da producao.")
+            except:
+                logger.warning(f"OURO: Modelo {alg} nao encontrado no R2.")
+        return modelos
 
-        agora = self._obter_agora_br()
+    def _gerar_contagio_na_malha_total(self, df_malha, df_crimes_prata):
+        """O UPGRADE: Popula a malha vazia com os crimes da prata."""
+        logger.info("OURO: Populando Malha Geografica com dados da Prata...")
+        df_full = df_malha.join(
+            df_crimes_prata.select(["H3_INDEX", "TOTAL_CRIMES"]), 
+            on="H3_INDEX", 
+            how="left"
+        ).with_columns(pl.col("TOTAL_CRIMES").fill_null(0))
+
+        df_pd = df_full.to_pandas()
+        crimes_dit = dict(zip(df_pd['H3_INDEX'], df_pd['TOTAL_CRIMES']))
+        usar_grid_disk = hasattr(h3, 'grid_disk')
         
-        # Pega as métricas de forma robusta, independentemente de onde o main.py empacotar
-        higiene_stats = stats.get('hygiene', {})
-        taxa = higiene_stats.get('taxa_recuperacao', stats.get('taxa_recuperacao', 100))
-        cura_grade = higiene_stats.get('recuperado_grade', stats.get('recuperado_grade', 0))
-        linhas_ouro = higiene_stats.get('linhas_ouro', stats.get('linhas_ouro', "N/A")) # <--- Busca os dados da Ouro
+        contagio = []
+        for h3_index in df_pd['H3_INDEX']:
+            try:
+                v1 = set(h3.grid_disk(h3_index, 1) if usar_grid_disk else h3.k_ring(h3_index, 1))
+                v1.discard(h3_index)
+                c1 = sum(crimes_dit.get(v, 0) for v in v1)
+                
+                v_total = set(h3.grid_disk(h3_index, 2) if usar_grid_disk else h3.k_ring(h3_index, 2))
+                v2 = v_total - v1
+                v2.discard(h3_index)
+                c2 = sum(crimes_dit.get(v, 0) for v in v2)
+                
+                contagio.append((c1 * 1.0) + (c2 * 0.5))
+            except: contagio.append(0.0)
+            
+        df_pd['CONTAGIO_PONDERADO'] = contagio
+        df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE_AJUSTADA'] + 0.001)
         
-        cor = self.COR_SUCESSO if taxa > 80 else self.COR_ALERTA
+        return pl.from_pandas(df_pd)
 
-        em_repouso = all(v == "⏭️ (Cache)" for v in stats.get('status_camadas', {}).values())
-        titulo = "😴 Ciclo SafeDriver: Sem Alterações" if em_repouso else "🛡️ Ciclo SafeDriver: Atualização Concluída"
+    def _obter_contexto_preditivo_total(self):
+        """Busca o estado preditivo total."""
+        logger.info("OURO: Iniciando Enriquecimento Bilateral (Malha <-> Prata)")
+        try:
+            resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
+            df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read()))
 
-        data_formatada = agora.strftime("%d/%m/%Y %H:%M:%S")
-        descricao_relatorio = f"Status do ecossistema SafeDriver atualizado em **{data_formatada}** (Horário de Brasília)."
+            ano_atual = datetime.now().year
+            path_prata = self._get_path("prata", f"ssp_consolidada_{ano_atual}.parquet")
+            resp_p = self.s3.get_object(Bucket=self.bucket, Key=path_prata)
+            df_prata = pl.read_parquet(io.BytesIO(resp_p['Body'].read()))
 
-        embed = {
-            "title": titulo,
-            "description": descricao_relatorio,
-            "color": cor,
-            "fields": [
-                {
-                    "name": "⛓️ Status do Pipeline",
-                    "value": (
-                        f"**Bronze:** {stats.get('status_camadas', {}).get('bronze', 'N/A')}\n"
-                        f"**Prata:** {stats.get('status_camadas', {}).get('prata', 'N/A')}\n"
-                        f"**IA (Treino):** {stats.get('status_camadas', {}).get('ia', 'N/A')}\n"
-                        f"**Ouro (DW):** {stats.get('status_camadas', {}).get('ouro', 'N/A')}"
-                    ),
-                    "inline": False
-                },
-                {
-                    "name": "🧹 Higiene (Prata)",
-                    "value": f"Taxa: `{taxa}%` ✅",
-                    "inline": True
-                },
-                {
-                    "name": "🛠️ Cura Geográfica", 
-                    "value": f"`{cura_grade}` hexágonos",
-                    "inline": True
-                },
-                {
-                    "name": "🏆 Destino Ouro", # <--- CAMPO NOVO ADICIONADO AQUI
-                    "value": f"`{linhas_ouro}` predições",
-                    "inline": True
-                },
-                {
-                    "name": "🧠 IA MAE",
-                    "value": f"`{stats.get('metrics_ia', {}).get('mae', 'N/A')}`",
-                    "inline": True
-                },
-                {
-                    "name": "⏱️ Duração",
-                    "value": f"`{stats.get('duracao', '0s')}`",
-                    "inline": True
-                }
-            ],
-            "timestamp": agora.isoformat(),
-            "footer": {"text": self.rodape_padrao}
-        }
+            df_malha_enriquecida = self._gerar_contagio_na_malha_total(df_malha, df_prata)
 
-        payload = {"username": "SafeDriver Maestro", "embeds": [embed]}
-        return self._disparar(self.webhook_sucesso, payload)
+            df_final = df_malha_enriquecida.with_columns([
+                pl.col("NM_MUN").fill_null("SAO PAULO"),
+                pl.col("NM_BAIRRO").fill_null("INDEFINIDO"),
+                pl.lit("TARDE").alias("PERIODO_DIA"), 
+                pl.lit("PEDESTRE").alias("PERFIL_ALVO"),
+                pl.lit("VIA PUBLICA").alias("TIPO_LOCAL"),
+                pl.lit(datetime.now().month).alias("MES_OCORRENCIA"),
+                pl.lit(datetime.now().weekday()).alias("DIA_SEMANA_OCORRENCIA"),
+                pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE"),
+                pl.lit(0.5).alias("RANKING_RISCO_LOCAL"),
+                pl.lit(0.1).alias("INDICE_EXPOSICAO")
+            ])
 
-    def relatar_erro_critico(self, modulo, erro):
-        if not self.webhook_erro:
-            return False
+            df_pd = df_final.to_pandas()
+            for col in self.features_categoricas:
+                df_pd[col] = df_pd[col].astype(str).astype('category')
+            for col in self.features_numericas:
+                df_pd[col] = pd.to_numeric(df_pd[col], errors='coerce').fillna(0.0)
+            
+            return df_pd
+        except Exception as e:
+            logger.error(f"OURO: Falha ao carregar contexto preditivo: {e}")
+            return None
 
-        agora = self._obter_agora_br()
+    def _gerar_scores_ponderados(self, df, modelos):
+        """Aplica o modelo."""
+        logger.info("OURO: Calculando Scores e explicabilidade SHAP...")
+        mults = self.cal.obter_multiplicadores()
+        
+        p_cat = modelos["cat"].predict(df[self.features_full])
+        p_lgb = modelos["lgb"].predict(df[self.features_full]) if modelos["lgb"] else p_cat
+        
+        score_base = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
+        df['SCORE_RISCO_BRUTO'] = score_base * mults.get("geral", 1.0)
+        
+        max_val = df['SCORE_RISCO_BRUTO'].max() or 1
+        df['SCORE_RISCO_FINAL'] = ((df['SCORE_RISCO_BRUTO'] / max_val) * 100).clip(0, 100).round(2)
+        
+        if 'TOTAL_CRIMES' in df.columns:
+            df['FLAG_ALERTA_SILENCIOSO'] = (df['TOTAL_CRIMES'] == 0) & (df['SCORE_RISCO_FINAL'] > 70)
+        
+        df['DT_PROCESSAMENTO'] = datetime.now()
 
-        embed_erro = {
-            "title": f"🚨 Falha Crítica: {modulo}",
-            "description": f"Erro no módulo **{modulo}** às {agora.strftime('%H:%M:%S')}.\n\n```python\n{erro}\n```",
-            "color": self.COR_ERRO,
-            "timestamp": agora.isoformat(),
-            "footer": {"text": self.rodape_padrao}
-        }
+        try:
+            explainer = shap.TreeExplainer(modelos["cat"])
+            df_top = df.nlargest(min(len(df), 5000), 'SCORE_RISCO_FINAL')
+            shap_values = explainer.shap_values(df_top[self.features_full])
+            
+            for i, feat in enumerate(['NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO']):
+                col_name = f'SHAP_{feat}'
+                df[col_name] = 0.0
+                if feat in self.features_full:
+                    feat_idx = self.features_full.index(feat)
+                    df.loc[df_top.index, col_name] = shap_values[:, feat_idx]
+        except Exception as e:
+            logger.warning(f"OURO: Erro ao processar SHAP: {e}")
+            
+        return df
 
-        payload = {"username": "SafeDriver Alerta", "embeds": [embed_erro]}
-        return self._disparar(self.webhook_erro, payload)
+    def _salvar_parquet_ouro(self, df):
+        buffer = io.BytesIO()
+        df_save = df.copy()
+        for col in self.features_categoricas:
+            df_save[col] = df_save[col].astype(str)
+        pl.from_pandas(df_save).write_parquet(buffer, compression="lz4")
+        key = self._get_path("ouro", "fato_risco_consolidada.parquet")
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=buffer.getvalue())
+        logger.info("OURO: Artefato persistido no R2.")
+
+    def _sincronizar_bq(self, df):
+        """Merge Atômico com BigQuery."""
+        tabela_final = f"{self.project_id}.{self.dataset_id}.fato_risco_h3_vigente"
+        tabela_staging = f"{tabela_final}_staging"
+        
+        df_bq = df.copy()
+        for col in self.features_categoricas:
+            df_bq[col] = df_bq[col].astype(str)
+
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+        self.bq_client.load_table_from_dataframe(df_bq, tabela_staging, job_config=job_config).result()
+        
+        sql_merge = f"""
+        MERGE `{tabela_final}` T
+        USING `{tabela_staging}` S
+        ON T.H3_INDEX = S.H3_INDEX AND T.PERIODO_DIA = S.PERIODO_DIA AND T.PERFIL_ALVO = S.PERFIL_ALVO
+        WHEN MATCHED THEN
+          UPDATE SET 
+            T.SCORE_RISCO_FINAL = S.SCORE_RISCO_FINAL,
+            T.DT_PROCESSAMENTO = S.DT_PROCESSAMENTO
+        WHEN NOT MATCHED THEN
+          INSERT ROW AS S
+        """
+        self.bq_client.query(sql_merge).result()
+        logger.info("OURO: BigQuery MERGE concluido.")
+
+if __name__ == "__main__":
+    ouro = CamadaOuroSafeDriver(dev_mode=False)
+    ouro.executar_predicao_atual()
