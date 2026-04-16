@@ -31,7 +31,7 @@ tzdata
 requests
 python-dotenv
 pytest
-
+tzdata
 # --- Visualização ---
 folium
 pandas-gbq
