@@ -31,15 +31,22 @@ class TreinadorEvolutivo:
                               aws_secret_access_key=self.secret_key,
                               config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}, max_pool_connections=50))
         
-        # Auditoria de Caminho (Sincronizado com Prata/Maestro)
+        # Auditoria de Caminho
         self.base_path = self._localizar_datalake_real()
         logger.info(f"IA: Datalake mestre localizado em: '{self.base_path}'")
         
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         
-        # Definição do Escopo de Features (Saída da Prata)
+        # Definição do Escopo de Features (Sincronizado com a nova Prata)
         self.target = "TOTAL_CRIMES"
-        self.features_numericas = ['DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO']
+        
+        # Features Numéricas: Incluindo a inteligência de contágio e tempo
+        self.features_numericas = [
+            'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
+            'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+            'MES_OCORRENCIA', 'DIA_SEMANA_OCORRENCIA'
+        ]
+        
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
         self.stats_treino = {}
 
@@ -72,28 +79,30 @@ class TreinadorEvolutivo:
         X = df_treino[colunas_ia].copy()
         y = df_treino[self.target]
 
-        # Garantia de Tipagem para as Engines de ML
+        # --- CORREÇÃO CRÍTICA DE TIPAGEM ---
         for col in self.features_categoricas:
-            X[col] = X[col].astype(str).fillna("INDEFINIDO")
+            # Converte para string -> Preenche Nulos -> Converte para CATEGORY (Exigência do LightGBM)
+            X[col] = X[col].astype(str).fillna("INDEFINIDO").astype('category')
+            
         for col in self.features_numericas:
             X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0.0)
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # 1. CatBoost Tweedie (Lida nativamente com categorias)
-        logger.info("IA: [1/2] Treinando CatBoost (Foco em Generalização)...")
+        # 1. CatBoost Tweedie
+        logger.info("IA: [1/2] Treinando CatBoost (Foco em Generalizacao)...")
         model_cat = CatBoostRegressor(
             iterations=1200, 
             depth=6, 
             learning_rate=0.03, 
             cat_features=self.features_categoricas,
-            loss_function='Tweedie:variance_power=1.5', # Ideal para contagem de crimes
+            loss_function='Tweedie:variance_power=1.5',
             early_stopping_rounds=50, 
             verbose=200
         )
         model_cat.fit(X_train, y_train, eval_set=(X_test, y_test))
 
-        # 2. LightGBM Tweedie (Foco em Velocidade/Grandes volumes)
+        # 2. LightGBM Tweedie
         logger.info("IA: [2/2] Treinando LightGBM (Foco em Performance)...")
         model_lgb = LGBMRegressor(
             n_estimators=500, 
@@ -104,6 +113,7 @@ class TreinadorEvolutivo:
             importance_type='gain',
             verbosity=-1 
         )
+        # O LightGBM agora lerá as colunas 'category' sem erro
         model_lgb.fit(X_train, y_train)
 
         # Avaliação de Erro
@@ -116,7 +126,7 @@ class TreinadorEvolutivo:
         self._exportar_modelo(model_cat, "cat_geral")
         self._exportar_modelo(model_lgb, "lgb_geral")
         
-        # Telemetria para o Maestro
+        # Telemetria
         self.stats_treino = {
             "mae": round(min(mae_cat, mae_lgb), 4),
             "modelo_vencedor": "CatBoost" if mae_cat < mae_lgb else "LightGBM",
@@ -125,7 +135,7 @@ class TreinadorEvolutivo:
         return True
 
     def _carregar_datalake_consolidado(self):
-        """Consome a Prata e aplica Feature Engineering de última hora."""
+        """Consome a Prata e aplica Feature Engineering."""
         lista_dfs = []
         anos = [2026] if self.dev_mode else range(2022, datetime.now().year + 1)
         
@@ -135,31 +145,31 @@ class TreinadorEvolutivo:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 
-                # Conversão explícita para evitar erros de schema no concat
-                df = df.with_columns([
-                    pl.col(c).cast(pl.Float64, strict=False).fill_null(0.0) 
-                    for c in self.features_numericas if c in df.columns
-                ])
+                # Garante que as novas colunas da Prata existem e são Float
+                for col in self.features_numericas:
+                    if col in df.columns:
+                        df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False).fill_null(0.0))
+                
                 lista_dfs.append(df)
-            except Exception as e:
-                logger.warning(f"IA: Arquivo de {ano} ignorado (Possível ausência na Prata).")
+            except Exception:
                 continue
         
         if not lista_dfs: return None
         
         df_pl = pl.concat(lista_dfs, how="diagonal")
         
-        # Feature Engineering: Perfil de Área baseado em Densidade
-        df_pl = df_pl.with_columns([
-            pl.when(pl.col('DENSIDADE') > 5000).then(pl.lit("ALTO_FLUXO"))
-              .when(pl.col('DENSIDADE') <= 500).then(pl.lit("BAIXO_FLUXO"))
-              .otherwise(pl.lit("MODERADO")).alias('PERFIL_AREA')
-        ])
+        # Feature Engineering Final
+        if 'DENSIDADE' in df_pl.columns:
+            df_pl = df_pl.with_columns([
+                pl.when(pl.col('DENSIDADE') > 5000).then(pl.lit("ALTO_FLUXO"))
+                  .when(pl.col('DENSIDADE') <= 500).then(pl.lit("BAIXO_FLUXO"))
+                  .otherwise(pl.lit("MODERADO")).alias('PERFIL_AREA')
+            ])
         
         return df_pl.to_pandas()
 
     def _exportar_modelo(self, modelo, nome):
-        """Salva o modelo com versão e como 'latest' para a Camada Ouro."""
+        """Salva o modelo no R2."""
         key_ver = self._get_path("modelos_ml/versions", f"v{self.versao_modelo}_{nome}.pkl")
         key_lat = self._get_path("modelos_ml", f"latest_{nome}.pkl")
         
