@@ -68,9 +68,12 @@ class CamadaOuroSafeDriver:
     def _conectar_bigquery(self):
         gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
         try:
-            cred_info = json.loads(gcp_json)
-            credentials = service_account.Credentials.from_service_account_info(cred_info)
-            self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
+            if gcp_json:
+                cred_info = json.loads(gcp_json)
+                credentials = service_account.Credentials.from_service_account_info(cred_info)
+                self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
+            else:
+                logger.warning("OURO: BQ_SERVICE_ACCOUNT_JSON não encontrado. Pulando conexão BQ.")
         except Exception as e:
             logger.error(f"OURO: Falha na autenticação BigQuery: {e}")
 
@@ -80,7 +83,6 @@ class CamadaOuroSafeDriver:
         try:
             modelos = self._carregar_modelos_producao()
             
-            # Mudança: Agora buscamos a malha completa para inferência
             df_input = self._obter_contexto_preditivo_total()
             
             if df_input is None or modelos["cat"] is None: 
@@ -92,7 +94,8 @@ class CamadaOuroSafeDriver:
             
             # Persistência
             self._salvar_parquet_ouro(df_final)
-            self._sincronizar_bq(df_final)
+            if hasattr(self, 'bq_client'):
+                self._sincronizar_bq(df_final)
             
             return True
         except Exception as e:
@@ -107,8 +110,8 @@ class CamadaOuroSafeDriver:
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path)
                 modelos[alg] = joblib.load(io.BytesIO(obj['Body'].read()))
                 logger.info(f"OURO: Modelo {alg} carregado com sucesso.")
-            except:
-                logger.warning(f"OURO: Falha ao carregar modelo {alg}.")
+            except Exception as e:
+                logger.warning(f"OURO: Falha ao carregar modelo {alg}. Erro: {e}")
         return modelos
 
     def _obter_contexto_preditivo_total(self):
@@ -118,16 +121,14 @@ class CamadaOuroSafeDriver:
         """
         logger.info("OURO: Consolidando Malha Geográfica Total para predição...")
         
-        # Carregamos os dados da Prata mais recentes
-        ano_atual = datetime.now().year
-        key_prata = self._get_path("prata", f"ssp_consolidada_{ano_atual}.parquet")
+        # CORREÇÃO: Removido o f"ssp_consolidada_{ano_atual}.parquet"
+        # Agora busca diretamente o arquivo unificado gerado pela camada Prata.
+        key_prata = self._get_path("prata", "ssp_consolidada.parquet")
         
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=key_prata)
             df_prata = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             
-            # Se houver uma malha de referência sem crimes (ex: bronze/georef), 
-            # você faria um join aqui. Por enquanto, garantimos a tipagem da Prata.
             df = df_prata.to_pandas()
             
             # Blindagem de tipos para LightGBM e CatBoost
@@ -142,7 +143,7 @@ class CamadaOuroSafeDriver:
                     
             return df
         except Exception as e:
-            logger.error(f"OURO: Erro ao carregar malha: {e}")
+            logger.error(f"OURO: Erro ao carregar malha '{key_prata}': {e}")
             return None
 
     def _gerar_scores_ponderados(self, df, modelos):
@@ -197,7 +198,7 @@ class CamadaOuroSafeDriver:
         pl.from_pandas(df_save).write_parquet(buffer, compression="lz4")
         key = self._get_path("ouro", "fato_risco_consolidada.parquet")
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=buffer.getvalue())
-        logger.info(f"OURO: Parquet persistido no R2.")
+        logger.info(f"OURO: Parquet persistido no R2 em {key}.")
 
     def _sincronizar_bq(self, df):
         """Sincronização via MERGE no BigQuery."""
