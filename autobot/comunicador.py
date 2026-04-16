@@ -15,7 +15,6 @@ class ComunicadorSafeDriver:
         self.COR_ALERTA = 16776960 # Amarelo
         self.COR_ERRO = 15158332    # Vermelho
         self.rodape_padrao = "SafeDriver Autobot • Monitoramento de Ciclo de Dados"
-        # Definimos o fuso horário de Brasília como padrão da classe
         self.fuso_br = ZoneInfo("America/Sao_Paulo")
 
     def _obter_agora_br(self):
@@ -38,13 +37,15 @@ class ComunicadorSafeDriver:
 
         agora = self._obter_agora_br()
         
+        # Pega as métricas de higiene e cura enviadas pela Prata
         taxa = stats.get('hygiene', {}).get('taxa_recuperacao', 100)
+        cura_grade = stats.get('recuperado_grade', 0) # <--- NOVO: Valor da cura geográfica
+        
         cor = self.COR_SUCESSO if taxa > 80 else self.COR_ALERTA
 
         em_repouso = all(v == "⏭️ (Cache)" for v in stats.get('status_camadas', {}).values())
         titulo = "😴 Ciclo SafeDriver: Sem Alterações" if em_repouso else "🛡️ Ciclo SafeDriver: Atualização Concluída"
 
-        # Formatação legível para o corpo da mensagem
         data_formatada = agora.strftime("%d/%m/%Y %H:%M:%S")
         descricao_relatorio = f"Status do ecossistema SafeDriver atualizado em **{data_formatada}** (Horário de Brasília)."
 
@@ -69,8 +70,13 @@ class ComunicadorSafeDriver:
                     "inline": True
                 },
                 {
+                    "name": "🛠️ Cura Geográfica", # <--- NOVO CAMPO NO DISCORD
+                    "value": f"`{cura_grade}` hexágonos",
+                    "inline": True
+                },
+                {
                     "name": "🧠 IA MAE",
-                    "value": f"`{stats['metrics_ia'].get('mae', 'N/A')}`",
+                    "value": f"`{stats.get('metrics_ia', {}).get('mae', 'N/A')}`",
                     "inline": True
                 },
                 {
@@ -79,7 +85,6 @@ class ComunicadorSafeDriver:
                     "inline": True
                 }
             ],
-            # O campo 'timestamp' no Discord precisa ser ISO 8601
             "timestamp": agora.isoformat(),
             "footer": {"text": self.rodape_padrao}
         }
