@@ -47,7 +47,8 @@ class TreinadorEvolutivo:
             'MES_OCORRENCIA', 'DIA_SEMANA_OCORRENCIA'
         ]
         
-        self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERFIL_AREA', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
+        # ALINHAMENTO: PERFIL_AREA removido (Sincronizado com a Ouro)
+        self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
         self.stats_treino = {}
 
     def _localizar_datalake_real(self):
@@ -158,14 +159,7 @@ class TreinadorEvolutivo:
         
         df_pl = pl.concat(lista_dfs, how="diagonal")
         
-        # Feature Engineering Final
-        if 'DENSIDADE' in df_pl.columns:
-            df_pl = df_pl.with_columns([
-                pl.when(pl.col('DENSIDADE') > 5000).then(pl.lit("ALTO_FLUXO"))
-                  .when(pl.col('DENSIDADE') <= 500).then(pl.lit("BAIXO_FLUXO"))
-                  .otherwise(pl.lit("MODERADO")).alias('PERFIL_AREA')
-            ])
-        
+        # O bloco de criação do PERFIL_AREA foi removido daqui para manter a tabela limpa
         return df_pl.to_pandas()
 
     def _exportar_modelo(self, modelo, nome):
