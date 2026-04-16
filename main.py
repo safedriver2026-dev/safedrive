@@ -25,8 +25,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def verificar_estado_remoto(prefixo_path):
-    """Verifica a existência física de artefatos no Cloudflare R2."""
+def _descobrir_prefixo_datalake(s3, bucket):
+    """Localiza o datalake dinamicamente para evitar erro de caminho."""
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, MaxKeys=100):
+            for obj in page.get('Contents', []):
+                if "datalake/prata/" in obj['Key']:
+                    return obj['Key'].split("datalake/")[0] + "datalake"
+        return "datalake"
+    except: return "datalake"
+
+def verificar_estado_remoto(camada_arquivo):
+    """Verifica a existência física de artefatos no Cloudflare R2 com caminho inteligente."""
     try:
         s3 = boto3.client('s3', 
             endpoint_url=os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/'),
@@ -35,7 +46,10 @@ def verificar_estado_remoto(prefixo_path):
             config=Config(signature_version='s3v4')
         )
         bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-        s3.head_object(Bucket=bucket, Key=prefixo_path)
+        base_path = _descobrir_prefixo_datalake(s3, bucket)
+        
+        full_key = f"{base_path}/{camada_arquivo}".replace("//", "/")
+        s3.head_object(Bucket=bucket, Key=full_key)
         return True
     except:
         return False
@@ -48,7 +62,7 @@ def orquestrar_pipeline(force_reprocess=False):
     start_time = datetime.now()
     comunicador = ComunicadorSafeDriver()
 
-    # Telemetria centralizada para o Relatório Executivo
+    # Telemetria adaptada para a era "Heavy Silver"
     stats = {
         "status_camadas": {
             "bronze": "⏭️ (Cache)", 
@@ -57,11 +71,11 @@ def orquestrar_pipeline(force_reprocess=False):
             "ouro": "⏭️ (Cache)"
         },
         "hygiene": {
-            "linhas_in": 0, 
-            "linhas_out": 0, 
+            "linhas_in": "N/A (Otimizado)", 
+            "linhas_out": "N/A (Otimizado)", 
             "taxa_recuperacao": 100, 
             "linhas_ouro": 0,
-            "recuperado_grade": 0
+            "recuperado_grade": "N/A"
         },
         "metrics_ia": {"mae": "Aguardando..."},
         "duracao": "0s"
@@ -70,30 +84,27 @@ def orquestrar_pipeline(force_reprocess=False):
     try:
         # --- ETAPA 1: BRONZE (Ingestão) ---
         bronze = IngestaoBronze()
-        # novos_dados_bronze indica se houve download ou mudança de tamanho na SSP
         novos_dados_bronze = bronze.executar_ingestao_continua(force=force_reprocess)
         if novos_dados_bronze: 
             stats["status_camadas"]["bronze"] = "✅ (Novo)"
 
-        # --- ANÁLISE DE ESTADO FÍSICO (Verificação de Integridade no R2) ---
-        prata_existe = verificar_estado_remoto("datalake/prata/ssp_consolidada_2022.parquet")
-        modelos_existem = verificar_estado_remoto("datalake/modelos_ml/latest_cat_geral.pkl")
-        ouro_existe = verificar_estado_remoto("datalake/ouro/fato_risco_consolidada.parquet")
+        # --- ANÁLISE DE ESTADO FÍSICO COM GATILHOS BLINDADOS ---
+        prata_existe = verificar_estado_remoto("prata/ssp_consolidada_2022.parquet")
+        modelos_existem = verificar_estado_remoto("modelos_ml/latest_cat_geral.pkl")
+        ouro_existe = verificar_estado_remoto("ouro/fato_risco_consolidada.parquet")
         
-        # Lógica de Gatilhos: Só reprocessa se houver dado novo, se for forçado ou se o arquivo sumiu
         gatilho_prata = novos_dados_bronze or force_reprocess or not prata_existe
         gatilho_ia = gatilho_prata or not modelos_existem
         gatilho_ouro = gatilho_ia or not ouro_existe
 
-        # --- ETAPA 2: PRATA (Higiene e Normalização) ---
-        prata = ProcessamentoPrata()
+        # --- ETAPA 2: PRATA (Heavy Silver) ---
         if gatilho_prata:
-            logger.info("🚀 Prata: Iniciando processamento e filtragem de qualidade...")
+            logger.info("🚀 Prata: Iniciando processamento e engenharia de features...")
+            prata = ProcessamentoPrata()
             metricas_prata = prata.executar_todos_os_anos(force=force_reprocess)
             
-            if metricas_prata and isinstance(metricas_prata, dict):
+            if metricas_prata:
                 stats["status_camadas"]["prata"] = "✅ (Processado)"
-                stats["hygiene"].update(metricas_prata)
             else:
                 stats["status_camadas"]["prata"] = "⚠️ (Vazio/Erro)"
         else:
@@ -118,8 +129,8 @@ def orquestrar_pipeline(force_reprocess=False):
             ouro = CamadaOuroSafeDriver(dev_mode=False) 
             if ouro.executar_predicao_atual():
                 stats["status_camadas"]["ouro"] = "✅ (Sincronizado)"
-                # Aqui a Ouro poderia retornar a contagem real de predições
-                stats["hygiene"]["linhas_ouro"] = stats["hygiene"].get("linhas_out", 0)
+                # Como a Ouro processa a malha total enriquecida, podemos usar o height da malha como métrica de sucesso
+                stats["hygiene"]["linhas_ouro"] = "Toda a Malha (H9)"
             else:
                 comunicador.relatar_erro_critico("Camada Ouro", "Erro na sincronização com BigQuery.")
                 return
@@ -128,12 +139,6 @@ def orquestrar_pipeline(force_reprocess=False):
         
         # --- FINALIZAÇÃO E RELATÓRIO ---
         stats["duracao"] = str(datetime.now() - start_time).split(".")[0]
-        
-        # Recalcula a taxa de recuperação final para o relatório
-        if stats["hygiene"]["linhas_in"] > 0:
-            stats["hygiene"]["taxa_recuperacao"] = round(
-                (stats["hygiene"]["linhas_out"] / stats["hygiene"]["linhas_in"]) * 100, 1
-            )
 
         logger.info(f"✨ SafeDriver finalizado. Enviando telemetria para o Discord...")
         comunicador.enviar_relatorio_executivo(stats)
