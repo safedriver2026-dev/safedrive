@@ -16,13 +16,12 @@ logger = logging.getLogger(__name__)
 
 class ProcessamentoPrata:
     def __init__(self):
-        # Credenciais Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
-        # Configuração de Conexão S3 com Pool estendido para velocidade
+        # Conexão S3 de Alta Performance
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
                               aws_access_key_id=self.access_key,
                               aws_secret_access_key=self.secret_key, 
@@ -46,6 +45,7 @@ class ProcessamentoPrata:
         except: return "datalake"
 
     def _limpar_texto_extremo(self, coluna):
+        """Rodará apenas nas linhas únicas, economizando minutos de processamento."""
         return (
             pl.col(coluna)
             .cast(pl.String)
@@ -67,10 +67,9 @@ class ProcessamentoPrata:
             self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
             self.df_malha_lazy = self.df_malha.lazy().with_columns([
                 self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
-                self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO"),
-                self._limpar_texto_extremo("LOGRADOURO").alias("LOGRADOURO_GRID")
+                self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-            logger.info("PRATA: Malha geográfica normalizada carregada.")
+            logger.info("PRATA: Malha geográfica mestre carregada.")
         except Exception as e:
             logger.error(f"PRATA: Falha ao carregar malha H3: {e}")
             self.df_malha_lazy = None
@@ -94,19 +93,13 @@ class ProcessamentoPrata:
         self.df_malha_lazy = self.df_malha.lazy()
 
     def _gerar_features_espaciais_ia(self, df_pd):
-        """
-        OTIMIZAÇÃO DE ALTA PERFORMANCE:
-        Calcula a matemática espacial apenas uma vez por hexágono único,
-        reduzindo o tempo de processamento em até 90%.
-        """
+        """Otimizado para rodar a matemática H3 apenas em Hexágonos Únicos."""
         usar_grid_disk = hasattr(h3, 'grid_disk')
         
-        # Isola os hexágonos únicos e soma os crimes totais para o cálculo vizinho
         df_unique = df_pd.groupby('H3_INDEX', as_index=False)['TOTAL_CRIMES'].sum()
         crimes_dit = dict(zip(df_unique['H3_INDEX'], df_unique['TOTAL_CRIMES']))
         
         contagio_dit = {}
-        # Loop passa apenas nos hexágonos únicos, não nas milhares de linhas duplicadas
         for h3_index in df_unique['H3_INDEX']:
             try:
                 v1 = set(h3.grid_disk(h3_index, 1) if usar_grid_disk else h3.k_ring(h3_index, 1))
@@ -119,10 +112,9 @@ class ProcessamentoPrata:
                 c2 = sum(crimes_dit.get(v, 0) for v in v2)
                 
                 contagio_dit[h3_index] = (c1 * 1.0) + (c2 * 0.5)
-            except: 
-                contagio_dit[h3_index] = 0.0
+            except: contagio_dit[h3_index] = 0.0
         
-        # Mapeia os resultados de volta para a base completa em milissegundos
+        # Mapeia em milissegundos para a tabela completa
         df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_dit)
         df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
         return df_pd
@@ -139,6 +131,16 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
+            # --- 1. FILTRO DE ALTA VELOCIDADE (Droppa lixo imediatamente) ---
+            lf = lf.filter(
+                (pl.col("NUM_BO").is_not_null()) & 
+                (pl.col("NUM_BO").cast(pl.String).str.contains(r"[0-9]")) &
+                (~pl.col("NUM_BO").cast(pl.String).str.contains(r"(?i)A PRESENTE TABELA|CONTEUDO")) &
+                (pl.col("H3_INDEX").is_not_null()) # O SEGREDO DO DESEMPENHO AQUI
+            )
+            total_in = lf.select(pl.len()).collect().item()
+
+            # --- 2. RENAME RÁPIDO ---
             cols = lf.collect_schema().names()
             if "DESCR_SUBTIPOLOCAL" in cols:
                 lf = lf.rename({"DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"})
@@ -148,79 +150,80 @@ class ProcessamentoPrata:
 
             mapeamento = {
                 "CIDADE": "NM_MUN_ORIGINAL", "NOME_MUNICIPIO": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL",
-                "BAIRRO": "NM_BAIRRO_ORIGINAL", "LOGRADOURO": "LOGRADOURO_ORIGINAL",
-                "HORA_OCORRENCIA_BO": "HORA", "DESC_PERIODO": "PERIODO_TEXTO", "DESCR_PERIODO": "PERIODO_TEXTO",
-                "DESCR_CONDUTA": "CONDUTA",
-                "DATA_OCORRENCIA_BO": "DATA", "DATA_OCORRENCIA": "DATA"
+                "BAIRRO": "NM_BAIRRO_ORIGINAL", "HORA_OCORRENCIA_BO": "HORA", "DATA_OCORRENCIA_BO": "DATA_BRUTA",
+                "DATA_OCORRENCIA": "DATA_BRUTA"
             }
-            rename_dict = {old: new for old, new in mapeamento.items() if old in cols}
-            if rename_dict: lf = lf.rename(rename_dict)
-
+            lf = lf.rename({old: new for old, new in mapeamento.items() if old in lf.collect_schema().names()})
             cols_atualizadas = lf.collect_schema().names()
-            if "DATA" in cols_atualizadas:
-                lf = lf.with_columns(pl.col("DATA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA_PARSED"))
+
+            # --- 3. DATAS VETORIZADAS ---
+            if "DATA_BRUTA" in cols_atualizadas:
+                lf = lf.with_columns(pl.col("DATA_BRUTA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"))
                 lf = lf.with_columns([
-                    pl.col("DATA_PARSED").dt.month().fill_null(1).alias("MES_OCORRENCIA"),
-                    pl.col("DATA_PARSED").dt.weekday().fill_null(1).alias("DIA_SEMANA_OCORRENCIA")
+                    pl.col("DATA").dt.month().fill_null(1).alias("MES_OCORRENCIA"),
+                    pl.col("DATA").dt.weekday().fill_null(1).alias("DIA_SEMANA_OCORRENCIA")
                 ])
             else:
                 lf = lf.with_columns([pl.lit(1).alias("MES_OCORRENCIA"), pl.lit(1).alias("DIA_SEMANA_OCORRENCIA")])
 
-            total_in = lf.select(pl.len()).collect().item()
-            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "LOGRADOURO_ORIGINAL", "RUBRICA", "CONDUTA", "TIPO_LOCAL", "PERIODO_TEXTO"]
-            lf = lf.with_columns([self._limpar_texto_extremo(c) for c in campos_texto if c in cols_atualizadas])
-
-            if "H3_INDEX" in cols_atualizadas:
-                self._curar_malha_referencia(lf.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect())
-
-            lf_enriquecido = lf.join(self.df_malha_lazy, on="H3_INDEX", how="left")
-            lf_enriquecido = lf_enriquecido.with_columns([
-                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN_FINAL"),
-                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO_FINAL")
+            # Período e Alvo
+            lf = lf.with_columns([
+                pl.col("HORA").cast(pl.String).str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT"),
+                pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA")).otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
+            ]).with_columns([
+                pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA")).when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA")).when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE")).otherwise(pl.lit("NOITE")).alias("PERIODO_DIA")
             ])
 
+            # --- 4. A PRÉ-AGREGAÇÃO (O pulo do gato que encolhe a tabela de Milhões p/ Milhares) ---
+            lf_agg = lf.group_by([
+                "H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
+                "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA", 
+                "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"
+            ]).agg([
+                pl.when(pl.col("RUBRICA").str.contains("(?i)ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES")
+            ])
+
+            # --- 5. LIMPEZA DE TEXTO (Agora sim, super rápido na tabela encolhida) ---
+            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "TIPO_LOCAL"]
+            lf_agg = lf_agg.with_columns([self._limpar_texto_extremo(c) for c in campos_texto if c in lf_agg.collect_schema().names()])
+
+            # --- 6. CURA DA MALHA E JOIN ---
+            self._curar_malha_referencia(lf_agg.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect())
+
+            lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
+                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN_FINAL"),
+                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO_FINAL"),
+                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float64, strict=False).fill_null(0.0).alias("DENSIDADE"),
+                pl.col("TAXA_VACANCIA").cast(pl.Float64, strict=False).fill_null(0.0).alias("TAXA_VACANCIA")
+            ])
+
+            # Remove lixo do Join para evitar falhas do BigQuery depois
             lf_enriquecido = lf_enriquecido.filter(
-                (pl.col("H3_INDEX").is_not_null()) & 
                 (pl.col("NM_MUN_FINAL") != "INDEFINIDO") & 
                 (pl.col("NM_BAIRRO_FINAL") != "INDEFINIDO")
             )
 
-            lf_enriquecido = lf_enriquecido.with_columns([
-                pl.col("HORA").str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT"),
-                pl.when(pl.col("CONDUTA").str.contains("TRANSEUNTE|PEDESTRE")).then(pl.lit("PEDESTRE"))
-                  .when(pl.col("RUBRICA").str.contains("VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA"))
-                  .otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
-            ]).with_columns([
-                pl.when((pl.col("HORA_INT") > 0) & (pl.col("HORA_INT") < 6)).then(pl.lit("MADRUGADA"))
-                  .when((pl.col("HORA_INT") >= 6) & (pl.col("HORA_INT") < 12)).then(pl.lit("MANHA"))
-                  .when((pl.col("HORA_INT") >= 12) & (pl.col("HORA_INT") < 18)).then(pl.lit("TARDE"))
-                  .when((pl.col("HORA_INT") >= 18) & (pl.col("HORA_INT") <= 23)).then(pl.lit("NOITE"))
-                  .when(pl.col("PERIODO_TEXTO").str.contains("MADRUGADA")).then(pl.lit("MADRUGADA"))
-                  .when(pl.col("PERIODO_TEXTO").str.contains("MANHA")).then(pl.lit("MANHA"))
-                  .when(pl.col("PERIODO_TEXTO").str.contains("TARDE")).then(pl.lit("TARDE"))
-                  .when(pl.col("PERIODO_TEXTO").str.contains("NOITE")).then(pl.lit("NOITE"))
-                  .otherwise(pl.lit("MADRUGADA")).alias("PERIODO_DIA")
-            ])
-
-            lf_agg = lf_enriquecido.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA"]).agg([
-                pl.when(pl.col("RUBRICA").str.contains("ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES"),
+            # Consolidamos a tabela final
+            lf_final_agg = lf_enriquecido.group_by([
+                "H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA"
+            ]).agg([
+                pl.col("TOTAL_CRIMES").sum().alias("TOTAL_CRIMES"),
                 pl.col("NM_MUN_FINAL").first().alias("NM_MUN"),
                 pl.col("NM_BAIRRO_FINAL").first().alias("NM_BAIRRO"),
-                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float64).first().alias("DENSIDADE"),
-                pl.col("TAXA_VACANCIA").cast(pl.Float64).first().alias("TAXA_VACANCIA")
+                pl.col("DENSIDADE").first().alias("DENSIDADE"),
+                pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA")
             ])
 
-            # Processamento super veloz da IA
-            df_final_pd = self._gerar_features_espaciais_ia(lf_agg.collect().to_pandas())
+            # --- 7. IA VETORIZADA NO PANDAS ---
+            df_final_pd = self._gerar_features_espaciais_ia(lf_final_agg.collect().to_pandas())
 
-            lf_final = pl.from_pandas(df_final_pd).with_columns([
+            df_final = pl.from_pandas(df_final_pd).with_columns([
                 (pl.col("TOTAL_CRIMES").rank().over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).alias("RANKING_RISCO_LOCAL"),
-                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE").fill_null(0) + 1)).alias("INDICE_EXPOSICAO"),
+                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).alias("INDICE_EXPOSICAO"),
                 pl.lit(ano).alias("ANO_REFERENCIA")
             ])
 
-            df_final = lf_final.collect(engine="streaming") if hasattr(lf_final, "collect") else lf_final
-            
+            # --- 8. PERSISTÊNCIA ---
             buffer = io.BytesIO()
             df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
@@ -242,16 +245,14 @@ class ProcessamentoPrata:
                 stats["linhas_out"] += res["linhas_out"]
                 self._salvar_tracker(estado)
         
-        # OTIMIZAÇÃO DE I/O: Salva a Malha curada no R2 UMA única vez no final
+        # Salva a malha corrigida 1 SÓ VEZ no final
         if self.campos_recuperados_grade > 0:
             try:
                 buffer_malha = io.BytesIO()
                 self.df_malha.write_parquet(buffer_malha, compression="lz4")
                 self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer_malha.getvalue())
-                logger.info("💾 Malha de referência atualizada persistida no R2.")
-            except Exception as e:
-                logger.warning(f"Aviso ao salvar malha: {e}")
-        
+            except Exception as e: logger.warning(f"Erro salvando malha: {e}")
+
         stats["recuperado_grade"] = self.campos_recuperados_grade
         stats["taxa_recuperacao"] = round((stats["linhas_out"] / stats["linhas_in"] * 100), 2) if stats["linhas_in"] > 0 else 100
         stats["status_camadas"] = {"prata": "✅ Concluido"}
