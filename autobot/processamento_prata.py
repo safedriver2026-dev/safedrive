@@ -25,7 +25,7 @@ class ProcessamentoPrata:
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
 
-        # Conexão S3
+        # Conexão S3 de Alta Performance
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
                               aws_access_key_id=self.access_key,
                               aws_secret_access_key=self.secret_key, 
@@ -74,7 +74,7 @@ class ProcessamentoPrata:
             ])
             logger.info("PRATA: Malha geografica mestre carregada.")
         except Exception as e:
-            logger.error(f"PRATA: Falha ao carregar malha: {e}")
+            logger.error(f"PRATA: Falha ao carregar malha H3: {e}")
             self.df_malha = None
 
     def _gerar_features_espaciais_ia(self, df_pd):
@@ -110,6 +110,14 @@ class ProcessamentoPrata:
             pl.when(pl.col("NM_BAIRRO") == "INDEFINIDO").then(pl.col("BAIRRO_NOVO")).otherwise(pl.col("NM_BAIRRO")).alias("NM_BAIRRO")
         ]).drop(["MUN_NOVO", "BAIRRO_NOVO"])
         self.campos_recuperados_grade += (self.df_malha.filter(pl.col("NM_MUN") != "INDEFINIDO").height - malha_antes)
+        self._persistir_malha_corrigida()
+
+    def _persistir_malha_corrigida(self):
+        try:
+            buffer = io.BytesIO()
+            self.df_malha.write_parquet(buffer, compression="lz4")
+            self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer.getvalue())
+        except Exception: pass
 
     def processar_ano_com_delta(self, ano, estado, force=False):
         path_trusted = f"{self.base_path}/bronze/trusted/ssp_trusted_{ano}.parquet"
@@ -118,51 +126,44 @@ class ProcessamentoPrata:
         try:
             meta = self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
             tamanho_atual = meta['ContentLength']
-            if not force and estado.get(str(ano)) == tamanho_atual: return None
+            if not force and estado.get(str(ano)) == tamanho_atual: 
+                logger.info(f"PRATA: Ano {ano} em cache.")
+                return None
 
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # --- 1. REMOÇÃO DA "CAPA" (LIMPEZA DE METADADOS SSP) ---
-            # Remove linhas que são textos explicativos ou cabeçalhos fantasmas
-            filtro_capa = (
+            # --- 1. REMOÇÃO DA CAPA (SKIP INTRO) ---
+            # Filtra apenas linhas que possuem um Número de B.O. válido e remove as explicações da SSP
+            lf = lf.filter(
                 (pl.col("NUM_BO").is_not_null()) & 
                 (pl.col("NUM_BO").cast(pl.String).str.contains(r"[0-9]")) &
-                (~pl.col("NUM_BO").cast(pl.String).str.contains("A PRESENTE TABELA"))
+                (~pl.col("NUM_BO").cast(pl.String).str.contains("A PRESENTE TABELA|CONTEUDO", ignore_case=True))
             )
-            lf = lf.filter(filtro_capa)
 
-            # --- 2. RESOLUÇÃO DE SCHEMA E DUPLICATAS ---
-            cols_originais = lf.collect_schema().names()
-            
-            # Remove colunas de metadados inúteis se existirem
-            cols_remover = [c for c in cols_originais if "UNNAMED" in c.upper() or "A PRESENTE TABELA" in c.upper()]
-            if cols_remover: lf = lf.drop(cols_remover)
-
-            mapeamento = {
-                "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL", "BAIRRO": "NM_BAIRRO_ORIGINAL",
-                "LOGRADOURO": "LOGRADOURO_ORIGINAL", "HORA_OCORRENCIA_BO": "HORA", "DATA_OCORRENCIA_BO": "DATA_BRUTA",
-                "DESCR_PERIODO": "PERIODO_TEXTO", "DESC_PERIODO": "PERIODO_TEXTO"
-            }
-            
-            # Tratamento especial para TIPO_LOCAL para evitar erro de duplicata
-            if "DESCR_SUBTIPOLOCAL" in cols_originais:
-                lf = lf.rename({"DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"})
-                if "DESCR_TIPOLOCAL" in cols_originais: lf = lf.drop("DESCR_TIPOLOCAL")
-                if "TIPO_LOCAL" in cols_originais and "DESCR_SUBTIPOLOCAL" in cols_originais:
-                    # Se já existe uma TIPO_LOCAL, removemos para evitar conflito no rename
-                    lf = lf.drop("TIPO_LOCAL").rename({"DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"})
-            elif "DESCR_TIPOLOCAL" in cols_originais:
-                lf = lf.rename({"DESCR_TIPOLOCAL": "TIPO_LOCAL"})
-
-            lf = lf.rename({old: new for old, new in mapeamento.items() if old in lf.collect_schema().names()})
-
-            # --- 3. CASTING E INTELIGÊNCIA ---
+            # --- 2. CONVERSÃO DE TIPOS (BRONZE STRING -> PRATA TYPED) ---
+            # Resolve o problema de tudo ser String na Bronze
             lf = lf.with_columns([
-                pl.col("DATA_BRUTA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA_PARSED"),
+                pl.col("DATA_OCORRENCIA_BO").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA_PARSED"),
                 pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
                 pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0)
-            ]).with_columns([
+            ])
+
+            # --- 3. RESOLUÇÃO DE SCHEMA DRIFT ---
+            cols = lf.collect_schema().names()
+            mapeamento = {
+                "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL", "BAIRRO": "NM_BAIRRO_ORIGINAL",
+                "LOGRADOURO": "LOGRADOURO_ORIGINAL", "HORA_OCORRENCIA_BO": "HORA", "DESCR_PERIODO": "PERIODO_TEXTO", 
+                "DESCR_SUBTIPOLOCAL": "TIPO_LOCAL", "DESCR_TIPOLOCAL": "TIPO_LOCAL"
+            }
+            # Remove colunas explicativas remanescentes
+            cols_remover = [c for c in cols if "UNNAMED" in c.upper() or "TABELA" in c.upper()]
+            if cols_remover: lf = lf.drop(cols_remover)
+            
+            lf = lf.rename({old: new for old, new in mapeamento.items() if old in lf.collect_schema().names()})
+
+            # --- 4. INTELIGÊNCIA TEMPORAL ---
+            lf = lf.with_columns([
                 pl.col("DATA_PARSED").dt.month().alias("MES_OCORRENCIA"),
                 pl.col("DATA_PARSED").dt.weekday().alias("DIA_SEMANA_OCORRENCIA"),
                 pl.col("HORA").cast(pl.String).str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT"),
@@ -178,14 +179,16 @@ class ProcessamentoPrata:
             campos_txt = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "TIPO_LOCAL", "PERIODO_TEXTO"]
             lf = lf.with_columns([self._limpar_texto_extremo(c) for c in campos_txt if c in lf.collect_schema().names()])
 
-            # --- 4. CURA E JOIN ---
-            self._curar_malha_referencia(lf.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect())
+            # --- 5. CURA E JOIN GEOGRÁFICO ---
+            df_para_cura = lf.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect()
+            self._curar_malha_referencia(df_para_cura)
+
             lf = lf.join(self.df_malha.lazy(), on="H3_INDEX", how="left").with_columns([
                 pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN_FINAL"),
                 pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO_FINAL")
             ])
 
-            # --- 5. AGREGAÇÃO IA ---
+            # --- 6. AGREGAÇÃO IA ---
             lf_agg = lf.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA"]).agg([
                 pl.len().alias("TOTAL_CRIMES"),
                 pl.col("NM_MUN_FINAL").first().alias("NM_MUN"),
@@ -205,7 +208,7 @@ class ProcessamentoPrata:
             df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
             estado[str(ano)] = tamanho_atual 
-            return {"linhas_in": df_para_cura.height if 'df_para_cura' in locals() else 100, "linhas_out": df_final.height}
+            return {"linhas_in": df_para_cura.height, "linhas_out": df_final.height}
         except Exception as e:
             logger.error(f"PRATA: Erro critico no ano {ano}: {e}")
             return None
@@ -219,7 +222,7 @@ class ProcessamentoPrata:
                 stats["linhas_in"] += res["linhas_in"]; stats["linhas_out"] += res["linhas_out"]
                 self._salvar_tracker(estado)
         stats["recuperado_grade"] = self.campos_recuperados_grade
-        stats["taxa_recuperacao"] = round((stats["linhas_out"] / stats["linhas_in"] * 100), 2) if stats["linhas_in"] > 0 else 100
+        stats["taxa_recuperacao"] = round((stats["linhas_out"]/stats["linhas_in"]*100),2) if stats["linhas_in"] > 0 else 100
         stats["status_camadas"] = {"prata": "✅ Concluido"}
         return stats
 
