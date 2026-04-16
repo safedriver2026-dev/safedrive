@@ -37,9 +37,10 @@ class ComunicadorSafeDriver:
 
         agora = self._obter_agora_br()
         
-        # Pega as métricas de higiene e cura enviadas pela Prata
-        taxa = stats.get('hygiene', {}).get('taxa_recuperacao', 100)
-        cura_grade = stats.get('recuperado_grade', 0) # <--- NOVO: Valor da cura geográfica
+        # Busca robusta: procura a métrica dentro de 'hygiene' ou na raiz do dicionário
+        higiene_stats = stats.get('hygiene', {})
+        taxa = higiene_stats.get('taxa_recuperacao', stats.get('taxa_recuperacao', 100))
+        cura_grade = higiene_stats.get('recuperado_grade', stats.get('recuperado_grade', 0))
         
         cor = self.COR_SUCESSO if taxa > 80 else self.COR_ALERTA
 
@@ -57,10 +58,10 @@ class ComunicadorSafeDriver:
                 {
                     "name": "⛓️ Status do Pipeline",
                     "value": (
-                        f"**Bronze:** {stats['status_camadas'].get('bronze', 'N/A')}\n"
-                        f"**Prata:** {stats['status_camadas'].get('prata', 'N/A')}\n"
-                        f"**IA (Treino):** {stats['status_camadas'].get('ia', 'N/A')}\n"
-                        f"**Ouro (DW):** {stats['status_camadas'].get('ouro', 'N/A')}"
+                        f"**Bronze:** {stats.get('status_camadas', {}).get('bronze', 'N/A')}\n"
+                        f"**Prata:** {stats.get('status_camadas', {}).get('prata', 'N/A')}\n"
+                        f"**IA (Treino):** {stats.get('status_camadas', {}).get('ia', 'N/A')}\n"
+                        f"**Ouro (DW):** {stats.get('status_camadas', {}).get('ouro', 'N/A')}"
                     ),
                     "inline": False
                 },
@@ -70,7 +71,7 @@ class ComunicadorSafeDriver:
                     "inline": True
                 },
                 {
-                    "name": "🛠️ Cura Geográfica", # <--- NOVO CAMPO NO DISCORD
+                    "name": "🛠️ Cura Geográfica", 
                     "value": f"`{cura_grade}` hexágonos",
                     "inline": True
                 },
