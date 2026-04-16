@@ -79,7 +79,7 @@ class IngestaoBronze:
 
         try:
             if tamanho_remoto != tamanho_local:
-                logger.info(f"BRONZE: [{ano}] Baixando novo arquivo (Delta detected)...")
+                logger.info(f"BRONZE: [{ano}] Baixando novo arquivo...")
                 resp = requests.get(url, headers=self.headers, timeout=300)
                 excel_bytes = resp.content
                 self.s3.put_object(Bucket=self.bucket, Key=path_raw, Body=excel_bytes)
@@ -88,21 +88,18 @@ class IngestaoBronze:
                 excel_bytes = obj['Body'].read()
 
             xlsx_io = io.BytesIO(excel_bytes)
-            dfs = []
-            
-            # --- COLUNAS QUE REALMENTE IMPORTAM PARA O SAFEDRIVER ---
-            # Ao ler apenas estas, economizamos ~60% de RAM
+            dfs_acumulados = []
             colunas_alvo = [
                 "MUNICIPIO", "CIDADE", "NOME_MUNICIPIO", "BAIRRO", "LOGRADOURO",
                 "DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "HORA_OCORRENCIA_BO", 
                 "RUBRICA", "LATITUDE", "LONGITUDE", "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"
             ]
-            
-            # Buscas estruturais (âncoras) para achar o cabeçalho real
             ancoras = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "LATITUDE"}
             
-            for i in range(1, 4): # Otimização semestral (1º sem, 2º sem e reserva)
+            # --- LOOP NAS ABAS ---
+            for i in range(1, 4):
                 try:
+                    xlsx_io.seek(0) # CRÍTICO: Reseta o buffer para o início antes de ler cada aba
                     df_scan = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", has_header=False, read_options={"n_rows": 50})
                     
                     real_header_idx = None
@@ -114,33 +111,31 @@ class IngestaoBronze:
                             break
                     
                     if real_header_idx is not None:
-                        # Lemos a aba partindo do cabeçalho real
+                        xlsx_io.seek(0)
                         df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": real_header_idx})
                         df.columns = [c.upper().strip() for c in df.columns]
                         
-                        # --- FILTRO NUCLEAR DE COLUNAS ---
-                        # Mantemos apenas o que a IA vai usar. O resto é descartado na hora.
-                        cols_to_keep = [c for c in df.columns if c in colunas_alvo or c == "H3_INDEX"]
+                        cols_to_keep = [c for c in df.columns if c in colunas_alvo]
                         df = df.select(cols_to_keep)
-                        
-                        # Converte tudo para String (Regra da Bronze)
                         df = df.with_columns(pl.all().cast(pl.String))
                         
-                        # Filtro Nuclear de Capa/Lixo
                         regex_capa = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
                         df = df.filter(~pl.any_horizontal(pl.all().str.contains(regex_capa)))
                         df = df.filter(pl.any_horizontal(pl.all().is_not_null()))
                         
-                        dfs.append(df)
-                except: continue
+                        dfs_acumulados.append(df)
+                        logger.info(f"BRONZE: [{ano}] Aba {i} processada com {df.height} linhas.")
+                except Exception as e:
+                    logger.debug(f"BRONZE: [{ano}] Ignorando aba {i} ou erro: {e}")
+                    continue
 
-            if dfs:
-                # Concatenação Diagonal Segura (trata nomes de colunas variando entre anos)
-                df_trusted = pl.concat(dfs, how="diagonal")
+            if dfs_acumulados:
+                # Concatena TODAS as abas encontradas antes de salvar
+                df_trusted = pl.concat(dfs_acumulados, how="diagonal")
 
-                logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros...")
+                logger.info(f"BRONZE: [{ano}] Total consolidado: {df_trusted.height} registros.")
                 
-                # Geocodificação H3 interna
+                # Geocodificação H3
                 df_trusted = df_trusted.with_columns([
                     pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
                     pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
@@ -150,12 +145,11 @@ class IngestaoBronze:
                     .alias("H3_INDEX")
                 )
 
-                # Persistência final em Parquet (Compactado com LZ4 para velocidade)
                 buffer = io.BytesIO()
                 df_trusted.write_parquet(buffer, compression="lz4")
                 self.s3.put_object(Bucket=self.bucket, Key=path_trusted, Body=buffer.getvalue())
                 
-                logger.info(f"BRONZE: [{ano}] Sincronizada com sucesso.")
+                logger.info(f"BRONZE: [{ano}] Sincronizada com sucesso (Total de abas: {len(dfs_acumulados)}).")
                 return True
                 
         except Exception as e:
