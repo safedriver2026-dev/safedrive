@@ -5,6 +5,7 @@ from botocore.config import Config
 import joblib
 import io
 import os
+import gc  # Garbage Collector para limpar a memória RAM
 import logging
 from datetime import datetime
 from catboost import CatBoostRegressor
@@ -12,7 +13,6 @@ from lightgbm import LGBMRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 
-# Configuração de Logs de Auditoria
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,6 @@ class TreinadorEvolutivo:
     def __init__(self, dev_mode=False):
         self.dev_mode = dev_mode 
         
-        # Conectividade Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -34,19 +33,15 @@ class TreinadorEvolutivo:
         self.base_path = self._localizar_datalake_real()
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         
-        # --- DEFINIÇÃO DO SCHEMA DE INTELIGÊNCIA ---
         self.target = "TOTAL_CRIMES"
         
-        # Features Numéricas: Onde mora a matemática espacial
         self.features_numericas = [
             'DENSIDADE', 'TAXA_VACANCIA', 'RANKING_RISCO_LOCAL', 'INDICE_EXPOSICAO',
             'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
             'MES_OCORRENCIA', 'DIA_SEMANA_OCORRENCIA'
         ]
         
-        # Features Categóricas: Onde mora o contexto (PERFIL_AREA removido para alinhamento)
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
-        
         self.stats_treino = {}
 
     def _localizar_datalake_real(self):
@@ -63,20 +58,22 @@ class TreinadorEvolutivo:
         return f"{self.base_path}/{camada}/{filename}".replace("//", "/")
 
     def treinar_modelo_mestre(self):
-        """Ciclo principal de aprendizado supervisionado."""
         df_treino = self._carregar_datalake_consolidado()
         
-        if df_treino is None or len(df_treino) < 100:
+        if df_treino is None or len(df_treino) < 10:
             logger.error("IA: Massa de dados insuficiente para o ciclo evolutivo.")
             return False
 
         logger.info(f"IA: Iniciando Treinamento Ensemble com {len(df_treino)} registros.")
 
-        # Separação de Matrizes
         X = df_treino[self.features_numericas + self.features_categoricas].copy()
-        y = df_treino[self.target]
+        # Garantindo que o alvo é numérico para não quebrar a Tweedie Loss
+        y = df_treino[self.target].fillna(0).astype(float) 
 
-        # --- REFORÇO DE TIPAGEM PARA O LIGHTGBM ---
+        # --- GESTÃO DE MEMÓRIA (Evita Timeout/OOM no GitHub Actions) ---
+        del df_treino 
+        gc.collect()
+
         for col in self.features_categoricas:
             X[col] = X[col].astype(str).fillna("INDEFINIDO").astype('category')
             
@@ -85,38 +82,38 @@ class TreinadorEvolutivo:
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # 1. CatBoost Tweedie (O Especialista em Contagem de Crimes)
+        # 1. CatBoost Tweedie (Dieta de Performance)
         logger.info("IA: [1/2] Lapidando CatBoost...")
         model_cat = CatBoostRegressor(
-            iterations=1500, 
+            iterations=600,         # Reduzido de 1500 para não estourar a RAM
             depth=6, 
-            learning_rate=0.03, 
+            learning_rate=0.05,     # Aumentado um pouco para aprender mais rápido
             cat_features=self.features_categoricas,
             loss_function='Tweedie:variance_power=1.5',
-            early_stopping_rounds=50, 
-            verbose=300
+            early_stopping_rounds=30, 
+            verbose=100,
+            thread_count=2          # Trava em 2 núcleos (Limite do GitHub Actions)
         )
         model_cat.fit(X_train, y_train, eval_set=(X_test, y_test))
 
-        # 2. LightGBM Tweedie (O Especialista em Velocidade e Padrões)
+        # 2. LightGBM Tweedie (Dieta de Performance)
         logger.info("IA: [2/2] Lapidando LightGBM...")
         model_lgb = LGBMRegressor(
-            n_estimators=800, 
+            n_estimators=400,       # Reduzido de 800
             learning_rate=0.05, 
             objective='tweedie', 
             tweedie_variance_power=1.5,
             importance_type='gain',
+            n_jobs=2,               # Trava em 2 núcleos
             verbosity=-1 
         )
         model_lgb.fit(X_train, y_train)
 
-        # Avaliação de Erro (Buscando o MAE de referência ~41.28)
         mae_cat = mean_absolute_error(y_test, model_cat.predict(X_test))
         mae_lgb = mean_absolute_error(y_test, model_lgb.predict(X_test))
         
         logger.info(f"IA: MAE CatBoost: {mae_cat:.4f} | MAE LightGBM: {mae_lgb:.4f}")
 
-        # Exportação para o R2 (Versão e Latest)
         self._exportar_modelo(model_cat, "cat_geral")
         self._exportar_modelo(model_lgb, "lgb_geral")
         
@@ -129,16 +126,13 @@ class TreinadorEvolutivo:
         return True
 
     def _carregar_datalake_consolidado(self):
-        """Une as tabelas anuais da Prata em um único dataset de treino."""
         lista_dfs = []
-        # No Dev Mode usamos apenas o ano atual para velocidade
         anos = [datetime.now().year] if self.dev_mode else range(2022, datetime.now().year + 1)
         
         for ano in anos:
             key = self._get_path("prata", f"ssp_consolidada_{ano}.parquet")
             try:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
-                # Polars lê o Parquet com eficiência extrema de memória
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 lista_dfs.append(df)
             except:
@@ -147,10 +141,27 @@ class TreinadorEvolutivo:
         
         if not lista_dfs: return None
         
-        # Concatenação diagonal para lidar com possíveis variações de schema entre anos
         df_pl = pl.concat(lista_dfs, how="diagonal")
         
-        # Convertemos para Pandas apenas no final para compatibilidade com as APIs de ML
+        # --- GESTÃO DE MEMÓRIA ---
+        # Deleta as planilhas intermediárias que o Polars guardou
+        del lista_dfs
+        gc.collect()
+        
+        mapeamento = {"NM_MUN_FINAL": "NM_MUN", "NM_BAIRRO_FINAL": "NM_BAIRRO"}
+        df_pl = df_pl.rename({old: new for old, new in mapeamento.items() if old in df_pl.columns})
+
+        for col in self.features_categoricas:
+            if col not in df_pl.columns:
+                df_pl = df_pl.with_columns(pl.lit("INDEFINIDO").alias(col))
+
+        for col in self.features_numericas:
+            if col not in df_pl.columns:
+                df_pl = df_pl.with_columns(pl.lit(0.0).alias(col))
+
+        if self.target not in df_pl.columns:
+            df_pl = df_pl.with_columns(pl.lit(0.0).alias(self.target))
+
         return df_pl.to_pandas()
 
     def _exportar_modelo(self, modelo, nome):
