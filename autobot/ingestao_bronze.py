@@ -91,7 +91,9 @@ class IngestaoBronze:
             dfs = []
             ancoras = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "ANO_BO", "LATITUDE"}
             
-            for i in range(1, 8):
+            # --- OTIMIZAÇÃO SEMESTRAL ---
+            # Vai ler a aba 1, a aba 2, e tenta a 3 só por segurança.
+            for i in range(1, 4):
                 try:
                     df_scan = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", has_header=False, read_options={"n_rows": 50})
                     
@@ -106,38 +108,33 @@ class IngestaoBronze:
                     if real_header_idx is not None:
                         df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": real_header_idx})
                         
-                        # --- 1. A SOLUÇÃO NUCLEAR DO CABEÇALHO ---
-                        # Se a SSP fundiu a capa com a coluna A, nós interceptamos e renomeamos
+                        # Solução Nuclear do Cabeçalho
                         colunas_limpas = []
                         for idx_col, col_name in enumerate(df.columns):
                             c_str = str(col_name).upper().strip()
-                            # Se a coluna tiver o texto da capa ou for gigante, neutralizamos
                             if "PRESENTE TABELA" in c_str or "FINALIDADE" in c_str or len(c_str) > 70:
                                 colunas_limpas.append(f"INFO_RECUPERADA_{idx_col}")
                             else:
                                 colunas_limpas.append(c_str)
                         df.columns = colunas_limpas
                         
-                        # Converte tudo para string para evitar crashes no concat
                         df = df.with_columns(pl.all().cast(pl.String))
                         
-                        # --- 2. A SOLUÇÃO NUCLEAR DAS LINHAS ---
-                        # Filtra qualquer linha que contenha esse texto maldito em *QUALQUER* coluna
+                        # Solução Nuclear das Linhas
                         regex_capa = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
                         df = df.filter(~pl.any_horizontal(pl.all().str.contains(regex_capa)))
-                        
-                        # Removemos linhas que por ventura ficaram vazias após a limpeza
                         df = df.filter(pl.any_horizontal(pl.all().is_not_null()))
                         
                         dfs.append(df)
-                except: continue
+                except: 
+                    # Acabaram as abas, segue o jogo.
+                    continue
 
             if dfs:
                 df_trusted = pl.concat(dfs, how="diagonal")
 
-                logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros...")
+                logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros (Abas lidas: {len(dfs)})...")
                 
-                # Prepara coordenadas para o H3 e calcula
                 df_trusted = df_trusted.with_columns([
                     pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
                     pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
@@ -147,7 +144,6 @@ class IngestaoBronze:
                     .alias("H3_INDEX")
                 )
 
-                # Persistência final
                 buffer = io.BytesIO()
                 df_trusted.write_parquet(buffer)
                 self.s3.put_object(Bucket=self.bucket, Key=path_trusted, Body=buffer.getvalue())
