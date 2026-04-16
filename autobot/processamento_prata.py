@@ -74,34 +74,30 @@ class ProcessamentoPrata:
                     self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
                 ])
             )
-            logger.info("PRATA: Malha geografica carregada.")
+            logger.info("PRATA: Malha geografica carregada e normalizada.")
         except Exception as e:
             logger.error(f"PRATA: Falha ao carregar malha H3: {e}")
             self.df_malha_lazy = None
 
     def _gerar_features_espaciais_ia(self, df_pd):
-        """Calcula o Contagio Ponderado e Pressao de Risco (Cérebro da IA)."""
-        logger.info(f"🗺️ Calculando contagio espacial (Raio {self.raio_contagio})...")
-        
+        """O UPGRADE: Contágio Espacial e Pressão de Risco."""
         crimes_dit = dict(zip(df_pd['H3_INDEX'], df_pd['TOTAL_CRIMES']))
         usar_grid_disk = hasattr(h3, 'grid_disk')
         
         contagio_final = []
         for h3_index in df_pd['H3_INDEX']:
             try:
-                # Raio 1 (Peso 1.0)
                 v1 = set(h3.grid_disk(h3_index, 1) if usar_grid_disk else h3.k_ring(h3_index, 1))
                 v1.discard(h3_index)
                 c1 = sum(crimes_dit.get(v, 0) for v in v1)
                 
-                # Raio 2 (Peso 0.5)
                 v_total = set(h3.grid_disk(h3_index, 2) if usar_grid_disk else h3.k_ring(h3_index, 2))
                 v2 = v_total - v1
                 v2.discard(h3_index)
                 c2 = sum(crimes_dit.get(v, 0) for v in v2)
                 
                 contagio_final.append((c1 * 1.0) + (c2 * 0.5))
-            except: contagio_final.append(0)
+            except: contagio_final.append(0.0)
         
         df_pd['CONTAGIO_PONDERADO'] = contagio_final
         df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
@@ -116,59 +112,72 @@ class ProcessamentoPrata:
             tamanho_atual = meta['ContentLength']
             
             if not force and estado.get(str(ano)) == tamanho_atual: 
+                logger.info(f"PRATA: Ano {ano} em cache (sem alteracoes).")
                 return None
 
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            # 1. Normalização de Schema e Colunas
+            # --- 1. RESOLUÇÃO DE SCHEMA (Sua lógica antiga refinada) ---
             cols = lf.collect_schema().names()
             mapeamento = {
-                "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL",
+                "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL", "NOME_MUNICIPIO": "NM_MUN_ORIGINAL",
                 "BAIRRO": "NM_BAIRRO_ORIGINAL", "LOGRADOURO": "LOGRADOURO_ORIGINAL",
-                "HORA_OCORRENCIA_BO": "HORA", "DESCR_PERIODO": "PERIODO_TEXTO",
-                "DATA_OCORRENCIA": "DATA", "DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"
+                "HORA_OCORRENCIA_BO": "HORA", "DESCR_PERIODO": "PERIODO_TEXTO", "DESC_PERIODO": "PERIODO_TEXTO",
+                "DATA_OCORRENCIA_BO": "DATA_REF", "DATA_OCORRENCIA": "DATA_REF"
             }
             lf = lf.rename({old: new for old, new in mapeamento.items() if old in cols})
 
-            # 2. Engenharia de Datas (Sazonalidade)
-            lf = lf.with_columns([
-                pl.col("DATA").dt.month().alias("MES_OCORRENCIA"),
-                pl.col("DATA").dt.weekday().alias("DIA_SEMANA_OCORRENCIA"),
-                pl.col("HORA").str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT")
-            ])
+            # --- 2. TRATAMENTO DE DATAS (Correção para o erro 'unable to find column DATA') ---
+            # Identificamos qual coluna de data sobrou e usamos ela para criar as features temporais
+            cols_pos_rename = lf.collect_schema().names()
+            col_data_final = "DATA_REF" if "DATA_REF" in cols_pos_rename else "DATA_OCORRENCIA_BO"
+            
+            if col_data_final in cols_pos_rename:
+                lf = lf.with_columns([
+                    pl.col(col_data_final).dt.month().alias("MES_OCORRENCIA"),
+                    pl.col(col_data_final).dt.weekday().alias("DIA_SEMANA_OCORRENCIA")
+                ])
+            
+            if "HORA" in cols_pos_rename:
+                lf = lf.with_columns(
+                    pl.col("HORA").str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT")
+                )
 
-            # 3. Normalização de Texto
-            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "TIPO_LOCAL", "PERIODO_TEXTO"]
-            lf = lf.with_columns([self._limpar_texto_extremo(c) for c in campos_texto if c in lf.collect_schema().names()])
+            # --- 3. NORMALIZAÇÃO DE TEXTO ---
+            campos_texto = ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "PERIODO_TEXTO"]
+            lf = lf.with_columns([self._limpar_texto_extremo(c) for c in campos_texto if c in cols_pos_rename])
 
-            # 4. Join Geográfico e Higiene
+            # --- 4. JOIN GEOGRÁFICO E CURA ---
             lf = lf.join(self.df_malha_lazy, on="H3_INDEX", how="left")
             lf = lf.with_columns([
                 pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
                 pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
-                pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
+                pl.when(pl.col("HORA_INT").is_null()).then(pl.lit("MADRUGADA")) # Default seguro
+                  .when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
                   .when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA"))
                   .when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE"))
                   .otherwise(pl.lit("NOITE")).alias("PERIODO_DIA")
             ])
 
-            # 5. Agregação IA
-            lf_agg = lf.group_by(["H3_INDEX", "PERIODO_DIA", "NM_MUN", "NM_BAIRRO", "TIPO_LOCAL", "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA"]).agg([
+            # --- 5. AGREGAÇÃO IA ---
+            # Agrupamos por H3 e Período para o Treinador IA
+            lf_agg = lf.group_by(["H3_INDEX", "PERIODO_DIA", "NM_MUN", "NM_BAIRRO", "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA"]).agg([
                 pl.len().alias("TOTAL_CRIMES"),
                 pl.col("DENSIDADE_AJUSTADA").first().alias("DENSIDADE"),
                 pl.col("TAXA_VACANCIA").first().alias("TAXA_VACANCIA")
             ])
 
-            # 6. Features de IA (Calculadas no Pandas pela complexidade do H3)
+            # --- 6. UPGRADE DE IA (Contágio no Pandas) ---
             df_final_pd = self._gerar_features_espaciais_ia(lf_agg.collect().to_pandas())
             
-            # 7. Métricas Finais e Persistência
             df_final = pl.from_pandas(df_final_pd).with_columns([
                 (pl.col("TOTAL_CRIMES").rank() / pl.len()).alias("RANKING_RISCO_LOCAL"),
-                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).alias("INDICE_EXPOSICAO")
+                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE").fill_null(0) + 1)).alias("INDICE_EXPOSICAO"),
+                pl.lit(ano).alias("ANO_REFERENCIA")
             ])
 
+            # Persistência
             buffer = io.BytesIO()
             df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
@@ -190,8 +199,9 @@ class ProcessamentoPrata:
                 stats["linhas_out"] += res["linhas_out"]
                 self._salvar_tracker(estado)
         
-        # Adiciona a taxa para o Comunicador
+        # Taxa de Recuperação para o Comunicador
         stats["taxa_recuperacao"] = round((stats["linhas_out"] / stats["linhas_in"] * 100), 2) if stats["linhas_in"] > 0 else 100
+        stats["status_camadas"] = {"prata": "✅ Concluido"}
         return stats
 
     def _carregar_tracker(self):
