@@ -7,9 +7,9 @@ import io
 import os
 import json
 import logging
+import gc
 from datetime import datetime
 
-# Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -61,52 +61,19 @@ class ProcessamentoPrata:
     def _inicializar_dependencias(self):
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
-            self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read()))
+            # Carregamos a malha com tipos leves
+            self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).with_columns([
+                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32),
+                pl.col("TAXA_VACANCIA").cast(pl.Float32)
+            ])
             self.df_malha_lazy = self.df_malha.lazy().with_columns([
                 self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
                 self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-            logger.info("PRATA: Malha geográfica mestre carregada.")
+            logger.info("PRATA: Malha mestre carregada e otimizada.")
         except Exception as e:
-            logger.error(f"PRATA: Falha ao carregar malha H3: {e}")
+            logger.error(f"PRATA: Falha crítica: {e}")
             self.df_malha_lazy = None
-
-    def _curar_malha_referencia(self, df_bo_limpo):
-        if self.df_malha is None: return
-        df_conhecimento = (
-            df_bo_limpo.filter((pl.col("H3_INDEX").is_not_null()) & (pl.col("NM_MUN_ORIGINAL") != "INDEFINIDO"))
-            .group_by("H3_INDEX").agg([
-                pl.col("NM_MUN_ORIGINAL").first().alias("MUN_NOVO"),
-                pl.col("NM_BAIRRO_ORIGINAL").first().alias("BAIRRO_NOVO")
-            ])
-        )
-        malha_antes = self.df_malha.filter((pl.col("NM_MUN") != "INDEFINIDO") & (pl.col("NM_MUN").is_not_null())).height
-        self.df_malha = self.df_malha.join(df_conhecimento, on="H3_INDEX", how="left").with_columns([
-            pl.coalesce([pl.col("MUN_NOVO"), pl.col("NM_MUN")]).fill_null("INDEFINIDO").alias("NM_MUN"),
-            pl.coalesce([pl.col("BAIRRO_NOVO"), pl.col("NM_BAIRRO")]).fill_null("INDEFINIDO").alias("NM_BAIRRO")
-        ]).drop(["MUN_NOVO", "BAIRRO_NOVO"])
-        
-        malha_depois = self.df_malha.filter((pl.col("NM_MUN") != "INDEFINIDO") & (pl.col("NM_MUN").is_not_null())).height
-        self.campos_recuperados_grade += (malha_depois - malha_antes)
-        self.df_malha_lazy = self.df_malha.lazy()
-
-    def _gerar_features_espaciais_ia(self, df_pd):
-        usar_grid_disk = hasattr(h3, 'grid_disk')
-        df_unique = df_pd.groupby('H3_INDEX', as_index=False)['TOTAL_CRIMES'].sum()
-        crimes_dit = dict(zip(df_unique['H3_INDEX'], df_unique['TOTAL_CRIMES']))
-        contagio_dit = {}
-        for h3_index in df_unique['H3_INDEX']:
-            try:
-                v1 = set(h3.grid_disk(h3_index, 1) if usar_grid_disk else h3.k_ring(h3_index, 1))
-                v1.discard(h3_index)
-                c1 = sum(crimes_dit.get(v, 0) for v in v1)
-                v_total = set(h3.grid_disk(h3_index, 2) if usar_grid_disk else h3.k_ring(h3_index, 2))
-                v2 = v_total - v1
-                contagio_dit[h3_index] = (c1 * 1.0) + (sum(crimes_dit.get(v, 0) for v in v2) * 0.5)
-            except: contagio_dit[h3_index] = 0.0
-        df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_dit)
-        df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
-        return df_pd
 
     def processar_ano_com_delta(self, ano, estado, force=False):
         path_trusted = f"{self.base_path}/bronze/trusted/ssp_trusted_{ano}.parquet"
@@ -120,135 +87,69 @@ class ProcessamentoPrata:
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
-            lf = lf.filter((pl.col("H3_INDEX").is_not_null()))
-            total_in = lf.select(pl.len()).collect().item()
-
-            # --- A MÁQUINA DE ESTADO DE ALIASES (Inteligente e Robusta) ---
+            # 1. Filtro e Renomeação Inteligente (Alias Machine)
             cols = lf.collect_schema().names()
             rename_map = {}
-            drop_cols = []
-
-            # 1. Busca Curinga por Município
-            mun_col = next((c for c in cols if c in ["CIDADE", "MUNICIPIO", "NOME_MUNICIPIO"]), None)
-            if mun_col: rename_map[mun_col] = "NM_MUN_ORIGINAL"
-
-            # 2. Busca Curinga por Data
-            data_col = next((c for c in cols if c in ["DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "DATA_FATO"]), None)
-            if data_col: rename_map[data_col] = "DATA_BRUTA"
-
-            # 3. Busca Curinga por Bairro e Hora
-            if "BAIRRO" in cols: rename_map["BAIRRO"] = "NM_BAIRRO_ORIGINAL"
-            hora_col = next((c for c in cols if c in ["HORA_OCORRENCIA_BO", "HORA_FATO", "HORA"]), None)
-            if hora_col: rename_map[hora_col] = "HORA"
-
-            # 4. Solução do Duplicate Column (Tipo Local)
-            if "DESCR_SUBTIPOLOCAL" in cols: 
-                rename_map["DESCR_SUBTIPOLOCAL"] = "TIPO_LOCAL"
-                if "DESCR_TIPOLOCAL" in cols: drop_cols.append("DESCR_TIPOLOCAL")
-            elif "DESCR_TIPOLOCAL" in cols: 
-                rename_map["DESCR_TIPOLOCAL"] = "TIPO_LOCAL"
-
-            # Executa renomeações e limpa o lixo
-            lf = lf.rename(rename_map)
-            if drop_cols:
-                lf = lf.drop(drop_cols)
-
-            # Injeta Invariantes: Se depois de tudo isso ainda faltar coluna essencial, a Prata cria pra não quebrar o GroupBy
-            schema_atual = lf.collect_schema().names()
-            if "NM_MUN_ORIGINAL" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("NM_MUN_ORIGINAL"))
-            if "NM_BAIRRO_ORIGINAL" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("NM_BAIRRO_ORIGINAL"))
-            if "TIPO_LOCAL" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("TIPO_LOCAL"))
-            if "RUBRICA" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("RUBRICA"))
-
-            # Tratamento Temporal Seguro
-            if "DATA_BRUTA" in schema_atual and "HORA" in schema_atual:
-                lf = lf.with_columns([
-                    pl.col("DATA_BRUTA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
-                    pl.col("HORA").cast(pl.String).str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT")
-                ])
-                lf = lf.with_columns([
-                    pl.col("DATA").dt.month().fill_null(1).alias("MES_OCORRENCIA"),
-                    pl.col("DATA").dt.weekday().fill_null(1).alias("DIA_SEMANA_OCORRENCIA"),
-                    pl.when(pl.col("HORA_INT") < 6).then(pl.lit("MADRUGADA"))
-                      .when(pl.col("HORA_INT") < 12).then(pl.lit("MANHA"))
-                      .when(pl.col("HORA_INT") < 18).then(pl.lit("TARDE"))
-                      .otherwise(pl.lit("NOITE")).alias("PERIODO_DIA"),
-                    pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA"))
-                      .otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
-                ])
-            else:
-                lf = lf.with_columns([
-                    pl.lit(1).alias("MES_OCORRENCIA"), pl.lit(1).alias("DIA_SEMANA_OCORRENCIA"),
-                    pl.lit("NOITE").alias("PERIODO_DIA"), pl.lit("PEDESTRE").alias("PERFIL_ALVO")
-                ])
+            if "NOME_MUNICIPIO" in cols: rename_map["NOME_MUNICIPIO"] = "NM_MUN_ORIGINAL"
+            elif "CIDADE" in cols: rename_map["CIDADE"] = "NM_MUN_ORIGINAL"
             
-            # Agregação Segura
+            if "DATA_OCORRENCIA_BO" in cols: rename_map["DATA_OCORRENCIA_BO"] = "DATA_BRUTA"
+            if "HORA_OCORRENCIA_BO" in cols: rename_map["HORA_OCORRENCIA_BO"] = "HORA"
+            if "BAIRRO" in cols: rename_map["BAIRRO"] = "NM_BAIRRO_ORIGINAL"
+            
+            lf = lf.rename(rename_map).filter(pl.col("H3_INDEX").is_not_null())
+
+            # 2. Engenharia de Recursos de Alta Performance (Features em Silver)
+            lf = lf.with_columns([
+                pl.col("DATA_BRUTA").str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
+                pl.col("HORA").str.split(":").list.first().cast(pl.Int8).alias("HORA_INT")
+            ]).with_columns([
+                pl.col("DATA").dt.month().cast(pl.Int8).alias("MES_OCORRENCIA"),
+                pl.col("DATA").dt.weekday().cast(pl.Int8).alias("DIA_SEMANA"),
+                pl.col("DATA").dt.day().cast(pl.Int8).alias("DIA_MES"),
+                # Inteligência de Negócio: Dia de Pagamento (5 ao 10)
+                pl.when(pl.col("DATA").dt.day().is_between(5, 10)).then(1).otherwise(0).cast(pl.Int8).alias("IS_PAGAMENTO"),
+                # Inteligência: Fim de Semana
+                pl.when(pl.col("DATA").dt.weekday() >= 6).then(1).otherwise(0).cast(pl.Int8).alias("IS_FDS")
+            ])
+
+            # 3. Agregação e Compactação
             lf_agg = lf.group_by([
                 "H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", 
-                "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"
+                "MES_OCORRENCIA", "DIA_SEMANA", "IS_PAGAMENTO", "IS_FDS"
             ]).agg([
-                pl.when(pl.col("RUBRICA").str.contains("(?i)ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES")
+                pl.len().cast(pl.Int32).alias("TOTAL_CRIMES")
             ])
 
-            # Cura da Malha
-            lf_agg = lf_agg.with_columns([self._limpar_texto_extremo(c) for c in ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "TIPO_LOCAL"]])
-            self._curar_malha_referencia(lf_agg.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect())
-
-            # Enriquecimento
-            lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
-                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
-                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
-                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float64).fill_null(0.0).alias("DENSIDADE"),
-                pl.col("TAXA_VACANCIA").cast(pl.Float64, strict=False).fill_null(0.0).alias("TAXA_VACANCIA")
+            # 4. Join Final e Downcasting de Tipos
+            df_final = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
+                pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).cast(pl.Categorical).alias("NM_MUN"),
+                pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).cast(pl.Categorical).alias("NM_BAIRRO"),
+                pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32).alias("DENSIDADE"),
+                pl.lit(ano).cast(pl.Int16).alias("ANO_REF")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"])
 
-            # Cálculo Matemático e Persistência
-            df_final_pd = self._gerar_features_espaciais_ia(lf_enriquecido.collect().to_pandas())
-            
-            df_final = pl.from_pandas(df_final_pd).with_columns([
-                (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).alias("INDICE_EXPOSICAO"),
-                (pl.col("TOTAL_CRIMES").rank().over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).alias("RANKING_RISCO_LOCAL"),
-                pl.lit(ano).alias("ANO_REFERENCIA")
-            ])
-
+            # 5. Persistência
             buffer = io.BytesIO()
-            df_final.write_parquet(buffer, compression="lz4")
+            df_final.collect().write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
 
             estado[str(ano)] = tamanho_atual 
-            return {"linhas_in": total_in, "linhas_out": df_final.height}
+            return True
         except Exception as e:
-            logger.error(f"PRATA: Erro no ano {ano}: {e}")
-            return None
+            logger.error(f"PRATA: Erro {ano}: {e}")
+            return False
 
     def executar_todos_os_anos(self, force=False):
-        stats = {"linhas_in": 0, "linhas_out": 0}
         estado = self._carregar_tracker()
         for ano in range(2022, datetime.now().year + 1):
-            res = self.processar_ano_com_delta(ano, estado, force)
-            if res:
-                stats["linhas_in"] += res["linhas_in"]
-                stats["linhas_out"] += res["linhas_out"]
+            if self.processar_ano_com_delta(ano, estado, force):
                 self._salvar_tracker(estado)
-        
-        if self.campos_recuperados_grade > 0:
-            buffer_malha = io.BytesIO()
-            self.df_malha.write_parquet(buffer_malha, compression="lz4")
-            self.s3.put_object(Bucket=self.bucket, Key=self.malha_path, Body=buffer_malha.getvalue())
-
-        stats["recuperado_grade"] = self.campos_recuperados_grade
-        stats["taxa_recuperacao"] = round((stats["linhas_out"] / stats["linhas_in"] * 100), 2) if stats["linhas_in"] > 0 else 100
-        stats["status_camadas"] = {"prata": "✅ Concluido"}
-        return stats
+        return {"status": "✅ Prata Otimizada"}
 
     def _carregar_tracker(self):
-        try:
-            return json.loads(self.s3.get_object(Bucket=self.bucket, Key=self.tracker_path)['Body'].read())
+        try: return json.loads(self.s3.get_object(Bucket=self.bucket, Key=self.tracker_path)['Body'].read())
         except: return {}
 
     def _salvar_tracker(self, estado):
         self.s3.put_object(Bucket=self.bucket, Key=self.tracker_path, Body=json.dumps(estado))
-
-if __name__ == "__main__":
-    prata = ProcessamentoPrata()
-    prata.executar_todos_os_anos(force=True)
