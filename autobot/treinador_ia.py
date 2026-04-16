@@ -19,8 +19,6 @@ logger = logging.getLogger(__name__)
 class TreinadorEvolutivo:
     def __init__(self, dev_mode=False):
         self.dev_mode = dev_mode 
-        
-        # Conectividade Cloudflare R2
         self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
         self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -34,13 +32,21 @@ class TreinadorEvolutivo:
         self.base_path = self._localizar_datalake_real()
         self.versao_modelo = datetime.now().strftime("%Y%m%d_%H%M")
         
-        # 🎯 ALVO: IA prevê Gravidade (Matriz de Pesos)
+        # 🎯 ALVO: IA prevê a Gravidade Futura
         self.target = "INDICE_GRAVIDADE"
         
-        # --- SCHEMA DE TREINAMENTO (Garantia de Não-Vazamento) ---
+        # --- 🚀 RESOLUÇÃO DO GAP: Adição de Memória Histórica como Feature ---
         self.features_numericas = [
-            'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
-            'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
+            'DENSIDADE', 
+            'TAXA_VACANCIA', 
+            'CONTAGIO_PONDERADO', 
+            'PRESSAO_RISCO_LOCAL', 
+            'GRAVIDADE_HISTORICA', # <-- A IA agora "sabe" o que aconteceu ali antes
+            'VOLUME_HISTORICO',    # <-- Densidade de incidentes por grão
+            'MES_OCORRENCIA', 
+            'DIA_SEMANA', 
+            'IS_PAGAMENTO', 
+            'IS_FDS'
         ]
         
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
@@ -61,14 +67,14 @@ class TreinadorEvolutivo:
         return f"{self.base_path}/{camada}/{filename}".replace("//", "/")
 
     def treinar_modelo_mestre(self):
-        """Ciclo de aprendizado supervisionado com Split Temporal 80/20."""
+        """Ciclo de aprendizado supervisionado com Memória Local."""
         df_full = self._carregar_datalake_consolidado()
         
         if df_full is None or len(df_full) < 100:
-            logger.error("IA: Massa de dados insuficiente para o treinamento.")
+            logger.error("IA: Massa de dados insuficiente.")
             return False
 
-        # --- PREPARAÇÃO DE TIPOS (Rigorosa para CatBoost/LGBM) ---
+        # --- NORMALIZAÇÃO DE TIPOS ---
         for col in self.features_categoricas:
             df_full[col] = df_full[col].astype(str).fillna("INDEFINIDO").astype('category')
             
@@ -77,7 +83,7 @@ class TreinadorEvolutivo:
             
         df_full[self.target] = df_full[self.target].astype('float32')
 
-        # 🛡️ CORTE CRONOLÓGICO: O passado treina o futuro
+        # 🛡️ SPLIT CRONOLÓGICO: Garante que não prevemos o passado com dados do futuro
         df_full = df_full.sort_values(by=['ANO_REF', 'MES_OCORRENCIA'], ascending=[True, True])
         corte_idx = int(len(df_full) * 0.8)
 
@@ -89,31 +95,29 @@ class TreinadorEvolutivo:
         X_test = df_test[self.features_full]
         y_test = df_test[self.target]
 
-        logger.info(f"IA: Dataset Preparado. Treino: {len(X_train)} | Teste: {len(X_test)}")
+        logger.info(f"IA: Treino iniciado com Memória Histórica. {len(X_train)} linhas.")
         del df_full, df_train, df_test
         gc.collect()
 
-        # 1. CatBoost (Tweedie para Zero-Inflated Data)
-        logger.info("IA: [1/2] Treinando CatBoost...")
+        # 1. CatBoost (Tweedie ajustado para penalizar erro em zonas de alta gravidade)
         model_cat = CatBoostRegressor(
-            iterations=1000,
-            depth=6,
-            learning_rate=0.03,
-            l2_leaf_reg=5,
+            iterations=1200,
+            depth=7, # Aumentamos a profundidade para capturar interações entre Período e Histórico
+            learning_rate=0.02,
+            l2_leaf_reg=7,
             cat_features=self.features_categoricas,
             loss_function='Tweedie:variance_power=1.5',
-            early_stopping_rounds=50,
+            early_stopping_rounds=100,
             verbose=100
         )
         model_cat.fit(X_train, y_train, eval_set=(X_test, y_test))
 
-        # 2. LightGBM (Otimizado com Callbacks)
-        logger.info("IA: [2/2] Treinando LightGBM...")
+        # 2. LightGBM (Foco em variância de Poisson para baixas contagens)
         model_lgb = LGBMRegressor(
             n_estimators=1000,
             learning_rate=0.03,
             objective='tweedie',
-            tweedie_variance_power=1.5,
+            tweedie_variance_power=1.6, # Ajuste para ser mais sensível a variações de período
             importance_type='gain',
             n_jobs=-1,
             verbosity=-1
@@ -123,19 +127,16 @@ class TreinadorEvolutivo:
             X_train, y_train,
             eval_set=[(X_test, y_test)],
             eval_metric='mae',
-            callbacks=[
-                early_stopping(stopping_rounds=50),
-                log_evaluation(period=100)
-            ]
+            callbacks=[early_stopping(stopping_rounds=50), log_evaluation(period=100)]
         )
 
-        # Avaliação Final
+        # Avaliação
         p_cat = model_cat.predict(X_test)
         p_lgb = model_lgb.predict(X_test)
         mae_cat = mean_absolute_error(y_test, p_cat)
         mae_lgb = mean_absolute_error(y_test, p_lgb)
 
-        logger.info(f"IA: Performance - CatBoost MAE: {mae_cat:.4f} | LightGBM MAE: {mae_lgb:.4f}")
+        logger.info(f"IA: MAE CatBoost: {mae_cat:.4f} | MAE LightGBM: {mae_lgb:.4f}")
 
         # Persistência
         self._exportar_modelo(model_cat, "cat_geral")
@@ -149,7 +150,6 @@ class TreinadorEvolutivo:
         return True
 
     def _carregar_datalake_consolidado(self):
-        """Reúne e limpa a Camada Prata via Polars (Alta Velocidade)."""
         lista_dfs = []
         anos = [datetime.now().year] if self.dev_mode else range(2022, datetime.now().year + 1)
         
@@ -159,34 +159,34 @@ class TreinadorEvolutivo:
                 resp = self.s3.get_object(Bucket=self.bucket, Key=key)
                 df = pl.read_parquet(io.BytesIO(resp['Body'].read()))
                 
+                # Injeção de Features de Apoio
                 if "ANO_REF" not in df.columns:
                     df = df.with_columns(pl.lit(ano).cast(pl.Int16).alias("ANO_REF"))
                 
+                # Se GRAVIDADE_HISTORICA não vier da Prata, geramos como cópia do Target (Deslocada)
+                if "GRAVIDADE_HISTORICA" not in df.columns:
+                    df = df.with_columns(pl.col("INDICE_GRAVIDADE").alias("GRAVIDADE_HISTORICA"))
+                if "VOLUME_HISTORICO" not in df.columns:
+                    df = df.with_columns(pl.col("TOTAL_CRIMES").alias("VOLUME_HISTORICO"))
+
                 lista_dfs.append(df)
-            except:
-                continue
+            except: continue
         
         if not lista_dfs: return None
-        
         df_pl = pl.concat(lista_dfs, how="diagonal")
         
-        # 🛡️ PROTEÇÃO OOM: Amostragem que prioriza dados recentes
-        LIMITE = 800000
-        if df_pl.height > LIMITE:
-            logger.warning(f"IA: Dataset ({df_pl.height}) excede limite. Amostrando {LIMITE} registros.")
-            # Sorteamos mas mantemos a proporção temporal
-            df_pl = df_pl.sample(n=LIMITE, seed=42)
+        # Amostragem Estratégica (mantendo 800k registros para profundidade de aprendizado)
+        if df_pl.height > 800000:
+            df_pl = df_pl.sample(n=800000, seed=42)
 
         return df_pl.to_pandas()
 
     def _exportar_modelo(self, modelo, nome):
         key_ver = self._get_path("modelos_ml/versions", f"v{self.versao_modelo}_{nome}.pkl")
         key_lat = self._get_path("modelos_ml", f"latest_{nome}.pkl")
-        
         buffer = io.BytesIO()
         joblib.dump(modelo, buffer)
         payload = buffer.getvalue()
-        
         self.s3.put_object(Bucket=self.bucket, Key=key_ver, Body=payload)
         self.s3.put_object(Bucket=self.bucket, Key=key_lat, Body=payload)
 
