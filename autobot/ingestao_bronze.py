@@ -98,7 +98,7 @@ class IngestaoBronze:
                 excel_bytes = resp.content
                 self.s3.put_object(Bucket=self.bucket, Key=path_raw, Body=excel_bytes)
             else:
-                logger.info(f"BRONZE: [{ano}] A ler RAW armazenado...")
+                logger.info(f"BRONZE: [{ano}] Lendo o arquivo RAW armazenado...")
                 obj = self.s3.get_object(Bucket=self.bucket, Key=path_raw)
                 excel_bytes = obj['Body'].read()
 
