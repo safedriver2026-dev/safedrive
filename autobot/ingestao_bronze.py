@@ -2,7 +2,6 @@ import os, boto3, requests, logging, io
 import polars as pl
 import h3
 from botocore.config import Config
-from botocore.exceptions import ClientError
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -20,21 +19,15 @@ class IngestaoBronze:
                               aws_secret_access_key=self.secret_key, 
                               config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
         
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0"}
-        
-        # Localização automática do Data Lake
+        self.headers = {"User-Agent": "Mozilla/5.0"}
         self.base_path = self._descobrir_prefixo_datalake()
-        logger.info(f"BRONZE: Raiz do Data Lake detectada em: '{self.base_path}'")
 
     def _descobrir_prefixo_datalake(self):
-        """Busca dinamicamente onde a pasta 'datalake' reside no bucket."""
         try:
-            response = self.s3.list_objects_v2(Bucket=self.bucket, MaxKeys=15)
+            response = self.s3.list_objects_v2(Bucket=self.bucket, MaxKeys=10)
             if 'Contents' in response:
-                keys = [obj['Key'] for obj in response['Contents']]
-                for key in keys:
-                    if "safedriver/datalake" in key: return "safedriver/datalake"
-                    if "datalake" in key: return "datalake"
+                for obj in response['Contents']:
+                    if "datalake" in obj['Key']: return obj['Key'].split("datalake")[0] + "datalake"
             return "datalake"
         except: return "datalake"
 
@@ -42,18 +35,24 @@ class IngestaoBronze:
         return f"{self.base_path}/{camada}/{subpasta}/{filename}".replace("//", "/")
 
     def _motor_h3(self, lat, lng):
-        """Converte coordenadas para H3 Resolução 9 com tratamento de erro."""
         try:
             l1, l2 = float(lat), float(lng)
-            # Filtro básico de coordenadas válidas (evita o meio do oceano ou valores nulos)
             if l1 == 0 or l2 == 0 or abs(l1) > 90 or abs(l2) > 180:
                 return None
-            return h3.latlng_to_cell(l1, l2, 9)
+            return h3.latlng_to_cell(l1, l2, 9) # H9 solicitado
         except:
             return None
 
+    def _obter_tamanho_remoto(self, url):
+        """Checagem de Idempotência: vê se o arquivo na SSP mudou de tamanho."""
+        try:
+            resp = requests.head(url, headers=self.headers, timeout=15)
+            return int(resp.headers.get('Content-Length', 0)) if resp.status_code == 200 else 0
+        except:
+            return 0
+
     def executar_ingestao_continua(self, force=False):
-        logger.info(f"BRONZE: Iniciando rotina de purificação com H3 (Force={force}).")
+        logger.info(f"BRONZE: Iniciando purificação Trusted (Force={force}).")
         novos_dados = False
         for ano in range(2022, datetime.now().year + 1):
             if self._verificar_e_baixar(ano, force):
@@ -65,78 +64,94 @@ class IngestaoBronze:
         path_trusted = self._get_path("bronze", "trusted", f"ssp_trusted_{ano}.parquet")
         url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
 
-        # Check de existência para evitar re-processamento
+        # 1. Comparação de bytes para evitar re-processamento desnecessário
+        tamanho_remoto = self._obter_tamanho_remoto(url)
+        tamanho_local = 0
         try:
-            self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
-            if not force:
-                logger.info(f"BRONZE: [{ano}] Camada Trusted já existe. Pulando.")
-                return False
+            meta = self.s3.head_object(Bucket=self.bucket, Key=path_raw)
+            tamanho_local = meta['ContentLength']
         except: pass
 
-        logger.info(f"BRONZE: [{ano}] Processando dados e calculando índices H3...")
-        
-        try:
-            # Recupera o binário do Excel (Cache R2 ou Download SSP)
+        if (tamanho_remoto == tamanho_local) and not force:
             try:
-                obj = self.s3.get_object(Bucket=self.bucket, Key=path_raw)
-                excel_bytes = obj['Body'].read()
-                logger.info(f"BRONZE: [{ano}] Usando cache Raw do R2.")
-            except:
-                logger.info(f"BRONZE: [{ano}] Baixando da SSP-SP...")
+                self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
+                logger.info(f"BRONZE: [{ano}] Arquivos idênticos. Pulando.")
+                return False
+            except: pass
+
+        try:
+            # 2. Download/Cache
+            if tamanho_remoto != tamanho_local:
+                logger.info(f"BRONZE: [{ano}] Baixando novo arquivo (Delta detected)...")
                 resp = requests.get(url, headers=self.headers, timeout=300)
                 excel_bytes = resp.content
                 self.s3.put_object(Bucket=self.bucket, Key=path_raw, Body=excel_bytes)
+            else:
+                obj = self.s3.get_object(Bucket=self.bucket, Key=path_raw)
+                excel_bytes = obj['Body'].read()
 
             xlsx_io = io.BytesIO(excel_bytes)
             dfs = []
             
-            # Header-Hunter para as abas do Excel
-            for i in range(1, 7):
+            # 3. HEADER HUNTER ESTRUTURAL
+            # Lista de colunas que esperadas em uma linha de cabeçalho REAL
+            ancoras = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "ANO_BO", "DATA_OCORRENCIA_BO", "LATITUDE"}
+            
+            for i in range(1, 8):
                 try:
-                    df_raw = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", has_header=False)
-                    header_idx = None
-                    for idx, row in enumerate(df_raw.slice(0, 30).iter_rows()):
-                        row_txt = " ".join([str(v).upper() for v in row if v is not None])
-                        if any(x in row_txt for x in ["LOGRADOURO", "MUNICIPIO", "CIDADE", "RUBRICA"]):
-                            header_idx = idx
+                    # Lemos sem cabeçalho para analisar a estrutura das linhas
+                    df_scan = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", has_header=False, read_options={"n_rows": 50})
+                    
+                    real_header_idx = None
+                    for idx, row in enumerate(df_scan.iter_rows()):
+                        # Verificamos quantos nomes de colunas esperados aparecem NESTA linha específica
+                        row_values = [str(cell).upper().strip() for cell in row if cell is not None]
+                        matches = [val for val in row_values if val in ancoras]
+                        
+                        # Se encontrarmos 3 ou mais âncoras na mesma linha, bingo! É o cabeçalho.
+                        if len(matches) >= 3:
+                            real_header_idx = idx
                             break
                     
-                    if header_idx is not None:
-                        df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": header_idx})
-                        df = df.with_columns(pl.all().cast(pl.String))
-                        df.columns = [c.upper().replace("Ç", "C").replace("Ã", "A").strip() for c in df.columns]
+                    if real_header_idx is not None:
+                        # Re-lemos a aba partindo do cabeçalho real
+                        df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": real_header_idx})
                         
-                        # Padronização de Colunas
-                        mapeamento = {"CIDADE": "MUNICIPIO", "NOME_MUNICIPIO": "MUNICIPIO"}
-                        for old, new in mapeamento.items():
-                            if old in df.columns: df = df.rename({old: new})
-                        
+                        # Limpeza pós-leitura: remove lixo de rodapé e padroniza
+                        df = df.filter(pl.col(df.columns[0]).is_not_null())
+                        df.columns = [c.upper().strip() for c in df.columns]
                         dfs.append(df)
                 except: continue
 
             if dfs:
+                # 4. Consolidação Diagonal (trata colunas diferentes entre anos/abas)
                 df_trusted = pl.concat(dfs, how="diagonal")
                 
-                # --- INTEGRAÇÃO H3 ---
-                logger.info(f"BRONZE: [{ano}] Calculando hexágonos H9 para {df_trusted.height} registros...")
+                # Remoção de qualquer linha de texto que tenha escapado (ex: avisos legais da SSP)
+                df_trusted = df_trusted.filter(
+                    ~pl.col(df_trusted.columns[0]).cast(pl.String).str.contains(r"(?i)PRESENTE|TABELA|FINALIDADE|CONTEÚDO")
+                )
+
+                logger.info(f"BRONZE: [{ano}] Calculando H9 para {df_trusted.height} registros...")
                 
+                # Casting e Integração H9 (mantendo os nulos conforme solicitado)
                 df_trusted = df_trusted.with_columns([
-                    pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0),
-                    pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0)
+                    pl.col("LATITUDE").cast(pl.String).str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
+                    pl.col("LONGITUDE").cast(pl.String).str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
                 ]).with_columns(
                     pl.struct(["LATITUDE", "LONGITUDE"])
                     .map_elements(lambda x: self._motor_h3(x["LATITUDE"], x["LONGITUDE"]), return_dtype=pl.String)
                     .alias("H3_INDEX")
-                ).filter(pl.col("H3_INDEX").is_not_null())
+                )
 
-                # Salvamento em Parquet (Trusted)
+                # 5. Persistência Final (Trusted)
                 buffer = io.BytesIO()
                 df_trusted.write_parquet(buffer)
                 self.s3.put_object(Bucket=self.bucket, Key=path_trusted, Body=buffer.getvalue())
                 
-                logger.info(f"BRONZE: [{ano}] Trusted gerado com H3_INDEX integrado.")
+                logger.info(f"BRONZE: [{ano}] Processamento concluído com sucesso.")
                 return True
                 
         except Exception as e:
-            logger.error(f"BRONZE: Falha crítica no ano {ano}: {e}")
+            logger.error(f"BRONZE: Erro no processamento do ano {ano}: {e}")
         return False
