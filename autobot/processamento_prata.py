@@ -8,7 +8,6 @@ import os
 import json
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -124,18 +123,45 @@ class ProcessamentoPrata:
             lf = lf.filter((pl.col("H3_INDEX").is_not_null()))
             total_in = lf.select(pl.len()).collect().item()
 
-            # Recuperando os mapeamentos de Tipo de Local que a IA ama
-            mapeamento = {
-                "CIDADE": "NM_MUN_ORIGINAL", "MUNICIPIO": "NM_MUN_ORIGINAL", "BAIRRO": "NM_BAIRRO_ORIGINAL",
-                "HORA_OCORRENCIA_BO": "HORA", "DATA_OCORRENCIA_BO": "DATA_BRUTA", "DATA_OCORRENCIA": "DATA_BRUTA",
-                "DESCR_TIPOLOCAL": "TIPO_LOCAL", "DESCR_SUBTIPOLOCAL": "TIPO_LOCAL"
-            }
-            lf = lf.rename({old: new for old, new in mapeamento.items() if old in lf.collect_schema().names()})
+            # --- A MÁQUINA DE ESTADO DE ALIASES (Inteligente e Robusta) ---
+            cols = lf.collect_schema().names()
+            rename_map = {}
+            drop_cols = []
 
-            if "TIPO_LOCAL" not in lf.collect_schema().names():
-                lf = lf.with_columns(pl.lit("INDEFINIDO").alias("TIPO_LOCAL"))
+            # 1. Busca Curinga por Município
+            mun_col = next((c for c in cols if c in ["CIDADE", "MUNICIPIO", "NOME_MUNICIPIO"]), None)
+            if mun_col: rename_map[mun_col] = "NM_MUN_ORIGINAL"
 
-            if "DATA_BRUTA" in lf.collect_schema().names():
+            # 2. Busca Curinga por Data
+            data_col = next((c for c in cols if c in ["DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "DATA_FATO"]), None)
+            if data_col: rename_map[data_col] = "DATA_BRUTA"
+
+            # 3. Busca Curinga por Bairro e Hora
+            if "BAIRRO" in cols: rename_map["BAIRRO"] = "NM_BAIRRO_ORIGINAL"
+            hora_col = next((c for c in cols if c in ["HORA_OCORRENCIA_BO", "HORA_FATO", "HORA"]), None)
+            if hora_col: rename_map[hora_col] = "HORA"
+
+            # 4. Solução do Duplicate Column (Tipo Local)
+            if "DESCR_SUBTIPOLOCAL" in cols: 
+                rename_map["DESCR_SUBTIPOLOCAL"] = "TIPO_LOCAL"
+                if "DESCR_TIPOLOCAL" in cols: drop_cols.append("DESCR_TIPOLOCAL")
+            elif "DESCR_TIPOLOCAL" in cols: 
+                rename_map["DESCR_TIPOLOCAL"] = "TIPO_LOCAL"
+
+            # Executa renomeações e limpa o lixo
+            lf = lf.rename(rename_map)
+            if drop_cols:
+                lf = lf.drop(drop_cols)
+
+            # Injeta Invariantes: Se depois de tudo isso ainda faltar coluna essencial, a Prata cria pra não quebrar o GroupBy
+            schema_atual = lf.collect_schema().names()
+            if "NM_MUN_ORIGINAL" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("NM_MUN_ORIGINAL"))
+            if "NM_BAIRRO_ORIGINAL" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("NM_BAIRRO_ORIGINAL"))
+            if "TIPO_LOCAL" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("TIPO_LOCAL"))
+            if "RUBRICA" not in schema_atual: lf = lf.with_columns(pl.lit("INDEFINIDO").alias("RUBRICA"))
+
+            # Tratamento Temporal Seguro
+            if "DATA_BRUTA" in schema_atual and "HORA" in schema_atual:
                 lf = lf.with_columns([
                     pl.col("DATA_BRUTA").cast(pl.String).str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
                     pl.col("HORA").cast(pl.String).str.split(":").list.first().cast(pl.Int32, strict=False).alias("HORA_INT")
@@ -156,7 +182,7 @@ class ProcessamentoPrata:
                     pl.lit("NOITE").alias("PERIODO_DIA"), pl.lit("PEDESTRE").alias("PERFIL_ALVO")
                 ])
             
-            # Agregando com toda a inteligência junta
+            # Agregação Segura
             lf_agg = lf.group_by([
                 "H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", 
                 "MES_OCORRENCIA", "DIA_SEMANA_OCORRENCIA", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL"
@@ -164,10 +190,11 @@ class ProcessamentoPrata:
                 pl.when(pl.col("RUBRICA").str.contains("(?i)ROUBO")).then(3).otherwise(1).sum().alias("TOTAL_CRIMES")
             ])
 
+            # Cura da Malha
             lf_agg = lf_agg.with_columns([self._limpar_texto_extremo(c) for c in ["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "TIPO_LOCAL"]])
             self._curar_malha_referencia(lf_agg.select(["H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"]).collect())
 
-            # Trazendo a DENSIDADE e TAXA_VACANCIA da malha, e cravando o nome final exato
+            # Enriquecimento
             lf_enriquecido = lf_agg.join(self.df_malha_lazy, on="H3_INDEX", how="left").with_columns([
                 pl.coalesce([pl.col("NM_MUN"), pl.col("NM_MUN_ORIGINAL")]).alias("NM_MUN"),
                 pl.coalesce([pl.col("NM_BAIRRO"), pl.col("NM_BAIRRO_ORIGINAL")]).alias("NM_BAIRRO"),
@@ -175,9 +202,9 @@ class ProcessamentoPrata:
                 pl.col("TAXA_VACANCIA").cast(pl.Float64, strict=False).fill_null(0.0).alias("TAXA_VACANCIA")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"])
 
+            # Cálculo Matemático e Persistência
             df_final_pd = self._gerar_features_espaciais_ia(lf_enriquecido.collect().to_pandas())
             
-            # Gerando Exposicao e o Ranking
             df_final = pl.from_pandas(df_final_pd).with_columns([
                 (pl.col("TOTAL_CRIMES") / (pl.col("DENSIDADE") + 1)).alias("INDICE_EXPOSICAO"),
                 (pl.col("TOTAL_CRIMES").rank().over("PERIODO_DIA") / pl.col("TOTAL_CRIMES").count().over("PERIODO_DIA")).alias("RANKING_RISCO_LOCAL"),
