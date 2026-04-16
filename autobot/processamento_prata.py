@@ -60,16 +60,19 @@ class ProcessamentoPrata:
     def _inicializar_dependencias(self):
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
+            
+            # 🛡️ A CURA ESTÁ AQUI: .unique(subset=["H3_INDEX"]) adicionado!
             # Downcasting na malha: Float64 para Float32 (50% menos RAM)
-            self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).with_columns([
+            self.df_malha = pl.read_parquet(io.BytesIO(resp['Body'].read())).unique(subset=["H3_INDEX"]).with_columns([
                 pl.col("DENSIDADE_AJUSTADA").cast(pl.Float32),
                 pl.col("TAXA_VACANCIA").cast(pl.Float32)
             ])
+            
             self.df_malha_lazy = self.df_malha.lazy().with_columns([
                 self._limpar_texto_extremo("NM_MUN").alias("NM_MUN"),
                 self._limpar_texto_extremo("NM_BAIRRO").alias("NM_BAIRRO")
             ])
-            logger.info("PRATA: Malha geográfica carregada e comprimida.")
+            logger.info("PRATA: Malha geográfica carregada, DEDUPLICADA e comprimida.")
         except Exception as e:
             logger.error(f"PRATA: Falha crítica na malha: {e}")
             self.df_malha_lazy = None
@@ -128,7 +131,7 @@ class ProcessamentoPrata:
                 pl.when(pl.col("DATA").dt.weekday() >= 6).then(1).otherwise(0).cast(pl.Int8).alias("IS_FDS")
             ])
 
-           
+            
             lf_agg = lf.group_by([
                 "H3_INDEX", "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", 
                 "MES_OCORRENCIA", "DIA_SEMANA", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
