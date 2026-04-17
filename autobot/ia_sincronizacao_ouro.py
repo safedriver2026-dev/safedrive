@@ -8,7 +8,7 @@ import os
 import json
 import logging
 import shap
-import sys  # Necessário para as Surrogate Keys do Esquema Estrela
+import sys
 from botocore.config import Config
 from datetime import datetime
 from google.cloud import bigquery
@@ -28,7 +28,7 @@ class ConfiguracaoOuro:
     ID_DATASET = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip()
     PESOS_MODELOS = {"catboost": 0.85, "lightgbm": 0.15}
     
-    # ATENÇÃO: VOLUME_REAL_OCORRIDO em quarentena (não entra aqui para evitar Data Leakage na IA)
+    # ATENÇÃO: VOLUME_REAL_OCORRIDO não entra aqui para não vazar a resposta para a IA (Data Leakage)
     ATRIBUTOS_NUMERICOS = [
         'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
         'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', 
@@ -62,17 +62,15 @@ class SincronizadorOuro:
 
     def _descobrir_raiz_datalake(self) -> str:
         try:
-            resposta = self.cliente_armazenamento.get_paginator('list_objects_v2').paginate(Bucket=self.configuracao.NOME_BUCKET, MaxKeys=100)
-            for pagina in resposta:
-                for objeto in pagina.get('Contents', []):
-                    if "datalake/prata/" in objeto['Key']: 
-                        return objeto['Key'].split("datalake/")[0] + "datalake"
+            resposta = self.cliente_armazenamento.list_objects_v2(Bucket=self.configuracao.NOME_BUCKET, MaxKeys=50)
+            for objeto in resposta.get('Contents', []):
+                if "datalake/" in objeto['Key']:
+                    return objeto['Key'].split("datalake/")[0] + "datalake"
             return "datalake"
         except Exception:
             return "datalake"
 
     def _inicializar_bigquery(self):
-        """AUTOREGENERAÇÃO 1: Cria o dataset se ele não existir"""
         credenciais_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
         try:
             informacoes_credencial = json.loads(credenciais_json)
@@ -84,19 +82,17 @@ class SincronizadorOuro:
                 cliente.get_dataset(referencia_dataset)
                 logger.info(f"Dataset '{self.configuracao.ID_DATASET}' validado no BigQuery.")
             except exceptions.NotFound:
-                logger.warning(f"Dataset '{self.configuracao.ID_DATASET}' ausente. Autoregenerando...")
+                logger.warning(f"Dataset '{self.configuracao.ID_DATASET}' ausente. Criando agora...")
                 dataset = bigquery.Dataset(referencia_dataset)
                 dataset.location = "US"
                 cliente.create_dataset(dataset)
-                logger.info("Dataset recriado com sucesso.")
             
             return cliente
         except Exception as erro:
-            logger.error(f"Erro de credencial/infraestrutura no BigQuery: {erro}")
+            logger.error(f"Erro de infraestrutura no BigQuery: {erro}")
             return None
 
     def _carregar_modelos_treinados(self) -> dict:
-        """AUTOREGENERAÇÃO 2: Fallback suave se o modelo não existir no Datalake"""
         modelos = {"cat": None, "lgb": None}
         for algoritmo in ["cat", "lgb"]:
             caminho = f"{self.caminho_raiz}/modelos_ml/latest_{algoritmo}_geral.pkl"
@@ -104,7 +100,7 @@ class SincronizadorOuro:
                 objeto = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho)
                 modelos[algoritmo] = joblib.load(io.BytesIO(objeto['Body'].read()))
             except Exception:
-                logger.error(f"FALHA: Modelo {algoritmo} não encontrado no R2 ({caminho}). O pipeline precisará pular este modelo.")
+                logger.warning(f"Modelo {algoritmo} não encontrado no R2. Pulando.")
         return modelos
 
     def _construir_matriz_preditiva(self) -> pd.DataFrame:
@@ -113,37 +109,32 @@ class SincronizadorOuro:
             resposta_malha = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=self.caminho_malha)
             dataframe_malha = pl.read_parquet(io.BytesIO(resposta_malha['Body'].read())).unique(subset=["H3_INDEX"])
             
-            logger.info("Iniciando varredura na camada Prata (Lendo historico completo)...")
-            prefixo_prata = f"{self.caminho_raiz}/prata/ssp_consolidada"
-            resposta_arquivos = self.cliente_armazenamento.list_objects_v2(Bucket=self.configuracao.NOME_BUCKET, Prefix=prefixo_prata)
-            
-            if 'Contents' not in resposta_arquivos:
-                logger.error(f"Nenhum arquivo encontrado no R2 com o prefixo: {prefixo_prata}")
-                return None
-                
-            # Captura TODOS os arquivos particionados da Prata (2022, 2023, 2024...)
-            arquivos_prata = [obj['Key'] for obj in resposta_arquivos['Contents'] if obj['Key'].endswith('.parquet')]
-            
-            if not arquivos_prata:
-                logger.error("A pasta existe, mas nao contem arquivos .parquet validos.")
-                return None
-                
-            logger.info(f"Encontrados {len(arquivos_prata)} arquivos particionados. Consolidando...")
-            
-            # Lê e empilha todos os anos em um único DataFrame
+            logger.info("Iniciando varredura deterministica na camada Prata...")
             lista_dfs = []
-            for caminho_arquivo in arquivos_prata:
-                resposta = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_arquivo)
-                df_temp = pl.read_parquet(io.BytesIO(resposta['Body'].read()))
-                lista_dfs.append(df_temp)
+            ano_atual = datetime.now().year
+            
+            # Sincronizado com a Prata: Busca os anos fisicos para evitar erro do Cloudflare
+            for ano in range(2022, ano_atual + 1):
+                caminho_arquivo = f"{self.caminho_raiz}/prata/ssp_consolidada_{ano}.parquet"
+                try:
+                    resposta = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_arquivo)
+                    df_temp = pl.read_parquet(io.BytesIO(resposta['Body'].read()))
+                    lista_dfs.append(df_temp)
+                    logger.info(f" -> Sucesso: Base Prata de {ano} carregada.")
+                except Exception:
+                    pass
+
+            if not lista_dfs:
+                logger.error("Nenhum arquivo 'ssp_consolidada' foi encontrado.")
+                return None
                 
             dataframe_prata = pl.concat(lista_dfs, how="vertical")
-            logger.info(f"Historico consolidado com sucesso! Total de registros: {len(dataframe_prata)}")
+            logger.info(f"Historico consolidado! Registros lidos: {len(dataframe_prata)}")
             
-            # Extração da Sazonalidade Histórica
+            # Extrai sazonalidade com base nos dados gerados pela Prata
             meses_disponiveis = dataframe_prata.select("MES_OCORRENCIA").unique().drop_nulls()
 
-            # Agrupamento da memória usando todo o histórico para o Looker Studio
+            # Agrupa a memória histórica e puxa o TOTAL_CRIMES da Prata como VOLUME_REAL_OCORRIDO para o Dashboard
             memoria_historica = dataframe_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"]).agg([
                 pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
                 pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
@@ -154,8 +145,7 @@ class SincronizadorOuro:
             periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
             perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
             
-            # Cross Join da malha garantindo todos os meses e contextos
-            logger.info("Cruzando dados geograficos, temporais e historicos...")
+            logger.info("Construindo matriz cartesiana (Malha x Perfis x Tempo)...")
             estrutura_base = dataframe_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
                 periodos, how="cross"
             ).join(
@@ -164,7 +154,7 @@ class SincronizadorOuro:
                 meses_disponiveis, how="cross"
             )
 
-            # Join da base com a memória histórica
+            # Reúne tudo
             dataframe_completo = estrutura_base.join(
                 memoria_historica, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"], how="left"
             ).with_columns([
@@ -178,13 +168,13 @@ class SincronizadorOuro:
             dataframe_pandas = dataframe_completo.to_pandas()
             dataframe_pandas['PRESSAO_RISCO_LOCAL'] = dataframe_pandas['CONTAGIO_PONDERADO'] / (dataframe_pandas['DENSIDADE'] + 0.001)
 
+            # Injeta o contexto de hoje (Para a predição da IA)
             contexto_temporal = self.calendario.obter_contexto_ia()
             dataframe_pandas['DIA_SEMANA'] = self.calendario.hoje.weekday()
             dataframe_pandas['IS_PAGAMENTO'] = contexto_temporal['IS_PAGAMENTO']
             dataframe_pandas['IS_FDS'] = contexto_temporal['IS_FDS']
             dataframe_pandas['TIPO_LOCAL'] = "VIA PUBLICA" 
             
-            logger.info(f"Matriz de inferencia gerada com sucesso: {len(dataframe_pandas)} linhas prontas para IA.")
             return dataframe_pandas
             
         except Exception as erro:
@@ -205,20 +195,18 @@ class SincronizadorOuro:
                 Key=caminho_arquivo, 
                 Body=buffer.getvalue()
             )
-            logger.info(f"Backup Parquet Ouro salvo no R2: {caminho_arquivo}")
+            logger.info(f"Backup Ouro salvo: {caminho_arquivo}")
         except Exception as erro:
-            logger.error(f"Aviso: Falha ao salvar backup no Datalake R2: {erro}")
+            logger.error(f"Falha ao salvar backup no Datalake: {erro}")
 
     def _exportar_bigquery(self, dataframe: pd.DataFrame) -> bool:
-        """Exportação otimizada com Esquema Estrela"""
         if not self.cliente_bigquery:
-            logger.warning("BigQuery inacessível. Pulando carga analítica.")
+            logger.warning("BigQuery inacessível. Pulando carga.")
             return False
 
         logger.info("Modelando DataFrame para Star Schema...")
         df_estrela = dataframe.copy()
 
-        # Criação de Chaves
         df_estrela['SK_CENARIO'] = (
             df_estrela['PERIODO_DIA'].astype(str) + "_" + 
             df_estrela['PERFIL_ALVO'].astype(str) + "_" + 
@@ -232,24 +220,20 @@ class SincronizadorOuro:
             df_estrela['IS_PAGAMENTO'].astype(str)
         ).apply(lambda x: hash(x) % ((sys.maxsize + 1) * 2)).astype(str)
 
-        # Divisão das Dimensões
         dim_geografia = df_estrela[['H3_INDEX', 'NM_MUN', 'NM_BAIRRO', 'DENSIDADE', 'TAXA_VACANCIA']].drop_duplicates(subset=['H3_INDEX'])
         dim_cenario = df_estrela[['SK_CENARIO', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']].drop_duplicates(subset=['SK_CENARIO'])
         dim_tempo = df_estrela[['SK_TEMPO', 'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_FDS', 'IS_PAGAMENTO']].drop_duplicates(subset=['SK_TEMPO'])
 
-        # Separação da Fato
         colunas_fato = [
             'H3_INDEX', 'SK_CENARIO', 'SK_TEMPO', 'DT_REF',
             'VOLUME_HISTORICO', 'GRAVIDADE_HISTORICA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL',
-            'SCORE_RISCO_BRUTO', 'SCORE_RISCO_FINAL',
-            'VOLUME_REAL_OCORRIDO'
+            'SCORE_RISCO_BRUTO', 'SCORE_RISCO_FINAL', 'VOLUME_REAL_OCORRIDO'
         ]
         
         colunas_shap = [c for c in df_estrela.columns if c.startswith('SHAP_')]
         fato_inferencia_risco = df_estrela[colunas_fato + colunas_shap].copy()
         fato_inferencia_risco['DT_REF'] = pd.to_datetime(fato_inferencia_risco['DT_REF'])
 
-        # Carga no BigQuery (WRITE_TRUNCATE limpa o obsoleto e cria o novo schema)
         try:
             tabelas_para_carregar = {
                 "dim_geografia": dim_geografia,
@@ -272,29 +256,23 @@ class SincronizadorOuro:
             logger.info("Estrutura Star Schema atualizada com sucesso no BigQuery.")
             return True
         except Exception as erro:
-            logger.error(f"Falha Crítica ao subir tabelas pro BigQuery: {erro}")
+            logger.error(f"Falha ao subir tabelas pro BigQuery: {erro}")
             return False
 
     def _criar_view_looker_studio(self):
-        """AUTOREGENERAÇÃO 3: Auditoria de dependências antes de montar a View"""
-        if not self.cliente_bigquery:
-            return
+        if not self.cliente_bigquery: return
 
         dataset_ref = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}"
         nome_view = f"{dataset_ref}.vw_safedriver_dashboard"
         
-        # Check de Segurança (Evita que o Action quebre se a carga da tabela falhou)
         tabelas_necessarias = ['fato_inferencia_risco', 'dim_geografia', 'dim_cenario', 'dim_tempo']
         for tabela in tabelas_necessarias:
-            tabela_id = f"{dataset_ref}.{tabela}"
             try:
-                self.cliente_bigquery.get_table(tabela_id)
+                self.cliente_bigquery.get_table(f"{dataset_ref}.{tabela}")
             except exceptions.NotFound:
-                logger.error(f"ABORTADO: View não pode ser criada pois a tabela '{tabela}' não existe.")
+                logger.error(f"View cancelada: Tabela '{tabela}' ausente.")
                 return False
 
-        logger.info("Dependências verificadas. Compilando View Analítica...")
-        
         query_sql = f"""
         CREATE OR REPLACE VIEW `{nome_view}` AS
         SELECT 
@@ -326,48 +304,42 @@ class SincronizadorOuro:
         
         try:
             self.cliente_bigquery.query(query_sql).result()
-            logger.info("Sucesso! View 'vw_safedriver_dashboard' gerada e protegida.")
+            logger.info("View 'vw_safedriver_dashboard' gerada para o BI.")
         except Exception as erro:
             logger.error(f"Erro ao orquestrar a View no BigQuery: {erro}")
 
     def executar_pipeline_preditivo(self) -> bool:
-        logger.info("=== Iniciando Pipeline Ouro (SafeDriver) ===")
+        logger.info("=== Iniciando Pipeline Ouro ===")
         try:
             modelos = self._carregar_modelos_treinados()
-            
             if modelos["cat"] is None:
-                logger.error("Interrompendo Ouro: Modelo preditivo ausente ou corrompido.")
+                logger.error("Modelo preditivo ausente. Abortando.")
                 return False
 
             dados_entrada = self._construir_matriz_preditiva()
             if dados_entrada is None or dados_entrada.empty: 
-                logger.error("Interrompendo Ouro: Matriz gerou resultado vazio.")
+                logger.error("Matriz gerou resultado vazio. Abortando.")
                 return False
 
-            # Preparação de Features Segura
             matriz_features = dados_entrada[self.configuracao.ATRIBUTOS_COMPLETOS].copy()
             for coluna in self.configuracao.ATRIBUTOS_CATEGORICOS:
                 matriz_features[coluna] = matriz_features[coluna].astype('category')
             for coluna in self.configuracao.ATRIBUTOS_NUMERICOS:
                 matriz_features[coluna] = matriz_features[coluna].astype('float32')
 
-            # Predição
-            logger.info("Executando motor de Inferencia da IA...")
+            logger.info("Executando Inferencia da IA...")
             previsao_catboost = modelos["cat"].predict(matriz_features)
             previsao_lightgbm = modelos["lgb"].predict(matriz_features) if modelos["lgb"] else previsao_catboost
 
-            # Ensemble
             pontuacao_bruta = (previsao_catboost * self.configuracao.PESOS_MODELOS["catboost"]) + (previsao_lightgbm * self.configuracao.PESOS_MODELOS["lightgbm"])
             dados_entrada['SCORE_RISCO_BRUTO'] = pontuacao_bruta
 
-            # Normalização (0 a 100)
             dados_entrada['SCORE_RISCO_FINAL'] = dados_entrada.groupby('PERFIL_ALVO')['SCORE_RISCO_BRUTO'].transform(
                 lambda x: ((x - x.min()) / (x.max() - x.min() + 0.001) * 100)
             ).clip(0, 100).round(2)
 
             dados_entrada['DT_REF'] = datetime.now() 
             
-            # SHAP Explainer
             try:
                 explicador = shap.TreeExplainer(modelos["cat"])
                 amostra_topo = dados_entrada.nlargest(1000, 'SCORE_RISCO_FINAL')
@@ -379,9 +351,8 @@ class SincronizadorOuro:
                     indice_atributo = self.configuracao.ATRIBUTOS_COMPLETOS.index(atributo)
                     dados_entrada.loc[amostra_topo.index, nome_coluna] = valores_shap[:, indice_atributo]
             except Exception as shap_erro:
-                logger.warning(f"Cálculo SHAP ignorado por instabilidade computacional: {shap_erro}")
+                logger.warning(f"Cálculo SHAP ignorado: {shap_erro}")
 
-            # Persistência final
             self._exportar_datalake(dados_entrada)
             carga_sucesso = self._exportar_bigquery(dados_entrada)
             
@@ -389,18 +360,14 @@ class SincronizadorOuro:
                 self._criar_view_looker_studio() 
                 logger.info("=== Pipeline Ouro Concluído com Sucesso ===")
                 return True
-            else:
-                logger.error("Pipeline Finalizado com falhas na exportação.")
-                return False
+            return False
             
         except Exception as erro:
-            logger.error(f"Falha estrutural não mapeada na camada analítica: {erro}")
+            logger.error(f"Falha não mapeada na Ouro: {erro}")
             return False
 
 if __name__ == "__main__":
     processador_ouro = SincronizadorOuro()
     processamento_ok = processador_ouro.executar_pipeline_preditivo()
-    
-    # Sai com código de erro 1 se falhar, para que o GitHub Actions sinalize "Failed"
     if not processamento_ok:
         sys.exit(1)
