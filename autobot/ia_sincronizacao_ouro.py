@@ -33,12 +33,13 @@ class CamadaOuroSafeDriver:
         self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
         
         self.cal = CalendarioEstrategico()
-        self.pesos = {"catboost": 0.85, "lightgbm": 0.15} # CatBoost lidera pela precisão em Tweedie
+        self.pesos = {"catboost": 0.85, "lightgbm": 0.15}
         
-        # --- 🚀 ALINHAMENTO COM O TREINADOR V3: Inclusão de Memória como Feature ---
+        # --- ALINHAMENTO COM O TREINADOR V3 ---
         self.features_numericas = [
-            'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
-            'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', # <-- Memória Local para curar a surdez temporal
+            'DENSIDADE', 
+            'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+            'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', 
             'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
         ]
         self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
@@ -74,7 +75,7 @@ class CamadaOuroSafeDriver:
             logger.error(f"OURO: Erro de Infra BQ: {e}")
 
     def executar_predicao_atual(self):
-        logger.info(f"OURO: Iniciando inferência dinâmica com Memória Histórica.")
+        logger.info(f"OURO: Iniciando inferência dinâmica com Memória Histórica Defasada.")
         try:
             modelos = self._carregar_modelos_producao()
             df_input = self._obter_contexto_preditivo_total()
@@ -95,8 +96,7 @@ class CamadaOuroSafeDriver:
             score_raw = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
             df_input['SCORE_RISCO_BRUTO'] = score_raw
 
-            # --- 🚀 RESOLUÇÃO DO VIÉS: Normalização Intra-Perfil ---
-            # Isso garante que a variação de horário apareça no mapa, não sendo esmagada pelo peso do motorista
+            # --- NORMALIZAÇÃO DE CONTRASTE INTRA-PERFIL ---
             logger.info("OURO: Aplicando Normalização de Contraste por Perfil...")
             df_input['SCORE_RISCO_FINAL'] = df_input.groupby('PERFIL_ALVO')['SCORE_RISCO_BRUTO'].transform(
                 lambda x: ((x - x.min()) / (x.max() - x.min() + 0.001) * 100)
@@ -114,7 +114,8 @@ class CamadaOuroSafeDriver:
                     df_input[col_name] = 0.0
                     feat_idx = self.features_full.index(feat)
                     df_input.loc[df_top.index, col_name] = shap_values[:, feat_idx]
-            except: pass
+            except Exception as e: 
+                logger.warning(f"OURO: Aviso ao gerar valores SHAP: {e}")
 
             self._sincronizar_star_schema(df_input)
             return True
@@ -160,11 +161,13 @@ class CamadaOuroSafeDriver:
             path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
             df_prata = pl.read_parquet(io.BytesIO(self.s3.get_object(Bucket=self.bucket, Key=path_prata)['Body'].read()))
             
-            # Agregação para consolidar o histórico por cenário
-            df_prata_agg = df_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).agg([
-                pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
-                pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
-                pl.col("CONTAGIO_PONDERADO").max().alias("CONTAGIO_PONDERADO")
+            # 🚨 CORREÇÃO DO VAZAMENTO: 
+            # Pegamos o ÚLTIMO dado conhecido do local e o transformamos no passado (HISTORICO) de hoje.
+            df_memoria = df_prata.sort("MES_OCORRENCIA").group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).last().select([
+                "H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO",
+                pl.col("INDICE_GRAVIDADE").alias("GRAVIDADE_HISTORICA"),
+                pl.col("TOTAL_CRIMES").alias("VOLUME_HISTORICO"),
+                "CONTAGIO_PONDERADO"
             ])
 
             # 3. SCAFFOLD: Criação da Malha Total de Predição (24h)
@@ -176,10 +179,9 @@ class CamadaOuroSafeDriver:
                 scaffold, how="cross"
             )
 
-            # 4. Join: Injecão de Memória no Scaffold
-            # Onde não há histórico, a IA usará as features vizinhas e densidade
+            # 4. Join: Injecão da Memória Recente no Scaffold Atual
             df_full = df_base.join(
-                df_prata_agg, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"], how="left"
+                df_memoria, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"], how="left"
             ).with_columns([
                 pl.col("GRAVIDADE_HISTORICA").fill_null(0.0),
                 pl.col("VOLUME_HISTORICO").fill_null(0.0),
