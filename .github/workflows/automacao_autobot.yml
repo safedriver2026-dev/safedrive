@@ -27,7 +27,7 @@ env:
 
 jobs:
   validacao_qualidade:
-    name: "Validacao de Seguranca"
+    name: "01. Validacao de Seguranca"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -35,11 +35,11 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-      - run: pip install pytest polars
+      - run: pip install pytest polars pyarrow
       - run: python -m pytest tests/test_seguranca.py --maxfail=1 --disable-warnings
 
   processamento_bronze:
-    name: "Ingestao Bronze"
+    name: "02. Ingestao Bronze"
     needs: validacao_qualidade
     runs-on: ubuntu-latest
     steps:
@@ -53,7 +53,7 @@ jobs:
           python -c "from autobot.ingestao_bronze import IngestaoBronze; IngestaoBronze().executar_ingestao_continua(forcar_execucao=${{ github.event.inputs.force_execution == 'true' && 'True' || 'False' }})"
 
   processamento_prata:
-    name: "Engenharia Prata"
+    name: "03. Engenharia Prata"
     needs: processamento_bronze
     runs-on: ubuntu-latest
     steps:
@@ -67,7 +67,7 @@ jobs:
           python -c "from autobot.processamento_prata import ProcessadorPrata; ProcessadorPrata().executar_completo(forcar_execucao=${{ github.event.inputs.force_execution == 'true' && 'True' || 'False' }})"
 
   treinamento_ia:
-    name: "Treinamento Preditivo"
+    name: "04. Treinamento Preditivo"
     needs: processamento_prata
     runs-on: ubuntu-latest
     steps:
@@ -78,7 +78,7 @@ jobs:
           cache: 'pip'
       - run: |
           sudo apt-get install -y libgomp1
-          pip install polars pandas scikit-learn catboost lightgbm joblib boto3 botocore
+          pip install polars pandas pyarrow scikit-learn catboost lightgbm joblib boto3 botocore
       - run: |
           python -c "from autobot.treinador_ia import TreinadorModelos; TreinadorModelos().treinar_modelos()"
       - if: always()
@@ -89,7 +89,7 @@ jobs:
           echo "- Status: Operacional" >> $GITHUB_STEP_SUMMARY
 
   sincronizacao_ouro:
-    name: "Sincronizacao Ouro"
+    name: "05. Sincronizacao Ouro"
     needs: treinamento_ia
     runs-on: ubuntu-latest
     steps:
@@ -100,12 +100,12 @@ jobs:
           cache: 'pip'
       - run: |
           sudo apt-get install -y libgomp1
-          pip install polars pandas google-cloud-bigquery google-auth shap h3 holidays boto3 botocore catboost lightgbm joblib
+          pip install polars pandas pyarrow google-cloud-bigquery google-auth shap h3 holidays boto3 botocore catboost lightgbm joblib
       - run: |
           python -c "from autobot.ia_sincronizacao_ouro import SincronizadorOuro; SincronizadorOuro().executar_pipeline_preditivo()"
 
   notificacao_operacional:
-    name: "Notificacao Discord"
+    name: "06. Notificacao Discord"
     needs: [validacao_qualidade, processamento_bronze, processamento_prata, treinamento_ia, sincronizacao_ouro]
     if: always()
     runs-on: ubuntu-latest
