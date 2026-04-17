@@ -84,10 +84,17 @@ class ProcessadorPrata:
 
     def _aplicar_transformacoes_temporais(self, estrutura_preguicosa: pl.LazyFrame) -> pl.LazyFrame:
         colunas_atuais = estrutura_preguicosa.collect_schema().names()
-        mapa_renomeacao = {origem: destino for destino, origens in self.configuracao.MAPA_DE_COLUNAS.items() 
-                           for origem in origens if origem in colunas_atuais}
         
-        return estrutura_preguicosa.rename(mapa_renomeacao).with_columns([
+        expressoes_mapeamento = []
+        colunas_para_remover = []
+        
+        for destino, origens in self.configuracao.MAPA_DE_COLUNAS.items():
+            presentes = [o for o in origens if o in colunas_atuais]
+            if presentes:
+                expressoes_mapeamento.append(pl.coalesce(presentes).alias(destino))
+                colunas_para_remover.extend([o for o in presentes if o != destino])
+
+        return estrutura_preguicosa.with_columns(expressoes_mapeamento).drop(colunas_para_remover).with_columns([
             pl.col("DATA_BRUTA").str.to_date(format="%d/%m/%Y", strict=False).alias("DATA"),
             pl.col("HORA").str.split(":").list.first().cast(pl.Int8, strict=False).alias("HORA_INT"),
             
