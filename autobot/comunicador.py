@@ -4,166 +4,143 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# Configuração de Logs
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(module)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class ComunicadorSafeDriver:
+class ConfiguracaoComunicador:
+    WEBHOOK_SUCESSO = os.getenv("DISCORD_SUCESSO")
+    WEBHOOK_ERRO = os.getenv("DISCORD_ERRO")
+    COR_SUCESSO = 3066993
+    COR_ALERTA = 16776960
+    COR_ERRO = 15158332
+    RODAPE_PADRAO = "SafeDriver Autobot • Inteligencia de Seguranca Publica"
+    FUSO_HORARIO = "America/Sao_Paulo"
+    NOME_USUARIO_SUCESSO = "SafeDriver Maestro"
+    NOME_USUARIO_ERRO = "SafeDriver Alerta"
+
+class ComunicadorDiscord:
     def __init__(self):
-        self.webhook_sucesso = os.getenv("DISCORD_SUCESSO")
-        self.webhook_erro = os.getenv("DISCORD_ERRO")
-        self.COR_SUCESSO = 3066993  # Verde
-        self.COR_ALERTA = 16776960 # Amarelo
-        self.COR_ERRO = 15158332    # Vermelho
-        self.rodape_padrao = "SafeDriver Autobot • Inteligência de Segurança Pública"
-        self.fuso_br = ZoneInfo("America/Sao_Paulo")
+        self.configuracao = ConfiguracaoComunicador()
+        self.fuso = ZoneInfo(self.configuracao.FUSO_HORARIO)
 
-    def _obter_agora_br(self):
-        """Obtém a data e hora atual no fuso horário de São Paulo."""
-        return datetime.now(self.fuso_br)
+    def _obter_horario_atual(self) -> datetime:
+        return datetime.now(self.fuso)
 
-    def _formatar_numero(self, valor):
-        """
-        Formata um número inteiro para o padrão brasileiro (ex: 1.000.000)
-        para melhor legibilidade em relatórios executivos.
-        """
+    def _formatar_milhares(self, valor) -> str:
         try:
-            # Converte para int primeiro para garantir que não há casas decimais indesejadas
-            # e depois formata com separador de milhares.
             return f"{int(valor):,}".replace(",", ".")
         except (ValueError, TypeError):
-            # Retorna o valor original se não for possível formatar (ex: se for string)
-            return valor
+            return str(valor)
 
-    def _disparar(self, url, payload):
-        """
-        Envia o payload para a URL do webhook.
-        Retorna True em caso de sucesso, False em caso de falha.
-        """
+    def _enviar_webhook(self, url: str, carga_util: dict) -> bool:
         if not url:
-            logger.warning("URL do webhook não fornecida. Impossível disparar.")
+            logger.warning("URL do webhook ausente. Envio cancelado.")
             return False
         try:
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()  # Levanta um HTTPError para códigos de status ruins (4xx ou 5xx)
-            logger.info(f"Webhook enviado com sucesso para {url[:30]}...")
+            resposta = requests.post(url, json=carga_util, timeout=10)
+            resposta.raise_for_status()
             return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Falha ao enviar webhook para {url[:30]}...: {e}")
+        except requests.exceptions.RequestException as erro:
+            logger.error(f"Falha na comunicacao com webhook: {erro}")
             return False
 
-    def enviar_relatorio_executivo(self, stats):
-        """
-        Envia um relatório executivo para o Discord com base nas estatísticas fornecidas.
-        Inclui métricas de higiene, severidade e integridade do pipeline.
-        """
-        if not self.webhook_sucesso:
-            logger.warning("Webhook de sucesso não configurado. Não foi possível enviar o relatório executivo.")
+    def enviar_relatorio_operacional(self, estatisticas: dict) -> bool:
+        if not self.configuracao.WEBHOOK_SUCESSO:
             return False
 
-        agora = self._obter_agora_br()
-        higiene_stats = stats.get('hygiene', {})
+        agora = self._obter_horario_atual()
+        metricas_higiene = estatisticas.get('hygiene', {})
+        
+        taxa_recuperacao = metricas_higiene.get('taxa_recuperacao', 100)
+        malha_processada = self._formatar_milhares(metricas_higiene.get('recuperado_grade', 0))
+        cenarios_gerados = self._formatar_milhares(metricas_higiene.get('linhas_ouro', 0))
+        
+        severidade_total = self._formatar_milhares(estatisticas.get('severidade_total', 0))
+        
+        cor_destaque = self.configuracao.COR_SUCESSO if taxa_recuperacao > 90 else self.configuracao.COR_ALERTA
+        
+        status_camadas = estatisticas.get('status_camadas', {})
+        operacao_em_cache = all("Cache" in str(valor) for valor in status_camadas.values())
+        
+        titulo_relatorio = "💤 SafeDriver: Operacao em Cache" if operacao_em_cache else "🛡️ SafeDriver: Atualizacao de Risco Concluida"
 
-        # Métricas de higiene e volume
-        taxa = higiene_stats.get('taxa_recuperacao', 100)
-        cura_grade = self._formatar_numero(higiene_stats.get('recuperado_grade', 0))
-        linhas_ouro = self._formatar_numero(higiene_stats.get('linhas_ouro', 0))
-
-        # Métrica de Severidade (se presente nas stats)
-        severidade_total = self._formatar_numero(stats.get('severidade_total', 0))
-
-        # Define a cor do embed com base na taxa de recuperação
-        cor = self.COR_SUCESSO if taxa > 90 else self.COR_ALERTA
-
-        # Verifica o status das camadas para determinar se o pipeline está em repouso (cache)
-        status_camadas = stats.get('status_camadas', {})
-        em_repouso = all("Cache" in str(v) for v in status_camadas.values())
-
-        # Título dinâmico para o relatório
-        titulo = "💤 SafeDriver: Mantido em Cache" if em_repouso else "🛡️ SafeDriver: Snapshot de Risco Atualizado"
-
-        # Campos padrão do embed
-        fields = [
+        campos_relatorio = [
             {
-                "name": "⛓️ Integridade do Pipeline",
+                "name": "⛓️ Integridade do Fluxo",
                 "value": (
                     f"**Bronze:** {status_camadas.get('bronze', 'N/A')}\n"
                     f"**Prata:** {status_camadas.get('prata', 'N/A')}\n"
-                    f"**IA (Train):** {status_camadas.get('ia', 'N/A')}\n"
-                    f"**Ouro (DW):** {status_camadas.get('ouro', 'N/A')}"
+                    f"**Treinamento IA:** {status_camadas.get('ia', 'N/A')}\n"
+                    f"**Sincronizacao Ouro:** {status_camadas.get('ouro', 'N/A')}"
                 ),
                 "inline": False
             },
             {
-                "name": "🧹 Higiene Crítica",
-                "value": f"`{taxa}%` ✅",
+                "name": "🧹 Higiene de Dados",
+                "value": f"`{taxa_recuperacao}%` ✅",
                 "inline": True
             },
             {
-                "name": "🗺️ Malha Ativa", 
-                "value": f"`{cura_grade}` hex",
+                "name": "🗺️ Cobertura Espacial", 
+                "value": f"`{malha_processada}` hex",
                 "inline": True
             },
             {
-                "name": "🏆 Volume de Predição",
-                "value": f"`{linhas_ouro}` cenários",
+                "name": "🏆 Volume Analitico",
+                "value": f"`{cenarios_gerados}` cenarios",
                 "inline": True
             },
             {
-                "name": "🧠 Precisão (MAE)",
-                "value": f"`{stats.get('metrics_ia', {}).get('mae', 'N/A')}`",
+                "name": "🧠 Precisao do Modelo (MAE)",
+                "value": f"`{estatisticas.get('metrics_ia', {}).get('mae', 'N/A')}`",
                 "inline": True
             },
             {
-                "name": "⏱️ Tempo de Ciclo",
-                "value": f"`{stats.get('duracao', '0s')}`",
+                "name": "⏱️ Tempo de Processamento",
+                "value": f"`{estatisticas.get('duracao', '0s')}`",
                 "inline": True
             }
         ]
 
-        # Adiciona a métrica de severidade se o pipeline não estiver em repouso e houver dados de severidade
-        if not em_repouso and severidade_total != "0":
-             fields.insert(4, { # Insere na posição 4 para ficar antes da Precisão (MAE)
-                "name": "🔥 Severidade Total",
+        if not operacao_em_cache and str(severidade_total) != "0":
+             campos_relatorio.insert(4, {
+                "name": "🔥 Severidade Acumulada",
                 "value": f"`{severidade_total}` pts",
                 "inline": True
             })
 
-        embed = {
-            "title": titulo,
-            "description": f"Relatório de inteligência gerado em **{agora.strftime('%d/%m/%Y %H:%M:%S')}**.",
-            "color": cor,
-            "fields": fields,
+        estrutura_mensagem = {
+            "title": titulo_relatorio,
+            "description": f"Relatorio gerado em **{agora.strftime('%d/%m/%Y %H:%M:%S')}**.",
+            "color": cor_destaque,
+            "fields": campos_relatorio,
             "timestamp": agora.isoformat(),
-            "footer": {"text": self.rodape_padrao}
+            "footer": {"text": self.configuracao.RODAPE_PADRAO}
         }
 
-        payload = {"username": "SafeDriver Maestro", "embeds": [embed]}
-        return self._disparar(self.webhook_sucesso, payload)
+        carga_util = {"username": self.configuracao.NOME_USUARIO_SUCESSO, "embeds": [estrutura_mensagem]}
+        return self._enviar_webhook(self.configuracao.WEBHOOK_SUCESSO, carga_util)
 
-    def relatar_erro_critico(self, modulo, erro):
-        """
-        Envia um relatório de erro crítico para o Discord.
-        Limita o tamanho da mensagem de erro para evitar falhas no webhook.
-        """
-        if not self.webhook_erro:
-            logger.warning("Webhook de erro não configurado. Não foi possível enviar o relatório de erro.")
+    def reportar_falha_critica(self, modulo_origem: str, detalhes_erro: str) -> bool:
+        if not self.configuracao.WEBHOOK_ERRO:
             return False
 
-        agora = self._obter_agora_br()
+        agora = self._obter_horario_atual()
+        erro_truncado = str(detalhes_erro)[:1800] 
+        
+        if len(str(detalhes_erro)) > 1800:
+            erro_truncado += "..."
 
-        # Limita o erro a 1800 caracteres para evitar problemas com o limite do Discord
-        erro_formatado = str(erro)[:1800] 
-        if len(str(erro)) > 1800:
-            erro_formatado += "..." # Adiciona reticências se o erro foi truncado
-
-        embed_erro = {
-            "title": f"🚨 Falha Crítica: {modulo}",
-            "description": f"Ocorreu uma interrupção no módulo **{modulo}**.\n\n```\n{erro_formatado}\n```",
-            "color": self.COR_ERRO,
+        estrutura_mensagem = {
+            "title": f"🚨 Falha de Operacao: {modulo_origem}",
+            "description": f"Interrupcao detectada no modulo **{modulo_origem}**.\n\n```\n{erro_truncado}\n```",
+            "color": self.configuracao.COR_ERRO,
             "timestamp": agora.isoformat(),
-            "footer": {"text": self.rodape_padrao}
+            "footer": {"text": self.configuracao.RODAPE_PADRAO}
         }
 
-        payload = {"username": "SafeDriver Alerta", "embeds": [embed_erro]}
-        return self._disparar(self.webhook_erro, payload)
+        carga_util = {"username": self.configuracao.NOME_USUARIO_ERRO, "embeds": [estrutura_mensagem]}
+        return self._enviar_webhook(self.configuracao.WEBHOOK_ERRO, carga_util)
