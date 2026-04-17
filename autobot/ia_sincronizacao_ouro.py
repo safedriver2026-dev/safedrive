@@ -148,6 +148,24 @@ class SincronizadorOuro:
             logger.error(f"Erro na construcao da matriz de contexto: {erro}")
             return None
 
+    def _exportar_datalake(self, dataframe: pd.DataFrame):
+        try:
+            dataframe_exportacao = pl.from_pandas(dataframe)
+            buffer = io.BytesIO()
+            dataframe_exportacao.write_parquet(buffer, compression="lz4")
+            
+            data_atual = datetime.now().strftime("%Y%m%d")
+            caminho_arquivo = f"{self.caminho_raiz}/ouro/fato_risco_consolidada_{data_atual}.parquet"
+            
+            self.cliente_armazenamento.put_object(
+                Bucket=self.configuracao.NOME_BUCKET, 
+                Key=caminho_arquivo, 
+                Body=buffer.getvalue()
+            )
+            logger.info(f"Copia fisica armazenada no Datalake (R2): {caminho_arquivo}")
+        except Exception as erro:
+            logger.error(f"Falha ao salvar backup no Datalake: {erro}")
+
     def _exportar_bigquery(self, dataframe: pd.DataFrame):
         if not self.cliente_bigquery:
             logger.warning("Cliente BigQuery nao inicializado. Pulando sincronizacao.")
@@ -168,6 +186,7 @@ class SincronizadorOuro:
         )
         
         self.cliente_bigquery.load_table_from_dataframe(dataframe_exportacao, identificador_tabela, job_config=configuracao_job).result()
+        logger.info("Sincronizacao com BigQuery concluida.")
 
     def executar_pipeline_preditivo(self) -> bool:
         logger.info("Iniciando inferencia e sincronizacao de dados.")
@@ -213,8 +232,9 @@ class SincronizadorOuro:
             except Exception:
                 pass
 
+            self._exportar_datalake(dados_entrada)
             self._exportar_bigquery(dados_entrada)
-            logger.info("Processo de sincronizacao concluido.")
+            
             return True
             
         except Exception as erro:
