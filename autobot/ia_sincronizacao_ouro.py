@@ -28,6 +28,7 @@ class ConfiguracaoOuro:
     ID_DATASET = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip()
     PESOS_MODELOS = {"catboost": 0.85, "lightgbm": 0.15}
     
+    # ATENÇÃO: VOLUME_REAL_OCORRIDO não entra aqui para não vazar a resposta para a IA (Data Leakage)
     ATRIBUTOS_NUMERICOS = [
         'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
         'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', 
@@ -111,26 +112,37 @@ class SincronizadorOuro:
             resposta_prata = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_prata)
             dataframe_prata = pl.read_parquet(io.BytesIO(resposta_prata['Body'].read()))
             
-            memoria_historica = dataframe_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).agg([
+            # 1. Extrair os meses disponíveis na base histórica
+            meses_disponiveis = dataframe_prata.select("MES_OCORRENCIA").unique().drop_nulls()
+
+            # 2. Agrupar memória histórica MANTENDO o mês e capturando o crime real
+            memoria_historica = dataframe_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"]).agg([
                 pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
                 pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
-                pl.col("CONTAGIO_PONDERADO").max().alias("CONTAGIO_PONDERADO")
+                pl.col("CONTAGIO_PONDERADO").max().alias("CONTAGIO_PONDERADO"),
+                pl.col("TOTAL_CRIMES").sum().alias("VOLUME_REAL_OCORRIDO") # <-- Aqui resgatamos o passado!
             ])
 
             periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
             perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
-            estrutura_base = periodos.join(perfis, how="cross")
             
-            dataframe_base = dataframe_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
-                estrutura_base, how="cross"
+            # 3. Cruzamento base agora inclui todos os meses históricos
+            estrutura_base = dataframe_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
+                periodos, how="cross"
+            ).join(
+                perfis, how="cross"
+            ).join(
+                meses_disponiveis, how="cross"
             )
 
-            dataframe_completo = dataframe_base.join(
-                memoria_historica, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"], how="left"
+            # 4. Join final
+            dataframe_completo = estrutura_base.join(
+                memoria_historica, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"], how="left"
             ).with_columns([
                 pl.col("GRAVIDADE_HISTORICA").fill_null(0.0),
                 pl.col("VOLUME_HISTORICO").fill_null(0.0),
                 pl.col("CONTAGIO_PONDERADO").fill_null(0.0),
+                pl.col("VOLUME_REAL_OCORRIDO").fill_null(0.0),
                 pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE")
             ])
 
@@ -138,7 +150,7 @@ class SincronizadorOuro:
             dataframe_pandas['PRESSAO_RISCO_LOCAL'] = dataframe_pandas['CONTAGIO_PONDERADO'] / (dataframe_pandas['DENSIDADE'] + 0.001)
 
             contexto_temporal = self.calendario.obter_contexto_ia()
-            dataframe_pandas['MES_OCORRENCIA'] = self.calendario.hoje.month
+            # Removido: dataframe_pandas['MES_OCORRENCIA'] = hoje.month (Agora a base já tem os meses preenchidos)
             dataframe_pandas['DIA_SEMANA'] = self.calendario.hoje.weekday()
             dataframe_pandas['IS_PAGAMENTO'] = contexto_temporal['IS_PAGAMENTO']
             dataframe_pandas['IS_FDS'] = contexto_temporal['IS_FDS']
@@ -177,14 +189,12 @@ class SincronizadorOuro:
         df_estrela = dataframe.copy()
 
         # 1. CRIAÇÃO DAS CHAVES PRIMÁRIAS (SURROGATE KEYS)
-        # Cenário (Turno + Perfil + Local)
         df_estrela['SK_CENARIO'] = (
             df_estrela['PERIODO_DIA'].astype(str) + "_" + 
             df_estrela['PERFIL_ALVO'].astype(str) + "_" + 
             df_estrela['TIPO_LOCAL'].astype(str)
         ).apply(lambda x: hash(x) % ((sys.maxsize + 1) * 2)).astype(str)
 
-        # Tempo (Mês + Dia + FDS + Pagamento)
         df_estrela['SK_TEMPO'] = (
             df_estrela['MES_OCORRENCIA'].astype(str) + "_" + 
             df_estrela['DIA_SEMANA'].astype(str) + "_" + 
@@ -192,16 +202,17 @@ class SincronizadorOuro:
             df_estrela['IS_PAGAMENTO'].astype(str)
         ).apply(lambda x: hash(x) % ((sys.maxsize + 1) * 2)).astype(str)
 
-        # 2. SEPARAÇÃO DAS DIMENSÕES (Tirando duplicatas)
+        # 2. SEPARAÇÃO DAS DIMENSÕES
         dim_geografia = df_estrela[['H3_INDEX', 'NM_MUN', 'NM_BAIRRO', 'DENSIDADE', 'TAXA_VACANCIA']].drop_duplicates(subset=['H3_INDEX'])
         dim_cenario = df_estrela[['SK_CENARIO', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']].drop_duplicates(subset=['SK_CENARIO'])
         dim_tempo = df_estrela[['SK_TEMPO', 'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_FDS', 'IS_PAGAMENTO']].drop_duplicates(subset=['SK_TEMPO'])
 
-        # 3. SEPARAÇÃO DA TABELA FATO (Métricas e Chaves)
+        # 3. SEPARAÇÃO DA TABELA FATO
         colunas_fato = [
             'H3_INDEX', 'SK_CENARIO', 'SK_TEMPO', 'DT_REF',
             'VOLUME_HISTORICO', 'GRAVIDADE_HISTORICA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL',
-            'SCORE_RISCO_BRUTO', 'SCORE_RISCO_FINAL'
+            'SCORE_RISCO_BRUTO', 'SCORE_RISCO_FINAL',
+            'VOLUME_REAL_OCORRIDO' # <-- Adicionado na Fato
         ]
         
         colunas_shap = [c for c in df_estrela.columns if c.startswith('SHAP_')]
@@ -215,14 +226,12 @@ class SincronizadorOuro:
             "dim_tempo": dim_tempo,
         }
 
-        # Carrega Dimensões (Rapidez e atualização completa)
         for nome_tabela, df_tabela in tabelas_para_carregar.items():
             job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
             id_tabela = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.{nome_tabela}"
             self.cliente_bigquery.load_table_from_dataframe(df_tabela, id_tabela, job_config=job_config).result()
             logger.info(f"Dimensão {nome_tabela} atualizada com {len(df_tabela)} linhas.")
 
-        # Carrega Fato (Alta performance com clusterização)
         configuracao_fato = bigquery.LoadJobConfig(
             write_disposition="WRITE_TRUNCATE", 
             time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
@@ -230,14 +239,14 @@ class SincronizadorOuro:
         )
         id_tabela_fato = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.fato_inferencia_risco"
         self.cliente_bigquery.load_table_from_dataframe(fato_inferencia_risco, id_tabela_fato, job_config=configuracao_fato).result()
-        logger.info(f"Tabela Fato carregada com {len(fato_inferencia_risco)} linhas. Carga Estrela finalizada com sucesso.")
+        logger.info(f"Tabela Fato carregada com {len(fato_inferencia_risco)} linhas.")
 
     def _criar_view_looker_studio(self):
         """Cria ou atualiza a View desnormalizada para o BI consumir"""
         if not self.cliente_bigquery:
             return
 
-        logger.info("Criando/Atualizando a View 'vw_safedriver_dashboard' para o Looker Studio...")
+        logger.info("Criando a View 'vw_safedriver_dashboard' com histórico e predição...")
         
         dataset_ref = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}"
         nome_view = f"{dataset_ref}.vw_safedriver_dashboard"
@@ -262,8 +271,9 @@ class SincronizadorOuro:
             f.GRAVIDADE_HISTORICA,
             f.CONTAGIO_PONDERADO,
             f.PRESSAO_RISCO_LOCAL,
-            f.SCORE_RISCO_BRUTO,
-            f.SCORE_RISCO_FINAL
+            f.SCORE_RISCO_FINAL,
+            f.VOLUME_REAL_OCORRIDO,
+            (f.SCORE_RISCO_FINAL - f.VOLUME_REAL_OCORRIDO) AS DELTA_ALERTA_IA
         FROM `{dataset_ref}.fato_inferencia_risco` f
         LEFT JOIN `{dataset_ref}.dim_geografia` g ON f.H3_INDEX = g.H3_INDEX
         LEFT JOIN `{dataset_ref}.dim_cenario` c ON f.SK_CENARIO = c.SK_CENARIO
@@ -272,7 +282,7 @@ class SincronizadorOuro:
         
         try:
             self.cliente_bigquery.query(query_sql).result()
-            logger.info(f"View Analítica '{nome_view}' criada com sucesso e pronta para uso no Looker!")
+            logger.info(f"View Analítica '{nome_view}' atualizada! Pronta para comparação.")
         except Exception as erro:
             logger.error(f"Erro ao criar a View no BigQuery: {erro}")
 
@@ -322,7 +332,7 @@ class SincronizadorOuro:
 
             self._exportar_datalake(dados_entrada)
             self._exportar_bigquery(dados_entrada)
-            self._criar_view_looker_studio() # Gera a View automatizada
+            self._criar_view_looker_studio() 
             
             return True
             
