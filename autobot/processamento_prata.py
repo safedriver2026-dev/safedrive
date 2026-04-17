@@ -53,7 +53,7 @@ class ProcessamentoPrata:
             if not force and estado.get(str(ano)) == meta['ContentLength']: 
                 return False
 
-            logger.info(f"PRATA: [{ano}] Iniciando processamento de alta resolução...")
+            logger.info(f"PRATA: [{ano}] Iniciando processamento de alta resolução temporal...")
             resp = self.s3.get_object(Bucket=self.bucket, Key=path_trusted)
             lf = pl.read_parquet(io.BytesIO(resp['Body'].read())).lazy()
 
@@ -104,44 +104,49 @@ class ProcessamentoPrata:
                 pl.when(pl.col("RUBRICA").str.contains("(?i)VEICULO|AUTO|MOTO")).then(pl.lit("MOTORISTA")).otherwise(pl.lit("PEDESTRE")).alias("PERFIL_ALVO")
             ])
 
-            # 3. CONSOLIDAÇÃO DIMENSIONAL
-            df_agg = lf.group_by([
+            # 3. CONSOLIDAÇÃO DIMENSIONAL (SÉRIE TEMPORAL REAL)
+            # 🚨 Correção: O Mês agora compõe a chave de agrupamento para podermos calcular o Lag.
+            lf_agg = lf.group_by([
                 "H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "TIPO_LOCAL", 
-                "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL"
+                "NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL",
+                pl.col("DATA").dt.month().alias("MES_OCORRENCIA")
             ]).agg([
                 pl.len().alias("TOTAL_CRIMES"),
                 pl.col("PESO_CRIME").sum().alias("INDICE_GRAVIDADE"),
-                pl.col("DATA").dt.month().first().alias("MES_OCORRENCIA"),
                 pl.col("DATA").dt.weekday().first().alias("DIA_SEMANA")
+            ])
+
+            # 4. A CURA DO VAZAMENTO: DEFASAGEM TEMPORAL (LAG D-1)
+            # Ordenamos cronologicamente e deslocamos (shift) os indicadores de risco
+            # Assim, a linha de Junho terá os valores de Maio na coluna "HISTORICA".
+            df_agg = lf_agg.sort(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"]).with_columns([
+                pl.col("INDICE_GRAVIDADE").shift(1).over(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).fill_null(0.0).alias("GRAVIDADE_HISTORICA"),
+                pl.col("TOTAL_CRIMES").shift(1).over(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).fill_null(0.0).alias("VOLUME_HISTORICO")
             ]).collect()
 
-            # 🚀 RESOLUÇÃO: Memória Temporal e Espacial
             df_pd = df_agg.to_pandas()
             
-            # Mapas de Memória (Agregados por H3 para contexto de vizinhança)
-            gravidade_por_h3 = df_pd.groupby("H3_INDEX")["INDICE_GRAVIDADE"].sum().to_dict()
-            volume_por_h3 = df_pd.groupby("H3_INDEX")["TOTAL_CRIMES"].sum().to_dict()
+            # 5. CONTAGIO ESPACIAL (Baseado no passado, não no presente)
+            # Agregamos a gravidade histórica média do H3 para evitar vazar dados espaciais do momento atual
+            gravidade_hist_por_h3 = df_pd.groupby("H3_INDEX")["GRAVIDADE_HISTORICA"].mean().to_dict()
 
             contagio_map = {}
             for hx in df_pd['H3_INDEX'].unique():
                 try:
                     v1 = h3.k_ring(hx, 1)
-                    # Soma da gravidade dos vizinhos (Contágio)
-                    contagio_map[hx] = sum(gravidade_por_h3.get(v, 0) for v in v1 if v != hx)
+                    contagio_map[hx] = sum(gravidade_hist_por_h3.get(v, 0.0) for v in v1 if v != hx)
                 except: contagio_map[hx] = 0.0
 
             # --- INJEÇÃO DE FEATURES DISCRIMINANTES ---
             df_pd['CONTAGIO_PONDERADO'] = df_pd['H3_INDEX'].map(contagio_map).fillna(0.0)
-            df_pd['GRAVIDADE_HISTORICA'] = df_pd['INDICE_GRAVIDADE'] # Memória do grão (H3+Periodo+Perfil)
-            df_pd['VOLUME_HISTORICO'] = df_pd['TOTAL_CRIMES']       # Densidade de eventos do grão
-            df_pd['PESO_TOTAL_H3'] = df_pd['H3_INDEX'].map(gravidade_por_h3) # Memória do local (Todos os turnos)
-            
+            df_pd['PESO_TOTAL_H3'] = df_pd['H3_INDEX'].map(gravidade_hist_por_h3).fillna(0.0) 
             df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO']
+            
             df_pd['ANO_REF'] = ano
             df_pd['IS_FDS'] = (df_pd['DIA_SEMANA'] >= 5).astype(int)
-            df_pd['IS_PAGAMENTO'] = 0 # Placeholder a ser populado no Treinador/Ouro
+            df_pd['IS_PAGAMENTO'] = 0 # Placeholder para o Treinador/Ouro
 
-            # 4. JOIN GEOGRÁFICO FINAL
+            # 6. JOIN GEOGRÁFICO FINAL
             df_final = pl.from_pandas(df_pd).join(
                 self.df_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]), 
                 on="H3_INDEX", how="left"
@@ -152,7 +157,7 @@ class ProcessamentoPrata:
                 pl.col("TIPO_LOCAL").fill_null("VIA PUBLICA")
             ]).drop(["NM_MUN_ORIGINAL", "NM_BAIRRO_ORIGINAL", "DENSIDADE_AJUSTADA"])
 
-            # 5. PERSISTÊNCIA LZ4
+            # 7. PERSISTÊNCIA LZ4
             buffer = io.BytesIO()
             df_final.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.bucket, Key=path_prata, Body=buffer.getvalue())
@@ -165,7 +170,7 @@ class ProcessamentoPrata:
             return False
 
     def executar_todos_os_anos(self, force=False):
-        logger.info("PRATA: Iniciando consolidação com Memória Temporal.")
+        logger.info("PRATA: Iniciando consolidação com Memória Temporal (Lags de Segurança Ativados).")
         estado = self._carregar_tracker()
         for ano in range(2022, datetime.now().year + 1):
             if self.processar_ano_com_delta(ano, estado, force):
