@@ -28,7 +28,6 @@ class ConfiguracaoOuro:
     ID_DATASET = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip()
     PESOS_MODELOS = {"catboost": 0.85, "lightgbm": 0.15}
     
-    # ATENÇÃO: VOLUME_REAL_OCORRIDO não entra aqui para não vazar a resposta para a IA (Data Leakage)
     ATRIBUTOS_NUMERICOS = [
         'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
         'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', 
@@ -109,11 +108,14 @@ class SincronizadorOuro:
             resposta_malha = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=self.caminho_malha)
             dataframe_malha = pl.read_parquet(io.BytesIO(resposta_malha['Body'].read())).unique(subset=["H3_INDEX"])
             
+            if dataframe_malha.height == 0:
+                logger.error("A tabela de malha geografica (H3) esta vazia! Abortando Ouro.")
+                return None
+
             logger.info("Iniciando varredura deterministica na camada Prata...")
             lista_dfs = []
             ano_atual = datetime.now().year
             
-            # Sincronizado com a Prata: Busca os anos fisicos para evitar erro do Cloudflare
             for ano in range(2022, ano_atual + 1):
                 caminho_arquivo = f"{self.caminho_raiz}/prata/ssp_consolidada_{ano}.parquet"
                 try:
@@ -131,10 +133,12 @@ class SincronizadorOuro:
             dataframe_prata = pl.concat(lista_dfs, how="vertical")
             logger.info(f"Historico consolidado! Registros lidos: {len(dataframe_prata)}")
             
-            # Extrai sazonalidade com base nos dados gerados pela Prata
-            meses_disponiveis = dataframe_prata.select("MES_OCORRENCIA").unique().drop_nulls()
+            # TRATAMENTO DE BLINDAGEM: Garante que o MES_OCORRENCIA seja Inteiro (Int8)
+            dataframe_prata = dataframe_prata.with_columns(
+                pl.col("MES_OCORRENCIA").cast(pl.Int8, strict=False)
+            )
 
-            # Agrupa a memória histórica e puxa o TOTAL_CRIMES da Prata como VOLUME_REAL_OCORRIDO para o Dashboard
+            # Agrupa a memória histórica puxando as métricas para a IA
             memoria_historica = dataframe_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"]).agg([
                 pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
                 pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
@@ -142,10 +146,13 @@ class SincronizadorOuro:
                 pl.col("TOTAL_CRIMES").sum().alias("VOLUME_REAL_OCORRIDO") 
             ])
 
+            # GARANTIA DE SAZONALIDADE: Força os 12 meses matematicamente (Evita erro de mês ausente)
+            meses_disponiveis = pl.DataFrame({"MES_OCORRENCIA": pl.Series(range(1, 13), dtype=pl.Int8)})
             periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
             perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
             
-            logger.info("Construindo matriz cartesiana (Malha x Perfis x Tempo)...")
+            logger.info(f"Dimensões para Join -> Malha: {dataframe_malha.height} | Meses: {meses_disponiveis.height} | Memoria: {memoria_historica.height}")
+            
             estrutura_base = dataframe_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
                 periodos, how="cross"
             ).join(
@@ -166,9 +173,13 @@ class SincronizadorOuro:
             ])
 
             dataframe_pandas = dataframe_completo.to_pandas()
+            
+            if dataframe_pandas.empty:
+                logger.error("ERRO GRAVE: A matriz gerou 0 linhas após os cruzamentos.")
+                return None
+                
             dataframe_pandas['PRESSAO_RISCO_LOCAL'] = dataframe_pandas['CONTAGIO_PONDERADO'] / (dataframe_pandas['DENSIDADE'] + 0.001)
 
-            # Injeta o contexto de hoje (Para a predição da IA)
             contexto_temporal = self.calendario.obter_contexto_ia()
             dataframe_pandas['DIA_SEMANA'] = self.calendario.hoje.weekday()
             dataframe_pandas['IS_PAGAMENTO'] = contexto_temporal['IS_PAGAMENTO']
