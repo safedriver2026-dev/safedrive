@@ -1,187 +1,131 @@
 import polars as pl
 import pandas as pd
-import h3, boto3, joblib, io, os, json, logging, shap, gc
+import h3
+import boto3
+import joblib
+import io
+import os
+import json
+import logging
+import shap
 from botocore.config import Config
 from datetime import datetime
 from google.cloud import bigquery
 from google.api_core import exceptions
 from google.oauth2 import service_account
-
-# Importa o Calendário Estratégico refatorado
 from autobot.calendario_estrategico import CalendarioEstrategico
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(module)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class CamadaOuroSafeDriver:
-    def __init__(self, dev_mode=False):
-        self.dev_mode = dev_mode
-        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
-        self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
-        self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
-        self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-        
-        self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9").strip()
-        self.dataset_id = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip() 
+class ConfiguracaoOuro:
+    NOME_BUCKET = os.getenv("R2_BUCKET_NAME", "").strip()
+    ID_PROJETO = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9").strip()
+    ID_DATASET = os.getenv("BQ_DATASET_ID", "safedriver_gold").strip()
+    PESOS_MODELOS = {"catboost": 0.85, "lightgbm": 0.15}
+    
+    ATRIBUTOS_NUMERICOS = [
+        'DENSIDADE', 'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
+        'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', 
+        'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
+    ]
+    ATRIBUTOS_CATEGORICOS = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
+    ATRIBUTOS_COMPLETOS = ATRIBUTOS_NUMERICOS + ATRIBUTOS_CATEGORICOS
 
-        self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
-                              aws_access_key_id=self.access_key,
-                              aws_secret_access_key=self.secret_key, 
-                              config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}, max_pool_connections=50))
-        
-        self.base_path = self._localizar_datalake_real()
-        self.malha_path = f"{self.base_path}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
-        
-        self.cal = CalendarioEstrategico()
-        self.pesos = {"catboost": 0.85, "lightgbm": 0.15}
-        
-        # --- ALINHAMENTO COM O TREINADOR V3 ---
-        self.features_numericas = [
-            'DENSIDADE', 
-            'TAXA_VACANCIA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL', 
-            'GRAVIDADE_HISTORICA', 'VOLUME_HISTORICO', 
-            'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_PAGAMENTO', 'IS_FDS'
-        ]
-        self.features_categoricas = ['NM_BAIRRO', 'NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']
-        self.features_full = self.features_numericas + self.features_categoricas
+class SincronizadorOuro:
+    def __init__(self, modo_desenvolvimento: bool = False):
+        self.modo_desenvolvimento = modo_desenvolvimento
+        self.configuracao = ConfiguracaoOuro()
+        self.calendario = CalendarioEstrategico()
+        self.cliente_armazenamento = self._inicializar_cliente_armazenamento()
+        self.caminho_raiz = self._descobrir_raiz_datalake()
+        self.caminho_malha = f"{self.caminho_raiz}/base_geografica/safedriver_geo_base_sp_h3_9.parquet"
+        self.cliente_bigquery = self._inicializar_bigquery()
 
-        self._conectar_e_preparar_bq()
-
-    def _localizar_datalake_real(self):
-        try:
-            paginator = self.s3.get_paginator('list_objects_v2')
-            for page in paginator.paginate(Bucket=self.bucket, MaxKeys=100):
-                for obj in page.get('Contents', []):
-                    if "datalake/prata/" in obj['Key']: return obj['Key'].split("datalake/")[0] + "datalake"
-            return "datalake"
-        except: return "datalake"
-
-    def _conectar_e_preparar_bq(self):
-        gcp_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
-        try:
-            cred_info = json.loads(gcp_json)
-            credentials = service_account.Credentials.from_service_account_info(cred_info)
-            self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
-            
-            dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
-            try:
-                self.bq_client.get_dataset(dataset_ref)
-            except exceptions.NotFound:
-                dataset = bigquery.Dataset(dataset_ref)
-                dataset.location = "US"
-                dataset.description = "Camada Ouro SafeDriver - IA Preditiva Granular"
-                self.bq_client.create_dataset(dataset)
-        except Exception as e:
-            logger.error(f"OURO: Erro de Infra BQ: {e}")
-
-    def executar_predicao_atual(self):
-        logger.info(f"OURO: Iniciando inferência dinâmica com Memória Histórica Defasada.")
-        try:
-            modelos = self._carregar_modelos_producao()
-            df_input = self._obter_contexto_preditivo_total()
-            
-            if df_input is None or df_input.empty: 
-                return False
-
-            # --- PREPARAÇÃO DE ENTRADA PARA OS MODELOS ---
-            X = df_input[self.features_full].copy()
-            for col in self.features_categoricas: X[col] = X[col].astype('category')
-            for col in self.features_numericas: X[col] = X[col].astype('float32')
-
-            logger.info("OURO: Gerando Scores IA para Malha Total (Scaffold Mode)...")
-            p_cat = modelos["cat"].predict(X) if modelos["cat"] else None
-            p_lgb = modelos["lgb"].predict(X) if modelos["lgb"] else p_cat
-
-            # Cálculo de Risco Baseado em Ensemble Tweedie
-            score_raw = (p_cat * self.pesos["catboost"]) + (p_lgb * self.pesos["lightgbm"])
-            df_input['SCORE_RISCO_BRUTO'] = score_raw
-
-            # --- NORMALIZAÇÃO DE CONTRASTE INTRA-PERFIL ---
-            logger.info("OURO: Aplicando Normalização de Contraste por Perfil...")
-            df_input['SCORE_RISCO_FINAL'] = df_input.groupby('PERFIL_ALVO')['SCORE_RISCO_BRUTO'].transform(
-                lambda x: ((x - x.min()) / (x.max() - x.min() + 0.001) * 100)
-            ).clip(0, 100).round(2)
-
-            df_input['DT_REF'] = datetime.now() 
-            
-            # SHAP para Explicabilidade (Auditoria de Decisão da IA)
-            try:
-                explainer = shap.TreeExplainer(modelos["cat"])
-                df_top = df_input.nlargest(1000, 'SCORE_RISCO_FINAL')
-                shap_values = explainer.shap_values(df_top[self.features_full])
-                for i, feat in enumerate(['NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO']):
-                    col_name = f'SHAP_{feat}'
-                    df_input[col_name] = 0.0
-                    feat_idx = self.features_full.index(feat)
-                    df_input.loc[df_top.index, col_name] = shap_values[:, feat_idx]
-            except Exception as e: 
-                logger.warning(f"OURO: Aviso ao gerar valores SHAP: {e}")
-
-            self._sincronizar_star_schema(df_input)
-            return True
-        except Exception as e:
-            logger.error(f"OURO Erro Crítico: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def _sincronizar_star_schema(self, df):
-        """Alimenta a Tabela de Fatos com Clustering para Alta Performance no Dashboard."""
-        table_id = f"{self.project_id}.{self.dataset_id}.fato_risco_consolidada"
-        df_bq = df.copy()
-        for col in self.features_categoricas: df_bq[col] = df_bq[col].astype(str)
-        df_bq['DT_REF'] = pd.to_datetime(df_bq['DT_REF'])
-
-        job_config = bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE",
-            time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
-            clustering_fields=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"] 
+    def _inicializar_cliente_armazenamento(self):
+        return boto3.client(
+            's3',
+            endpoint_url=os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/'),
+            aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
+            aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
+            config=Config(
+                signature_version='s3v4',
+                s3={'addressing_style': 'path'},
+                max_pool_connections=50
+            )
         )
-        self.bq_client.load_table_from_dataframe(df_bq, table_id, job_config=job_config).result()
 
-    def _carregar_modelos_producao(self):
-        modelos = {"cat": None, "lgb": None}
-        for alg in ["cat", "lgb"]:
-            path = f"{self.base_path}/modelos_ml/latest_{alg}_geral.pkl"
+    def _descobrir_raiz_datalake(self) -> str:
+        try:
+            resposta = self.cliente_armazenamento.get_paginator('list_objects_v2').paginate(Bucket=self.configuracao.NOME_BUCKET, MaxKeys=100)
+            for pagina in resposta:
+                for objeto in pagina.get('Contents', []):
+                    if "datalake/prata/" in objeto['Key']: 
+                        return objeto['Key'].split("datalake/")[0] + "datalake"
+            return "datalake"
+        except Exception:
+            return "datalake"
+
+    def _inicializar_bigquery(self):
+        credenciais_json = os.getenv("BQ_SERVICE_ACCOUNT_JSON", "").strip()
+        try:
+            informacoes_credencial = json.loads(credenciais_json)
+            credenciais = service_account.Credentials.from_service_account_info(informacoes_credencial)
+            cliente = bigquery.Client(credentials=credenciais, project=self.configuracao.ID_PROJETO)
+            
+            referencia_dataset = bigquery.DatasetReference(self.configuracao.ID_PROJETO, self.configuracao.ID_DATASET)
             try:
-                obj = self.s3.get_object(Bucket=self.bucket, Key=path)
-                modelos[alg] = joblib.load(io.BytesIO(obj['Body'].read()))
-            except: logger.warning(f"OURO: Modelo {alg} não encontrado no Datalake.")
+                cliente.get_dataset(referencia_dataset)
+            except exceptions.NotFound:
+                dataset = bigquery.Dataset(referencia_dataset)
+                dataset.location = "US"
+                cliente.create_dataset(dataset)
+            
+            return cliente
+        except Exception as erro:
+            logger.error(f"Erro de infraestrutura no BigQuery: {erro}")
+            return None
+
+    def _carregar_modelos_treinados(self) -> dict:
+        modelos = {"cat": None, "lgb": None}
+        for algoritmo in ["cat", "lgb"]:
+            caminho = f"{self.caminho_raiz}/modelos_ml/latest_{algoritmo}_geral.pkl"
+            try:
+                objeto = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho)
+                modelos[algoritmo] = joblib.load(io.BytesIO(objeto['Body'].read()))
+            except Exception:
+                logger.warning(f"Modelo {algoritmo} nao encontrado no Datalake.")
         return modelos
 
-    def _obter_contexto_preditivo_total(self):
-        """Gera o Scaffold de predição integrando a Memória da Camada Prata."""
+    def _construir_matriz_preditiva(self) -> pd.DataFrame:
         try:
-            # 1. Malha Geográfica Base
-            resp_m = self.s3.get_object(Bucket=self.bucket, Key=self.malha_path)
-            df_malha = pl.read_parquet(io.BytesIO(resp_m['Body'].read())).unique(subset=["H3_INDEX"])
+            resposta_malha = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=self.caminho_malha)
+            dataframe_malha = pl.read_parquet(io.BytesIO(resposta_malha['Body'].read())).unique(subset=["H3_INDEX"])
             
-            # 2. Carrega Memória da Prata (Histórico Real)
-            ano = datetime.now().year
-            path_prata = f"{self.base_path}/prata/ssp_consolidada_{ano}.parquet"
-            df_prata = pl.read_parquet(io.BytesIO(self.s3.get_object(Bucket=self.bucket, Key=path_prata)['Body'].read()))
+            ano_atual = datetime.now().year
+            caminho_prata = f"{self.caminho_raiz}/prata/ssp_consolidada_{ano_atual}.parquet"
+            resposta_prata = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_prata)
+            dataframe_prata = pl.read_parquet(io.BytesIO(resposta_prata['Body'].read()))
             
-            # 🚨 CORREÇÃO DO VAZAMENTO: 
-            # Pegamos o ÚLTIMO dado conhecido do local e o transformamos no passado (HISTORICO) de hoje.
-            df_memoria = df_prata.sort("MES_OCORRENCIA").group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).last().select([
-                "H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO",
-                pl.col("INDICE_GRAVIDADE").alias("GRAVIDADE_HISTORICA"),
-                pl.col("TOTAL_CRIMES").alias("VOLUME_HISTORICO"),
-                "CONTAGIO_PONDERADO"
+            memoria_historica = dataframe_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"]).agg([
+                pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
+                pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
+                pl.col("CONTAGIO_PONDERADO").max().alias("CONTAGIO_PONDERADO")
             ])
 
-            # 3. SCAFFOLD: Criação da Malha Total de Predição (24h)
             periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
             perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
-            scaffold = periodos.join(perfis, how="cross")
+            estrutura_base = periodos.join(perfis, how="cross")
             
-            df_base = df_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
-                scaffold, how="cross"
+            dataframe_base = dataframe_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
+                estrutura_base, how="cross"
             )
 
-            # 4. Join: Injecão da Memória Recente no Scaffold Atual
-            df_full = df_base.join(
-                df_memoria, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"], how="left"
+            dataframe_completo = dataframe_base.join(
+                memoria_historica, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"], how="left"
             ).with_columns([
                 pl.col("GRAVIDADE_HISTORICA").fill_null(0.0),
                 pl.col("VOLUME_HISTORICO").fill_null(0.0),
@@ -189,24 +133,94 @@ class CamadaOuroSafeDriver:
                 pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE")
             ])
 
-            df_pd = df_full.to_pandas()
+            dataframe_pandas = dataframe_completo.to_pandas()
+            dataframe_pandas['PRESSAO_RISCO_LOCAL'] = dataframe_pandas['CONTAGIO_PONDERADO'] / (dataframe_pandas['DENSIDADE'] + 0.001)
 
-            # 5. Cálculo Dinâmico de Pressão de Risco
-            df_pd['PRESSAO_RISCO_LOCAL'] = df_pd['CONTAGIO_PONDERADO'] / (df_pd['DENSIDADE'] + 0.001)
-
-            # 6. Contexto Temporal do Calendário Inteligente
-            contexto_cal = self.cal.obter_contexto_ia()
-            df_pd['MES_OCORRENCIA'] = self.cal.hoje.month
-            df_pd['DIA_SEMANA'] = self.cal.hoje.weekday()
-            df_pd['IS_PAGAMENTO'] = contexto_cal['IS_PAGAMENTO']
-            df_pd['IS_FDS'] = contexto_cal['IS_FDS']
-            df_pd['TIPO_LOCAL'] = "VIA PUBLICA" 
+            contexto_temporal = self.calendario.obter_contexto_ia()
+            dataframe_pandas['MES_OCORRENCIA'] = self.calendario.hoje.month
+            dataframe_pandas['DIA_SEMANA'] = self.calendario.hoje.weekday()
+            dataframe_pandas['IS_PAGAMENTO'] = contexto_temporal['IS_PAGAMENTO']
+            dataframe_pandas['IS_FDS'] = contexto_temporal['IS_FDS']
+            dataframe_pandas['TIPO_LOCAL'] = "VIA PUBLICA" 
             
-            return df_pd
-        except Exception as e:
-            logger.error(f"OURO Erro Contexto: {e}")
+            return dataframe_pandas
+        except Exception as erro:
+            logger.error(f"Erro na construcao da matriz de contexto: {erro}")
             return None
 
+    def _exportar_bigquery(self, dataframe: pd.DataFrame):
+        if not self.cliente_bigquery:
+            logger.warning("Cliente BigQuery nao inicializado. Pulando sincronizacao.")
+            return
+
+        identificador_tabela = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.fato_risco_consolidada"
+        dataframe_exportacao = dataframe.copy()
+        
+        for coluna in self.configuracao.ATRIBUTOS_CATEGORICOS:
+            dataframe_exportacao[coluna] = dataframe_exportacao[coluna].astype(str)
+            
+        dataframe_exportacao['DT_REF'] = pd.to_datetime(dataframe_exportacao['DT_REF'])
+
+        configuracao_job = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
+            clustering_fields=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"] 
+        )
+        
+        self.cliente_bigquery.load_table_from_dataframe(dataframe_exportacao, identificador_tabela, job_config=configuracao_job).result()
+
+    def executar_pipeline_preditivo(self) -> bool:
+        logger.info("Iniciando inferencia e sincronizacao de dados.")
+        try:
+            modelos = self._carregar_modelos_treinados()
+            dados_entrada = self._construir_matriz_preditiva()
+            
+            if dados_entrada is None or dados_entrada.empty: 
+                return False
+
+            matriz_features = dados_entrada[self.configuracao.ATRIBUTOS_COMPLETOS].copy()
+            for coluna in self.configuracao.ATRIBUTOS_CATEGORICOS:
+                matriz_features[coluna] = matriz_features[coluna].astype('category')
+            for coluna in self.configuracao.ATRIBUTOS_NUMERICOS:
+                matriz_features[coluna] = matriz_features[coluna].astype('float32')
+
+            previsao_catboost = modelos["cat"].predict(matriz_features) if modelos["cat"] else None
+            previsao_lightgbm = modelos["lgb"].predict(matriz_features) if modelos["lgb"] else previsao_catboost
+
+            if previsao_catboost is None:
+                logger.error("Nenhum modelo viavel encontrado para inferencia.")
+                return False
+
+            pontuacao_bruta = (previsao_catboost * self.configuracao.PESOS_MODELOS["catboost"]) + (previsao_lightgbm * self.configuracao.PESOS_MODELOS["lightgbm"])
+            dados_entrada['SCORE_RISCO_BRUTO'] = pontuacao_bruta
+
+            dados_entrada['SCORE_RISCO_FINAL'] = dados_entrada.groupby('PERFIL_ALVO')['SCORE_RISCO_BRUTO'].transform(
+                lambda x: ((x - x.min()) / (x.max() - x.min() + 0.001) * 100)
+            ).clip(0, 100).round(2)
+
+            dados_entrada['DT_REF'] = datetime.now() 
+            
+            try:
+                explicador = shap.TreeExplainer(modelos["cat"])
+                amostra_topo = dados_entrada.nlargest(1000, 'SCORE_RISCO_FINAL')
+                valores_shap = explicador.shap_values(amostra_topo[self.configuracao.ATRIBUTOS_COMPLETOS])
+                
+                for atributo in ['NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO']:
+                    nome_coluna = f'SHAP_{atributo}'
+                    dados_entrada[nome_coluna] = 0.0
+                    indice_atributo = self.configuracao.ATRIBUTOS_COMPLETOS.index(atributo)
+                    dados_entrada.loc[amostra_topo.index, nome_coluna] = valores_shap[:, indice_atributo]
+            except Exception:
+                pass
+
+            self._exportar_bigquery(dados_entrada)
+            logger.info("Processo de sincronizacao concluido.")
+            return True
+            
+        except Exception as erro:
+            logger.error(f"Falha na camada analitica: {erro}")
+            return False
+
 if __name__ == "__main__":
-    ouro = CamadaOuroSafeDriver()
-    ouro.executar_predicao_atual()
+    processador_ouro = SincronizadorOuro()
+    processador_ouro.executar_pipeline_preditivo()
