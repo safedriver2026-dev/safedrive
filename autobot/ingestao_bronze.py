@@ -1,184 +1,201 @@
-import os, boto3, requests, logging, io
+import os
+import boto3
+import requests
+import logging
+import io
 import polars as pl
 import h3
 from botocore.config import Config
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from typing import Optional, List
 
-# Configuração de Logs
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [%(levelname)s] - %(module)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+class ConfiguracaoIngestao:
+    NOME_BUCKET = os.getenv("R2_BUCKET_NAME", "").strip()
+    URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+    RESOLUCAO_H3 = 9
+    
+    COLUNAS_ALVO = [
+        "MUNICIPIO", "CIDADE", "NOME_MUNICIPIO", "BAIRRO", "LOGRADOURO",
+        "DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "HORA_OCORRENCIA_BO", 
+        "DESC_PERIODO", "RUBRICA", "LATITUDE", "LONGITUDE", 
+        "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"
+    ]
+    ANCORAS_CABECALHO = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "LATITUDE", "DESC_PERIODO"}
+    PADRAO_LIMPEZA = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
+    CABECALHOS_HTTP = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SafeDriverBot/1.0"}
 
 class IngestaoBronze:
     def __init__(self):
-        # Configurações de Conectividade Cloudflare R2
-        self.endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
-        self.access_key = os.getenv("R2_ACCESS_KEY_ID", "").strip()
-        self.secret_key = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
-        self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-        
-        self.s3 = boto3.client('s3', endpoint_url=self.endpoint, 
-                              aws_access_key_id=self.access_key,
-                              aws_secret_access_key=self.secret_key, 
-                              config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}))
-        
-        # 🛡️ PROTEÇÃO DE REDE: Sessão com Retry Inteligente
-        self.session = requests.Session()
-        retry_strategy = Retry(
+        self.configuracao = ConfiguracaoIngestao()
+        self.cliente_armazenamento = self._inicializar_cliente_armazenamento()
+        self.sessao_http = self._inicializar_sessao_http()
+        self.caminho_raiz = self._descobrir_raiz_datalake()
+
+    def _inicializar_cliente_armazenamento(self):
+        return boto3.client(
+            's3', 
+            endpoint_url=os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/'),
+            aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
+            aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
+            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+        )
+
+    def _inicializar_sessao_http(self):
+        sessao = requests.Session()
+        estrategia_tentativas = Retry(
             total=5,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504]
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SafeDriverBot/1.0"}
-        self.base_path = self._descobrir_prefixo_datalake()
+        adaptador = HTTPAdapter(max_retries=estrategia_tentativas)
+        sessao.mount("http://", adaptador)
+        sessao.mount("https://", adaptador)
+        return sessao
 
-    def _descobrir_prefixo_datalake(self):
+    def _descobrir_raiz_datalake(self) -> str:
         try:
-            response = self.s3.list_objects_v2(Bucket=self.bucket, MaxKeys=10)
-            if 'Contents' in response:
-                for obj in response['Contents']:
-                    if "datalake" in obj['Key']: return obj['Key'].split("datalake")[0] + "datalake"
+            resposta = self.cliente_armazenamento.list_objects_v2(Bucket=self.configuracao.NOME_BUCKET, MaxKeys=10)
+            if 'Contents' in resposta:
+                for objeto in resposta['Contents']:
+                    if "datalake" in objeto['Key']: 
+                        return objeto['Key'].split("datalake")[0] + "datalake"
             return "datalake"
-        except: return "datalake"
+        except Exception:
+            return "datalake"
 
-    def _get_path(self, camada, subpasta, filename):
-        return f"{self.base_path}/{camada}/{subpasta}/{filename}".replace("//", "/")
+    def _obter_caminho(self, camada: str, subpasta: str, nome_arquivo: str) -> str:
+        return f"{self.caminho_raiz}/{camada}/{subpasta}/{nome_arquivo}".replace("//", "/")
 
-    def _motor_h3(self, lat, lng):
+    def _calcular_indice_h3(self, latitude: float, longitude: float) -> Optional[str]:
         try:
-            l1, l2 = float(lat), float(lng)
-            if l1 == 0 or l2 == 0 or abs(l1) > 90 or abs(l2) > 180:
+            lat, lon = float(latitude), float(longitude)
+            if lat == 0 or lon == 0 or abs(lat) > 90 or abs(lon) > 180:
                 return None
-            return h3.latlng_to_cell(l1, l2, 9)
-        except:
+            return h3.latlng_to_cell(lat, lon, self.configuracao.RESOLUCAO_H3)
+        except Exception:
             return None
 
-    def _obter_tamanho_remoto(self, url):
+    def _verificar_tamanho_remoto(self, url: str) -> int:
         try:
-            resp = self.session.head(url, headers=self.headers, timeout=20)
-            return int(resp.headers.get('Content-Length', 0)) if resp.status_code == 200 else 0
-        except:
+            resposta = self.sessao_http.head(url, headers=self.configuracao.CABECALHOS_HTTP, timeout=20)
+            return int(resposta.headers.get('Content-Length', 0)) if resposta.status_code == 200 else 0
+        except Exception:
             return 0
 
-    def executar_ingestao_continua(self, force=False):
-        logger.info(f"BRONZE: Iniciando ciclo de purificação (Force={force}).")
-        novos_dados = False
-        for ano in range(2022, datetime.now().year + 1):
-            if self._verificar_e_baixar(ano, force):
-                novos_dados = True
-        return novos_dados
-
-    def _verificar_e_baixar(self, ano, force=False):
-        path_raw = self._get_path("bronze", "raw", f"ssp_raw_{ano}.xlsx")
-        path_trusted = self._get_path("bronze", "trusted", f"ssp_trusted_{ano}.parquet")
-        url = f"https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
-
-        tamanho_remoto = self._obter_tamanho_remoto(url)
-        tamanho_local = 0
+    def _obter_tamanho_local(self, caminho_arquivo: str) -> int:
         try:
-            meta = self.s3.head_object(Bucket=self.bucket, Key=path_raw)
-            tamanho_local = meta['ContentLength']
-        except: pass
+            metadados = self.cliente_armazenamento.head_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_arquivo)
+            return metadados['ContentLength']
+        except Exception:
+            return 0
 
-        if (tamanho_remoto == tamanho_local) and not force and tamanho_remoto > 0:
+    def _processar_planilha(self, bytes_excel: bytes, ano: int) -> Optional[pl.DataFrame]:
+        fluxo_memoria = io.BytesIO(bytes_excel)
+        lista_dataframes = []
+
+        for aba in range(1, 4):
             try:
-                self.s3.head_object(Bucket=self.bucket, Key=path_trusted)
-                logger.info(f"BRONZE: [{ano}] Cache validado.")
+                fluxo_memoria.seek(0)
+                dataframe_leitura = pl.read_excel(fluxo_memoria, sheet_id=aba, engine="calamine", has_header=False, read_options={"n_rows": 50})
+                
+                indice_cabecalho = None
+                for indice, linha in enumerate(dataframe_leitura.iter_rows()):
+                    valores_linha = [str(celula).upper().strip() for celula in linha if celula is not None]
+                    correspondencias = [valor for valor in valores_linha if valor in self.configuracao.ANCORAS_CABECALHO]
+                    if len(correspondencias) >= 3:
+                        indice_cabecalho = indice
+                        break
+                
+                if indice_cabecalho is not None:
+                    fluxo_memoria.seek(0)
+                    dataframe = pl.read_excel(fluxo_memoria, sheet_id=aba, engine="calamine", read_options={"skip_rows": indice_cabecalho})
+                    dataframe.columns = [coluna.upper().strip() for coluna in dataframe.columns]
+                    
+                    colunas_presentes = [coluna for coluna in dataframe.columns if coluna in self.configuracao.COLUNAS_ALVO]
+                    dataframe = dataframe.select(colunas_presentes).with_columns(pl.all().cast(pl.String))
+                    
+                    dataframe = dataframe.filter(~pl.any_horizontal(pl.all().str.contains(self.configuracao.PADRAO_LIMPEZA)))
+                    dataframe = dataframe.filter(pl.any_horizontal(pl.all().is_not_null()))
+                    
+                    lista_dataframes.append(dataframe)
+            except Exception:
+                continue
+
+        if not lista_dataframes:
+            return None
+
+        dataframe_consolidado = pl.concat(lista_dataframes, how="diagonal")
+        
+        dataframe_consolidado = dataframe_consolidado.with_columns([
+            pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
+            pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
+        ])
+
+        dados_coordenadas = dataframe_consolidado.select(["LATITUDE", "LONGITUDE"]).unique().to_dicts()
+        for dicionario in dados_coordenadas:
+            dicionario["H3_INDEX"] = self._calcular_indice_h3(dicionario["LATITUDE"], dicionario["LONGITUDE"])
+        
+        mapa_h3 = pl.DataFrame(dados_coordenadas, schema={"LATITUDE": pl.Float64, "LONGITUDE": pl.Float64, "H3_INDEX": pl.String})
+        return dataframe_consolidado.join(mapa_h3, on=["LATITUDE", "LONGITUDE"], how="left")
+
+    def _processar_ano(self, ano: int, forcar_execucao: bool = False) -> bool:
+        caminho_bruto = self._obter_caminho("bronze", "raw", f"ssp_raw_{ano}.xlsx")
+        caminho_confiavel = self._obter_caminho("bronze", "trusted", f"ssp_trusted_{ano}.parquet")
+        url_origem = self.configuracao.URL_BASE_SSP.format(ano=ano)
+
+        tamanho_remoto = self._verificar_tamanho_remoto(url_origem)
+        tamanho_local = self._obter_tamanho_local(caminho_bruto)
+
+        if (tamanho_remoto == tamanho_local) and not forcar_execucao and tamanho_remoto > 0:
+            try:
+                self.cliente_armazenamento.head_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_confiavel)
+                logger.info(f"[{ano}] Integridade confirmada. Processamento ignorado.")
                 return False
-            except: pass
+            except Exception:
+                pass
 
         try:
-            if tamanho_remoto != tamanho_local or force or tamanho_local == 0:
-                logger.info(f"BRONZE: [{ano}] Descarregando ficheiro original...")
-                resp = self.session.get(url, headers=self.headers, timeout=300)
-                excel_bytes = resp.content
-                self.s3.put_object(Bucket=self.bucket, Key=path_raw, Body=excel_bytes)
+            if tamanho_remoto != tamanho_local or forcar_execucao or tamanho_local == 0:
+                logger.info(f"[{ano}] Iniciando transferencia da fonte externa.")
+                resposta_http = self.sessao_http.get(url_origem, headers=self.configuracao.CABECALHOS_HTTP, timeout=300)
+                bytes_excel = resposta_http.content
+                self.cliente_armazenamento.put_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_bruto, Body=bytes_excel)
             else:
-                obj = self.s3.get_object(Bucket=self.bucket, Key=path_raw)
-                excel_bytes = obj['Body'].read()
+                objeto_armazenado = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_bruto)
+                bytes_excel = objeto_armazenado['Body'].read()
 
-            xlsx_io = io.BytesIO(excel_bytes)
-            dfs_acumulados = []
+            dataframe_processado = self._processar_planilha(bytes_excel, ano)
             
-            # 🎯 ALINHAMENTO: Incluindo colunas vitais para a Matriz de Gravidade e Período
-            colunas_alvo = [
-                "MUNICIPIO", "CIDADE", "NOME_MUNICIPIO", "BAIRRO", "LOGRADOURO",
-                "DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "HORA_OCORRENCIA_BO", 
-                "DESC_PERIODO", # <--- ESSENCIAL para evitar o viés noturno
-                "RUBRICA", "LATITUDE", "LONGITUDE", "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"
-            ]
-            ancoras = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "LATITUDE", "DESC_PERIODO"}
-            
-            # Processamento das Abas (Geralmente 1 a 3 contêm dados)
-            for i in range(1, 4):
-                try:
-                    xlsx_io.seek(0)
-                    df_scan = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", has_header=False, read_options={"n_rows": 50})
-                    
-                    real_header_idx = None
-                    for idx, row in enumerate(df_scan.iter_rows()):
-                        row_values = [str(cell).upper().strip() for cell in row if cell is not None]
-                        matches = [val for val in row_values if val in ancoras]
-                        if len(matches) >= 3:
-                            real_header_idx = idx
-                            break
-                    
-                    if real_header_idx is not None:
-                        xlsx_io.seek(0)
-                        df = pl.read_excel(xlsx_io, sheet_id=i, engine="calamine", read_options={"skip_rows": real_header_idx})
-                        df.columns = [c.upper().strip() for c in df.columns]
-                        
-                        cols_to_keep = [c for c in df.columns if c in colunas_alvo]
-                        df = df.select(cols_to_keep)
-                        df = df.with_columns(pl.all().cast(pl.String))
-                        
-                        # Limpeza de Capas e Rodapés
-                        regex_capa = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
-                        df = df.filter(~pl.any_horizontal(pl.all().str.contains(regex_capa)))
-                        df = df.filter(pl.any_horizontal(pl.all().is_not_null()))
-                        
-                        dfs_acumulados.append(df)
-                        logger.info(f"BRONZE: [{ano}] Aba {i} lida ({df.height} registos).")
-                except:
-                    continue
-
-            if dfs_acumulados:
-                df_trusted = pl.concat(dfs_acumulados, how="diagonal")
-                
-                # Conversão de Coordenadas
-                df_trusted = df_trusted.with_columns([
-                    pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
-                    pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
-                ])
-
-                # 🚀 OTIMIZAÇÃO: Geocodificação de Pontos Únicos
-                logger.info(f"BRONZE: [{ano}] Vetorizando motor H3...")
-                df_coords = df_trusted.select(["LATITUDE", "LONGITUDE"]).unique()
-                
-                coords_list = df_coords.to_dicts()
-                for d in coords_list:
-                    d["H3_INDEX"] = self._motor_h3(d["LATITUDE"], d["LONGITUDE"])
-                
-                df_h3_map = pl.DataFrame(coords_list, schema={"LATITUDE": pl.Float64, "LONGITUDE": pl.Float64, "H3_INDEX": pl.String})
-                df_trusted = df_trusted.join(df_h3_map, on=["LATITUDE", "LONGITUDE"], how="left")
-
-                # Escrita no Data Lake (Parquet LZ4)
+            if dataframe_processado is not None:
                 buffer = io.BytesIO()
-                df_trusted.write_parquet(buffer, compression="lz4")
-                self.s3.put_object(Bucket=self.bucket, Key=path_trusted, Body=buffer.getvalue())
-                
-                logger.info(f"BRONZE: [{ano}] Trusted guardada. Sucesso total.")
+                dataframe_processado.write_parquet(buffer, compression="lz4")
+                self.cliente_armazenamento.put_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_confiavel, Body=buffer.getvalue())
+                logger.info(f"[{ano}] Dados refinados e armazenados com exito.")
                 return True
                 
-        except Exception as e:
-            logger.error(f"BRONZE: Erro fatal no ano {ano}: {e}")
+        except Exception as erro:
+            logger.error(f"Interrupcao no ciclo do ano {ano}: {erro}")
         return False
 
+    def executar_ingestao_continua(self, forcar_execucao: bool = False) -> bool:
+        logger.info(f"Iniciando varredura de dados.")
+        houve_atualizacao = False
+        ano_atual = datetime.now().year
+        
+        for ano in range(2022, ano_atual + 1):
+            if self._processar_ano(ano, forcar_execucao):
+                houve_atualizacao = True
+                
+        return houve_atualizacao
+
 if __name__ == "__main__":
-    bronze = IngestaoBronze()
-    bronze.executar_ingestao_continua(force=True)
+    ingestao = IngestaoBronze()
+    ingestao.executar_ingestao_continua(forcar_execucao=True)
