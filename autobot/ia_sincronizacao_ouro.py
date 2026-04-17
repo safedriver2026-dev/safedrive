@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import shap
+import sys  # Necessário para gerar as Surrogate Keys do Esquema Estrela
 from botocore.config import Config
 from datetime import datetime
 from google.cloud import bigquery
@@ -167,26 +168,113 @@ class SincronizadorOuro:
             logger.error(f"Falha ao salvar backup no Datalake: {erro}")
 
     def _exportar_bigquery(self, dataframe: pd.DataFrame):
+        """Exportação otimizada com Esquema Estrela (Star Schema)"""
         if not self.cliente_bigquery:
             logger.warning("Cliente BigQuery nao inicializado. Pulando sincronizacao.")
             return
 
-        identificador_tabela = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.fato_risco_consolidada"
-        dataframe_exportacao = dataframe.copy()
-        
-        for coluna in self.configuracao.ATRIBUTOS_CATEGORICOS:
-            dataframe_exportacao[coluna] = dataframe_exportacao[coluna].astype(str)
-            
-        dataframe_exportacao['DT_REF'] = pd.to_datetime(dataframe_exportacao['DT_REF'])
+        logger.info("Modelando DataFrame para Esquema Estrela (Star Schema)...")
+        df_estrela = dataframe.copy()
 
-        configuracao_job = bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE",
-            time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
-            clustering_fields=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO"] 
-        )
+        # 1. CRIAÇÃO DAS CHAVES PRIMÁRIAS (SURROGATE KEYS)
+        # Cenário (Turno + Perfil + Local)
+        df_estrela['SK_CENARIO'] = (
+            df_estrela['PERIODO_DIA'].astype(str) + "_" + 
+            df_estrela['PERFIL_ALVO'].astype(str) + "_" + 
+            df_estrela['TIPO_LOCAL'].astype(str)
+        ).apply(lambda x: hash(x) % ((sys.maxsize + 1) * 2)).astype(str)
+
+        # Tempo (Mês + Dia + FDS + Pagamento)
+        df_estrela['SK_TEMPO'] = (
+            df_estrela['MES_OCORRENCIA'].astype(str) + "_" + 
+            df_estrela['DIA_SEMANA'].astype(str) + "_" + 
+            df_estrela['IS_FDS'].astype(str) + "_" + 
+            df_estrela['IS_PAGAMENTO'].astype(str)
+        ).apply(lambda x: hash(x) % ((sys.maxsize + 1) * 2)).astype(str)
+
+        # 2. SEPARAÇÃO DAS DIMENSÕES (Tirando duplicatas)
+        dim_geografia = df_estrela[['H3_INDEX', 'NM_MUN', 'NM_BAIRRO', 'DENSIDADE', 'TAXA_VACANCIA']].drop_duplicates(subset=['H3_INDEX'])
+        dim_cenario = df_estrela[['SK_CENARIO', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']].drop_duplicates(subset=['SK_CENARIO'])
+        dim_tempo = df_estrela[['SK_TEMPO', 'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_FDS', 'IS_PAGAMENTO']].drop_duplicates(subset=['SK_TEMPO'])
+
+        # 3. SEPARAÇÃO DA TABELA FATO (Métricas e Chaves)
+        colunas_fato = [
+            'H3_INDEX', 'SK_CENARIO', 'SK_TEMPO', 'DT_REF',
+            'VOLUME_HISTORICO', 'GRAVIDADE_HISTORICA', 'CONTAGIO_PONDERADO', 'PRESSAO_RISCO_LOCAL',
+            'SCORE_RISCO_BRUTO', 'SCORE_RISCO_FINAL'
+        ]
         
-        self.cliente_bigquery.load_table_from_dataframe(dataframe_exportacao, identificador_tabela, job_config=configuracao_job).result()
-        logger.info("Sincronizacao com BigQuery concluida.")
+        colunas_shap = [c for c in df_estrela.columns if c.startswith('SHAP_')]
+        fato_inferencia_risco = df_estrela[colunas_fato + colunas_shap].copy()
+        fato_inferencia_risco['DT_REF'] = pd.to_datetime(fato_inferencia_risco['DT_REF'])
+
+        # 4. CARGA NO BIGQUERY
+        tabelas_para_carregar = {
+            "dim_geografia": dim_geografia,
+            "dim_cenario": dim_cenario,
+            "dim_tempo": dim_tempo,
+        }
+
+        # Carrega Dimensões (Rapidez e atualização completa)
+        for nome_tabela, df_tabela in tabelas_para_carregar.items():
+            job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+            id_tabela = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.{nome_tabela}"
+            self.cliente_bigquery.load_table_from_dataframe(df_tabela, id_tabela, job_config=job_config).result()
+            logger.info(f"Dimensão {nome_tabela} atualizada com {len(df_tabela)} linhas.")
+
+        # Carrega Fato (Alta performance com clusterização)
+        configuracao_fato = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE", 
+            time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
+            clustering_fields=["H3_INDEX", "SK_CENARIO", "SK_TEMPO"] 
+        )
+        id_tabela_fato = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.fato_inferencia_risco"
+        self.cliente_bigquery.load_table_from_dataframe(fato_inferencia_risco, id_tabela_fato, job_config=configuracao_fato).result()
+        logger.info(f"Tabela Fato carregada com {len(fato_inferencia_risco)} linhas. Carga Estrela finalizada com sucesso.")
+
+    def _criar_view_looker_studio(self):
+        """Cria ou atualiza a View desnormalizada para o BI consumir"""
+        if not self.cliente_bigquery:
+            return
+
+        logger.info("Criando/Atualizando a View 'vw_safedriver_dashboard' para o Looker Studio...")
+        
+        dataset_ref = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}"
+        nome_view = f"{dataset_ref}.vw_safedriver_dashboard"
+        
+        query_sql = f"""
+        CREATE OR REPLACE VIEW `{nome_view}` AS
+        SELECT 
+            f.DT_REF,
+            g.H3_INDEX,
+            g.NM_MUN,
+            g.NM_BAIRRO,
+            g.DENSIDADE,
+            g.TAXA_VACANCIA,
+            c.PERIODO_DIA,
+            c.PERFIL_ALVO,
+            c.TIPO_LOCAL,
+            t.MES_OCORRENCIA,
+            t.DIA_SEMANA,
+            t.IS_FDS,
+            t.IS_PAGAMENTO,
+            f.VOLUME_HISTORICO,
+            f.GRAVIDADE_HISTORICA,
+            f.CONTAGIO_PONDERADO,
+            f.PRESSAO_RISCO_LOCAL,
+            f.SCORE_RISCO_BRUTO,
+            f.SCORE_RISCO_FINAL
+        FROM `{dataset_ref}.fato_inferencia_risco` f
+        LEFT JOIN `{dataset_ref}.dim_geografia` g ON f.H3_INDEX = g.H3_INDEX
+        LEFT JOIN `{dataset_ref}.dim_cenario` c ON f.SK_CENARIO = c.SK_CENARIO
+        LEFT JOIN `{dataset_ref}.dim_tempo` t ON f.SK_TEMPO = t.SK_TEMPO;
+        """
+        
+        try:
+            self.cliente_bigquery.query(query_sql).result()
+            logger.info(f"View Analítica '{nome_view}' criada com sucesso e pronta para uso no Looker!")
+        except Exception as erro:
+            logger.error(f"Erro ao criar a View no BigQuery: {erro}")
 
     def executar_pipeline_preditivo(self) -> bool:
         logger.info("Iniciando inferencia e sincronizacao de dados.")
@@ -234,6 +322,7 @@ class SincronizadorOuro:
 
             self._exportar_datalake(dados_entrada)
             self._exportar_bigquery(dados_entrada)
+            self._criar_view_looker_studio() # Gera a View automatizada
             
             return True
             
