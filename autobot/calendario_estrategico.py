@@ -1,77 +1,72 @@
-import pandas as pd
-from datetime import datetime, timedelta
-import holidays
 import logging
+import holidays
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [%(levelname)s] - %(module)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-class CalendarioEstrategico:
-    def __init__(self, data_ref=None):
-        # Permitir injeção de data é essencial para fazer Backtesting (testar o passado)
-        self.hoje = data_ref if data_ref else datetime.now()
-        
-        # Feriados oficiais do Estado de São Paulo
-        self.feriados_sp = holidays.BR(state='SP')
+class ConfiguracaoCalendario:
+    ESTADO = 'SP'
+    FUSO_HORARIO = "America/Sao_Paulo"
+    DIAS_PAGAMENTO_INICIO = (5, 10)
+    DIAS_PAGAMENTO_FIM = (19, 22)
 
-    def is_pagamento(self):
-        """
-        Feature ML (0 ou 1). Identifica períodos de injeção de liquidez:
-        - 5º dia útil (geralmente entre o dia 5 e 10).
-        - Vales e Adiantamentos (dias 19 a 22).
-        """
+class CalendarioEstrategico:
+    def __init__(self, data_referencia=None):
+        self.configuracao = ConfiguracaoCalendario()
+        self.fuso = ZoneInfo(self.configuracao.FUSO_HORARIO)
+        self.hoje = data_referencia if data_referencia else datetime.now(self.fuso)
+        self.feriados_estaduais = holidays.BR(state=self.configuracao.ESTADO)
+
+    def verificar_periodo_pagamento(self) -> int:
         dia = self.hoje.day
-        if (5 <= dia <= 10) or (19 <= dia <= 22):
+        inicio = self.configuracao.DIAS_PAGAMENTO_INICIO
+        fim = self.configuracao.DIAS_PAGAMENTO_FIM
+        
+        if (inicio[0] <= dia <= inicio[1]) or (fim[0] <= dia <= fim[1]):
             return 1
         return 0
 
-    def is_vespera_feriado(self):
-        """
-        Feature ML (0 ou 1). Identifica a proximidade de feriados.
-        Crucial para o modelo detetar esvaziamento residencial e fluxo em autoestradas.
-        """
+    def verificar_proximidade_feriado(self) -> int:
         amanha = self.hoje + timedelta(days=1)
         depois_amanha = self.hoje + timedelta(days=2)
         
-        tem_feriado = (self.hoje in self.feriados_sp) or \
-                      (amanha in self.feriados_sp) or \
-                      (depois_amanha in self.feriados_sp)
+        datas_criticas = [self.hoje, amanha, depois_amanha]
         
-        return 1 if tem_feriado else 0
+        if any(data in self.feriados_estaduais for data in datas_criticas):
+            return 1
+        return 0
 
-    def is_fds(self):
-        """Feature ML (0 ou 1). Identifica fins de semana."""
-        return 1 if self.hoje.weekday() >= 5 else 0 # 5 = Sábado, 6 = Domingo
+    def verificar_final_de_semana(self) -> int:
+        if self.hoje.weekday() >= 5:
+            return 1
+        return 0
 
-    def obter_contexto_ia(self):
-        """
-        Substitui os antigos 'Multiplicadores'.
-        Retorna um dicionário de features puras para injetar diretamente no DataFrame da Camada Ouro.
-        """
-        contexto = {
-            "IS_PAGAMENTO": self.is_pagamento(),
-            "IS_FERIADO": self.is_vespera_feriado(),
-            "IS_FDS": self.is_fds()
+    def obter_contexto_ia(self) -> dict:
+        return {
+            "IS_PAGAMENTO": self.verificar_periodo_pagamento(),
+            "IS_FERIADO": self.verificar_proximidade_feriado(),
+            "IS_FDS": self.verificar_final_de_semana()
         }
-        return contexto
 
-    def deve_rodar_hoje(self):
-        """
-        Gatilho de DevOps para o GitHub Actions (O Batedor).
-        Retorna True se for Domingo OU se houver contexto de alta tensão.
-        """
+    def validar_execucao_automatica(self) -> bool:
         if self.hoje.weekday() == 6:
-            logger.info("DevOps: Domingo detetado. Execução de rotina autorizada.")
+            logger.info("Execucao autorizada: Ciclo semanal de domingo.")
             return True
         
-        if self.is_pagamento() or self.is_vespera_feriado():
-            logger.info("DevOps: Contexto de tensão detetado (Pagamento/Feriado). Execução tática autorizada.")
+        if self.verificar_periodo_pagamento() or self.verificar_proximidade_feriado():
+            logger.info("Execucao autorizada: Contexto de alta movimentacao financeira ou feriado.")
             return True
         
-        logger.info("DevOps: Sem gatilhos estratégicos. Pipeline em repouso.")
+        logger.info("Execucao postergada: Sem gatilhos estrategicos ativos.")
         return False
 
 if __name__ == "__main__":
-    cal = CalendarioEstrategico()
-    print(f"Data Base: {cal.hoje.strftime('%d/%m/%Y')}")
-    print(f"Gatilho GitHub Actions: {cal.deve_rodar_hoje()}")
-    print(f"Features Injetadas na IA: {cal.obter_contexto_ia()}")
+    calendario = CalendarioEstrategico()
+    logger.info(f"Data de Analise: {calendario.hoje.strftime('%d/%m/%Y')}")
+    logger.info(f"Contexto para Modelagem: {calendario.obter_contexto_ia()}")
+    logger.info(f"Gatilho de Operacao: {calendario.validar_execucao_automatica()}")
