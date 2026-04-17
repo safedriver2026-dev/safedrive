@@ -8,7 +8,7 @@ import os
 import json
 import logging
 import shap
-import sys  # Necessário para as Surrogate Keys
+import sys  # Necessário para as Surrogate Keys do Esquema Estrela
 from botocore.config import Config
 from datetime import datetime
 from google.cloud import bigquery
@@ -82,7 +82,7 @@ class SincronizadorOuro:
             referencia_dataset = bigquery.DatasetReference(self.configuracao.ID_PROJETO, self.configuracao.ID_DATASET)
             try:
                 cliente.get_dataset(referencia_dataset)
-                logger.info(f"Dataset '{self.configuracao.ID_DATASET}' validado.")
+                logger.info(f"Dataset '{self.configuracao.ID_DATASET}' validado no BigQuery.")
             except exceptions.NotFound:
                 logger.warning(f"Dataset '{self.configuracao.ID_DATASET}' ausente. Autoregenerando...")
                 dataset = bigquery.Dataset(referencia_dataset)
@@ -109,18 +109,41 @@ class SincronizadorOuro:
 
     def _construir_matriz_preditiva(self) -> pd.DataFrame:
         try:
+            logger.info("Lendo malha geografica (H3)...")
             resposta_malha = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=self.caminho_malha)
             dataframe_malha = pl.read_parquet(io.BytesIO(resposta_malha['Body'].read())).unique(subset=["H3_INDEX"])
             
-            ano_atual = datetime.now().year
-            caminho_prata = f"{self.caminho_raiz}/prata/ssp_consolidada_{ano_atual}.parquet"
-            resposta_prata = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_prata)
-            dataframe_prata = pl.read_parquet(io.BytesIO(resposta_prata['Body'].read()))
+            logger.info("Iniciando varredura na camada Prata (Lendo historico completo)...")
+            prefixo_prata = f"{self.caminho_raiz}/prata/ssp_consolidada"
+            resposta_arquivos = self.cliente_armazenamento.list_objects_v2(Bucket=self.configuracao.NOME_BUCKET, Prefix=prefixo_prata)
+            
+            if 'Contents' not in resposta_arquivos:
+                logger.error(f"Nenhum arquivo encontrado no R2 com o prefixo: {prefixo_prata}")
+                return None
+                
+            # Captura TODOS os arquivos particionados da Prata (2022, 2023, 2024...)
+            arquivos_prata = [obj['Key'] for obj in resposta_arquivos['Contents'] if obj['Key'].endswith('.parquet')]
+            
+            if not arquivos_prata:
+                logger.error("A pasta existe, mas nao contem arquivos .parquet validos.")
+                return None
+                
+            logger.info(f"Encontrados {len(arquivos_prata)} arquivos particionados. Consolidando...")
+            
+            # Lê e empilha todos os anos em um único DataFrame
+            lista_dfs = []
+            for caminho_arquivo in arquivos_prata:
+                resposta = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_arquivo)
+                df_temp = pl.read_parquet(io.BytesIO(resposta['Body'].read()))
+                lista_dfs.append(df_temp)
+                
+            dataframe_prata = pl.concat(lista_dfs, how="vertical")
+            logger.info(f"Historico consolidado com sucesso! Total de registros: {len(dataframe_prata)}")
             
             # Extração da Sazonalidade Histórica
             meses_disponiveis = dataframe_prata.select("MES_OCORRENCIA").unique().drop_nulls()
 
-            # Agrupamento resgatando o Volume Real para o Delta do Dashboard
+            # Agrupamento da memória usando todo o histórico para o Looker Studio
             memoria_historica = dataframe_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"]).agg([
                 pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
                 pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
@@ -131,7 +154,8 @@ class SincronizadorOuro:
             periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
             perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
             
-            # Cross Join da malha
+            # Cross Join da malha garantindo todos os meses e contextos
+            logger.info("Cruzando dados geograficos, temporais e historicos...")
             estrutura_base = dataframe_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
                 periodos, how="cross"
             ).join(
@@ -140,7 +164,7 @@ class SincronizadorOuro:
                 meses_disponiveis, how="cross"
             )
 
-            # Join da base com a memória
+            # Join da base com a memória histórica
             dataframe_completo = estrutura_base.join(
                 memoria_historica, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"], how="left"
             ).with_columns([
@@ -160,9 +184,11 @@ class SincronizadorOuro:
             dataframe_pandas['IS_FDS'] = contexto_temporal['IS_FDS']
             dataframe_pandas['TIPO_LOCAL'] = "VIA PUBLICA" 
             
+            logger.info(f"Matriz de inferencia gerada com sucesso: {len(dataframe_pandas)} linhas prontas para IA.")
             return dataframe_pandas
+            
         except Exception as erro:
-            logger.error(f"Falha ao construir a matriz base (Verifique as tabelas Prata/Malha no R2): {erro}")
+            logger.error(f"Falha ao construir a matriz base: {erro}")
             return None
 
     def _exportar_datalake(self, dataframe: pd.DataFrame):
@@ -179,7 +205,7 @@ class SincronizadorOuro:
                 Key=caminho_arquivo, 
                 Body=buffer.getvalue()
             )
-            logger.info(f"Backup Parquet Ouro salvo com sucesso: {caminho_arquivo}")
+            logger.info(f"Backup Parquet Ouro salvo no R2: {caminho_arquivo}")
         except Exception as erro:
             logger.error(f"Aviso: Falha ao salvar backup no Datalake R2: {erro}")
 
@@ -189,7 +215,7 @@ class SincronizadorOuro:
             logger.warning("BigQuery inacessível. Pulando carga analítica.")
             return False
 
-        logger.info("Modelando DataFrame para Star Schema (Autoregenerativo)...")
+        logger.info("Modelando DataFrame para Star Schema...")
         df_estrela = dataframe.copy()
 
         # Criação de Chaves
@@ -223,7 +249,7 @@ class SincronizadorOuro:
         fato_inferencia_risco = df_estrela[colunas_fato + colunas_shap].copy()
         fato_inferencia_risco['DT_REF'] = pd.to_datetime(fato_inferencia_risco['DT_REF'])
 
-        # Carga Autoregenerativa (WRITE_TRUNCATE limpa o obsoleto e cria o novo schema)
+        # Carga no BigQuery (WRITE_TRUNCATE limpa o obsoleto e cria o novo schema)
         try:
             tabelas_para_carregar = {
                 "dim_geografia": dim_geografia,
@@ -309,7 +335,6 @@ class SincronizadorOuro:
         try:
             modelos = self._carregar_modelos_treinados()
             
-            # Se o Catboost (Modelo principal) não carregou, não temos como predizer.
             if modelos["cat"] is None:
                 logger.error("Interrompendo Ouro: Modelo preditivo ausente ou corrompido.")
                 return False
@@ -327,6 +352,7 @@ class SincronizadorOuro:
                 matriz_features[coluna] = matriz_features[coluna].astype('float32')
 
             # Predição
+            logger.info("Executando motor de Inferencia da IA...")
             previsao_catboost = modelos["cat"].predict(matriz_features)
             previsao_lightgbm = modelos["lgb"].predict(matriz_features) if modelos["lgb"] else previsao_catboost
 
@@ -334,14 +360,14 @@ class SincronizadorOuro:
             pontuacao_bruta = (previsao_catboost * self.configuracao.PESOS_MODELOS["catboost"]) + (previsao_lightgbm * self.configuracao.PESOS_MODELOS["lightgbm"])
             dados_entrada['SCORE_RISCO_BRUTO'] = pontuacao_bruta
 
-            # Normalização (0 a 100) por Perfil Alvo
+            # Normalização (0 a 100)
             dados_entrada['SCORE_RISCO_FINAL'] = dados_entrada.groupby('PERFIL_ALVO')['SCORE_RISCO_BRUTO'].transform(
                 lambda x: ((x - x.min()) / (x.max() - x.min() + 0.001) * 100)
             ).clip(0, 100).round(2)
 
             dados_entrada['DT_REF'] = datetime.now() 
             
-            # SHAP Explainer (Opcional, protegido por try/except para não quebrar a carga principal)
+            # SHAP Explainer
             try:
                 explicador = shap.TreeExplainer(modelos["cat"])
                 amostra_topo = dados_entrada.nlargest(1000, 'SCORE_RISCO_FINAL')
@@ -355,7 +381,7 @@ class SincronizadorOuro:
             except Exception as shap_erro:
                 logger.warning(f"Cálculo SHAP ignorado por instabilidade computacional: {shap_erro}")
 
-            # Persistência
+            # Persistência final
             self._exportar_datalake(dados_entrada)
             carga_sucesso = self._exportar_bigquery(dados_entrada)
             
@@ -375,6 +401,6 @@ if __name__ == "__main__":
     processador_ouro = SincronizadorOuro()
     processamento_ok = processador_ouro.executar_pipeline_preditivo()
     
-    # Sai com código de erro 1 se falhar, para que o GitHub Actions sinalize "Failed" no Card
+    # Sai com código de erro 1 se falhar, para que o GitHub Actions sinalize "Failed"
     if not processamento_ok:
         sys.exit(1)
