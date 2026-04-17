@@ -9,7 +9,7 @@ from botocore.config import Config
 from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from typing import Optional, List
+from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -30,7 +30,13 @@ class ConfiguracaoIngestao:
     ]
     ANCORAS_CABECALHO = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "LATITUDE", "DESC_PERIODO"}
     PADRAO_LIMPEZA = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
-    CABECALHOS_HTTP = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SafeDriverBot/1.0"}
+    
+    CABECALHOS_HTTP = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive"
+    }
 
 class IngestaoBronze:
     def __init__(self):
@@ -85,8 +91,11 @@ class IngestaoBronze:
 
     def _verificar_tamanho_remoto(self, url: str) -> int:
         try:
-            resposta = self.sessao_http.head(url, headers=self.configuracao.CABECALHOS_HTTP, timeout=20)
+            resposta = self.sessao_http.head(url, headers=self.configuracao.CABECALHOS_HTTP, timeout=45)
             return int(resposta.headers.get('Content-Length', 0)) if resposta.status_code == 200 else 0
+        except requests.exceptions.Timeout:
+            logger.warning(f"O portal da SSP demorou muito a responder: {url}")
+            return 0
         except Exception:
             return 0
 
@@ -97,7 +106,7 @@ class IngestaoBronze:
         except Exception:
             return 0
 
-    def _processar_planilha(self, bytes_excel: bytes, ano: int) -> Optional[pl.DataFrame]:
+    def _processar_planilha(self, bytes_excel: bytes) -> Optional[pl.DataFrame]:
         fluxo_memoria = io.BytesIO(bytes_excel)
         lista_dataframes = []
 
@@ -150,21 +159,32 @@ class IngestaoBronze:
         caminho_bruto = self._obter_caminho("bronze", "raw", f"ssp_raw_{ano}.xlsx")
         caminho_confiavel = self._obter_caminho("bronze", "trusted", f"ssp_trusted_{ano}.parquet")
         url_origem = self.configuracao.URL_BASE_SSP.format(ano=ano)
+        ano_atual = datetime.now().year
 
+        # Otimizacao: Se o arquivo Trusted já existe e não é o ano atual, ignoramos a rede
+        if ano < ano_atual and not forcar_execucao:
+            try:
+                self.cliente_armazenamento.head_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_confiavel)
+                logger.info(f"[{ano}] Dados historicos ja consolidados no Datalake. Ignorando consulta externa.")
+                return False
+            except Exception:
+                pass
+
+        # Para o ano atual (ou se o arquivo estiver ausente), verificamos o tamanho remoto
         tamanho_remoto = self._verificar_tamanho_remoto(url_origem)
         tamanho_local = self._obter_tamanho_local(caminho_bruto)
 
         if (tamanho_remoto == tamanho_local) and not forcar_execucao and tamanho_remoto > 0:
             try:
                 self.cliente_armazenamento.head_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_confiavel)
-                logger.info(f"[{ano}] Integridade confirmada. Processamento ignorado.")
+                logger.info(f"[{ano}] Sem novas atualizacoes no portal da SSP. Cache mantido.")
                 return False
             except Exception:
                 pass
 
         try:
             if tamanho_remoto != tamanho_local or forcar_execucao or tamanho_local == 0:
-                logger.info(f"[{ano}] Iniciando transferencia da fonte externa.")
+                logger.info(f"[{ano}] Iniciando transferencia do ficheiro original.")
                 resposta_http = self.sessao_http.get(url_origem, headers=self.configuracao.CABECALHOS_HTTP, timeout=300)
                 bytes_excel = resposta_http.content
                 self.cliente_armazenamento.put_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_bruto, Body=bytes_excel)
@@ -172,7 +192,7 @@ class IngestaoBronze:
                 objeto_armazenado = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_bruto)
                 bytes_excel = objeto_armazenado['Body'].read()
 
-            dataframe_processado = self._processar_planilha(bytes_excel, ano)
+            dataframe_processado = self._processar_planilha(bytes_excel)
             
             if dataframe_processado is not None:
                 buffer = io.BytesIO()
