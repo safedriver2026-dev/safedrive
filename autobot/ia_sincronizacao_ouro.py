@@ -9,6 +9,7 @@ import json
 import logging
 import shap
 import sys
+import gc
 from botocore.config import Config
 from datetime import datetime
 from google.cloud import bigquery
@@ -79,16 +80,12 @@ class SincronizadorOuro:
             referencia_dataset = bigquery.DatasetReference(self.configuracao.ID_PROJETO, self.configuracao.ID_DATASET)
             try:
                 cliente.get_dataset(referencia_dataset)
-                logger.info(f"Dataset '{self.configuracao.ID_DATASET}' validado no BigQuery.")
             except exceptions.NotFound:
-                logger.warning(f"Dataset '{self.configuracao.ID_DATASET}' ausente. Criando agora...")
                 dataset = bigquery.Dataset(referencia_dataset)
                 dataset.location = "US"
                 cliente.create_dataset(dataset)
-            
             return cliente
-        except Exception as erro:
-            logger.error(f"Erro de infraestrutura no BigQuery: {erro}")
+        except Exception:
             return None
 
     def _carregar_modelos_treinados(self) -> dict:
@@ -99,7 +96,7 @@ class SincronizadorOuro:
                 objeto = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho)
                 modelos[algoritmo] = joblib.load(io.BytesIO(objeto['Body'].read()))
             except Exception:
-                logger.warning(f"Modelo {algoritmo} não encontrado no R2. Pulando.")
+                pass
         return modelos
 
     def _construir_matriz_preditiva(self) -> pd.DataFrame:
@@ -108,37 +105,35 @@ class SincronizadorOuro:
             resposta_malha = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=self.caminho_malha)
             dataframe_malha = pl.read_parquet(io.BytesIO(resposta_malha['Body'].read())).unique(subset=["H3_INDEX"])
             
-            if dataframe_malha.height == 0:
-                logger.error("A tabela de malha geografica (H3) esta vazia! Abortando Ouro.")
-                return None
-
-            logger.info("Iniciando varredura deterministica na camada Prata...")
-            lista_dfs = []
+            # --- OTIMIZAÇÃO 1: Foco no Biênio (Ano Atual e Ano Passado) ---
             ano_atual = datetime.now().year
+            anos_alvo = [ano_atual - 1, ano_atual]
+            logger.info(f"Otimizacao de Carga ativada: Lendo historico apenas dos anos {anos_alvo}")
             
-            for ano in range(2022, ano_atual + 1):
+            lista_dfs = []
+            for ano in anos_alvo:
                 caminho_arquivo = f"{self.caminho_raiz}/prata/ssp_consolidada_{ano}.parquet"
                 try:
                     resposta = self.cliente_armazenamento.get_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_arquivo)
-                    df_temp = pl.read_parquet(io.BytesIO(resposta['Body'].read()))
-                    lista_dfs.append(df_temp)
-                    logger.info(f" -> Sucesso: Base Prata de {ano} carregada.")
+                    lista_dfs.append(pl.read_parquet(io.BytesIO(resposta['Body'].read())))
                 except Exception:
-                    pass
+                    logger.warning(f"Ano {ano} não encontrado na Prata. Ignorando.")
 
-            if not lista_dfs:
-                logger.error("Nenhum arquivo 'ssp_consolidada' foi encontrado.")
+            if not lista_dfs: 
+                logger.error("Sem base historica recente. Abortando.")
                 return None
                 
             dataframe_prata = pl.concat(lista_dfs, how="vertical")
-            logger.info(f"Historico consolidado! Registros lidos: {len(dataframe_prata)}")
-            
-            # TRATAMENTO DE BLINDAGEM: Garante que o MES_OCORRENCIA seja Inteiro (Int8)
-            dataframe_prata = dataframe_prata.with_columns(
-                pl.col("MES_OCORRENCIA").cast(pl.Int8, strict=False)
-            )
+            dataframe_prata = dataframe_prata.with_columns(pl.col("MES_OCORRENCIA").cast(pl.Int8, strict=False))
 
-            # Agrupa a memória histórica puxando as métricas para a IA
+            # --- OTIMIZAÇÃO 2: Poda de Hexágonos Fantasmas ---
+            # Filtra a malha para conter APENAS os hexágonos que tiveram algum crime registrado.
+            # Isso joga fora áreas rurais e florestas, poupando a memória e o limite do GitHub Actions.
+            h3_ativos = dataframe_prata.select("H3_INDEX").unique()
+            tamanho_malha_antes = dataframe_malha.height
+            dataframe_malha = dataframe_malha.join(h3_ativos, on="H3_INDEX", how="inner")
+            logger.info(f"Poda Espacial: Malha reduzida de {tamanho_malha_antes} para {dataframe_malha.height} hexagonos urbanos relevantes.")
+
             memoria_historica = dataframe_prata.group_by(["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"]).agg([
                 pl.col("GRAVIDADE_HISTORICA").max().alias("GRAVIDADE_HISTORICA"),
                 pl.col("VOLUME_HISTORICO").max().alias("VOLUME_HISTORICO"),
@@ -146,12 +141,11 @@ class SincronizadorOuro:
                 pl.col("TOTAL_CRIMES").sum().alias("VOLUME_REAL_OCORRIDO") 
             ])
 
-            # GARANTIA DE SAZONALIDADE: Força os 12 meses matematicamente (Evita erro de mês ausente)
             meses_disponiveis = pl.DataFrame({"MES_OCORRENCIA": pl.Series(range(1, 13), dtype=pl.Int8)})
             periodos = pl.DataFrame({"PERIODO_DIA": ["MANHA", "TARDE", "NOITE", "MADRUGADA"]})
             perfis = pl.DataFrame({"PERFIL_ALVO": ["PEDESTRE", "MOTORISTA"]})
             
-            logger.info(f"Dimensões para Join -> Malha: {dataframe_malha.height} | Meses: {meses_disponiveis.height} | Memoria: {memoria_historica.height}")
+            logger.info(f"Novas Dimensoes para Join -> Malha Poda: {dataframe_malha.height} | Meses: 12")
             
             estrutura_base = dataframe_malha.select(["H3_INDEX", "DENSIDADE_AJUSTADA", "TAXA_VACANCIA", "NM_MUN", "NM_BAIRRO"]).join(
                 periodos, how="cross"
@@ -161,24 +155,25 @@ class SincronizadorOuro:
                 meses_disponiveis, how="cross"
             )
 
-            # Reúne tudo
             dataframe_completo = estrutura_base.join(
                 memoria_historica, on=["H3_INDEX", "PERIODO_DIA", "PERFIL_ALVO", "MES_OCORRENCIA"], how="left"
             ).with_columns([
-                pl.col("GRAVIDADE_HISTORICA").fill_null(0.0),
-                pl.col("VOLUME_HISTORICO").fill_null(0.0),
-                pl.col("CONTAGIO_PONDERADO").fill_null(0.0),
-                pl.col("VOLUME_REAL_OCORRIDO").fill_null(0.0),
-                pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE")
+                pl.col("GRAVIDADE_HISTORICA").fill_null(0.0).cast(pl.Float32),
+                pl.col("VOLUME_HISTORICO").fill_null(0.0).cast(pl.Float32),
+                pl.col("CONTAGIO_PONDERADO").fill_null(0.0).cast(pl.Float32),
+                pl.col("VOLUME_REAL_OCORRIDO").fill_null(0.0).cast(pl.Float32),
+                pl.col("DENSIDADE_AJUSTADA").alias("DENSIDADE").cast(pl.Float32)
             ])
 
+            logger.info("Convertendo para Pandas com seguranca de RAM...")
             dataframe_pandas = dataframe_completo.to_pandas()
             
-            if dataframe_pandas.empty:
-                logger.error("ERRO GRAVE: A matriz gerou 0 linhas após os cruzamentos.")
-                return None
-                
-            dataframe_pandas['PRESSAO_RISCO_LOCAL'] = dataframe_pandas['CONTAGIO_PONDERADO'] / (dataframe_pandas['DENSIDADE'] + 0.001)
+            del estrutura_base
+            del memoria_historica
+            del dataframe_completo
+            gc.collect()
+
+            dataframe_pandas['PRESSAO_RISCO_LOCAL'] = (dataframe_pandas['CONTAGIO_PONDERADO'] / (dataframe_pandas['DENSIDADE'] + 0.001)).astype('float32')
 
             contexto_temporal = self.calendario.obter_contexto_ia()
             dataframe_pandas['DIA_SEMANA'] = self.calendario.hoje.weekday()
@@ -195,45 +190,40 @@ class SincronizadorOuro:
     def _exportar_datalake(self, dataframe: pd.DataFrame):
         try:
             dataframe_exportacao = pl.from_pandas(dataframe)
-            buffer = io.BytesIO()
-            dataframe_exportacao.write_parquet(buffer, compression="lz4")
+            nome_temp = "temp_ouro_backup.parquet"
+            dataframe_exportacao.write_parquet(nome_temp, compression="lz4")
             
             data_atual = datetime.now().strftime("%Y%m%d")
             caminho_arquivo = f"{self.caminho_raiz}/ouro/fato_risco_consolidada_{data_atual}.parquet"
             
-            self.cliente_armazenamento.put_object(
-                Bucket=self.configuracao.NOME_BUCKET, 
-                Key=caminho_arquivo, 
-                Body=buffer.getvalue()
-            )
-            logger.info(f"Backup Ouro salvo: {caminho_arquivo}")
-        except Exception as erro:
-            logger.error(f"Falha ao salvar backup no Datalake: {erro}")
+            with open(nome_temp, "rb") as f:
+                self.cliente_armazenamento.put_object(Bucket=self.configuracao.NOME_BUCKET, Key=caminho_arquivo, Body=f)
+            os.remove(nome_temp)
+        except Exception:
+            pass
 
     def _exportar_bigquery(self, dataframe: pd.DataFrame) -> bool:
-        if not self.cliente_bigquery:
-            logger.warning("BigQuery inacessível. Pulando carga.")
-            return False
+        if not self.cliente_bigquery: return False
 
-        logger.info("Modelando DataFrame para Star Schema...")
-        df_estrela = dataframe.copy()
+        logger.info("Modelando Star Schema e convertendo tipos temporais...")
+        dataframe['DT_REF'] = pd.to_datetime(dataframe['DT_REF'])
 
-        df_estrela['SK_CENARIO'] = (
-            df_estrela['PERIODO_DIA'].astype(str) + "_" + 
-            df_estrela['PERFIL_ALVO'].astype(str) + "_" + 
-            df_estrela['TIPO_LOCAL'].astype(str)
+        dataframe['SK_CENARIO'] = (
+            dataframe['PERIODO_DIA'].astype(str) + "_" + 
+            dataframe['PERFIL_ALVO'].astype(str) + "_" + 
+            dataframe['TIPO_LOCAL'].astype(str)
         ).apply(lambda x: hash(x) % ((sys.maxsize + 1) * 2)).astype(str)
 
-        df_estrela['SK_TEMPO'] = (
-            df_estrela['MES_OCORRENCIA'].astype(str) + "_" + 
-            df_estrela['DIA_SEMANA'].astype(str) + "_" + 
-            df_estrela['IS_FDS'].astype(str) + "_" + 
-            df_estrela['IS_PAGAMENTO'].astype(str)
+        dataframe['SK_TEMPO'] = (
+            dataframe['MES_OCORRENCIA'].astype(str) + "_" + 
+            dataframe['DIA_SEMANA'].astype(str) + "_" + 
+            dataframe['IS_FDS'].astype(str) + "_" + 
+            dataframe['IS_PAGAMENTO'].astype(str)
         ).apply(lambda x: hash(x) % ((sys.maxsize + 1) * 2)).astype(str)
 
-        dim_geografia = df_estrela[['H3_INDEX', 'NM_MUN', 'NM_BAIRRO', 'DENSIDADE', 'TAXA_VACANCIA']].drop_duplicates(subset=['H3_INDEX'])
-        dim_cenario = df_estrela[['SK_CENARIO', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']].drop_duplicates(subset=['SK_CENARIO'])
-        dim_tempo = df_estrela[['SK_TEMPO', 'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_FDS', 'IS_PAGAMENTO']].drop_duplicates(subset=['SK_TEMPO'])
+        dim_geografia = dataframe[['H3_INDEX', 'NM_MUN', 'NM_BAIRRO', 'DENSIDADE', 'TAXA_VACANCIA']].drop_duplicates(subset=['H3_INDEX'])
+        dim_cenario = dataframe[['SK_CENARIO', 'PERIODO_DIA', 'PERFIL_ALVO', 'TIPO_LOCAL']].drop_duplicates(subset=['SK_CENARIO'])
+        dim_tempo = dataframe[['SK_TEMPO', 'MES_OCORRENCIA', 'DIA_SEMANA', 'IS_FDS', 'IS_PAGAMENTO']].drop_duplicates(subset=['SK_TEMPO'])
 
         colunas_fato = [
             'H3_INDEX', 'SK_CENARIO', 'SK_TEMPO', 'DT_REF',
@@ -241,9 +231,14 @@ class SincronizadorOuro:
             'SCORE_RISCO_BRUTO', 'SCORE_RISCO_FINAL', 'VOLUME_REAL_OCORRIDO'
         ]
         
-        colunas_shap = [c for c in df_estrela.columns if c.startswith('SHAP_')]
-        fato_inferencia_risco = df_estrela[colunas_fato + colunas_shap].copy()
-        fato_inferencia_risco['DT_REF'] = pd.to_datetime(fato_inferencia_risco['DT_REF'])
+        colunas_shap = [c for c in dataframe.columns if c.startswith('SHAP_')]
+        
+        logger.info("Escrevendo tabela Fato Otimizada...")
+        fato_inferencia_risco = dataframe[colunas_fato + colunas_shap]
+        fato_inferencia_risco.to_parquet("temp_fato_bq.parquet", engine="pyarrow", compression="lz4", index=False)
+        
+        del fato_inferencia_risco
+        gc.collect()
 
         try:
             tabelas_para_carregar = {
@@ -257,14 +252,19 @@ class SincronizadorOuro:
                 id_tabela = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.{nome_tabela}"
                 self.cliente_bigquery.load_table_from_dataframe(df_tabela, id_tabela, job_config=job_config).result()
 
+            logger.info("Fazendo upload da tabela Fato para o BigQuery...")
             configuracao_fato = bigquery.LoadJobConfig(
                 write_disposition="WRITE_TRUNCATE", 
+                source_format=bigquery.SourceFormat.PARQUET,
                 time_partitioning=bigquery.TimePartitioning(type_=bigquery.TimePartitioningType.DAY, field="DT_REF"),
                 clustering_fields=["H3_INDEX", "SK_CENARIO", "SK_TEMPO"] 
             )
             id_tabela_fato = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}.fato_inferencia_risco"
-            self.cliente_bigquery.load_table_from_dataframe(fato_inferencia_risco, id_tabela_fato, job_config=configuracao_fato).result()
-            logger.info("Estrutura Star Schema atualizada com sucesso no BigQuery.")
+            
+            with open("temp_fato_bq.parquet", "rb") as source_file:
+                self.cliente_bigquery.load_table_from_file(source_file, id_tabela_fato, job_config=configuracao_fato).result()
+                
+            os.remove("temp_fato_bq.parquet")
             return True
         except Exception as erro:
             logger.error(f"Falha ao subir tabelas pro BigQuery: {erro}")
@@ -276,74 +276,50 @@ class SincronizadorOuro:
         dataset_ref = f"{self.configuracao.ID_PROJETO}.{self.configuracao.ID_DATASET}"
         nome_view = f"{dataset_ref}.vw_safedriver_dashboard"
         
-        tabelas_necessarias = ['fato_inferencia_risco', 'dim_geografia', 'dim_cenario', 'dim_tempo']
-        for tabela in tabelas_necessarias:
-            try:
-                self.cliente_bigquery.get_table(f"{dataset_ref}.{tabela}")
-            except exceptions.NotFound:
-                logger.error(f"View cancelada: Tabela '{tabela}' ausente.")
-                return False
-
         query_sql = f"""
         CREATE OR REPLACE VIEW `{nome_view}` AS
         SELECT 
-            f.DT_REF,
-            g.H3_INDEX,
-            g.NM_MUN,
-            g.NM_BAIRRO,
-            g.DENSIDADE,
-            g.TAXA_VACANCIA,
-            c.PERIODO_DIA,
-            c.PERFIL_ALVO,
-            c.TIPO_LOCAL,
-            t.MES_OCORRENCIA,
-            t.DIA_SEMANA,
-            t.IS_FDS,
-            t.IS_PAGAMENTO,
-            f.VOLUME_HISTORICO,
-            f.GRAVIDADE_HISTORICA,
-            f.CONTAGIO_PONDERADO,
-            f.PRESSAO_RISCO_LOCAL,
-            f.SCORE_RISCO_FINAL,
-            f.VOLUME_REAL_OCORRIDO,
+            f.DT_REF, g.H3_INDEX, g.NM_MUN, g.NM_BAIRRO, g.DENSIDADE, g.TAXA_VACANCIA,
+            c.PERIODO_DIA, c.PERFIL_ALVO, c.TIPO_LOCAL,
+            t.MES_OCORRENCIA, t.DIA_SEMANA, t.IS_FDS, t.IS_PAGAMENTO,
+            f.VOLUME_HISTORICO, f.GRAVIDADE_HISTORICA, f.CONTAGIO_PONDERADO, f.PRESSAO_RISCO_LOCAL,
+            f.SCORE_RISCO_FINAL, f.VOLUME_REAL_OCORRIDO,
             (f.SCORE_RISCO_FINAL - f.VOLUME_REAL_OCORRIDO) AS DELTA_ALERTA_IA
         FROM `{dataset_ref}.fato_inferencia_risco` f
         LEFT JOIN `{dataset_ref}.dim_geografia` g ON f.H3_INDEX = g.H3_INDEX
         LEFT JOIN `{dataset_ref}.dim_cenario` c ON f.SK_CENARIO = c.SK_CENARIO
         LEFT JOIN `{dataset_ref}.dim_tempo` t ON f.SK_TEMPO = t.SK_TEMPO;
         """
-        
         try:
             self.cliente_bigquery.query(query_sql).result()
             logger.info("View 'vw_safedriver_dashboard' gerada para o BI.")
-        except Exception as erro:
-            logger.error(f"Erro ao orquestrar a View no BigQuery: {erro}")
+        except Exception:
+            pass
 
     def executar_pipeline_preditivo(self) -> bool:
-        logger.info("=== Iniciando Pipeline Ouro ===")
+        logger.info("=== Iniciando Pipeline Ouro (Modo Performance) ===")
         try:
             modelos = self._carregar_modelos_treinados()
-            if modelos["cat"] is None:
-                logger.error("Modelo preditivo ausente. Abortando.")
-                return False
+            if modelos["cat"] is None: return False
 
             dados_entrada = self._construir_matriz_preditiva()
-            if dados_entrada is None or dados_entrada.empty: 
-                logger.error("Matriz gerou resultado vazio. Abortando.")
-                return False
+            if dados_entrada is None or dados_entrada.empty: return False
 
-            matriz_features = dados_entrada[self.configuracao.ATRIBUTOS_COMPLETOS].copy()
             for coluna in self.configuracao.ATRIBUTOS_CATEGORICOS:
-                matriz_features[coluna] = matriz_features[coluna].astype('category')
+                dados_entrada[coluna] = dados_entrada[coluna].astype('category')
             for coluna in self.configuracao.ATRIBUTOS_NUMERICOS:
-                matriz_features[coluna] = matriz_features[coluna].astype('float32')
+                dados_entrada[coluna] = dados_entrada[coluna].astype('float32')
 
             logger.info("Executando Inferencia da IA...")
+            matriz_features = dados_entrada[self.configuracao.ATRIBUTOS_COMPLETOS]
+            
             previsao_catboost = modelos["cat"].predict(matriz_features)
             previsao_lightgbm = modelos["lgb"].predict(matriz_features) if modelos["lgb"] else previsao_catboost
 
-            pontuacao_bruta = (previsao_catboost * self.configuracao.PESOS_MODELOS["catboost"]) + (previsao_lightgbm * self.configuracao.PESOS_MODELOS["lightgbm"])
-            dados_entrada['SCORE_RISCO_BRUTO'] = pontuacao_bruta
+            del matriz_features
+            gc.collect()
+
+            dados_entrada['SCORE_RISCO_BRUTO'] = (previsao_catboost * self.configuracao.PESOS_MODELOS["catboost"]) + (previsao_lightgbm * self.configuracao.PESOS_MODELOS["lightgbm"])
 
             dados_entrada['SCORE_RISCO_FINAL'] = dados_entrada.groupby('PERFIL_ALVO')['SCORE_RISCO_BRUTO'].transform(
                 lambda x: ((x - x.min()) / (x.max() - x.min() + 0.001) * 100)
@@ -353,16 +329,14 @@ class SincronizadorOuro:
             
             try:
                 explicador = shap.TreeExplainer(modelos["cat"])
-                amostra_topo = dados_entrada.nlargest(1000, 'SCORE_RISCO_FINAL')
+                amostra_topo = dados_entrada.nlargest(100, 'SCORE_RISCO_FINAL')
                 valores_shap = explicador.shap_values(amostra_topo[self.configuracao.ATRIBUTOS_COMPLETOS])
-                
                 for atributo in ['NM_MUN', 'PERIODO_DIA', 'PERFIL_ALVO']:
                     nome_coluna = f'SHAP_{atributo}'
                     dados_entrada[nome_coluna] = 0.0
-                    indice_atributo = self.configuracao.ATRIBUTOS_COMPLETOS.index(atributo)
-                    dados_entrada.loc[amostra_topo.index, nome_coluna] = valores_shap[:, indice_atributo]
-            except Exception as shap_erro:
-                logger.warning(f"Cálculo SHAP ignorado: {shap_erro}")
+                    dados_entrada.loc[amostra_topo.index, nome_coluna] = valores_shap[:, self.configuracao.ATRIBUTOS_COMPLETOS.index(atributo)]
+            except Exception:
+                pass
 
             self._exportar_datalake(dados_entrada)
             carga_sucesso = self._exportar_bigquery(dados_entrada)
@@ -374,7 +348,7 @@ class SincronizadorOuro:
             return False
             
         except Exception as erro:
-            logger.error(f"Falha não mapeada na Ouro: {erro}")
+            logger.error(f"Falha na Ouro: {erro}")
             return False
 
 if __name__ == "__main__":
