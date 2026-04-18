@@ -18,19 +18,24 @@ jobs:
       - name: "Instalar Dependencias"
         run: pip install polars h3==3.7.6 requests duckdb boto3 pyarrow
 
-      - name: "Download IBGE (Estrategia de Retry)"
+      - name: "Download IBGE (Estrategia de Retry e SSL Bypass)"
         run: |
           mkdir -p dados_ibge
+          
+          # Funcao para contornar instabilidade (503) e certificados ruins (SSL) do IBGE
           download_ibge() {
-            wget --retry-connrefused --waitretry=15 --read-timeout=30 --timeout=20 --tries=20 -O $1 $2
+            wget --no-check-certificate --retry-connrefused --waitretry=15 --read-timeout=30 --timeout=20 --tries=20 -O $1 $2
             sleep 5
           }
+
           echo "Baixando Malhas Administrativas 2025..."
           download_ibge mun.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_Municipios_2025.zip
           download_ibge rgi.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Imediatas_2025.zip
           download_ibge rint.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Intermediarias_2025.zip
+          
           echo "Baixando Faces de Logradouro 2022..."
           download_ibge faces.zip https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022_censo_demografico/json/SP_faces_de_logradouros_2022_json.zip
+          
           unzip -o mun.zip -d dados_ibge/municipios
           unzip -o rgi.zip -d dados_ibge/imediata
           unzip -o rint.zip -d dados_ibge/intermediaria
