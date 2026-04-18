@@ -1,11 +1,12 @@
-name: 🚀 Enriquecimento e Migração de Malha
+name: 🚀 Enriquecimento e Migração (Malha Geográfica)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Disparo manual pelo botão "Run workflow"
 
 jobs:
-  process-geo:
+  job-enriquecimento:
     runs-on: ubuntu-latest
+    
     env:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -13,16 +14,26 @@ jobs:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Python
+      - name: 📥 Passo 1: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Passo 2: Configurar Ambiente Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install Deps
+      - name: 📦 Passo 3: Instalar Bibliotecas
         run: pip install polars duckdb boto3
 
-      - name: Run Pipeline
+      - name: 🔍 Passo 4: Diagnóstico de Caminhos (Debug)
+        run: |
+          echo "Diretório atual:"
+          pwd
+          echo "Conteúdo da raiz:"
+          ls -F
+          echo "Conteúdo da pasta autobot:"
+          ls -F autobot/ || echo "Pasta autobot não encontrada!"
+
+      - name: 🚀 Passo 5: Executar Script de Enriquecimento
         run: python autobot/enriquece_malha_final.py
