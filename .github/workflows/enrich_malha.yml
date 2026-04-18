@@ -1,18 +1,18 @@
-name: 🚀 Enriquecimento e Migração (Malha Geográfica)
+name:  Enriquecimento e Migração (Malha Geográfica)
 
 on:
-  workflow_dispatch: # Permite a execução manual através do botão "Run workflow"
+  workflow_dispatch:
+
+# Credenciais movidas para o nível global para evitar erros de sintaxe no Job
+env:
+  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
   job-enriquecimento:
     runs-on: ubuntu-latest
-    
-    # Mapeamento dos segredos do repositório para as variáveis de ambiente
-    env:
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
     steps:
       - name: Passo 1: Obter o Código (Checkout)
@@ -27,18 +27,5 @@ jobs:
       - name: Passo 3: Instalar Dependências
         run: pip install polars duckdb boto3
 
-      - name:  Passo 4: Diagnóstico de Diretórios (Prevenção de Erros)
-        run: |
-          echo "=== A VERIFICAR A ESTRUTURA DO REPOSITÓRIO ==="
-          pwd
-          echo "--- Conteúdo da Raiz ---"
-          ls -la
-          echo "--- Conteúdo da pasta 'autobot' (se existir) ---"
-          if [ -d "autobot" ]; then
-            ls -la autobot/
-          else
-            echo "🚨 ALERTA: A pasta 'autobot' não foi encontrada no repositório!"
-          fi
-
-      - name:  Passo 5: Executar o Script de Enriquecimento
+      - name: Passo 4: Executar Script de Enriquecimento e Migração
         run: python autobot/enriquece_malha_final.py
