@@ -26,7 +26,7 @@ jobs:
           wget -O rgi.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Imediatas_2025.zip
           wget -O rint.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Intermediarias_2025.zip
           
-          # Link Corrigido das Faces de Logradouro (Removido o sufixo longo que causou 404)
+          # LINK CORRIGIDO: Removido o sufixo que causava o 404
           wget -O faces.zip https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malhas_territoriais/malhas_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022/json/SP_faces_de_logradouros_2022_json.zip
           
           unzip -o mun.zip -d dados_ibge/municipios
