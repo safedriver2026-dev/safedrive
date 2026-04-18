@@ -1,9 +1,9 @@
 name: Auditoria e Qualidade de Dados (QA)
 
 on:
-  workflow_dispatch: # Permite correr manualmente
+  workflow_dispatch: # Permite execução manual a qualquer momento
   schedule:
-    - cron: '0 0 * * 1' # Corre automaticamente toda segunda-feira à meia-noite
+    - cron: '0 0 * * 1' # Execução automática toda segunda-feira à meia-noite
 
 env:
   R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -28,5 +28,5 @@ jobs:
       - name: Passo 3 - Instalar bibliotecas
         run: pip install polars boto3 pyarrow
 
-      - name: Passo 4 - Executar Auditoria de Sanidade
+      - name: Passo 4 - Executar Auditoria Inteligente
         run: python autobot/auditoria_datalake.py
