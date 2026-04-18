@@ -1,59 +1,28 @@
-name: "Geografia Mestra SP"
+name: "Setup Camada Zero"
 
 on:
-  workflow_dispatch:
-    inputs:
-      reason:
-        description: 'Motivo da execução (ex: Atualização semestral)'
-        required: false
-        default: 'Carga inicial de referência'
-
-env:
-  # Credenciais do Data Lake (R2)
-  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-  
-  # Credenciais do BigQuery
-  BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-  BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
+  workflow_dispatch: 
 
 jobs:
-  gerar_malha_referencia:
-    name: "Processar Malha Rica (BQ -> R2)"
+  build-master-grid:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout do Código
+      - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Configurar Python 3.10
+      - name: Configurar Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-          cache: 'pip'
 
-      - name: Instalar Dependências de Big Data
+      - name: Instalar Dependências
         run: |
-          pip install polars pandas pyarrow h3 \
-                      google-cloud-bigquery db-dtypes \
-                      boto3 botocore
+          pip install polars h3 requests boto3 botocore pyarrow
 
-      - name: Executar Script de Setup
-        run: |
-          # Executa o script que criamos para unir Censo, RAIS e OSM em SP
-          python -m autobot.gerar_referencia
-
-      - name: Finalização
-        if: success()
-        run: |
-          echo "## ✅ Sucesso na Geração da Malha" >> $GITHUB_STEP_SUMMARY
-          echo "A malha mestra equalizada foi salva no R2 em: `referencia/malha_mestra_sp_rica.parquet`" >> $GITHUB_STEP_SUMMARY
-          echo "Este arquivo agora pode ser consumido pelos pipelines mensais." >> $GITHUB_STEP_SUMMARY
-
-      - name: Notificar Falha
-        if: failure()
-        run: |
-          echo "## ❌ Falha no Processamento" >> $GITHUB_STEP_SUMMARY
-          echo "Ocorreu um erro ao processar a malha geográfica. Verifique os logs de execução e as permissões do BigQuery em southamerica-east1." >> $GITHUB_STEP_SUMMARY
+      - name: Gerar e Sincronizar Grid
+        env:
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: python autobot/gerar_camada_zero.py
