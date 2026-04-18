@@ -1,10 +1,9 @@
-import os, h3, polars as pl, duckdb, boto3, io, glob, unicodedata
+import os, h3, polars as pl, duckdb, boto3, io, glob, unicodedata, sys
 from botocore.config import Config
 
 def remover_acentos(texto):
     if texto is None: return None
-    # Normaliza para decompor caracteres acentuados e remove os marks
-    nfkd_form = unicodedata.normalize('NFKD', texto)
+    nfkd_form = unicodedata.normalize('NFKD', str(texto))
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).upper()
 
 def build_malha_mestra():
@@ -20,24 +19,39 @@ def build_malha_mestra():
     con.execute("INSTALL spatial; LOAD spatial;")
 
     try:
-        print("⬢ Lendo Malha Base H3...")
+        print("🔍 --- DEBUG: LISTANDO ESTRUTURA DE ARQUIVOS ---")
+        for root, dirs, files in os.walk("dados_ibge"):
+            level = root.replace("dados_ibge", "").count(os.sep)
+            indent = " " * 4 * (level)
+            print(f"{indent}[{os.path.basename(root)}/]")
+            for f in files:
+                print(f"{indent}    - {f}")
+
+        print("\n⬢ Lendo Malha Base H3 do R2...")
         r2 = boto3.client("s3", **R2_CONF)
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-        # Caminhos dos arquivos extraídos pelo workflow
-        path_mun = "dados_ibge/municipios/SP_Municipios_2025.shp"
-        path_rgi = "dados_ibge/imediata/SP_RG_Imediatas_2025.shp"
-        path_rint = "dados_ibge/intermediaria/SP_RG_Intermediarias_2025.shp"
-        path_faces = glob.glob("dados_ibge/faces/*.json")[0]
+        # Busca recursiva para achar o JSON (o ** procura em subpastas)
+        json_files = glob.glob("dados_ibge/faces/**/*.json", recursive=True)
+        
+        if not json_files:
+            print("🚨 ERRO CRÍTICO: Nenhum arquivo .json encontrado em dados_ibge/faces!")
+            sys.exit(1)
+        
+        path_faces = json_files[0]
+        print(f"🎯 Arquivo de Faces selecionado: {path_faces}")
 
-        print("⚔️ Cruzamento Espacial Múltiplo...")
+        path_mun = glob.glob("dados_ibge/municipios/**/*.shp", recursive=True)[0]
+        path_rgi = glob.glob("dados_ibge/imediata/**/*.shp", recursive=True)[0]
+        path_rint = glob.glob("dados_ibge/intermediaria/**/*.shp", recursive=True)[0]
+
+        print("⚔️ Executando Cruzamento Espacial...")
         df_raw = con.execute(f"""
             SELECT 
                 h.id_h3_h9,
                 CAST(h.lat AS FLOAT) as latitude,
                 CAST(h.lon AS FLOAT) as longitude,
-                CAST(m.CD_MUN AS UINT32) as cidade_id,
                 m.NM_MUN as cidade_nome,
                 rgi.NM_RGI as regiao_imediata,
                 rint.NM_RGINT as regiao_intermediaria,
@@ -52,29 +66,28 @@ def build_malha_mestra():
             QUALIFY ROW_NUMBER() OVER(PARTITION BY h.id_h3_h9 ORDER BY ST_Distance(ST_Point(h.lon, h.lat), f.geom) ASC) = 1
         """).pl()
 
-        print("🔠 Padronizando textos (MAIÚSCULO E SEM ACENTO)...")
-        # Colunas que precisam de limpeza
+        print("🔠 Formatando Textos (MAIÚSCULO E SEM ACENTO)...")
         cols_texto = ["cidade_nome", "regiao_imediata", "regiao_intermediaria", "logradouro", "bairro"]
         
-        # Aplicando a limpeza e convertendo H3 para Inteiro (Baixa Latência)
         df_final = df_raw.with_columns([
             pl.col(c).map_elements(remover_acentos, return_dtype=pl.String) for c in cols_texto
         ]).with_columns([
-            pl.col("id_h3_h9").map_elements(h3.string_to_int, return_dtype=pl.UInt64).alias("id_h3_int"),
-            pl.col("cidade_nome").cast(pl.Categorical)
+            pl.col("id_h3_h9").map_elements(h3.string_to_int, return_dtype=pl.UInt64).alias("id_h3_int")
         ]).drop("id_h3_h9")
 
-        print("💾 Gravando Malha Mestra Consolidada (ZSTD)...")
+        print(f"📊 Preview do documento:\n{df_final.head(3)}")
+
         buffer = io.BytesIO()
-        df_final.write_parquet(buffer, compression="zstd", compression_level=3)
+        df_final.write_parquet(buffer, compression="zstd")
         buffer.seek(0)
-        
         r2.upload_fileobj(buffer, BUCKET, "ouro/malha_mestra_consolidada_2025.parquet")
-        print(f"✅ Sucesso! Malha criada com {len(df_final)} hexágonos.")
+        print("✅ Processo concluído com sucesso!")
 
     except Exception as e:
-        print(f"🚨 Erro no Script: {e}")
-        raise e
+        print(f"🚨 DEBUG DE ERRO DETALHADO:\n{str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     build_malha_mestra()
