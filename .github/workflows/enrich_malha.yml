@@ -26,8 +26,8 @@ jobs:
       - name: Passo 3 - Instalar Dependencias
         run: pip install polars duckdb boto3 pyarrow requests h3
 
-      - name: Passo 4 - Fase 1: Enriquecimento IBGE (Oficial)
+      - name: Passo 4 - Fase 1: Enriquecimento IBGE
         run: python autobot/enriquece_malha_final.py
 
-      - name: Passo 5 - Fase 2: Enriquecimento Total OSM (Topo + Social)
+      - name: Passo 5 - Fase 2: Enriquecimento OSM
         run: python autobot/processa_osm_completo.py
