@@ -1,77 +1,48 @@
-import os, boto3, io, polars as pl, sys, traceback
-from botocore.config import Config
+name: Auditoria de Reconciliação Geográfica
 
-def auditoria_qualidade():
-    R2_CONF = {
-        "endpoint_url": os.getenv("R2_ENDPOINT_URL").strip(),
-        "aws_access_key_id": os.getenv("R2_ACCESS_KEY_ID").strip(),
-        "aws_secret_access_key": os.getenv("R2_SECRET_ACCESS_KEY").strip(),
-        "config": Config(region_name="auto")
-    }
-    BUCKET = os.getenv("R2_BUCKET_NAME").strip()
-    
-    ARQUIVOS = [
-        "malha geografica/malha_mestra_consolidada_2025.parquet",
-        "datalake/bronze/malha_geografica_infraestrutura.parquet"
-    ]
+on:
+  workflow_dispatch:
 
-    try:
-        r2 = boto3.client("s3", **R2_CONF)
-        print("🔍 --- INICIANDO AUDITORIA DE QUALIDADE (DATA QUALITY) ---")
-        
-        falha_critica = False
+env:
+  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
-        for caminho in ARQUIVOS:
-            print(f"\n📄 Analisando: {caminho}")
-            obj = r2.get_object(Bucket=BUCKET, Key=caminho)
-            df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+jobs:
+  auditoria-comparativa:
+    runs-on: ubuntu-latest
 
-            total_linhas = len(df)
-            print(f"📊 Total de registros: {total_linhas}")
+    steps:
+      - name: Passo 1 - Checkout
+        uses: actions/checkout@v4
 
-            # 1. TESTE DE NULOS
-            null_report = df.null_count()
-            for col in df.columns:
-                nulos = null_report[col][0]
-                if nulos > 0:
-                    perc = (nulos / total_linhas) * 100
-                    # Se for setor_id ou id_h3_int com muito nulo, é erro crítico
-                    if perc > 5.0 and col in ['setor_id', 'id_h3_int']:
-                        print(f"   🚨 [CRÍTICO] COLUNA [{col}]: {nulos} nulos ({perc:.2f}%)")
-                        falha_critica = True
-                    else:
-                        print(f"   ⚠️ [AVISO] COLUNA [{col}]: {nulos} nulos ({perc:.2f}%)")
+      - name: Passo 2 - Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-            # 2. TESTE DE UNICIDADE
-            if "id_h3_int" in df.columns:
-                if df["id_h3_int"].n_unique() < total_linhas:
-                    print(f"   🚨 [CRÍTICO] Hexágonos duplicados encontrados!")
-                    falha_critica = True
-                else:
-                    print("   ✅ Integridade H3: Todos os IDs são únicos.")
+      - name: Passo 3 - Instalar Dependências
+        run: pip install polars duckdb boto3 pyarrow
 
-            # 3. TESTE DE COBERTURA DE INFRAESTRUTURA (CORRIGIDO)
-            if "police" in df.columns or "bus_stop" in df.columns:
-                cols_infra = [c for c in df.columns if c not in ["id_h3_int", "bairro", "distrito", "cidade", "cidade_nome"]]
-                
-                # Forma correta de somar tudo no Polars moderno:
-                total_infra = df.select(pl.col(cols_infra).sum()).sum_horizontal().item()
-                
-                if total_infra == 0:
-                    print("   🚨 [CRÍTICO] Nenhuma infraestrutura encontrada (Base zerada)!")
-                    falha_critica = True
-                else:
-                    print(f"   ✅ Cobertura: {total_infra} pontos de interesse detectados.")
+      - name: Passo 4 - Download dos SHP e Parquet (Landing Zone)
+        run: |
+          python -c "
+          import boto3, os
+          s3 = boto3.client('s3', 
+                            endpoint_url=os.getenv('R2_ENDPOINT_URL').strip(), 
+                            aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID').strip(), 
+                            aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY').strip())
+          
+          bucket = os.getenv('R2_BUCKET_NAME').strip()
+          
+          # Baixa a Malha Mestra para comparar
+          s3.download_file(bucket, 'malha geografica/malha_mestra_consolidada_2025.parquet', 'malha_mestra.parquet')
+          
+          # Baixa o Shapefile original (assumindo que você subiu como zip)
+          s3.download_file(bucket, 'malha geografica/setores_ibge_sp.zip', 'setores_originais.zip')
+          "
+          unzip -q setores_originais.zip -d shp_original
 
-        if falha_critica:
-            print("\n❌ AUDITORIA REPROVADA: Corrija os erros críticos (🚨) acima.")
-            sys.exit(1)
-        else:
-            print("\n💎 AUDITORIA APROVADA: Dados prontos para uso.")
-
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
-
-if __name__ == "__main__":
-    auditoria_qualidade()
+      - name: Passo 5 - Executar Auditoria de Confronto
+        run: python autobot/auditoria_comparativa.py
