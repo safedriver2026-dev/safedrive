@@ -1,71 +1,51 @@
-import os, h3, polars as pl, duckdb, boto3, io, glob
-from botocore.config import Config
+name: "02. Build: Malha Mestra Consolidada"
 
-def build_malha_mestra():
-    R2_CONF = {
-        "endpoint_url": os.getenv("R2_ENDPOINT_URL"),
-        "aws_access_key_id": os.getenv("R2_ACCESS_KEY_ID").strip(),
-        "aws_secret_access_key": os.getenv("R2_SECRET_ACCESS_KEY").strip(),
-        "config": Config(region_name="auto")
-    }
-    BUCKET = os.getenv("R2_BUCKET_NAME")
+on:
+  workflow_dispatch:
 
-    con = duckdb.connect()
-    con.execute("INSTALL spatial; LOAD spatial;")
+jobs:
+  build-malha:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v3
 
-    try:
-        print("⬢ Carregando Malha Base...")
-        r2 = boto3.client("s3", **R2_CONF)
-        obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
-        df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-        # Caminhos dos arquivos
-        path_mun = "dados_ibge/municipios/SP_Municipios_2025.shp"
-        path_rgi = "dados_ibge/imediata/SP_RG_Imediatas_2025.shp"
-        path_rint = "dados_ibge/intermediaria/SP_RG_Intermediarias_2025.shp"
-        path_faces = glob.glob("dados_ibge/faces/*.json")[0]
+      - name: 📦 Instalar Dependências
+        run: pip install polars h3==3.7.6 requests duckdb boto3 pyarrow
 
-        print("⚔️ Cruzamento Espacial Múltiplo...")
-        df_raw = con.execute(f"""
-            SELECT 
-                h.id_h3_h9,
-                CAST(h.lat AS FLOAT) as latitude,
-                CAST(h.lon AS FLOAT) as longitude,
-                CAST(m.CD_MUN AS UINT32) as cidade_id,
-                m.NM_MUN as cidade_nome,
-                rgi.NM_RGI as regiao_imediata,
-                rint.NM_RGINT as regiao_intermediaria,
-                f.properties->>'NM_LOGRAD' as logradouro,
-                f.properties->>'NM_BAIRRO' as bairro,
-                CAST(f.properties->>'CD_SETOR' AS UINT64) as setor_id
-            FROM df_hex h
-            JOIN ST_Read('{path_mun}') m ON ST_Within(ST_Point(h.lon, h.lat), m.geom)
-            JOIN ST_Read('{path_rgi}') rgi ON ST_Within(ST_Point(h.lon, h.lat), rgi.geom)
-            JOIN ST_Read('{path_rint}') rint ON ST_Within(ST_Point(h.lon, h.lat), rint.geom)
-            LEFT JOIN ST_Read('{path_faces}') f ON ST_DWithin(ST_Point(h.lon, h.lat), f.geom, 0.0001)
-            QUALIFY ROW_NUMBER() OVER(PARTITION BY h.id_h3_h9 ORDER BY ST_Distance(ST_Point(h.lon, h.lat), f.geom) ASC) = 1
-        """).pl()
+      - name: 🌍 Download IBGE (Resiliente)
+        run: |
+          mkdir -p dados_ibge
+          
+          # Função para download com retry pesado (vence o erro 503)
+          smart_download() {
+            wget --retry-connrefused --waitretry=15 --read-timeout=30 --timeout=20 --tries=20 -O $1 $2 || exit 1
+            sleep 10
+          }
 
-        print("🛠️ Otimizando Tipos de Dados...")
-        # H3 como Inteiro e Categorical para nomes reduzem o uso de RAM em ~70%
-        df_final = df_raw.with_columns([
-            pl.col("id_h3_h9").map_elements(lambda x: h3.string_to_int(x), return_dtype=pl.UInt64).alias("id_h3_int"),
-            pl.col("cidade_nome").cast(pl.Categorical),
-            pl.col("regiao_imediata").cast(pl.Categorical),
-            pl.col("regiao_intermediaria").cast(pl.Categorical)
-        ]).drop("id_h3_h9")
+          echo "🚀 Baixando Malhas 2025..."
+          smart_download mun.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_Municipios_2025.zip
+          smart_download rgi.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Imediatas_2025.zip
+          smart_download rint.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Intermediarias_2025.zip
+          
+          echo "🚀 Baixando Faces de Logradouro 2022..."
+          # Link corrigido sem o sufixo que causa 404
+          smart_download faces.zip https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malhas_territoriais/malhas_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022/json/SP_faces_de_logradouros_2022_json.zip
+          
+          unzip -o mun.zip -d dados_ibge/municipios
+          unzip -o rgi.zip -d dados_ibge/imediata
+          unzip -o rint.zip -d dados_ibge/intermediaria
+          unzip -o faces.zip -d dados_ibge/faces
 
-        print("💾 Gravando Parquet (ZSTD)...")
-        buffer = io.BytesIO()
-        df_final.write_parquet(buffer, compression="zstd", compression_level=3)
-        buffer.seek(0)
-        
-        r2.upload_fileobj(buffer, BUCKET, "ouro/malha_mestra_consolidada_2025.parquet")
-        print("✅ Malha Mestra concluída.")
-
-    except Exception as e:
-        print(f"🚨 Erro: {e}")
-        raise e
-
-if __name__ == "__main__":
-    build_malha_mestra()
+      - name: 🚀 Executar Construção da Malha
+        env:
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: python autobot/setup_malha_mestra.py
