@@ -36,7 +36,7 @@ jobs:
           unzip -o rint.zip -d dados_ibge/intermediaria
           unzip -o faces.zip -d dados_ibge/faces
 
-      - name: 🔍 Debug: Listar pastas extraidas
+      - name: Debug: Listar pastas extraidas
         run: ls -R dados_ibge
 
       - name: Executar Script Python
