@@ -1,67 +1,40 @@
-name: Enriquecimento de Malha Estadual
-
-on:
-  workflow_dispatch:
-
-env:
-  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-
-jobs:
-  processamento-geografico:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Passo 1 - Checkout do código
-        uses: actions/checkout@v4
-
-      - name: Passo 2 - Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Passo 3 - Instalar bibliotecas
-        run: pip install polars duckdb boto3 pyarrow h3 requests
-
-      - name: Passo 4 - Download Inteligente e Resiliente (SP com Fallback Sudeste)
+- name: Passo 4 - Download Inteligente com Fallback e Diagnóstico
         run: |
           python -c "
-          import requests, sys, os
-          def download(url, name):
-              print(f'📡 A tentar descarregar de: {url}')
+          import requests, sys, os, zipfile
+          
+          def validar_e_baixar(url, nome):
+              print(f'📡 Tentando baixar de: {url}')
+              h = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
               try:
-                  # User-Agent para evitar bloqueios de firewall
-                  h = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-                  with requests.get(url, headers=h, stream=True, timeout=60) as r:
-                      if r.status_code == 200:
-                          with open(name, 'wb') as f:
-                              for chunk in r.iter_content(chunk_size=1024*1024): f.write(chunk)
-                          return True
+                  r = requests.get(url, headers=h, stream=True, timeout=60)
+                  with open(nome, 'wb') as f:
+                      for chunk in r.iter_content(chunk_size=1024*1024): f.write(chunk)
+                  
+                  size_kb = os.path.getsize(nome) / 1024
+                  print(f'📊 Tamanho baixado: {size_kb:.2f} KB')
+                  
+                  # Validação Real: É um ZIP e tem um tamanho mínimo (SP tem > 500MB)
+                  if zipfile.is_zipfile(nome) and size_kb > 1000:
+                      print('✅ ZIP válido detectado!')
+                      return True
+                  else:
+                      print('⚠️ Arquivo inválido ou bloqueado pelo servidor.')
+                      return False
               except Exception as e:
-                  print(f'⚠️ Erro na tentativa: {e}')
+                  print(f'❌ Erro na conexão: {e}')
                   return False
-              return False
 
           url_sp = 'https://download.geofabrik.de/south-america/brazil/sao-paulo-latest-free.shp.zip'
           url_sudeste = 'https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.shp.zip'
 
-          if download(url_sp, 'dados_osm.zip'):
-              print('✅ Base de São Paulo obtida com sucesso.')
-          elif download(url_sudeste, 'dados_osm.zip'):
-              print('✅ Base do Sudeste obtida como fallback.')
-          else:
-              print('❌ ERRO: Ambas as fontes falharam ou o servidor bloqueou a ligação.'); sys.exit(1)
+          # TENTATIVA 1: SÃO PAULO
+          if not validar_e_baixar(url_sp, 'dados_osm.zip'):
+              print('🔄 Iniciando Fallback: Tentando região SUDESTE...')
+              # TENTATIVA 2: SUDESTE
+              if not validar_e_baixar(url_sudeste, 'dados_osm.zip'):
+                  print('🚨 [DIAGNÓSTICO] Ambas as fontes falharam. Expondo conteúdo do erro:')
+                  with open('dados_osm.zip', 'r', encoding='utf-8', errors='ignore') as f:
+                      print(f.read()[:1000]) # Mostra os primeiros 1000 caracteres do erro
+                  sys.exit(1)
           "
-
-      - name: Passo 5 - Extração via Sistema (Unzip)
-        run: |
-          echo "📂 A descompactar ficheiros..."
-          unzip -q dados_osm.zip -d temp_estadual
-          rm dados_osm.zip
-          echo "✅ Extração concluída."
-
-      - name: Passo 6 - Processamento e Injeção (Python)
-        run: python autobot/processa_osm_completo.py
