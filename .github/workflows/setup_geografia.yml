@@ -1,86 +1,93 @@
-name: "SafeDriver: Sincronização da Camada Bronze"
+name: "SafeDriver: Sincronização Bronze"
 
 on:
-  schedule:
-    - cron: "0 0 1 * *" # Roda todo dia 1º do mês
-  workflow_dispatch: # Permite rodar manualmente
+  workflow_dispatch: # Execução manual via painel
 
 jobs:
   # ---------------------------------------------------
-  # 1. JOB GEOGRAFIA (IBGE)
+  # JOB 1: GEOGRAFIA (IBGE Municipios + Faces)
   # ---------------------------------------------------
-  sincronizar_geografia:
-    name: "Sincronização: Malha Geográfica"
+  geo_sync:
+    name: "Sincronizar Geografia"
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do Código
-        uses: actions/checkout@v4
-      
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
-          
-      - name: Instalar Dependências
-        run: pip install polars duckdb boto3 h3 requests
-        
-      - name: Executar Ingestão Geográfica
+      - name: Instalar Libs
+        run: pip install polars duckdb boto3 h3
+
+      - name: 📥 Download IBGE (Mun + Faces)
+        run: |
+          mkdir -p temp_ibge
+          wget -qO mun.zip "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2022/UFs/SP/SP_Municipios_2022.zip"
+          wget -qO faces.zip "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_de_setores_censitarios__divisoes_intramunicipais/2022/Faces_de_Logradouros/SP/SP_Faces_de_Logradouros_2022.zip"
+          unzip -q mun.zip -d temp_ibge/mun
+          unzip -q faces.zip -d temp_ibge/faces
+
+      - name: ⚙️ Processar Geografia
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/ingest_geo.py
+        run: python autobot/bronze/malha_geo/ingest_geo.py
 
   # ---------------------------------------------------
-  # 2. JOB INFRAESTRUTURA (OSM)
+  # JOB 2: INFRAESTRUTURA (OSM)
   # ---------------------------------------------------
-  sincronizar_infra:
-    name: "Sincronização: Infraestrutura (OSM)"
+  infra_sync:
+    name: "Sincronizar Infraestrutura"
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do Código
-        uses: actions/checkout@v4
-        
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          
-      - name: Instalar Dependências
-        run: pip install polars duckdb boto3 h3 requests
-        
-      - name: Executar Ingestão de Infraestrutura
+      - name: Instalar Libs
+        run: pip install polars duckdb boto3 h3
+
+      - name: 📥 Download OSM (Geofabrik)
+        run: |
+          mkdir -p temp_osm
+          wget -qO osm_sp.zip "https://download.geofabrik.de/south-america/brazil/sao-paulo-latest-free.shp.zip"
+          # Extraímos apenas as camadas de POIs e Ruas para economizar disco
+          unzip -q osm_sp.zip "gis_osm_pois_free_1.*" "gis_osm_roads_free_1.*" -d temp_osm
+
+      - name: ⚙️ Processar Infraestrutura
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/ingest_infra.py
+        run: python autobot/bronze/malha_geo/ingest_infra.py
 
   # ---------------------------------------------------
-  # 3. JOB POPULAÇÃO (CENSO)
+  # JOB 3: POPULAÇÃO (Censo 2022)
   # ---------------------------------------------------
-  sincronizar_populacao:
-    name: "Sincronização: Populacional (Censo)"
+  pop_sync:
+    name: "Sincronizar População"
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do Código
-        uses: actions/checkout@v4
-        
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          
-      - name: Instalar Dependências
-        run: pip install polars duckdb boto3 h3 requests
-        
-      - name: Executar Ingestão Populacional
+      - name: Instalar Libs
+        run: pip install polars boto3
+
+      - name: 📥 Download Censo (CSV)
+        run: |
+          mkdir -p temp_pop
+          # URL exemplo para os agregados do Censo 2022
+          wget -qO pop.zip "https://ftp.ibge.gov.br/Censo_2022/Agregados_por_Setores_Censitarios_Preliminares/Resultados_Pre-Liminares_Distritos_SP.zip"
+          unzip -q pop.zip -d temp_pop
+
+      - name: ⚙️ Processar População
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/ingest_pop.py
+        run: python autobot/bronze/malha_geo/ingest_pop.py
