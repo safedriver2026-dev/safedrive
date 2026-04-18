@@ -18,27 +18,31 @@ def criar_dim_logradouro():
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
         print("🛣️ Extraindo ruas do OSM...")
+        # Note o uso de tags['name'] para PBF
         df_ruas = con.execute("""
-            SELECT tags['name'] as nome_rua, tags['highway'] as tipo_via,
-                   ST_Y(ST_Centroid(geom)) as lat, ST_X(ST_Centroid(geom)) as lon
+            SELECT 
+                tags['name'] as nome_rua, 
+                tags['highway'] as tipo_via,
+                ST_Y(ST_Centroid(geom)) as lat, 
+                ST_X(ST_Centroid(geom)) as lon
             FROM st_read('sao-paulo-latest.osm.pbf')
             WHERE tags['name'] IS NOT NULL AND tags['highway'] IS NOT NULL
         """).pl()
 
+        print("⬢ Mapeando H3 para Logradouros...")
         dim_logradouros = df_ruas.with_columns(
             pl.struct(["lat", "lon"]).map_elements(
                 lambda x: h3.geo_to_h3(x["lat"], x["lon"], 9), return_dtype=pl.Utf8
             ).alias("id_h3_h9")
         ).select(["id_h3_h9", "nome_rua", "tipo_via"]).unique()
 
-        # Garante que apenas ruas dentro da malha de SP sejam mantidas
         dim_logradouros = dim_logradouros.join(df_hex.select("id_h3_h9"), on="id_h3_h9", how="inner")
 
         buffer = io.BytesIO()
         dim_logradouros.write_parquet(buffer)
         buffer.seek(0)
         r2.upload_fileobj(buffer, BUCKET, "referencia/dim_logradouro.parquet")
-        print(f"✅ Dimensão Logradouro concluída: {len(dim_logradouros)} registos.")
+        print(f"✅ Dimensão Logradouro concluída.")
     except Exception as e:
         print(f"🚨 Erro: {e}")
         raise e
