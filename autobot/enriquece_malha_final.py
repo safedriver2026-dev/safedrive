@@ -1,4 +1,4 @@
-import os, duckdb, polars as pl, boto3, io, unicodedata, sys, traceback, shutil
+import os, duckdb, polars as pl, boto3, io, unicodedata, sys, traceback
 from botocore.config import Config
 
 def remover_acentos(texto):
@@ -7,7 +7,7 @@ def remover_acentos(texto):
     nfkd_form = unicodedata.normalize('NFKD', str(texto))
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).upper().strip()
 
-def pipeline_final():
+def pipeline_migracao_final():
     R2_CONF = {
         "endpoint_url": os.getenv("R2_ENDPOINT_URL"),
         "aws_access_key_id": os.getenv("R2_ACCESS_KEY_ID").strip(),
@@ -16,47 +16,45 @@ def pipeline_final():
     }
     BUCKET = os.getenv("R2_BUCKET_NAME")
     
-    # Caminhos definidos conforme os arquivos subidos
-    PASTA_LOCAL = "dados_ibge/setores"
-    ARQUIVO_SHP = f"{PASTA_LOCAL}/SP_setores_CD2022.shp"
-    
-    ORIGEM_R2 = "ouro/malha_mestra_consolidada_2025.parquet"
-    DESTINO_R2 = "malha geografica/malha_mestra_consolidada_2025.parquet"
+    # Nomes dos ficheiros que carregou no R2
+    PREFIXO_IBGE = "SP_setores_CD2022" 
+    CAMINHO_MALHA_ANTIGA = "ouro/malha_mestra_consolidada_2025.parquet"
+    CAMINHO_MALHA_NOVA = "malha geografica/malha_mestra_consolidada_2025.parquet"
 
     try:
         r2 = boto3.client("s3", **R2_CONF)
-        print("🔍 [LOG PROVA] Iniciando processamento da Malha Geográfica...")
+        print("🔍 [LOG PROVA] Iniciando migração e enriquecimento...")
 
-        # 1. Leitura dos Atributos Locais (Setores 2022)
-        if not os.path.exists(ARQUIVO_SHP):
-            print(f"🚨 [ERRO] Arquivo nao encontrado: {ARQUIVO_SHP}")
-            sys.exit(1)
+        # 1. Download dos ficheiros Shapefile/DBF do R2 para a máquina local do GitHub
+        for extensao in ['shp', 'dbf', 'shx', 'prj', 'cpg']:
+            chave_r2 = f"ouro/{PREFIXO_IBGE}.{extensao}" # Assumindo que os colocou na pasta ouro
+            print(f"📥 Baixando {chave_r2}...")
+            r2.download_file(BUCKET, chave_r2, f"temp_ibge.{extensao}")
 
+        # 2. Extração de Dados com DuckDB
         con = duckdb.connect()
         con.execute("INSTALL spatial; LOAD spatial;")
         
-        print(f"📖 [LOG PROVA] Extraindo NM_BAIRRO e NM_DIST de {ARQUIVO_SHP}...")
-        df_ibge = con.execute(f"""
+        print("📖 [LOG PROVA] Lendo atributos do Censo 2022...")
+        df_ibge = con.execute("""
             SELECT 
                 CAST(CD_SETOR AS VARCHAR) as setor_id,
                 NM_BAIRRO as bairro_raw,
                 NM_DIST as distrito,
                 NM_SUBDIST as subdistrito
-            FROM ST_Read('{ARQUIVO_SHP}')
+            FROM ST_Read('temp_ibge.shp')
         """).pl().unique(subset=["setor_id"])
-        
-        print(f"✅ [LOG PROVA] {len(df_ibge)} setores carregados da base local.")
 
-        # 2. Download da Malha Mestra para Enriquecimento
-        print(f"📥 [LOG PROVA] Buscando malha base em '{ORIGEM_R2}'...")
-        obj = r2.get_object(Bucket=BUCKET, Key=ORIGEM_R2)
+        # 3. Download da Malha Mestra
+        print(f"📥 Baixando malha antiga de '{CAMINHO_MALHA_ANTIGA}'...")
+        obj = r2.get_object(Bucket=BUCKET, Key=CAMINHO_MALHA_ANTIGA)
         df_malha = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
         if "bairro" in df_malha.columns:
             df_malha = df_malha.drop("bairro")
 
-        # 3. Join e Higienização
-        print("🧩 [LOG PROVA] Executando Join e normalizacao de strings...")
+        # 4. Join e Higienização
+        print("🧩 [LOG PROVA] Unificando dados espaciais e nomes de bairros...")
         df_final = df_malha.join(df_ibge, on="setor_id", how="left")
         
         df_final = df_final.with_columns([
@@ -65,26 +63,24 @@ def pipeline_final():
             pl.col("subdistrito").fill_null("NAO MAPEADO").map_elements(remover_acentos, return_dtype=pl.String)
         ]).drop("bairro_raw")
 
-        # 4. Upload para a Nova Pasta e Limpeza da Antiga
-        print(f"💾 [LOG PROVA] Salvando nova malha enriquecida em '{DESTINO_R2}'...")
+        # 5. Upload para a NOVA PASTA e Limpeza
+        print(f"💾 Salvando nova malha em '{CAMINHO_MALHA_NOVA}'...")
         buffer = io.BytesIO()
         df_final.write_parquet(buffer, compression="zstd")
         buffer.seek(0)
-        r2.upload_fileobj(buffer, BUCKET, DESTINO_R2)
+        r2.upload_fileobj(buffer, BUCKET, CAMINHO_MALHA_NOVA)
 
-        print(f"🗑️ [LOG PROVA] Removendo arquivo obsoleto da pasta 'ouro'...")
-        r2.delete_object(Bucket=BUCKET, Key=ORIGEM_R2)
+        print("🧹 [LOG PROVA] Eliminando ficheiros antigos e temporários...")
+        # Apaga a malha antiga e os ficheiros de setores do R2
+        r2.delete_object(Bucket=BUCKET, Key=CAMINHO_MALHA_ANTIGA)
+        for extensao in ['shp', 'dbf', 'shx', 'prj', 'cpg']:
+            r2.delete_object(Bucket=BUCKET, Key=f"ouro/{PREFIXO_IBGE}.{extensao}")
 
-        # 5. Expurgo dos Arquivos Locais
-        if os.path.exists(PASTA_LOCAL):
-            shutil.rmtree(PASTA_LOCAL)
-            print(f"✨ [LOG PROVA] Pasta '{PASTA_LOCAL}' deletada. Ambiente limpo.")
-
-        print("🏆 [LOG PROVA] Enriquecimento e migracao concluidos com sucesso!")
+        print("✨ [LOG PROVA] Sucesso! Malha Geográfica consolidada e pasta 'ouro' limpa.")
 
     except Exception:
         traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
-    pipeline_final()
+    pipeline_migracao_final()
