@@ -1,32 +1,77 @@
-name: Auditoria e Qualidade de Dados (QA)
+import os, boto3, io, polars as pl, sys, traceback
+from botocore.config import Config
 
-on:
-  workflow_dispatch: # Permite execução manual a qualquer momento
-  schedule:
-    - cron: '0 0 * * 1' # Execução automática toda segunda-feira à meia-noite
+def auditoria_qualidade():
+    R2_CONF = {
+        "endpoint_url": os.getenv("R2_ENDPOINT_URL").strip(),
+        "aws_access_key_id": os.getenv("R2_ACCESS_KEY_ID").strip(),
+        "aws_secret_access_key": os.getenv("R2_SECRET_ACCESS_KEY").strip(),
+        "config": Config(region_name="auto")
+    }
+    BUCKET = os.getenv("R2_BUCKET_NAME").strip()
+    
+    ARQUIVOS = [
+        "malha geografica/malha_mestra_consolidada_2025.parquet",
+        "datalake/bronze/malha_geografica_infraestrutura.parquet"
+    ]
 
-env:
-  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+    try:
+        r2 = boto3.client("s3", **R2_CONF)
+        print("🔍 --- INICIANDO AUDITORIA DE QUALIDADE (DATA QUALITY) ---")
+        
+        falha_critica = False
 
-jobs:
-  data-quality-audit:
-    runs-on: ubuntu-latest
+        for caminho in ARQUIVOS:
+            print(f"\n📄 Analisando: {caminho}")
+            obj = r2.get_object(Bucket=BUCKET, Key=caminho)
+            df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-    steps:
-      - name: Passo 1 - Checkout do código
-        uses: actions/checkout@v4
+            total_linhas = len(df)
+            print(f"📊 Total de registros: {total_linhas}")
 
-      - name: Passo 2 - Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
+            # 1. TESTE DE NULOS
+            null_report = df.null_count()
+            for col in df.columns:
+                nulos = null_report[col][0]
+                if nulos > 0:
+                    perc = (nulos / total_linhas) * 100
+                    # Se for setor_id ou id_h3_int com muito nulo, é erro crítico
+                    if perc > 5.0 and col in ['setor_id', 'id_h3_int']:
+                        print(f"   🚨 [CRÍTICO] COLUNA [{col}]: {nulos} nulos ({perc:.2f}%)")
+                        falha_critica = True
+                    else:
+                        print(f"   ⚠️ [AVISO] COLUNA [{col}]: {nulos} nulos ({perc:.2f}%)")
 
-      - name: Passo 3 - Instalar bibliotecas
-        run: pip install polars boto3 pyarrow
+            # 2. TESTE DE UNICIDADE
+            if "id_h3_int" in df.columns:
+                if df["id_h3_int"].n_unique() < total_linhas:
+                    print(f"   🚨 [CRÍTICO] Hexágonos duplicados encontrados!")
+                    falha_critica = True
+                else:
+                    print("   ✅ Integridade H3: Todos os IDs são únicos.")
 
-      - name: Passo 4 - Executar Auditoria Inteligente
-        run: python autobot/auditoria_datalake.py
+            # 3. TESTE DE COBERTURA DE INFRAESTRUTURA (CORRIGIDO)
+            if "police" in df.columns or "bus_stop" in df.columns:
+                cols_infra = [c for c in df.columns if c not in ["id_h3_int", "bairro", "distrito", "cidade", "cidade_nome"]]
+                
+                # Forma correta de somar tudo no Polars moderno:
+                total_infra = df.select(pl.col(cols_infra).sum()).sum_horizontal().item()
+                
+                if total_infra == 0:
+                    print("   🚨 [CRÍTICO] Nenhuma infraestrutura encontrada (Base zerada)!")
+                    falha_critica = True
+                else:
+                    print(f"   ✅ Cobertura: {total_infra} pontos de interesse detectados.")
+
+        if falha_critica:
+            print("\n❌ AUDITORIA REPROVADA: Corrija os erros críticos (🚨) acima.")
+            sys.exit(1)
+        else:
+            print("\n💎 AUDITORIA APROVADA: Dados prontos para uso.")
+
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    auditoria_qualidade()
