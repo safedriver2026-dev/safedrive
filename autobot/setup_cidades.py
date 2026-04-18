@@ -22,8 +22,13 @@ def criar_dim_cidade():
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
+        # A mágica está aqui: d.properties->>'nm_mun'
+        print("⚔️ Executando Join Espacial (Cidades)...")
         dim_cidade = con.execute("""
-            SELECT h.id_h3_h9, d.nm_mun as nome_cidade, d.cd_mun as codigo_ibge_cidade
+            SELECT 
+                h.id_h3_h9, 
+                d.properties->>'nm_mun' as nome_cidade, 
+                d.properties->>'cd_mun' as codigo_ibge_cidade
             FROM df_hex h
             JOIN st_read('municipios.json') d ON ST_Within(ST_Point(h.lon, h.lat), d.geom)
         """).pl()
@@ -32,7 +37,7 @@ def criar_dim_cidade():
         dim_cidade.write_parquet(buffer)
         buffer.seek(0)
         r2.upload_fileobj(buffer, BUCKET, "referencia/dim_cidade.parquet")
-        print(f"✅ Dimensão Cidade concluída: {len(dim_cidade)} registos.")
+        print(f"✅ Dimensão Cidade concluída: {len(dim_cidade)} registros.")
     except Exception as e:
         print(f"🚨 Erro: {e}")
         raise e
