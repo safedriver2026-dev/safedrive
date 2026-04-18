@@ -2,9 +2,12 @@ import os, h3, polars as pl, duckdb, boto3, io
 from botocore.config import Config
 
 def criar_dim_logradouro():
-    R2_URL = os.getenv("R2_ENDPOINT_URL")
-    R2_KEY = os.getenv("R2_ACCESS_KEY_ID")
-    R2_SECRET = os.getenv("R2_SECRET_ACCESS_KEY")
+    R2_CONFIG = {
+        "endpoint_url": os.getenv("R2_ENDPOINT_URL"),
+        "aws_access_key_id": os.getenv("R2_ACCESS_KEY_ID").strip(),
+        "aws_secret_access_key": os.getenv("R2_SECRET_ACCESS_KEY").strip(),
+        "config": Config(region_name="auto")
+    }
     BUCKET = os.getenv("R2_BUCKET_NAME")
 
     con = duckdb.connect()
@@ -12,24 +15,18 @@ def criar_dim_logradouro():
 
     try:
         print("☁️ Carregando Malha Base...")
-        r2 = boto3.client("s3", endpoint_url=R2_URL, aws_access_key_id=R2_KEY.strip(), 
-                          aws_secret_access_key=R2_SECRET.strip(), config=Config(region_name="auto"))
+        r2 = boto3.client("s3", **R2_CONFIG)
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-        print("🛣️ Extraindo ruas do OSM...")
-        # Note o uso de tags['name'] para PBF
+        print("🛣️ Extraindo logradouros do OSM (PBF)...")
         df_ruas = con.execute("""
-            SELECT 
-                tags['name'] as nome_rua, 
-                tags['highway'] as tipo_via,
-                ST_Y(ST_Centroid(geom)) as lat, 
-                ST_X(ST_Centroid(geom)) as lon
+            SELECT tags['name'] as nome_rua, tags['highway'] as tipo_via,
+                   ST_Y(ST_Centroid(geom)) as lat, ST_X(ST_Centroid(geom)) as lon
             FROM st_read('sao-paulo-latest.osm.pbf')
             WHERE tags['name'] IS NOT NULL AND tags['highway'] IS NOT NULL
         """).pl()
 
-        print("⬢ Mapeando H3 para Logradouros...")
         dim_logradouros = df_ruas.with_columns(
             pl.struct(["lat", "lon"]).map_elements(
                 lambda x: h3.geo_to_h3(x["lat"], x["lon"], 9), return_dtype=pl.Utf8
@@ -42,9 +39,10 @@ def criar_dim_logradouro():
         dim_logradouros.write_parquet(buffer)
         buffer.seek(0)
         r2.upload_fileobj(buffer, BUCKET, "referencia/dim_logradouro.parquet")
-        print(f"✅ Dimensão Logradouro concluída.")
+        print("✅ Dimensão Logradouro concluída.")
+
     except Exception as e:
-        print(f"🚨 Erro: {e}")
+        print(f"🚨 Erro em Logradouros: {e}")
         raise e
 
 if __name__ == "__main__":
