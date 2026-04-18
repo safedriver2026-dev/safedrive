@@ -1,10 +1,12 @@
-import os, h3, polars as pl, duckdb, boto3, io, glob, unicodedata, sys
+import os, h3, polars as pl, duckdb, boto3, io, glob, unicodedata, sys, traceback
 from botocore.config import Config
 
 def remover_acentos(texto):
-    if texto is None: return None
+    if texto is None or texto == "": 
+        return "NAO MAPEADO"
+    # Normaliza para decompor caracteres acentuados e remove a acentuação
     nfkd_form = unicodedata.normalize('NFKD', str(texto))
-    return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).upper()
+    return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).upper().strip()
 
 def build_malha_mestra():
     R2_CONF = {
@@ -19,34 +21,33 @@ def build_malha_mestra():
     con.execute("INSTALL spatial; LOAD spatial;")
 
     try:
-        print("🔍 --- DEBUG: LISTANDO ESTRUTURA DE ARQUIVOS ---")
+        print("🔍 --- DEBUG: MAPEANDO ESTRUTURA DE ARQUIVOS ---")
         for root, dirs, files in os.walk("dados_ibge"):
-            level = root.replace("dados_ibge", "").count(os.sep)
-            indent = " " * 4 * (level)
-            print(f"{indent}[{os.path.basename(root)}/]")
             for f in files:
-                print(f"{indent}    - {f}")
+                print(f"📄 Encontrado: {os.path.join(root, f)}")
 
         print("\n⬢ Lendo Malha Base H3 do R2...")
         r2 = boto3.client("s3", **R2_CONF)
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-        # Busca recursiva para achar o JSON (o ** procura em subpastas)
-        json_files = glob.glob("dados_ibge/faces/**/*.json", recursive=True)
-        
-        if not json_files:
-            print("🚨 ERRO CRÍTICO: Nenhum arquivo .json encontrado em dados_ibge/faces!")
-            sys.exit(1)
-        
-        path_faces = json_files[0]
-        print(f"🎯 Arquivo de Faces selecionado: {path_faces}")
+        # Busca recursiva para garantir que achamos os arquivos mesmo em subpastas
+        def find_file(pattern):
+            files = glob.glob(pattern, recursive=True)
+            if not files:
+                print(f"🚨 ERRO: Nenhum arquivo encontrado para o padrao: {pattern}")
+                sys.exit(1)
+            return files[0]
 
-        path_mun = glob.glob("dados_ibge/municipios/**/*.shp", recursive=True)[0]
-        path_rgi = glob.glob("dados_ibge/imediata/**/*.shp", recursive=True)[0]
-        path_rint = glob.glob("dados_ibge/intermediaria/**/*.shp", recursive=True)[0]
+        path_faces = find_file("dados_ibge/faces/**/*.json")
+        path_mun = find_file("dados_ibge/municipios/**/*.shp")
+        path_rgi = find_file("dados_ibge/imediata/**/*.shp")
+        path_rint = find_file("dados_ibge/intermediaria/**/*.shp")
 
-        print("⚔️ Executando Cruzamento Espacial...")
+        print(f"🎯 Arquivos selecionados:\n - Faces: {path_faces}\n - Mun: {path_mun}")
+
+        print("⚔️ Executando Cruzamento Espacial Múltiplo...")
+        # Cruzamos o hexágono com polígonos (Cidades/Regiões) e a rua mais próxima (Faces)
         df_raw = con.execute(f"""
             SELECT 
                 h.id_h3_h9,
@@ -72,20 +73,22 @@ def build_malha_mestra():
         df_final = df_raw.with_columns([
             pl.col(c).map_elements(remover_acentos, return_dtype=pl.String) for c in cols_texto
         ]).with_columns([
-            pl.col("id_h3_h9").map_elements(h3.string_to_int, return_dtype=pl.UInt64).alias("id_h3_int")
+            pl.col("id_h3_h9").map_elements(h3.string_to_int, return_dtype=pl.UInt64).alias("id_h3_int"),
+            pl.col("cidade_nome").cast(pl.Categorical)
         ]).drop("id_h3_h9")
 
-        print(f"📊 Preview do documento:\n{df_final.head(3)}")
+        print(f"📊 Preview do documento Final:\n{df_final.head(3)}")
 
+        print("💾 Gravando Malha Mestra no R2 (Parquet ZSTD)...")
         buffer = io.BytesIO()
-        df_final.write_parquet(buffer, compression="zstd")
+        df_final.write_parquet(buffer, compression="zstd", compression_level=3)
         buffer.seek(0)
         r2.upload_fileobj(buffer, BUCKET, "ouro/malha_mestra_consolidada_2025.parquet")
-        print("✅ Processo concluído com sucesso!")
+        
+        print("✅ Malha Mestra consolidada com sucesso!")
 
-    except Exception as e:
-        print(f"🚨 DEBUG DE ERRO DETALHADO:\n{str(e)}")
-        import traceback
+    except Exception:
+        print("🚨 ERRO DETALHADO NO SCRIPT:")
         traceback.print_exc()
         sys.exit(1)
 
