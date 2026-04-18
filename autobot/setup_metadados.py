@@ -3,7 +3,6 @@ import requests
 import json
 import boto3
 from botocore.config import Config
-import io
 
 def descobrir_metadados():
     R2_URL = os.getenv("R2_ENDPOINT_URL")
@@ -13,36 +12,40 @@ def descobrir_metadados():
 
     try:
         print("\n" + "="*50)
-        print("🔍 ESCANEANDO API DE METADADOS DO IBGE")
+        print("🔍 EXPLORANDO API DE METADADOS DO IBGE")
         print("="*50)
         
-        # Consultando a pesquisa de Malhas (CL)
-        url_meta = "https://apimetadados.ibge.gov.br/api/v1/pesquisas/CL"
+        # Endpoint raiz para listar TODAS as pesquisas disponíveis
+        url_lista_pesquisas = "https://apimetadados.ibge.gov.br/api/v1/pesquisas"
         headers = {"User-Agent": "Mozilla/5.0"}
         
-        response = requests.get(url_meta, headers=headers)
+        print(f"📡 Acessando: {url_lista_pesquisas}")
+        response = requests.get(url_lista_pesquisas, headers=headers)
         response.raise_for_status()
-        dados_brutos = response.json()
+        todas_pesquisas = response.json()
 
         # --- EXIBIÇÃO NA TELA ---
-        print("\n📄 CONTEÚDO DO CATÁLOGO ENCONTRADO:")
-        print(json.dumps(dados_brutos, indent=4, ensure_ascii=False))
-        print("\n" + "="*50)
+        print(f"\n✅ {len(todas_pesquisas)} Pesquisas Encontradas!")
+        print("-" * 50)
+        # Exibe as pesquisas para você identificar a sigla correta no log
+        for p in todas_pesquisas:
+            print(f"Sigla: {p.get('sigla')} | Nome: {p.get('nome')}")
+        print("-" * 50)
         # ------------------------
 
-        print(f"\n☁️ Salvando cópia de segurança no R2: config/catalogo_ibge_bruto.json")
+        print(f"\n☁️ Salvando lista completa no R2: config/lista_pesquisas_ibge.json")
         r2 = boto3.client("s3", endpoint_url=R2_URL, aws_access_key_id=R2_KEY, 
                           aws_secret_access_key=R2_SECRET, config=Config(region_name="auto"))
         
         r2.put_object(
             Bucket=BUCKET, 
-            Key="config/catalogo_ibge_bruto.json",
-            Body=json.dumps(dados_brutos, indent=4, ensure_ascii=False)
+            Key="config/lista_pesquisas_ibge.json",
+            Body=json.dumps(todas_pesquisas, indent=4, ensure_ascii=False)
         )
-        print("✅ Processo concluído com sucesso!")
+        print("✅ Backup salvo no R2.")
 
     except Exception as e:
-        print(f"\n❌ ERRO AO EXTRAIR METADADOS: {e}")
+        print(f"\n❌ ERRO NA EXPLORAÇÃO: {e}")
         raise e
 
 if __name__ == "__main__":
