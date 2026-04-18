@@ -27,8 +27,11 @@ def criar_dim_bairro():
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
+        print("⚔️ Executando Join Espacial (Bairros)...")
         dim_bairro = con.execute("""
-            SELECT h.id_h3_h9, COALESCE(d.nm_dis, d.nm_distrito, 'Desconhecido') as nome_bairro
+            SELECT 
+                h.id_h3_h9, 
+                COALESCE(d.properties->>'nm_dis', d.properties->>'nm_distrito', 'Desconhecido') as nome_bairro
             FROM df_hex h
             JOIN st_read('distritos.json') d ON ST_Within(ST_Point(h.lon, h.lat), d.geom)
         """).pl()
@@ -37,7 +40,7 @@ def criar_dim_bairro():
         dim_bairro.write_parquet(buffer)
         buffer.seek(0)
         r2.upload_fileobj(buffer, BUCKET, "referencia/dim_bairro.parquet")
-        print(f"✅ Dimensão Bairro concluída: {len(dim_bairro)} registos.")
+        print(f"✅ Dimensão Bairro concluída: {len(dim_bairro)} registros.")
     except Exception as e:
         print(f"🚨 Erro: {e}")
         raise e
