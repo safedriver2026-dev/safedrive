@@ -1,34 +1,43 @@
-name: "01. Setup: Malha Mestra"
+name: "02. Build: Malha Mestra Consolidada"
 
-# Permite rodar manualmente pela aba "Actions" do GitHub
 on:
   workflow_dispatch:
 
 jobs:
-  construir-malha:
+  build-malha:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: 📥 Checkout do Código
+      - name: 📥 Checkout
         uses: actions/checkout@v3
 
-      - name: 🐍 Configurar Python 3.10
+      - name: 🐍 Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
       - name: 📦 Instalar Dependências
-        # Instalamos o H3 na versão estável 3.7.6 para evitar erros de compatibilidade
+        run: pip install polars h3==3.7.6 requests duckdb boto3 pyarrow
+
+      - name: 🌍 Download Malhas IBGE 2025 e Faces 2022
         run: |
-          pip install polars h3==3.7.6 requests duckdb boto3 botocore pyarrow
+          mkdir -p dados_ibge
+          # Malhas Administrativas 2025
+          wget -O mun.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_Municipios_2025.zip
+          wget -O rgi.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Imediatas_2025.zip
+          wget -O rint.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Intermediarias_2025.zip
+          
+          # Faces de Logradouro 2022
+          wget -O faces.zip https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malhas_territoriais/malhas_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022_censo_demografico/json/SP_faces_de_logradouros_2022_json.zip
+          
+          unzip -o mun.zip -d dados_ibge/municipios
+          unzip -o rgi.zip -d dados_ibge/imediata
+          unzip -o rint.zip -d dados_ibge/intermediaria
+          unzip -o faces.zip -d dados_ibge/faces
 
       - name: 🚀 Executar Construção da Malha
-        # Passamos as suas chaves do R2 e Discord como variáveis de ambiente
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-          DISCORD_ERRO: ${{ secrets.DISCORD_ERRO }}
-        run: python autobot/setup_malha.py
+        run: python autobot/setup_malha_mestra.py
