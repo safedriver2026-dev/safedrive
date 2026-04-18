@@ -1,7 +1,10 @@
-name: Auditoria de Reconciliação Geográfica
+name: Auditoria de Qualidade Bronze
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Execução manual para conferência rápida
+  workflow_run:
+    workflows: ["Processamento e Organização Bronze"]
+    types: [completed] # Roda automaticamente após o processamento terminar
 
 env:
   R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -10,54 +13,23 @@ env:
   R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
-  auditoria-confronto:
+  qa-audit:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     steps:
-      - name: Passo 1 - Checkout
+      - name: 1. Checkout do código
         uses: actions/checkout@v4
 
-      - name: Passo 2 - Configurar Python
+      - name: 2. Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      - name: Passo 3 - Instalar Dependências
-        run: pip install polars duckdb boto3 pyarrow
-
-      - name: Passo 4 - Download Atômico do Shapefile e Parquet
+      - name: 3. Instalar dependências de Auditoria
         run: |
-          python -c "
-          import boto3, os, sys
-          s3 = boto3.client('s3', 
-                            endpoint_url=os.getenv('R2_ENDPOINT_URL').strip(), 
-                            aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID').strip(), 
-                            aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY').strip())
-          
-          bucket = os.getenv('R2_BUCKET_NAME').strip()
-          pasta_local = 'shp_original'
-          os.makedirs(pasta_local, exist_ok=True)
+          pip install polars boto3 pyarrow
 
-          # Lista exata dos arquivos que você subiu
-          prefixo = 'SP_setores_CD2022'
-          extensoes = ['.shp', '.shx', '.dbf', '.prj', '.cpg']
-          
-          print('📂 Iniciando download dos componentes do Shapefile...')
-          
-          for ext in extensoes:
-              nome_remoto = f'malha geografica/{prefixo}{ext}'
-              nome_local = f'{pasta_local}/{prefixo}{ext}'
-              try:
-                  s3.download_file(bucket, nome_remoto, nome_local)
-                  print(f'✅ Baixado: {nome_remoto}')
-              except Exception as e:
-                  print(f'❌ ERRO CRÍTICO: Não foi possível baixar {nome_remoto}. Erro: {e}')
-                  sys.exit(1) # Para o processo se faltar qualquer peça
-
-          # Baixa a Malha Mestra
-          print('📥 Baixando Malha Mestra para confronto...')
-          s3.download_file(bucket, 'malha geografica/malha_mestra_consolidada_2025.parquet', 'malha_mestra.parquet')
-          "
-
-      - name: Passo 5 - Executar Auditoria de Confronto e Limpeza
-        run: python autobot/auditoria_comparativa.py
+      - name: 4. Executar Auditoria Técnica
+        run: python autobot/auditoria_bronze.py
