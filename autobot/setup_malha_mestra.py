@@ -2,9 +2,9 @@ import os, h3, polars as pl, duckdb, boto3, io, glob, unicodedata, sys, tracebac
 from botocore.config import Config
 
 def remover_acentos(texto):
-    if texto is None or texto == "": 
+    if texto is None or texto == "" or str(texto).upper() == "NAN": 
         return "NAO MAPEADO"
-    # Normaliza para decompor caracteres acentuados e remove a acentuação
+    # Remove acentos e converte para maiúsculo
     nfkd_form = unicodedata.normalize('NFKD', str(texto))
     return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).upper().strip()
 
@@ -31,11 +31,10 @@ def build_malha_mestra():
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-        # Busca recursiva para garantir que achamos os arquivos mesmo em subpastas
         def find_file(pattern):
             files = glob.glob(pattern, recursive=True)
             if not files:
-                print(f"🚨 ERRO: Nenhum arquivo encontrado para o padrao: {pattern}")
+                print(f"🚨 ERRO: Nenhum arquivo encontrado para: {pattern}")
                 sys.exit(1)
             return files[0]
 
@@ -44,10 +43,7 @@ def build_malha_mestra():
         path_rgi = find_file("dados_ibge/imediata/**/*.shp")
         path_rint = find_file("dados_ibge/intermediaria/**/*.shp")
 
-        print(f"🎯 Arquivos selecionados:\n - Faces: {path_faces}\n - Mun: {path_mun}")
-
-        print("⚔️ Executando Cruzamento Espacial Múltiplo...")
-        # Cruzamos o hexágono com polígonos (Cidades/Regiões) e a rua mais próxima (Faces)
+        print("⚔️ Executando Cruzamento Espacial...")
         df_raw = con.execute(f"""
             SELECT 
                 h.id_h3_h9,
@@ -77,18 +73,17 @@ def build_malha_mestra():
             pl.col("cidade_nome").cast(pl.Categorical)
         ]).drop("id_h3_h9")
 
-        print(f"📊 Preview do documento Final:\n{df_final.head(3)}")
+        print(f"📊 Preview:\n{df_final.head(3)}")
 
-        print("💾 Gravando Malha Mestra no R2 (Parquet ZSTD)...")
         buffer = io.BytesIO()
         df_final.write_parquet(buffer, compression="zstd", compression_level=3)
         buffer.seek(0)
         r2.upload_fileobj(buffer, BUCKET, "ouro/malha_mestra_consolidada_2025.parquet")
         
-        print("✅ Malha Mestra consolidada com sucesso!")
+        print("✅ Malha Mestra concluída com sucesso!")
 
     except Exception:
-        print("🚨 ERRO DETALHADO NO SCRIPT:")
+        print("🚨 ERRO DETALHADO:")
         traceback.print_exc()
         sys.exit(1)
 
