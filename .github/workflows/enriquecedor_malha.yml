@@ -26,14 +26,21 @@ jobs:
       - name: Passo 3 - Instalar bibliotecas
         run: pip install polars duckdb boto3 pyarrow h3
 
-      - name: Passo 4 - Download e Extração (Via Sistema)
+      - name: Passo 4 - Download da Landing Zone (R2)
         run: |
-          echo "📥 Baixando base estadual da Geofabrik..."
-          wget -q https://download.geofabrik.de/south-america/brazil/sao-paulo-latest-free.shp.zip -O sp_data.zip
-          echo "unzipping..."
+          # Usamos um script rápido em Python para baixar do SEU R2 para o Runner
+          python -c "
+          import boto3, os
+          s3 = boto3.client('s3', endpoint_url=os.getenv('R2_ENDPOINT_URL'), aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'), aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'))
+          s3.download_file(os.getenv('R2_BUCKET_NAME'), 'raw/sp_referencia.zip', 'sp_data.zip')
+          "
+          echo "✅ Download do R2 concluído."
+
+      - name: Passo 5 - Unzip via Sistema
+        run: |
           unzip -q sp_data.zip -d temp_estadual
           rm sp_data.zip
-          echo "✅ Download e extração concluídos."
+          echo "✅ Extração concluída."
 
-      - name: Passo 5 - Processamento Pesado (Python)
+      - name: Passo 6 - Processamento e Injeção (Python)
         run: python autobot/processa_osm_completo.py
