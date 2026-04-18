@@ -1,28 +1,28 @@
-name: "Setup Camada Zero"
+name: "00. Setup Malha Mestra SP"
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
 
 jobs:
   build-master-grid:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Configurar Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+          cache: 'pip'
 
       - name: Instalar Dependências
-        run: |
-          pip install polars h3 requests boto3 botocore pyarrow
+        run: pip install polars h3 requests duckdb boto3 botocore pyarrow
 
-      - name: Gerar e Sincronizar Grid
+      - name: 📥 Baixar Mapa de SP (Geofabrik)
+        run: wget https://download.geofabrik.de/south-america/brazil/sao-paulo-latest.osm.pbf
+
+      - name: 🛠️ Gerar Malha Mestra Enriquecida
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/gerar_camada_zero.py
+        run: python autobot/setup_malha_mestra.py
