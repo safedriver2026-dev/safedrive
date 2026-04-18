@@ -1,0 +1,32 @@
+name: Auditoria e Qualidade de Dados (QA)
+
+on:
+  workflow_dispatch: # Permite correr manualmente
+  schedule:
+    - cron: '0 0 * * 1' # Corre automaticamente toda segunda-feira à meia-noite
+
+env:
+  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+
+jobs:
+  data-quality-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Passo 1 - Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Passo 2 - Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Passo 3 - Instalar bibliotecas
+        run: pip install polars boto3 pyarrow
+
+      - name: Passo 4 - Executar Auditoria de Sanidade
+        run: python autobot/auditoria_datalake.py
