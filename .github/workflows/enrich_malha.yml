@@ -1,4 +1,4 @@
-name: Enriquecimento e Migracao
+name: Pipeline Geografico e Contextual
 
 on:
   workflow_dispatch:
@@ -10,21 +10,27 @@ env:
   R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
-  job-enriquecimento:
+  construir-e-enriquecer:
     runs-on: ubuntu-latest
 
     steps:
       - name: Passo 1 - Checkout do Codigo
         uses: actions/checkout@v4
 
-      - name: Passo 2 - Configurar Ambiente Python
+      - name: Passo 2 - Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
       - name: Passo 3 - Instalar Dependencias
-        run: pip install polars duckdb boto3
+        run: pip install polars duckdb boto3 pyarrow requests h3
 
-      - name: Passo 4 - Executar Script
+      - name: Passo 4 - Fase 1: Enriquecimento IBGE (Oficial)
         run: python autobot/enriquece_malha_final.py
+
+      - name: Passo 5 - Fase 2: Topologia (Agua e Vias)
+        run: python autobot/enriquece_referencia_osm.py
+        
+      - name: Passo 6 - Fase 3: Enriquecimento Social (OSM)
+        run: python autobot/processa_osm_segregado.py
