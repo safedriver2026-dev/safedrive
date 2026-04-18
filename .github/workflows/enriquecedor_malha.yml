@@ -24,23 +24,16 @@ jobs:
           cache: 'pip'
 
       - name: Passo 3 - Instalar bibliotecas
-        run: pip install polars duckdb boto3 pyarrow h3
+        run: pip install polars duckdb boto3 pyarrow h3 requests
 
-      - name: Passo 4 - Download da Landing Zone (R2)
-        run: |
-          # Usamos um script rápido em Python para baixar do SEU R2 para o Runner
-          python -c "
-          import boto3, os
-          s3 = boto3.client('s3', endpoint_url=os.getenv('R2_ENDPOINT_URL'), aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'), aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'))
-          s3.download_file(os.getenv('R2_BUCKET_NAME'), 'raw/sp_referencia.zip', 'sp_data.zip')
-          "
-          echo "✅ Download do R2 concluído."
+      - name: Passo 4 - Download Inteligente (SP ou Sudeste)
+        run: python autobot/downloader_resiliente.py
 
       - name: Passo 5 - Unzip via Sistema
         run: |
-          unzip -q sp_data.zip -d temp_estadual
-          rm sp_data.zip
+          unzip -q dados_osm.zip -d temp_estadual
+          rm dados_osm.zip
           echo "✅ Extração concluída."
 
-      - name: Passo 6 - Processamento e Injeção (Python)
+      - name: Passo 6 - Processamento e Filtro SP (Python)
         run: python autobot/processa_osm_completo.py
