@@ -1,10 +1,10 @@
-name: "02. Build: Dimensões Geográficas"
+name: "02. Build: Faces de Logradouro (Mega Dimensão)"
 
 on:
   workflow_dispatch:
 
 jobs:
-  construir-dimensoes:
+  processar-faces:
     runs-on: ubuntu-latest
     steps:
       - name: 📥 Checkout
@@ -18,16 +18,16 @@ jobs:
       - name: 📦 Instalar Dependências
         run: pip install polars h3==3.7.6 requests duckdb boto3 botocore pyarrow
 
-      - name: 🌍 Baixar Mapa OSM
-        run: wget -O sao-paulo-latest.osm.pbf https://download.geofabrik.de/south-america/brazil/sao-paulo-latest.osm.pbf
+      - name: 🌍 Baixar Faces de Logradouros (IBGE 2022)
+        # Link direto do servidor FTP para o wget não falhar
+        run: |
+          wget -O SP_faces.zip https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022_censo_demografico/json/SP_faces_de_logradouros_2022_json.zip
+          unzip SP_faces.zip -d faces_data
 
-      - name: 🚀 Executar Dimensões
+      - name: 🚀 Executar Super Ingestão
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: |
-          python autobot/setup_cidades.py
-          python autobot/setup_bairros.py
-          python autobot/setup_logradouros.py
+        run: python autobot/setup_faces.py
