@@ -1,4 +1,4 @@
-name: "00. Setup Geografia Mestra SP"
+name: "Geografia Mestra SP"
 
 on:
   workflow_dispatch:
