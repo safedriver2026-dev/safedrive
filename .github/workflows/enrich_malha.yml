@@ -15,19 +15,19 @@ jobs:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
     steps:
-      - name: 📥 Passo 1: Obter o Código (Checkout)
+      - name: Passo 1: Obter o Código (Checkout)
         uses: actions/checkout@v4
 
-      - name: 🐍 Passo 2: Configurar Ambiente Python
+      - name: Passo 2: Configurar Ambiente Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: 📦 Passo 3: Instalar Dependências
+      - name: Passo 3: Instalar Dependências
         run: pip install polars duckdb boto3
 
-      - name: 🔍 Passo 4: Diagnóstico de Diretórios (Prevenção de Erros)
+      - name:  Passo 4: Diagnóstico de Diretórios (Prevenção de Erros)
         run: |
           echo "=== A VERIFICAR A ESTRUTURA DO REPOSITÓRIO ==="
           pwd
@@ -40,5 +40,5 @@ jobs:
             echo "🚨 ALERTA: A pasta 'autobot' não foi encontrada no repositório!"
           fi
 
-      - name: 🚀 Passo 5: Executar o Script de Enriquecimento
+      - name:  Passo 5: Executar o Script de Enriquecimento
         run: python autobot/enriquece_malha_final.py
