@@ -1,0 +1,53 @@
+name: Reparação de Malha Mestra (Spatial Fix)
+
+on:
+  workflow_dispatch:
+
+env:
+  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+
+jobs:
+  spatial-repair:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Passo 1 - Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Passo 2 - Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Passo 3 - Instalar Dependências
+        run: pip install polars duckdb boto3 pyarrow
+
+      - name: Passo 4 - Download dos Ativos (Malha + SHP)
+        run: |
+          python -c "
+          import boto3, os, sys
+          s3 = boto3.client('s3', 
+                            endpoint_url=os.getenv('R2_ENDPOINT_URL').strip(), 
+                            aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID').strip(), 
+                            aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY').strip())
+          
+          bucket = os.getenv('R2_BUCKET_NAME').strip()
+          os.makedirs('shp_original', exist_ok=True)
+
+          # Download da malha com erro
+          print('📥 Baixando Malha Mestra Corrompida...')
+          s3.download_file(bucket, 'malha geografica/malha_mestra_consolidada_2025.parquet', 'malha_mestra_erro.parquet')
+
+          # Download dos componentes do Shapefile
+          prefixo = 'SP_setores_CD2022'
+          extensoes = ['.shp', '.shx', '.dbf', '.prj', '.cpg']
+          for ext in extensoes:
+              s3.download_file(bucket, f'malha geografica/{prefixo}{ext}', f'shp_original/{prefixo}{ext}')
+              print(f'✅ Baixado: {prefixo}{ext}')
+          "
+
+      - name: Passo 5 - Executar Reparo Espacial
+        run: python autobot/repara_malha_mestra.py
