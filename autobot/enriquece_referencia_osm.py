@@ -20,9 +20,9 @@ def pipeline_osm_datalake():
     }
     BUCKET = os.getenv("R2_BUCKET_NAME")
     
-    # DEFINICAO DE CAMINHOS SEGUINDO A ARQUITETURA DATALAKE
+    # DEFINICAO DOS CAMINHOS COM A NOVA NOMENCLATURA
     CAMINHO_MALHA_BASE = "malha geografica/malha_mestra_consolidada_2025.parquet"
-    CAMINHO_BRONZE_SOCIAL = "datalake/bronze/malha_geografica_social.parquet"
+    CAMINHO_BRONZE_INFRA = "datalake/bronze/malha_geografica_infraestrutura.parquet"
     
     URL_OSM_SP = "https://download.geofabrik.de/south-america/brazil/sao-paulo-latest-free.shp.zip"
     PASTA_TEMP = "temp_osm_dados"
@@ -30,10 +30,9 @@ def pipeline_osm_datalake():
 
     try:
         r2 = boto3.client("s3", **R2_CONF)
-        print("[LOG] Iniciando Processamento para Camada Bronze...")
+        print("[LOG] Iniciando Processamento para Camada Bronze (Infraestrutura)...")
 
-        # 1. DOWNLOAD ROBUSTO (STREAMING PARA DISCO)
-        print("[LOG] Baixando base do OSM para SP...")
+        # 1. DOWNLOAD ROBUSTO
         headers = {'User-Agent': 'Mozilla/5.0'}
         with requests.get(URL_OSM_SP, headers=headers, stream=True) as r:
             r.raise_for_status()
@@ -41,7 +40,7 @@ def pipeline_osm_datalake():
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
         
-        # 2. EXTRACAO SEGREGADA
+        # 2. EXTRACAO
         os.makedirs(PASTA_TEMP, exist_ok=True)
         with zipfile.ZipFile(ARQUIVO_ZIP, 'r') as z:
             alvos = ['gis_osm_places_free_1', 'gis_osm_transport_free_1', 'gis_osm_pois_free_1']
@@ -50,12 +49,10 @@ def pipeline_osm_datalake():
                     z.extract(f, PASTA_TEMP)
         
         os.remove(ARQUIVO_ZIP)
-
         con = duckdb.connect()
         con.execute("INSTALL spatial; LOAD spatial;")
 
         # 3. ATUALIZACAO DA MALHA GEOGRAFICA (BASE)
-        print("[LOG] Lendo Malha Base para Fallback...")
         obj = r2.get_object(Bucket=BUCKET, Key=CAMINHO_MALHA_BASE)
         df_base = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
@@ -73,30 +70,31 @@ def pipeline_osm_datalake():
             .otherwise(pl.col("bairro")).alias("bairro")
         ).drop("osm_bairro")
 
-        # 4. CRIACAO DA MALHA GEOGRAFICA SOCIAL NA BRONZE
-        print("[LOG] Gerando arquivo Social para datalake/bronze...")
-        df_soc = con.execute(f"""
+        # 4. CRIACAO DA MALHA DE INFRAESTRUTURA
+        print("[LOG] Gerando arquivo de Infraestrutura Urbana...")
+        df_inf = con.execute(f"""
             SELECT fclass, ST_Y(geom) as lat, ST_X(geom) as lon FROM ST_Read('{PASTA_TEMP}/gis_osm_transport_free_1.shp') WHERE fclass IN ('bus_stop', 'railway_station')
             UNION ALL
             SELECT fclass, ST_Y(geom) as lat, ST_X(geom) as lon FROM ST_Read('{PASTA_TEMP}/gis_osm_pois_free_1.shp') WHERE fclass IN ('police', 'bank', 'bar', 'hospital', 'fuel')
         """).pl()
         
-        df_social = df_soc.with_columns(
+        df_infra = df_inf.with_columns(
             pl.struct(["lat", "lon"]).map_elements(lambda x: get_h3_int(x["lat"], x["lon"]), return_dtype=pl.UInt64).alias("id_h3_int")
         ).pivot(values="fclass", index="id_h3_int", columns="fclass", aggregate_function="len").fill_null(0)
 
-        # 5. UPLOAD SEGREGADO
-        print("[LOG] Salvando Malha Base...")
+        # 5. UPLOAD
+        # Base atualizada (Bairros corrigidos)
         buf_base = io.BytesIO()
         df_base.write_parquet(buf_base, compression="zstd")
         buf_base.seek(0)
         r2.upload_fileobj(buf_base, BUCKET, CAMINHO_MALHA_BASE)
 
-        print(f"[LOG] Salvando Malha Social em '{CAMINHO_BRONZE_SOCIAL}'...")
-        buf_soc = io.BytesIO()
-        df_social.write_parquet(buf_soc, compression="zstd")
-        buf_soc.seek(0)
-        r2.upload_fileobj(buf_soc, BUCKET, CAMINHO_BRONZE_SOCIAL)
+        # Infraestrutura (Novas features)
+        print(f"[LOG] Salvando Camada de Infraestrutura em '{CAMINHO_BRONZE_INFRA}'...")
+        buf_inf = io.BytesIO()
+        df_infra.write_parquet(buf_inf, compression="zstd")
+        buf_inf.seek(0)
+        r2.upload_fileobj(buf_inf, BUCKET, CAMINHO_BRONZE_INFRA)
 
         # 6. LIMPEZA
         shutil.rmtree(PASTA_TEMP)
