@@ -26,8 +26,5 @@ jobs:
       - name: Instalar bibliotecas
         run: pip install polars duckdb boto3 pyarrow requests h3
 
-      - name: Fase 1 - Enriquecimento IBGE
-        run: python autobot/enriquece_malha_final.py
-
       - name: Fase 2 - Enriquecimento OSM Total
         run: python autobot/processa_osm_completo.py
