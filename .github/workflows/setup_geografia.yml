@@ -1,23 +1,29 @@
 name: "01. Setup: Malha Mestra"
 
+# Permite rodar manualmente pela aba "Actions" do GitHub
 on:
   workflow_dispatch:
 
 jobs:
-  construir-esqueleto:
+  construir-malha:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v3
+      - name: 📥 Checkout do Código
+        uses: actions/checkout@v3
 
-      - name: Setup Python
+      - name: 🐍 Configurar Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Instalar Dependências
-        run: pip install polars h3==3.7.6 requests duckdb boto3 botocore pyarrow
+      - name: 📦 Instalar Dependências
+        # Instalamos o H3 na versão estável 3.7.6 para evitar erros de compatibilidade
+        run: |
+          pip install polars h3==3.7.6 requests duckdb boto3 botocore pyarrow
 
-      - name: 🛠️ Gerar Malha
+      - name: 🚀 Executar Construção da Malha
+        # Passamos as suas chaves do R2 e Discord como variáveis de ambiente
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
