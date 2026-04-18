@@ -18,34 +18,24 @@ jobs:
       - name: 📦 Instalar Dependências
         run: pip install polars h3==3.7.6 requests duckdb boto3 pyarrow
 
-      - name: 🌍 Download Malhas IBGE 2025 e Faces 2022 (Resiliente)
+      - name: 🌍 Download IBGE (Caminho Verificado)
         run: |
           mkdir -p dados_ibge
           
-          # Função para download com retry e timeout para evitar o 503
-          download_ibge() {
-            wget --retry-connrefused --waitretry=10 --read-timeout=20 --timeout=15 --tries=15 -O $1 $2
-            sleep 5 # Pausa para o servidor do IBGE respirar
-          }
-
-          echo "🚀 Baixando Municípios..."
-          download_ibge mun.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_Municipios_2025.zip
+          # Links 2025 (Municipios e Regiões)
+          wget -O mun.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_Municipios_2025.zip
+          wget -O rgi.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Imediatas_2025.zip
+          wget -O rint.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Intermediarias_2025.zip
           
-          echo "🚀 Baixando Regiões Imediatas..."
-          download_ibge rgi.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Imediatas_2025.zip
-          
-          echo "🚀 Baixando Regiões Intermediárias..."
-          download_ibge rint.zip https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2025/UFs/SP/SP_RG_Intermediarias_2025.zip
-          
-          echo "🚀 Baixando Faces de Logradouro..."
-          download_ibge faces.zip https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malhas_territoriais/malhas_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022/json/SP_faces_de_logradouros_2022_json.zip
+          # LINK DAS FACES (Caminho exato do seu print)
+          wget -O faces.zip https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022_censo_demografico/json/SP_faces_de_logradouros_2022_json.zip
           
           unzip -o mun.zip -d dados_ibge/municipios
           unzip -o rgi.zip -d dados_ibge/imediata
           unzip -o rint.zip -d dados_ibge/intermediaria
           unzip -o faces.zip -d dados_ibge/faces
 
-      - name: 🚀 Executar Construção da Malha
+      - name: 🚀 Construir Malha Mestra
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
