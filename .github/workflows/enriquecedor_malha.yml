@@ -1,7 +1,7 @@
 name: Processamento e Organização Bronze
 
 on:
-  workflow_dispatch: # Disparo manual pelo painel Actions
+  workflow_dispatch: # Permite execução manual pelo console do GitHub
 
 env:
   R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -12,72 +12,61 @@ env:
 jobs:
   build-bronze:
     runs-on: ubuntu-latest
+    timeout-minutes: 60 # Garante tempo suficiente para o processamento pesado
 
     steps:
-      - name: Passo 1 - Checkout do Código
+      - name: Passo 1 - Checkout do Repositório
         uses: actions/checkout@v4
 
-      - name: Passo 2 - Configurar Ambiente Python
+      - name: Passo 2 - Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Passo 3 - Instalar Dependências de Engenharia
+      - name: Passo 3 - Instalar Bibliotecas Necessárias
         run: |
           pip install polars duckdb boto3 pyarrow h3 requests
 
-      - name: Passo 4 - Download Resiliente (SP com Fallback Sudeste e Validação)
+      - name: Passo 4 - Download Resiliente do OSM (SP/Sudeste)
         run: |
           python -c "
           import requests, sys, os, zipfile
 
-          def baixar_e_validar(url, nome):
-              print(f'📡 Tentando download: {url}')
-              headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+          def baixar(url, nome):
+              print(f'📡 Conectando a: {url}')
+              headers = {'User-Agent': 'Mozilla/5.0'}
               try:
                   with requests.get(url, headers=headers, stream=True, timeout=120) as r:
                       r.raise_for_status()
                       with open(nome, 'wb') as f:
-                          for chunk in r.iter_content(chunk_size=1024*1024):
-                              f.write(chunk)
+                          for chunk in r.iter_content(chunk_size=1024*1024): f.write(chunk)
                   
                   tamanho_mb = os.path.getsize(nome) / (1024*1024)
-                  print(f'📊 Arquivo baixado: {tamanho_mb:.2f} MB')
-
-                  # Validação: SP tem ~550MB, Sudeste ~1.2GB. 
-                  # Se for menor que 50MB ou não for um ZIP válido, é erro do servidor.
                   if tamanho_mb > 50 and zipfile.is_zipfile(nome):
-                      print(f'✅ Arquivo {nome} validado com sucesso!')
+                      print(f'✅ Download concluído: {tamanho_mb:.2f} MB')
                       return True
-                  else:
-                      print('⚠️  Arquivo inválido (tamanho insuficiente ou erro de assinatura).')
-                      return False
+                  return False
               except Exception as e:
-                  print(f'❌ Erro na conexão: {e}')
+                  print(f'⚠️ Erro: {e}')
                   return False
 
           url_sp = 'https://download.geofabrik.de/south-america/brazil/sao-paulo-latest-free.shp.zip'
-          url_sudeste = 'https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.shp.zip'
+          url_se = 'https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.shp.zip'
 
-          # Tenta SP, se falhar, tenta Sudeste (Regional)
-          if not baixar_e_validar(url_sp, 'dados_osm.zip'):
-              print('🔄 Iniciando Fallback: Tentando base regional SUDESTE...')
-              if not baixar_e_validar(url_sudeste, 'dados_osm.zip'):
-                  print('🚨 [FALHA TOTAL] Ambas as fontes falharam. Verificando log de erro:')
-                  try:
-                      with open('dados_osm.zip', 'r', errors='ignore') as f:
-                          print(f.read()[:500])
-                  except: pass
+          if not baixar(url_sp, 'dados_osm.zip'):
+              print('🔄 Tentando Fallback para base regional Sudeste...')
+              if not baixar(url_se, 'dados_osm.zip'):
+                  print('🚨 Erro crítico: Fontes Geofabrik indisponíveis.')
                   sys.exit(1)
           "
 
-      - name: Passo 5 - Extração dos Shapefiles
+      - name: Passo 5 - Extração e Limpeza de Temporários
         run: |
-          echo "📂 Extraindo dados do OSM..."
+          echo "📂 Extraindo Shapefiles..."
           unzip -q dados_osm.zip -d temp_estadual
           rm dados_osm.zip
-          echo "✅ Extração concluída na pasta temp_estadual."
+          echo "✅ Arquivos extraídos com sucesso."
 
-      - name: Passo 6 - Executar Enriquecimento e Organização Bronze
+      - name: Passo 6 - Executar Organização Bronze e Inspeção de Dados
         run: python autobot/organiza_bronze.py
