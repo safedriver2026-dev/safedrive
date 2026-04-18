@@ -16,14 +16,14 @@ def build_malha_mestra():
     }
     BUCKET = os.getenv("R2_BUCKET_NAME")
 
-    # 1. Defesas Extremas para GitHub Actions
+    # Defesas Extremas para GitHub Actions
     if not os.path.exists('duckdb_temp'):
         os.makedirs('duckdb_temp')
         
     con = duckdb.connect()
-    con.execute("PRAGMA temp_directory='duckdb_temp'") # Força usar uma pasta controlada
+    con.execute("PRAGMA temp_directory='duckdb_temp'")
     con.execute("PRAGMA memory_limit='6GB'")
-    con.execute("PRAGMA threads=2") # Limita threads para evitar picos de memória
+    con.execute("PRAGMA threads=2")
     con.execute("INSTALL spatial; LOAD spatial;")
 
     try:
@@ -52,7 +52,6 @@ def build_malha_mestra():
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-        # 2. Estratégia Micro-Lotes (50k) para poupar disco/memória
         lote_tamanho = 50000
         total_linhas = len(df_hex)
         resultados = []
@@ -82,12 +81,13 @@ def build_malha_mestra():
             """)
             
             # PASSO B: Join Pesado Isolado (Faces de Logradouro)
+            # CORREÇÃO: f.CD_SETOR mantido como string, sem CAST para UINT64
             lote_raw = con.execute("""
                 SELECT 
                     a.*,
                     CONCAT_WS(' ', f.NM_TIP_LOG, f.NM_TIT_LOG, f.NM_LOG) as logradouro,
                     'NAO MAPEADO' as bairro,
-                    CAST(f.CD_SETOR AS UINT64) as setor_id
+                    f.CD_SETOR as setor_id
                 FROM lote_admin a
                 LEFT JOIN tb_faces f ON ST_DWithin(ST_Point(a.longitude, a.latitude), f.geom, 0.0001)
                 QUALIFY ROW_NUMBER() OVER(PARTITION BY a.id_h3_h9 ORDER BY ST_Distance(ST_Point(a.longitude, a.latitude), f.geom) ASC) = 1
@@ -95,7 +95,6 @@ def build_malha_mestra():
             
             resultados.append(lote_raw)
             
-            # Limpeza cirúrgica da memória após cada lote
             con.execute("DROP TABLE lote_admin")
             con.unregister("tb_lote_hex")
 
@@ -109,6 +108,8 @@ def build_malha_mestra():
             pl.col("id_h3_h9").map_elements(h3.string_to_int, return_dtype=pl.UInt64).alias("id_h3_int"),
             pl.col("cidade_nome").cast(pl.Categorical)
         ]).drop("id_h3_h9")
+
+        print(f"📊 Preview Final:\n{df_final.head(5)}")
 
         print("💾 Gravando Malha Mestra no R2 (Parquet ZSTD)...")
         buffer = io.BytesIO()
