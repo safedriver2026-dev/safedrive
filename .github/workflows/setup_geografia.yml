@@ -1,28 +1,23 @@
-name: "Malha Geográfica"
+name: "01. Setup: Malha Mestra"
 
 on:
   workflow_dispatch:
 
 jobs:
-  construir-malha-base:
+  construir-esqueleto:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do Código
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Configurar Ambiente Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
       - name: Instalar Dependências
-        # 🚨 CONGELAMENTO DE VERSÃO AQUI (h3==3.7.6) 🚨
         run: pip install polars h3==3.7.6 requests duckdb boto3 botocore pyarrow
 
-      - name: 📥 Baixar Malha Viária (OSM São Paulo)
-        run: wget -O sao-paulo-latest.osm.pbf https://download.openstreetmap.fr/extracts/south-america/brazil/southeast/sao-paulo-latest.osm.pbf
-
-      - name: 🛠️ Executar Processamento da Malha
+      - name: 🛠️ Gerar Malha
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
