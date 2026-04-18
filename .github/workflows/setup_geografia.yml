@@ -1,25 +1,31 @@
-name: "SafeDriver: Bronze Layer Sync"
+name: "SafeDriver: Sincronização da Camada Bronze"
 
 on:
   schedule:
     - cron: "0 0 1 * *" # Roda todo dia 1º do mês
-  workflow_dispatch: # Permite rodar manualmente cada Job
+  workflow_dispatch: # Permite rodar manualmente
 
 jobs:
-  # 1. JOB GEOGRAFIA
-  geo_sync:
-    name: "Sync: Malha Geográfica"
+  # ---------------------------------------------------
+  # 1. JOB GEOGRAFIA (IBGE)
+  # ---------------------------------------------------
+  sincronizar_geografia:
+    name: "Sincronização: Malha Geográfica"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Python
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+      
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-      - name: Install Dependencies
+          
+      - name: Instalar Dependências
         run: pip install polars duckdb boto3 h3 requests
-      - name: Run Geo Pipeline
+        
+      - name: Executar Ingestão Geográfica
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -27,19 +33,25 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: python autobot/ingest_geo.py
 
-  # 2. JOB INFRAESTRUTURA
-  infra_sync:
-    name: "Sync: Infraestrutura (OSM)"
+  # ---------------------------------------------------
+  # 2. JOB INFRAESTRUTURA (OSM)
+  # ---------------------------------------------------
+  sincronizar_infra:
+    name: "Sincronização: Infraestrutura (OSM)"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Python
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+        
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install Dependencies
+          
+      - name: Instalar Dependências
         run: pip install polars duckdb boto3 h3 requests
-      - name: Run Infra Pipeline
+        
+      - name: Executar Ingestão de Infraestrutura
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -47,38 +59,28 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: python autobot/ingest_infra.py
 
-  # 3. JOB POPULACIONAL
-  pop_sync:
-    name: "Sync: Populacional (Censo)"
+  # ---------------------------------------------------
+  # 3. JOB POPULAÇÃO (CENSO)
+  # ---------------------------------------------------
+  sincronizar_populacao:
+    name: "Sincronização: Populacional (Censo)"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Python
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+        
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install Dependencies
+          
+      - name: Instalar Dependências
         run: pip install polars duckdb boto3 h3 requests
-      - name: Run Pop Pipeline
+        
+      - name: Executar Ingestão Populacional
         env:
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: python autobot/ingest_pop.py
-
-  # 4. AUDITORIA FINAL (Só roda se os outros passarem ou você pode forçar)
-  audit_bronze:
-    name: "Audit: Camada Bronze"
-    needs: [geo_sync, infra_sync, pop_sync] # Espera os 3 terminarem
-    if: always() # Roda mesmo se um falhar para te dar o relatório do que quebrou
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Auditor
-        env:
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/audit_bronze.py
