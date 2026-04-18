@@ -34,19 +34,15 @@ def build_malha_mestra():
             "faces": find_file("dados_ibge/faces/**/*.json")
         }
 
-        print("\n📋 --- INSPECAO DE CABECALHOS (SCHEMA) ---")
-        for nome, path in paths.items():
-            print(f"\n--- Estrutura de: {nome.upper()} ---")
-            header = con.execute(f"DESCRIBE SELECT * FROM ST_Read('{path}') LIMIT 0").pl()
-            print(header.select(["column_name", "column_type"]))
-
         print("\n⬢ Lendo Malha Base H3 do R2...")
         r2 = boto3.client("s3", **R2_CONF)
         obj = r2.get_object(Bucket=BUCKET, Key="referencia/dim_hex_sp.parquet")
         df_hex = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-        print("\n⚔️ Executando Cruzamento Espacial...")
-        # Ajustado: Removido 'properties->>' pois o DuckDB achata o JSON automaticamente
+        print("\n⚔️ Executando Cruzamento Espacial com novo Schema...")
+        # Correções:
+        # 1. CONCAT_WS ignora valores nulos automaticamente na hora de colar os textos
+        # 2. 'NAO MAPEADO' para o bairro, já que o IBGE removeu essa coluna das Faces 2022
         df_raw = con.execute(f"""
             SELECT 
                 h.id_h3_h9,
@@ -55,8 +51,8 @@ def build_malha_mestra():
                 m.NM_MUN as cidade_nome,
                 rgi.NM_RGI as regiao_imediata,
                 rint.NM_RGINT as regiao_intermediaria,
-                f.NM_LOGRAD as logradouro,
-                f.NM_BAIRRO as bairro,
+                CONCAT_WS(' ', f.NM_TIP_LOG, f.NM_TIT_LOG, f.NM_LOG) as logradouro,
+                'NAO MAPEADO' as bairro,
                 CAST(f.CD_SETOR AS UINT64) as setor_id
             FROM df_hex h
             JOIN ST_Read('{paths['municipios']}') m ON ST_Within(ST_Point(h.lon, h.lat), m.geom)
