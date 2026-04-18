@@ -1,67 +1,72 @@
-import os, duckdb, polars as pl, sys, traceback, shutil
+import os, duckdb, polars as pl, sys, traceback
 
-def auditoria_confronto():
-    print("🕵️ --- INICIANDO AUDITORIA DE RECONCILIAÇÃO (SHP vs PARQUET) ---")
+def auditoria_detalhada_shp():
+    print("🕵️ --- INICIANDO INSPEÇÃO PROFUNDA DE METADADOS (SHP) ---")
     PASTA_SHP = 'shp_original'
-    ARQUIVO_SHP = f'{PASTA_SHP}/SP_setores_CD2022.shp'
-    ARQUIVO_PARQUET = 'malha_mestra.parquet'
+    ARQUIVO_SHP = f'{PASTA_DADOS}/SP_setores_CD2022.shp' if 'PASTA_DADOS' in locals() else f'{PASTA_SHP}/SP_setores_CD2022.shp'
 
     try:
         con = duckdb.connect()
         con.execute("INSTALL spatial; LOAD spatial;")
 
-        # 1. VALIDAR LEITURA DO SHAPEFILE (Precisa de todos os arquivos na pasta)
-        print("[LOG] Validando integridade do Shapefile original...")
-        # ST_Read falha se o .dbf ou .shx estiverem corrompidos
+        # 1. INSPEÇÃO TÉCNICA DO SHAPEFILE
+        print(f"\n📂 [CAMADA: SHAPEFILE ORIGINAL]")
         con.execute(f"CREATE VIEW v_shp AS SELECT * FROM ST_Read('{ARQUIVO_SHP}')")
         
-        info_shp = con.execute("SELECT COUNT(*), COUNT(DISTINCT CD_SETOR) FROM v_shp").fetchone()
-        total_shp = info_shp[0]
-        distintos_shp = info_shp[1]
+        # Extrair Esquema (DNA das colunas)
+        esquema_shp = con.execute("DESCRIBE v_shp").pl()
+        print("📋 Esquema de Colunas (Tipos de Dados):")
+        print(esquema_shp)
 
-        # 2. CARREGAR PARQUET
-        print("[LOG] Lendo Malha Mestra do Data Lake...")
-        df_p = pl.read_parquet(ARQUIVO_PARQUET)
-        con.register("v_parquet", df_p)
+        # Amostra de Dados (Ver como o ID está escrito)
+        print("\n👀 Amostra dos primeiros 5 registros do SHP:")
+        amostra_shp = con.execute("SELECT * FROM v_shp LIMIT 5").pl()
+        print(amostra_shp)
 
-        # 3. CONFRONTO DE DADOS
-        nulls_parquet = df_p.select(pl.col("setor_id").null_count()).item()
+        # 2. INSPEÇÃO DA MALHA MESTRA (PARQUET)
+        print(f"\n📂 [CAMADA: MALHA MESTRA PARQUET]")
+        df_p = pl.read_parquet('malha_mestra.parquet')
         
-        print(f"\n📊 --- RESULTADOS DA AUDITORIA ---")
-        print(f"✅ Shapefile Original: {total_shp} setores encontrados.")
-        print(f"✅ Setores Únicos no SHP: {distintos_shp}")
-        print(f"⚠️ Nulos na Malha Mestra (setor_id): {nulls_parquet}")
+        print("📋 Esquema de Colunas (Parquet):")
+        print(df_p.schema)
 
-        # 4. TESTE DE JOIN (A PROVA REAL)
-        # Verificamos se o ID do SHP (CD_SETOR) bate com o setor_id do Parquet
-        match_count = con.execute("""
+        print("\n👀 Amostra dos registros do Parquet (setor_id):")
+        # Mostramos os que NÃO são nulos (se houver) ou apenas os primeiros
+        print(df_p.select(["id_h3_int", "setor_id", "bairro"]).head(5))
+
+        # 3. ANÁLISE DE CAUSA RAIZ
+        print("\n🧠 [ANÁLISE DE CAUSA RAIZ]")
+        
+        # Teste 1: Contagem de caracteres no SHP
+        # Geralmente CD_SETOR do IBGE tem 15 caracteres
+        tamanho_id_shp = con.execute("""
+            SELECT length(CD_SETOR::VARCHAR) as len, COUNT(*) 
+            FROM v_shp 
+            GROUP BY len
+        """).pl()
+        print("📏 Tamanho dos IDs no SHP (esperado: 15):")
+        print(tamanho_id_shp)
+
+        # Teste 2: Verificar se existem zeros à esquerda que sumiram
+        zeros_esquerda = con.execute("""
             SELECT COUNT(*) 
-            FROM v_shp s 
-            INNER JOIN v_parquet p ON s.CD_SETOR::VARCHAR = p.setor_id::VARCHAR
+            FROM v_shp 
+            WHERE CD_SETOR::VARCHAR LIKE '0%'
         """).fetchone()[0]
+        print(f"🔢 IDs que começam com zero no SHP: {zeros_esquerda}")
 
-        print(f"🔗 Cruzamento de chaves: {match_count} registros encontrados em ambos.")
+        # Teste 3: Por que o Parquet está 100% nulo?
+        # Vamos ver se a coluna existe mas tem outro nome
+        print(f"❓ Colunas disponíveis no Parquet: {df_p.columns}")
 
-        # Lógica de Decisão para Limpeza
-        if match_count > 0 and nulls_parquet < (len(df_p) * 0.1): # Se bater e tiver menos de 10% de erro
-            print("\n✅ AUDITORIA SUCESSO: Os dados foram reconciliados. Iniciando limpeza...")
-            # SÓ DELETA SE TUDO ESTIVER OK
-            if os.path.exists(PASTA_SHP): shutil.rmtree(PASTA_SHP)
-            if os.path.exists(ARQUIVO_PARQUET): os.remove(ARQUIVO_PARQUET)
-            print("🧹 Limpeza concluída.")
-        else:
-            print("\n🚨 FALHA NA RECONCILIAÇÃO!")
-            if match_count == 0:
-                print("👉 Causa: O setor_id no Parquet não tem correspondência no SHP original. Verifique se houve perda de zeros à esquerda.")
-            if nulls_parquet > 0:
-                print(f"👉 Causa: Existem {nulls_parquet} registros órfãos na malha.")
-            
-            print("📂 Arquivos mantidos para debug manual.")
-            sys.exit(1)
+        print("\n--- FIM DA INSPEÇÃO ---")
+        
+        # Não deletamos nada agora para você poder ler o log
+        sys.exit(1) 
 
     except Exception:
         traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
-    auditoria_confronto()
+    auditoria_detalhada_shp()
