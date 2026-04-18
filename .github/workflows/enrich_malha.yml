@@ -1,10 +1,10 @@
-name: 🚀 Enriquecer Malha (Bairros/Distritos)
+name: 🚀 Enriquecimento e Migração de Malha
 
 on:
-  workflow_dispatch: # Permite rodar manualmente
+  workflow_dispatch:
 
 jobs:
-  enrich:
+  process-geo:
     runs-on: ubuntu-latest
     env:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -22,7 +22,7 @@ jobs:
           cache: 'pip'
 
       - name: Install Deps
-        run: pip install polars duckdb boto3 requests
+        run: pip install polars duckdb boto3
 
-      - name: Run Enrichment
-        run: python autobot/enriquece_malha_ibge.py
+      - name: Run Pipeline
+        run: python autobot/enriquece_malha_final.py
