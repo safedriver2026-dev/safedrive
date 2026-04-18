@@ -29,8 +29,5 @@ jobs:
       - name: Passo 4 - Fase 1: Enriquecimento IBGE (Oficial)
         run: python autobot/enriquece_malha_final.py
 
-      - name: Passo 5 - Fase 2: Topologia (Agua e Vias)
-        run: python autobot/enriquece_referencia_osm.py
-        
-      - name: Passo 6 - Fase 3: Enriquecimento Social (OSM)
-        run: python autobot/processa_osm_segregado.py
+      - name: Passo 5 - Fase 2: Enriquecimento Total OSM (Topo + Social)
+        run: python autobot/processa_osm_completo.py
