@@ -1,72 +1,49 @@
-import os, duckdb, polars as pl, sys, traceback
+import polars as pl
+import os, boto3, io, sys
+from botocore.config import Config
 
-def auditoria_detalhada_shp():
-    print("🕵️ --- INICIANDO INSPEÇÃO PROFUNDA DE METADADOS (SHP) ---")
-    PASTA_SHP = 'shp_original'
-    ARQUIVO_SHP = f'{PASTA_DADOS}/SP_setores_CD2022.shp' if 'PASTA_DADOS' in locals() else f'{PASTA_SHP}/SP_setores_CD2022.shp'
+def amostra_tabela_final():
+    # Configuração de Acesso (R2)
+    R2_CONF = {
+        "endpoint_url": os.getenv("R2_ENDPOINT_URL").strip(),
+        "aws_access_key_id": os.getenv("R2_ACCESS_KEY_ID").strip(),
+        "aws_secret_access_key": os.getenv("R2_SECRET_ACCESS_KEY").strip(),
+        "config": Config(region_name="auto")
+    }
+    BUCKET = os.getenv("R2_BUCKET_NAME").strip()
+    CAMINHO = "malha geografica/malha_mestra_consolidada_2025.parquet"
 
     try:
-        con = duckdb.connect()
-        con.execute("INSTALL spatial; LOAD spatial;")
-
-        # 1. INSPEÇÃO TÉCNICA DO SHAPEFILE
-        print(f"\n📂 [CAMADA: SHAPEFILE ORIGINAL]")
-        con.execute(f"CREATE VIEW v_shp AS SELECT * FROM ST_Read('{ARQUIVO_SHP}')")
+        r2 = boto3.client("s3", **R2_CONF)
+        print(f"📥 Baixando amostra de: {CAMINHO}...")
         
-        # Extrair Esquema (DNA das colunas)
-        esquema_shp = con.execute("DESCRIBE v_shp").pl()
-        print("📋 Esquema de Colunas (Tipos de Dados):")
-        print(esquema_shp)
+        # Lendo o arquivo
+        obj = r2.get_object(Bucket=BUCKET, Key=CAMINHO)
+        df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
 
-        # Amostra de Dados (Ver como o ID está escrito)
-        print("\n👀 Amostra dos primeiros 5 registros do SHP:")
-        amostra_shp = con.execute("SELECT * FROM v_shp LIMIT 5").pl()
-        print(amostra_shp)
+        print("\n--- 🧩 ESTRUTURA DA TABELA FINAL (ESQUEMA) ---")
+        for col, dtype in df.schema.items():
+            print(f"🔹 {col:25} | Tipo: {dtype}")
 
-        # 2. INSPEÇÃO DA MALHA MESTRA (PARQUET)
-        print(f"\n📂 [CAMADA: MALHA MESTRA PARQUET]")
-        df_p = pl.read_parquet('malha_mestra.parquet')
+        print("\n--- 📊 AMOSTRA DOS DADOS (TOP 10) ---")
+        # Selecionamos as colunas principais para a visualização não quebrar na tela
+        cols_viz = ["id_h3_int", "setor_id", "bairro", "cidade_nome", "regiao_imediata"]
         
-        print("📋 Esquema de Colunas (Parquet):")
-        print(df_p.schema)
-
-        print("\n👀 Amostra dos registros do Parquet (setor_id):")
-        # Mostramos os que NÃO são nulos (se houver) ou apenas os primeiros
-        print(df_p.select(["id_h3_int", "setor_id", "bairro"]).head(5))
-
-        # 3. ANÁLISE DE CAUSA RAIZ
-        print("\n🧠 [ANÁLISE DE CAUSA RAIZ]")
+        # Filtramos as colunas que realmente existem para evitar erro
+        cols_existentes = [c for c in cols_viz if c in df.columns]
         
-        # Teste 1: Contagem de caracteres no SHP
-        # Geralmente CD_SETOR do IBGE tem 15 caracteres
-        tamanho_id_shp = con.execute("""
-            SELECT length(CD_SETOR::VARCHAR) as len, COUNT(*) 
-            FROM v_shp 
-            GROUP BY len
-        """).pl()
-        print("📏 Tamanho dos IDs no SHP (esperado: 15):")
-        print(tamanho_id_shp)
+        # Mostra a amostra
+        with pl.Config(tbl_rows=10, tbl_width_chars=120):
+            print(df.select(cols_existentes).head(10))
 
-        # Teste 2: Verificar se existem zeros à esquerda que sumiram
-        zeros_esquerda = con.execute("""
-            SELECT COUNT(*) 
-            FROM v_shp 
-            WHERE CD_SETOR::VARCHAR LIKE '0%'
-        """).fetchone()[0]
-        print(f"🔢 IDs que começam com zero no SHP: {zeros_esquerda}")
+        print("\n--- 📈 RESUMO DE PREENCHIMENTO ---")
+        total = len(df)
+        print(f"Total de Hexágonos H3: {total}")
+        print(f"Setores Vinculados:   {df.select(pl.col('setor_id').is_not_null().sum())[0,0]} (Erro: {df.select(pl.col('setor_id').is_null().sum())[0,0]} nulos)")
 
-        # Teste 3: Por que o Parquet está 100% nulo?
-        # Vamos ver se a coluna existe mas tem outro nome
-        print(f"❓ Colunas disponíveis no Parquet: {df_p.columns}")
-
-        print("\n--- FIM DA INSPEÇÃO ---")
-        
-        # Não deletamos nada agora para você poder ler o log
-        sys.exit(1) 
-
-    except Exception:
-        traceback.print_exc()
+    except Exception as e:
+        print(f"❌ Erro ao gerar amostra: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
-    auditoria_detalhada_shp()
+    amostra_tabela_final()
