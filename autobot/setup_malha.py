@@ -26,27 +26,23 @@ def processar_malha_referencia():
     con.execute("INSTALL spatial; LOAD spatial;")
 
     try:
-        print("⬢ Gerando geometria H3 para o estado de São Paulo...")
+        print("⬢ Gerando geometria H3 (v3.7.6) para o estado de São Paulo...")
         url_sp = "https://servicodados.ibge.gov.br/api/v3/malhas/estados/35?formato=application/vnd.geo+json"
         res_sp = requests.get(url_sp).json()
         coords_ibge = res_sp['features'][0]['geometry']
         
         hexs = set()
-        # Ajuste para lidar com MultiPolygon ou Polygon simples
         geometrias = coords_ibge['coordinates'] if coords_ibge['type'] == 'MultiPolygon' else [coords_ibge['coordinates']]
-        
         for p in geometrias:
-            # Na v4, usamos h3.Polygon e h3.polygon_to_cells
-            # O IBGE entrega [lon, lat], o H3 espera [lat, lon]
-            exterior = [[c[1], c[0]] for c in p[0]] 
-            poligono = h3.Polygon(exterior)
-            # Substituindo o antigo h3.polyfill
-            hexs.update(h3.polygon_to_cells(poligono, 9))
+            # Padrão H3 v3.7.x
+            poligono = {'type': 'Polygon', 'coordinates': [[[c[1], c[0]] for c in p[0]]]}
+            hexs.update(h3.polyfill(poligono, 9))
 
+        # Mapeamento usando as funções consolidadas do H3 v3
         df_h3 = pl.DataFrame({"id_h3_h9": list(hexs)}).with_columns([
-            pl.col("id_h3_h9").map_elements(lambda x: h3.cell_to_parent(x, 8), return_dtype=pl.Utf8).alias("id_h3_h8"),
-            pl.col("id_h3_h9").map_elements(lambda x: h3.cell_to_latlng(x)[0], return_dtype=pl.Float64).alias("lat"),
-            pl.col("id_h3_h9").map_elements(lambda x: h3.cell_to_latlng(x)[1], return_dtype=pl.Float64).alias("lon")
+            pl.col("id_h3_h9").map_elements(lambda x: h3.h3_to_parent(x, 8), return_dtype=pl.Utf8).alias("id_h3_h8"),
+            pl.col("id_h3_h9").map_elements(lambda x: h3.h3_to_geo(x)[0], return_dtype=pl.Float64).alias("lat"),
+            pl.col("id_h3_h9").map_elements(lambda x: h3.h3_to_geo(x)[1], return_dtype=pl.Float64).alias("lon")
         ])
 
         print("🏘️ Mapeando divisões de Bairros e Municípios...")
@@ -67,9 +63,10 @@ def processar_malha_referencia():
             WHERE tags['highway'] IS NOT NULL AND tags['name'] IS NOT NULL
         """).pl()
 
+        # Usando a função h3.geo_to_h3 para converter as ruas
         df_ruas_h3 = df_ruas_raw.with_columns(
             pl.struct(["r_lat", "r_lon"]).map_elements(
-                lambda x: h3.latlng_to_cell(x["r_lat"], x["r_lon"], 9), 
+                lambda x: h3.geo_to_h3(x["r_lat"], x["r_lon"], 9), 
                 return_dtype=pl.Utf8
             ).alias("id_h3_h9")
         ).group_by("id_h3_h9").agg(pl.col("nome_rua").unique().alias("logradouros"))
