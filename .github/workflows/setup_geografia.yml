@@ -1,4 +1,4 @@
-name: "SafeDriver: Processamento Prata (ZSTD + H3)"
+name: "SafeDriver [03]: Camada Prata"
 
 on:
   workflow_dispatch:
@@ -13,10 +13,10 @@ jobs:
   build-silver:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repositorio
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
