@@ -15,7 +15,7 @@ from datetime import datetime
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
 PRATA_DIR = "data_prata"
-AUDIT_DIR = "data_prata/auditoria"
+# A variável AUDIT_DIR foi removida para unificar a saída na mesma pasta
 
 def normalizar_string(valor):
     if valor is None or valor == "" or str(valor).upper() in ["NULL", "NAN", ".", "N/A"]: 
@@ -29,7 +29,6 @@ class ArquitetoSafeDriver:
     def __init__(self):
         self.audit_log = {"DATA_EXECUCAO": datetime.now().isoformat(), "AUDITORIA_QUALIDADE": {}, "CAMADAS": {}}
         os.makedirs(PRATA_DIR, exist_ok=True)
-        os.makedirs(AUDIT_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
         # CONFIGURACAO DE AMBIENTE PARA OSM
@@ -87,20 +86,34 @@ class ArquitetoSafeDriver:
     # 📍 ETAPA 1: NORMALIZACAO DA MALHA VIARIA
     # ==========================================
     def normalizar_viaria(self):
-        print("📍 NORMALIZANDO MALHA VIARIA...")
+        print("📍 NORMALIZANDO MALHA VIARIA ESTADUAL EM LOTE...")
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        json_path = ""
+        json_paths = []
         with zipfile.ZipFile(faces_zip, 'r') as z:
             for f in z.namelist():
-                if f.endswith('.json'): z.extract(f, BRONZE_DIR); json_path = os.path.join(BRONZE_DIR, f); break
+                if f.endswith('.json'): 
+                    z.extract(f, BRONZE_DIR)
+                    json_paths.append(os.path.join(BRONZE_DIR, f))
 
-        q_faces = f"SELECT CD_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{json_path}') WHERE NM_LOG IS NOT NULL"
-        df_faces = self.con.execute(q_faces).pl()
+        print(f"   -> {len(json_paths)} ficheiros municipais de ruas encontrados. Iniciando processamento espacial...")
+
+        lista_df_faces = []
+        for path in json_paths:
+            q_faces = f"SELECT CD_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{path}') WHERE NM_LOG IS NOT NULL"
+            try:
+                df = self.con.execute(q_faces).pl()
+                lista_df_faces.append(df)
+            except Exception as e:
+                print(f"   -> Aviso: Erro ao ler a geometria de {path}: {e}")
+
+        df_faces = pl.concat(lista_df_faces)
+        lista_df_faces.clear()
+
         df_faces = self.normalizar_e_validar_espacial(df_faces)
 
-        # 🛡️ BLINDAGEM DO BINDER ERROR: USO DE SUBQUERY (CTE)
+        print("   -> Extraindo infraestrutura viária de todo o OSM...")
         q_osm = f"""
             SELECT * FROM (
                 SELECT 
@@ -112,6 +125,7 @@ class ArquitetoSafeDriver:
         """
         df_osm = self.con.execute(q_osm).pl()
 
+        print("   -> Indexando por H3 e removendo duplicados estaduais...")
         df_final = df_faces.with_columns([
             pl.col("RUA").map_elements(normalizar_string, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
@@ -119,7 +133,10 @@ class ArquitetoSafeDriver:
 
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["VIARIA"] = {"REGISTROS": df_final.height}
-        if os.path.exists(json_path): os.remove(json_path)
+        
+        for path in json_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
     # ==========================================
     # 👥 ETAPA 2: NORMALIZACAO DA MALHA SOCIAL
@@ -146,7 +163,6 @@ class ArquitetoSafeDriver:
         print("🛍️ NORMALIZANDO MALHA COMERCIAL...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        # 🛡️ BLINDAGEM DO BINDER ERROR: USO DE SUBQUERY (CTE) E FUNCOES ST_Y/ST_X
         q = f"""
             SELECT * FROM (
                 SELECT 
@@ -172,16 +188,16 @@ class ArquitetoSafeDriver:
     def upload_final(self):
         print("🚀 GERANDO AUDITORIA E SUBINDO PARA R2...")
         
-        # 📄 CRIA O ARQUIVO FISICO DA AUDITORIA
-        audit_file = f"{AUDIT_DIR}/AUDITORIA_PRATA.json"
+        # 📄 CRIA O ARQUIVO FISICO DA AUDITORIA DIRETAMENTE NA PRATA_DIR
+        audit_file = f"{PRATA_DIR}/AUDITORIA_PRATA.json"
         with open(audit_file, "w", encoding="utf-8") as f:
             json.dump(self.audit_log, f, indent=4, ensure_ascii=False)
             
+        # UPLOAD SIMPLIFICADO: TUDO VAI PARA A MESMA PASTA NO DATALAKE
         for root, dirs, files in os.walk(PRATA_DIR):
             for f in files:
                 local = os.path.join(root, f)
                 key = f"datalake/prata/malha_geo_infra_social/{f}"
-                if f.endswith('.json'): key = f"datalake/prata/auditoria/{f}"
                 self.s3.upload_file(local, self.bucket, key)
 
     def executar(self):
@@ -190,7 +206,7 @@ class ArquitetoSafeDriver:
         self.normalizar_social()
         self.normalizar_comercial()
         self.upload_final()
-        print("✅ TODAS AS ENTIDADES FORAM NORMALIZADAS, AUDITADAS E ESTAO PRONTAS.")
+        print("✅ TODAS AS ENTIDADES FORAM NORMALIZADAS, AUDITADAS E ESTÃO PRONTAS.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
