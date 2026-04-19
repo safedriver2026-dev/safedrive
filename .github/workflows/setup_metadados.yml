@@ -1,48 +1,33 @@
-import duckdb
-import os
+name: Discovery SafeDriver OSM
+on:
+  workflow_dispatch:
 
-def descoberta_total():
-    print("🔎 INICIANDO VARREDURA COMPLETA DO PBF (SEM FILTROS)")
-    
-    con = duckdb.connect()
-    con.execute("SET extension_directory='./duckdb_ext';")
-    con.execute("INSTALL spatial; LOAD spatial;")
-    
-    pbf_path = "sudeste.osm.pbf"
-    
-    if not os.path.exists(pbf_path):
-        print("❌ Arquivo não encontrado.")
-        return
+jobs:
+  discovery:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    # 1. DESCOBRINDO O DICIONÁRIO DE CHAVES (TUDO O QUE EXISTE)
-    print("\n--- 📚 DICIONÁRIO DE TODAS AS KEYS PRESENTES ---")
-    # Este comando 'desembrulha' o mapa de tags e lista as chaves mais comuns
-    try:
-        query_keys = f"""
-            SELECT 
-                key, 
-                count(*) as frequencia
-            FROM (
-                SELECT unnest(map_keys(tags)) as key 
-                FROM ST_Read('{pbf_path}')
-            ) 
-            GROUP BY key 
-            ORDER BY frequencia DESC 
-            LIMIT 50
-        """
-        keys_df = con.execute(query_keys).pl()
-        print(keys_df)
-    except Exception as e:
-        print(f"Erro na varredura de chaves: {e}")
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    # 2. AMOSTRAGEM BRUTA DE REGISTROS
-    print("\n--- 🧪 AMOSTRA BRUTA (OS PRIMEIROS 10 REGISTROS DO ARQUIVO) ---")
-    try:
-        # Mostra o ID, nome e o mapa completo de tags para você ver a estrutura
-        raw_sample = con.execute(f"SELECT osm_id, name, tags FROM ST_Read('{pbf_path}') LIMIT 10").pl()
-        print(raw_sample)
-    except Exception as e:
-        print(f"Erro na amostragem: {e}")
+      - name: Install Tools
+        run: pip install duckdb polars
 
-if __name__ == "__main__":
-    descoberta_total()
+      - name: Download Real PBF
+        run: |
+          # O segredo é o -L e o User-Agent
+          wget -L --user-agent="Mozilla/5.0" https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.osm.pbf -O data.osm.pbf
+          ls -lh data.osm.pbf # Aqui tem que aparecer ~800MB no log
+
+      - name: Deep Discovery Script
+        run: python scripts/discovery.py
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: osm-dictionary-report
+          path: reports/
