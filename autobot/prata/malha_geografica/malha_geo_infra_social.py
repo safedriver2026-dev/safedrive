@@ -10,7 +10,7 @@ import zipfile
 from datetime import datetime
 
 # ==========================================
-# CONFIGURACOES DE ARQUITETURA SAFEDRIVER
+# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
 # ==========================================
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
@@ -32,9 +32,12 @@ class ArquitetoSafeDriver:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # GERA CONFIGURACAO OSM PARA O GDAL (CORRECAO DE BINDER ERROR)
+        # 🛡️ CONFIGURAÇÃO DE AMBIENTE PARA EVITAR "TOO MANY FEATURES"
+        # Esta é a chave para ler arquivos PBF grandes sem estourar o buffer do GDAL
+        os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
         
+        # CONFIGURACAO R2
         self.s3 = boto3.client('s3',
             endpoint_url=os.getenv('R2_ENDPOINT_URL', '').strip(),
             aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID', '').strip(),
@@ -42,11 +45,12 @@ class ArquitetoSafeDriver:
         )
         self.bucket = os.getenv('R2_BUCKET_NAME', '').strip()
         
+        # MOTOR DUCKDB
         self.con = duckdb.connect()
         self.con.execute("INSTALL spatial; LOAD spatial;")
 
     def gerar_configuracao_osm(self):
-        print("⚙️ INJETANDO CONFIGURACOES DO OPENSTREETMAP (osmconf.ini)...")
+        print("⚙️ INJETANDO CONFIGURAÇÕES DO OPENSTREETMAP (osmconf.ini)...")
         ini_content = """
 [points]
 osm_id=yes
@@ -59,16 +63,6 @@ attributes=name
 other_tags=yes
 
 [multipolygons]
-osm_id=yes
-attributes=name
-other_tags=yes
-
-[multilinestrings]
-osm_id=yes
-attributes=name
-other_tags=yes
-
-[other_relations]
 osm_id=yes
 attributes=name
 other_tags=yes
@@ -102,15 +96,13 @@ other_tags=yes
         gdf = gpd.GeoDataFrame(pdf, geometry=gpd.points_from_xy(pdf['LON'], pdf['LAT']), crs="EPSG:4326")
         joined = gpd.sjoin(gdf, municipios[['NM_MUN', 'geometry']], how="left", predicate="within")
         
-        # VERIFICACAO DINAMICA DE COLUNA (CORRECAO DE KEYERROR)
         coluna_mun = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
-        
         erros = joined[joined['NM_MUN_left'] != joined[coluna_mun]].shape[0] if 'NM_MUN_left' in joined.columns else 0
         self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
         joined["NM_MUN_REAL"] = joined[coluna_mun].fillna("FORA DA AREA DE COBERTURA")
         
-        colunas_remover = ["geometry", "index_right", "NM_MUN", "NM_MUN_left", "NM_MUN_right"]
-        cols_existentes = [c for c in colunas_remover if c in joined.columns]
+        cols_remover = ["geometry", "index_right", "NM_MUN", "NM_MUN_left", "NM_MUN_right"]
+        cols_existentes = [c for c in cols_remover if c in joined.columns]
         return pl.from_pandas(joined.drop(columns=cols_existentes))
 
     def processar_viaria(self):
@@ -119,7 +111,6 @@ other_tags=yes
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
         json_path = None
-        print("   -> Lendo estrutura interna do ZIP de Faces...")
         with zipfile.ZipFile(faces_zip, 'r') as z:
             for filename in z.namelist():
                 if filename.endswith('.json'):
@@ -127,13 +118,26 @@ other_tags=yes
                     json_path = os.path.join(BRONZE_DIR, filename)
                     break
         
+        # 1. Carregar Geografia das Faces
         query_faces = f"SELECT CD_SETOR AS ID_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as LOGRADOURO, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{json_path}') WHERE NM_LOG IS NOT NULL"
         df_faces = self.con.execute(query_faces).pl()
         df_faces = self.validar_municipio_real(df_faces)
 
-        query_osm = f"SELECT COALESCE(regexp_extract(other_tags, '\"highway\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as TIPO_VIA, COALESCE(regexp_extract(other_tags, '\"maxspeed\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as VELOCIDADE_MAXIMA, COALESCE(regexp_extract(other_tags, '\"surface\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as PAVIMENTO, COALESCE(regexp_extract(other_tags, '\"lit\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as ILUMINACAO, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{osm_path}', layer='lines') WHERE TIPO_VIA != 'NAO INFORMADO'"
+        # 2. Carregar Infraestrutura (OSM)
+        print("   -> Extraindo Infraestrutura do OSM...")
+        query_osm = f"""
+            SELECT 
+                COALESCE(regexp_extract(other_tags, '"highway"=>"([^"]+)"', 1), 'NAO INFORMADO') as TIPO_VIA,
+                COALESCE(regexp_extract(other_tags, '"maxspeed"=>"([^"]+)"', 1), 'NAO INFORMADO') as VELOCIDADE_MAXIMA,
+                COALESCE(regexp_extract(other_tags, '"surface"=>"([^"]+)"', 1), 'NAO INFORMADO') as PAVIMENTO,
+                COALESCE(regexp_extract(other_tags, '"lit"=>"([^"]+)"', 1), 'NAO INFORMADO') as ILUMINACAO,
+                ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON
+            FROM ST_Read('{osm_path}', layer='lines')
+            WHERE other_tags LIKE '%"highway"=>%'
+        """
         df_osm = self.con.execute(query_osm).pl()
 
+        # 3. Unificar via H3
         df_final = df_faces.with_columns([
             pl.col("LOGRADOURO").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
@@ -159,7 +163,7 @@ other_tags=yes
     def processar_estabelecimentos(self):
         print("🛍️ PROCESSANDO MALHA ESTABELECIMENTOS...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
-        query = "SELECT COALESCE(regexp_extract(other_tags, '\"shop\"=>\"([^\"]+)\"', 1), regexp_extract(other_tags, '\"amenity\"=>\"([^\"]+)\"', 1)) as CATEGORIA, name as NOME, lat as LAT, lon as LON FROM ST_Read('" + osm_path + "', layer='points') WHERE CATEGORIA != ''"
+        query = f"SELECT COALESCE(regexp_extract(other_tags, '\"shop\"=>\"([^\"]+)\"', 1), regexp_extract(other_tags, '\"amenity\"=>\"([^\"]+)\"', 1)) as CATEGORIA, name as NOME, lat as LAT, lon as LON FROM ST_Read('{osm_path}', layer='points') WHERE CATEGORIA != ''"
         df = self.con.execute(query).pl()
         df_final = df.with_columns([
             pl.col("CATEGORIA").map_elements(limpar_texto, return_dtype=pl.Utf8),
@@ -186,7 +190,7 @@ other_tags=yes
         self.processar_social()
         self.processar_estabelecimentos()
         self.upload_r2()
-        print("✅ PIPELINE CONCLUIDO.")
+        print("✅ PIPELINE CONCLUIDO COM SUCESSO.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
