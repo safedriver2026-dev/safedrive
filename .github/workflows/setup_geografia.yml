@@ -1,34 +1,28 @@
-name: "SafeDriver [02]: Recorte Geografico OSM SP"
+name: "SafeDriver: Processamento Prata (ZSTD + H3)"
 
 on:
-  workflow_dispatch: # Execução manual após a ingestão bronze
+  workflow_dispatch:
+
+env:
+  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
-  recorte-sp:
+  build-silver:
     runs-on: ubuntu-latest
-    
-    env:
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-
     steps:
-      - name: "Checkout"
+      - name: Checkout Repositorio
         uses: actions/checkout@v4
 
-      - name: "Instalar Osmium Tool"
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y osmium-tool
-
-      - name: "Configurar Python"
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: "Instalar Boto3"
-        run: pip install boto3
+      - name: Instalar Dependencias
+        run: pip install boto3 polars duckdb h3 geopandas shapely pyarrow zstandard
 
-      - name: "Executar Recorte"
-        run: python autobot/osm_raw_sp.py
+      - name: Executar Arquitetura Prata
+        run: python autobot/prata/malha_geo_infra_social/build_prata_mestre.py
