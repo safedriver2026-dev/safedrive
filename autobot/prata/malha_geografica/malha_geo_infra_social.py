@@ -32,12 +32,11 @@ class ArquitetoSafeDriver:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # 🛡️ CONFIGURAÇÃO DE AMBIENTE PARA EVITAR "TOO MANY FEATURES"
-        # Esta é a chave para ler arquivos PBF grandes sem estourar o buffer do GDAL
+        # CONFIGURAÇÃO PARA EVITAR ERROS DE BUFFER NO OSM
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
         
-        # CONFIGURACAO R2
+        # CONFIGURAÇÃO R2
         self.s3 = boto3.client('s3',
             endpoint_url=os.getenv('R2_ENDPOINT_URL', '').strip(),
             aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID', '').strip(),
@@ -118,12 +117,10 @@ other_tags=yes
                     json_path = os.path.join(BRONZE_DIR, filename)
                     break
         
-        # 1. Carregar Geografia das Faces
         query_faces = f"SELECT CD_SETOR AS ID_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as LOGRADOURO, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{json_path}') WHERE NM_LOG IS NOT NULL"
         df_faces = self.con.execute(query_faces).pl()
         df_faces = self.validar_municipio_real(df_faces)
 
-        # 2. Carregar Infraestrutura (OSM)
         print("   -> Extraindo Infraestrutura do OSM...")
         query_osm = f"""
             SELECT 
@@ -137,7 +134,6 @@ other_tags=yes
         """
         df_osm = self.con.execute(query_osm).pl()
 
-        # 3. Unificar via H3
         df_final = df_faces.with_columns([
             pl.col("LOGRADOURO").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
@@ -150,13 +146,30 @@ other_tags=yes
     def processar_social(self):
         print("👥 PROCESSANDO MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
-        df = pl.read_csv(csv_path, separator=";", encoding="latin1", dtypes={"CD_SETOR": pl.Utf8})
-        df_final = df.filter(pl.col("CD_SETOR").str.starts_with("35")).select([
-            pl.col("CD_SETOR").alias("ID_SETOR"),
-            pl.col("NM_MUN").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("MUNICIPIO"),
-            pl.col("NM_BAIRRO").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("BAIRRO"),
-            pl.col("v0001").cast(pl.Int32).fill_null(0).alias("POPULACAO")
-        ]).unique(subset=["ID_SETOR"]).sort("ID_SETOR")
+        
+        # 🛠️ CORREÇÃO DO ERRO DE PARSING E DEPRECATION
+        # Adicionado null_values=["."] para tratar os pontos como nulos
+        # Alterado dtypes para schema_overrides
+        # Aumentado infer_schema_length para 10000
+        df = pl.read_csv(
+            csv_path, 
+            separator=";", 
+            encoding="latin1", 
+            schema_overrides={"CD_SETOR": pl.Utf8},
+            null_values=["."],
+            infer_schema_length=10000
+        )
+        
+        df_final = (
+            df.filter(pl.col("CD_SETOR").str.starts_with("35"))
+            .select([
+                pl.col("CD_SETOR").alias("ID_SETOR"),
+                pl.col("NM_MUN").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("MUNICIPIO"),
+                pl.col("NM_BAIRRO").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("BAIRRO"),
+                pl.col("v0001").cast(pl.Int32).fill_null(0).alias("POPULACAO")
+            ])
+            .unique(subset=["ID_SETOR"]).sort("ID_SETOR")
+        )
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
