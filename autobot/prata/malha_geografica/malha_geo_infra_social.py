@@ -134,7 +134,18 @@ class ArquitetoSafeDriver:
     def normalizar_comercial(self):
         print("🛍️ NORMALIZANDO MALHA COMERCIAL...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
-        q = f"SELECT COALESCE(regexp_extract(other_tags, '\"shop\"=>\"([^\"]+)\"', 1), regexp_extract(other_tags, '\"amenity\"=>\"([^\"]+)\"', 1)) as CAT, name, lat as LAT, lon as LON FROM ST_Read('{osm_path}', layer='points') WHERE other_tags LIKE '%\"shop\"=>%' OR other_tags LIKE '%\"amenity\"=>%'"
+        
+        # 🛠️ CORREÇÃO DO BINDER ERROR: Extraindo coordenadas usando as funções espaciais ST_Y e ST_X direto da 'geom'
+        q = f"""
+            SELECT 
+                COALESCE(regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
+                         regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CAT, 
+                name, 
+                ST_Y(geom) as LAT, 
+                ST_X(geom) as LON 
+            FROM ST_Read('{osm_path}', layer='points') 
+            WHERE other_tags LIKE '%"shop"=>%' OR other_tags LIKE '%"amenity"=>%'
+        """
         df = self.con.execute(q).pl()
         
         df_final = df.with_columns([
