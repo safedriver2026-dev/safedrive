@@ -1,4 +1,4 @@
-name: "SafeDriver [01]: Ingestão Bronze (Faces, OSM Sudeste e Trajetos)"
+name: "SafeDriver [01]: Ingestão Bronze (Link IBGE 2022 Oficial)"
 
 on:
   workflow_dispatch: # Execução manual
@@ -8,39 +8,45 @@ jobs:
     runs-on: ubuntu-latest
     
     env:
-      # URLs das Fontes
-      URL_FACES: "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_de_setores_censitarios__divisoes_intramunicipais/2022/Faces_de_Logradouros/SP/SP_Faces_de_Logradouros_2022.zip"
+      # URLs das Fontes (Agora com o link JSON correto)
+      URL_FACES_JSON: "https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022_censo_demografico/json/SP_faces_de_logradouros_2022_json.zip"
       URL_OSM_SUDESTE: "https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.osm.pbf"
       URL_TRAJETOS: "https://ftp.ibge.gov.br/Cadastro_Nacional_de_Enderecos_para_Fins_Estatisticos/Censo_Demografico_2022/Trajetos_dos_Recenseadores/35_SAO_PAULO.zip"
       
-      # Secrets do R2
-      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+      # Secrets brutos do GitHub
+      R2_ENDPOINT_RAW: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_KEY_ID_RAW: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_RAW: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_RAW: ${{ secrets.R2_BUCKET_NAME }}
 
     steps:
-      - name: Checkout do Repositório
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: 🧹 Higienizar Segredos e Configurar AWS CLI
         run: |
-          # Remove espaços e caracteres invisíveis
-          CLEAN_KEY=$(echo "${{ env.R2_KEY_ID }}" | xargs)
-          CLEAN_SECRET=$(echo "${{ env.R2_SECRET }}" | xargs)
+          # O xargs remove espaços, tabs e quebras de linha invisíveis
+          CLEAN_KEY=$(echo "${{ env.R2_KEY_ID_RAW }}" | xargs)
+          CLEAN_SECRET=$(echo "${{ env.R2_SECRET_RAW }}" | xargs)
+          CLEAN_ENDPOINT=$(echo "${{ env.R2_ENDPOINT_RAW }}" | xargs)
+          CLEAN_BUCKET=$(echo "${{ env.R2_BUCKET_RAW }}" | xargs)
           
+          # Configura o ambiente de forma limpa
           aws configure set aws_access_key_id $CLEAN_KEY
           aws configure set aws_secret_access_key $CLEAN_SECRET
           aws configure set default.region auto
+          
+          # Passa as variáveis limpas para os próximos steps
+          echo "CLEAN_ENDPOINT=$CLEAN_ENDPOINT" >> $GITHUB_ENV
+          echo "CLEAN_BUCKET=$CLEAN_BUCKET" >> $GITHUB_ENV
 
-      - name: 📁 Preparar Pasta de Ingestão
+      - name: 📁 Criar Pasta Temporária
         run: mkdir -p data_raw
 
-      - name: 📥 Baixar Faces de Logradouro (IBGE)
-        run: wget -L "${{ env.URL_FACES }}" -O data_raw/SP_Faces_2022.zip
+      - name: 📥 Baixar Faces de Logradouro (IBGE JSON)
+        run: wget -L "${{ env.URL_FACES_JSON }}" -O data_raw/SP_Faces_2022.zip
 
       - name: 🌍 Baixar OSM Sudeste (Geofabrik)
-        # Este arquivo é grande, o wget mostrará o progresso no log
         run: wget -L "${{ env.URL_OSM_SUDESTE }}" -O data_raw/sudeste-latest.osm.pbf
 
       - name: 🚶 Baixar Trajetos dos Recenseadores (IBGE)
@@ -48,25 +54,22 @@ jobs:
 
       - name: ☁️ Sincronizar com R2 (malha_raw)
         run: |
-          CLEAN_ENDPOINT=$(echo "${{ env.R2_ENDPOINT }}" | xargs)
-          CLEAN_BUCKET=$(echo "${{ env.BUCKET }}" | xargs)
-          
-          # 'sync' garante que o Agregados.csv e Municípios.shp que já estão no R2 não sejam apagados
-          aws s3 sync data_raw/ s3://$CLEAN_BUCKET/datalake/bronze/malha_raw/ \
-          --endpoint-url $CLEAN_ENDPOINT
+          # Sincroniza sem apagar o que já está lá (Agregados e Municípios)
+          aws s3 sync data_raw/ s3://${{ env.CLEAN_BUCKET }}/datalake/bronze/malha_raw/ \
+          --endpoint-url ${{ env.CLEAN_ENDPOINT }}
 
       - name: 📢 Notificação Discord
         if: always()
         run: |
           STATUS="${{ job.status }}"
-          WEBHOOK_URL=$(echo "${{ secrets.DISCORD_SUCESSO }}" | xargs)
           if [ "$STATUS" == "success" ]; then
-            MSG="🚀 **SafeDriver Bronze**: Ingestão concluída com sucesso! (OSM Sudeste, Faces e Trajetos)."
+            WEBHOOK=$(echo "${{ secrets.DISCORD_SUCESSO }}" | xargs)
+            MSG="🚀 **SafeDriver Bronze**: Ingestão concluída! Faces, OSM Sudeste e Trajetos salvos no R2."
           else
-            WEBHOOK_URL=$(echo "${{ secrets.DISCORD_ERRO }}" | xargs)
-            MSG="⚠️ **SafeDriver Bronze**: Falha na ingestão de dados. Verifique os logs."
+            WEBHOOK=$(echo "${{ secrets.DISCORD_ERRO }}" | xargs)
+            MSG="⚠️ **SafeDriver Bronze**: Erro na ingestão. Verifique os logs do Actions."
           fi
           
-          if [ ! -z "$WEBHOOK_URL" ]; then
-            curl -H "Content-Type: application/json" -X POST -d "{\"content\": \"$MSG\"}" $WEBHOOK_URL
+          if [ ! -z "$WEBHOOK" ]; then
+            curl -H "Content-Type: application/json" -X POST -d "{\"content\": \"$MSG\"}" $WEBHOOK
           fi
