@@ -1,93 +1,72 @@
-name: "SafeDriver: Sincronização Bronze"
+name: "SafeDriver [01]: Ingestão Bronze (Faces, OSM Sudeste e Trajetos)"
 
 on:
-  workflow_dispatch: # Execução manual via painel
+  workflow_dispatch: # Execução manual
 
 jobs:
-  # ---------------------------------------------------
-  # JOB 1: GEOGRAFIA (IBGE Municipios + Faces)
-  # ---------------------------------------------------
-  geo_sync:
-    name: "Sincronizar Geografia"
+  ingest_bronze:
     runs-on: ubuntu-latest
+    
+    env:
+      # URLs das Fontes
+      URL_FACES: "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_de_setores_censitarios__divisoes_intramunicipais/2022/Faces_de_Logradouros/SP/SP_Faces_de_Logradouros_2022.zip"
+      URL_OSM_SUDESTE: "https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.osm.pbf"
+      URL_TRAJETOS: "https://ftp.ibge.gov.br/Cadastro_Nacional_de_Enderecos_para_Fins_Estatisticos/Censo_Demografico_2022/Trajetos_dos_Recenseadores/35_SAO_PAULO.zip"
+      
+      # Secrets do R2
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Instalar Libs
-        run: pip install polars duckdb boto3 h3
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
 
-      - name: 📥 Download IBGE (Mun + Faces)
+      - name: 🧹 Higienizar Segredos e Configurar AWS CLI
         run: |
-          mkdir -p temp_ibge
-          wget -qO mun.zip "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2022/UFs/SP/SP_Municipios_2022.zip"
-          wget -qO faces.zip "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_de_setores_censitarios__divisoes_intramunicipais/2022/Faces_de_Logradouros/SP/SP_Faces_de_Logradouros_2022.zip"
-          unzip -q mun.zip -d temp_ibge/mun
-          unzip -q faces.zip -d temp_ibge/faces
+          # Remove espaços e caracteres invisíveis
+          CLEAN_KEY=$(echo "${{ env.R2_KEY_ID }}" | xargs)
+          CLEAN_SECRET=$(echo "${{ env.R2_SECRET }}" | xargs)
+          
+          aws configure set aws_access_key_id $CLEAN_KEY
+          aws configure set aws_secret_access_key $CLEAN_SECRET
+          aws configure set default.region auto
 
-      - name: ⚙️ Processar Geografia
-        env:
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/bronze/malha_geo/ingest_geo.py
+      - name: 📁 Preparar Pasta de Ingestão
+        run: mkdir -p data_raw
 
-  # ---------------------------------------------------
-  # JOB 2: INFRAESTRUTURA (OSM)
-  # ---------------------------------------------------
-  infra_sync:
-    name: "Sincronizar Infraestrutura"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Instalar Libs
-        run: pip install polars duckdb boto3 h3
+      - name: 📥 Baixar Faces de Logradouro (IBGE)
+        run: wget -L "${{ env.URL_FACES }}" -O data_raw/SP_Faces_2022.zip
 
-      - name: 📥 Download OSM (Geofabrik)
+      - name: 🌍 Baixar OSM Sudeste (Geofabrik)
+        # Este arquivo é grande, o wget mostrará o progresso no log
+        run: wget -L "${{ env.URL_OSM_SUDESTE }}" -O data_raw/sudeste-latest.osm.pbf
+
+      - name: 🚶 Baixar Trajetos dos Recenseadores (IBGE)
+        run: wget -L "${{ env.URL_TRAJETOS }}" -O data_raw/35_SAO_PAULO_Trajetos.zip
+
+      - name: ☁️ Sincronizar com R2 (malha_raw)
         run: |
-          mkdir -p temp_osm
-          wget -qO osm_sp.zip "https://download.geofabrik.de/south-america/brazil/sao-paulo-latest-free.shp.zip"
-          # Extraímos apenas as camadas de POIs e Ruas para economizar disco
-          unzip -q osm_sp.zip "gis_osm_pois_free_1.*" "gis_osm_roads_free_1.*" -d temp_osm
+          CLEAN_ENDPOINT=$(echo "${{ env.R2_ENDPOINT }}" | xargs)
+          CLEAN_BUCKET=$(echo "${{ env.BUCKET }}" | xargs)
+          
+          # 'sync' garante que o Agregados.csv e Municípios.shp que já estão no R2 não sejam apagados
+          aws s3 sync data_raw/ s3://$CLEAN_BUCKET/datalake/bronze/malha_raw/ \
+          --endpoint-url $CLEAN_ENDPOINT
 
-      - name: ⚙️ Processar Infraestrutura
-        env:
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/bronze/malha_geo/ingest_infra.py
-
-  # ---------------------------------------------------
-  # JOB 3: POPULAÇÃO (Censo 2022)
-  # ---------------------------------------------------
-  pop_sync:
-    name: "Sincronizar População"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Instalar Libs
-        run: pip install polars boto3
-
-      - name: 📥 Download Censo (CSV)
+      - name: 📢 Notificação Discord
+        if: always()
         run: |
-          mkdir -p temp_pop
-          # URL exemplo para os agregados do Censo 2022
-          wget -qO pop.zip "https://ftp.ibge.gov.br/Censo_2022/Agregados_por_Setores_Censitarios_Preliminares/Resultados_Pre-Liminares_Distritos_SP.zip"
-          unzip -q pop.zip -d temp_pop
-
-      - name: ⚙️ Processar População
-        env:
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: python autobot/bronze/malha_geo/ingest_pop.py
+          STATUS="${{ job.status }}"
+          WEBHOOK_URL=$(echo "${{ secrets.DISCORD_SUCESSO }}" | xargs)
+          if [ "$STATUS" == "success" ]; then
+            MSG="🚀 **SafeDriver Bronze**: Ingestão concluída com sucesso! (OSM Sudeste, Faces e Trajetos)."
+          else
+            WEBHOOK_URL=$(echo "${{ secrets.DISCORD_ERRO }}" | xargs)
+            MSG="⚠️ **SafeDriver Bronze**: Falha na ingestão de dados. Verifique os logs."
+          fi
+          
+          if [ ! -z "$WEBHOOK_URL" ]; then
+            curl -H "Content-Type: application/json" -X POST -d "{\"content\": \"$MSG\"}" $WEBHOOK_URL
+          fi
