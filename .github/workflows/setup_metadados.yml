@@ -1,6 +1,6 @@
 name: Discovery SafeDriver OSM
 on:
-  workflow_dispatch: # Botão manual no GitHub
+  workflow_dispatch:
 
 jobs:
   discovery:
@@ -9,26 +9,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install DuckDB
-        run: pip install duckdb polars
+      - name: Install GDAL Tools
+        run: sudo apt-get update && sudo apt-get install -y gdal-bin
 
       - name: Download Real PBF
         run: |
-          # Usando wget com User-Agent para o Geofabrik não bloquear o runner
           wget -L --user-agent="Mozilla/5.0" https://download.geofabrik.de/south-america/brazil/sudeste-latest.osm.pbf -O data.osm.pbf
-          
-          # Validação de tamanho: Se for < 100MB, o download falhou
-          FILESIZE=$(stat -c%s "data.osm.pbf")
-          echo "Tamanho do arquivo: $FILESIZE bytes"
-          if [ $FILESIZE -lt 100000000 ]; then
-            echo "❌ Erro: Download incompleto. Geofabrik bloqueou a requisição."
-            exit 1
-          fi
+          ls -lh data.osm.pbf
 
-      - name: Deep Discovery Script
-        run: python scripts/discovery.py
+      - name: 🔍 Interrogando Camadas (Esquema Real)
+        run: |
+          echo "--- LISTANDO CAMADAS ---"
+          ogrinfo data.osm.pbf
+          
+          echo "--- ESQUEMA DA CAMADA DE PONTOS ---"
+          ogrinfo -so data.osm.pbf points
+          
+          echo "--- ESQUEMA DA CAMADA DE LINHAS (RUAS) ---"
+          ogrinfo -so data.osm.pbf lines
