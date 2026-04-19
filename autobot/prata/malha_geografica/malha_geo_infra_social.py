@@ -10,7 +10,7 @@ import zipfile
 from datetime import datetime
 
 # ==========================================
-# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
+# CONFIGURACOES DE ARQUITETURA SAFEDRIVER
 # ==========================================
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
@@ -32,11 +32,11 @@ class ArquitetoSafeDriver:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # CONFIGURAÇÃO PARA EVITAR ERROS DE BUFFER NO OSM
+        # CONFIGURACAO PARA EVITAR ERROS DE BUFFER NO OSM E BINDER
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
         
-        # CONFIGURAÇÃO R2
+        # CONFIGURACAO R2
         self.s3 = boto3.client('s3',
             endpoint_url=os.getenv('R2_ENDPOINT_URL', '').strip(),
             aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID', '').strip(),
@@ -49,7 +49,7 @@ class ArquitetoSafeDriver:
         self.con.execute("INSTALL spatial; LOAD spatial;")
 
     def gerar_configuracao_osm(self):
-        print("⚙️ INJETANDO CONFIGURAÇÕES DO OPENSTREETMAP (osmconf.ini)...")
+        print("⚙️ INJETANDO CONFIGURACOES DO OPENSTREETMAP (osmconf.ini)...")
         ini_content = """
 [points]
 osm_id=yes
@@ -128,7 +128,7 @@ other_tags=yes
                 COALESCE(regexp_extract(other_tags, '"maxspeed"=>"([^"]+)"', 1), 'NAO INFORMADO') as VELOCIDADE_MAXIMA,
                 COALESCE(regexp_extract(other_tags, '"surface"=>"([^"]+)"', 1), 'NAO INFORMADO') as PAVIMENTO,
                 COALESCE(regexp_extract(other_tags, '"lit"=>"([^"]+)"', 1), 'NAO INFORMADO') as ILUMINACAO,
-                ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON
+                lat as LAT, lon as LON
             FROM ST_Read('{osm_path}', layer='lines')
             WHERE other_tags LIKE '%"highway"=>%'
         """
@@ -147,10 +147,6 @@ other_tags=yes
         print("👥 PROCESSANDO MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
         
-        # 🛠️ CORREÇÃO DO ERRO DE PARSING E DEPRECATION
-        # Adicionado null_values=["."] para tratar os pontos como nulos
-        # Alterado dtypes para schema_overrides
-        # Aumentado infer_schema_length para 10000
         df = pl.read_csv(
             csv_path, 
             separator=";", 
@@ -176,13 +172,34 @@ other_tags=yes
     def processar_estabelecimentos(self):
         print("🛍️ PROCESSANDO MALHA ESTABELECIMENTOS...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
-        query = f"SELECT COALESCE(regexp_extract(other_tags, '\"shop\"=>\"([^\"]+)\"', 1), regexp_extract(other_tags, '\"amenity\"=>\"([^\"]+)\"', 1)) as CATEGORIA, name as NOME, lat as LAT, lon as LON FROM ST_Read('{osm_path}', layer='points') WHERE CATEGORIA != ''"
+        
+        # 🛠️ CORRECAO DO BINDER ERROR: Uso de Subquery e nomes explicitos
+        query = f"""
+            WITH RAW_DATA AS (
+                SELECT 
+                    COALESCE(regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
+                             regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CAT_BRUTA,
+                    name as NOME_BRUTO, 
+                    lat as LAT_ORIG, 
+                    lon as LON_ORIG
+                FROM ST_Read('{osm_path}', layer='points')
+            )
+            SELECT 
+                CAT_BRUTA as CATEGORIA, 
+                NOME_BRUTO as NOME, 
+                LAT_ORIG as LAT, 
+                LON_ORIG as LON 
+            FROM RAW_DATA 
+            WHERE CAT_BRUTA IS NOT NULL AND CAT_BRUTA != ''
+        """
         df = self.con.execute(query).pl()
+        
         df_final = df.with_columns([
             pl.col("CATEGORIA").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.col("NOME").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
         ]).group_by(["H3_INDEX", "CATEGORIA"]).agg(pl.len().alias("QTD")).sort("H3_INDEX")
+        
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": df_final.height}
 
