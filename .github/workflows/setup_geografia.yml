@@ -61,7 +61,7 @@ jobs:
                   'key': 'datalake/bronze/malha_raw/SP_Faces_2022.zip'
               },
               {
-                  'url': 'https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.osm.pbf',
+                  'url': 'https://download.geofabrik.de/south-america/brazil/sudeste-latest.osm.pbf',
                   'key': 'datalake/bronze/malha_raw/sudeste-latest.osm.pbf'
               },
               {
