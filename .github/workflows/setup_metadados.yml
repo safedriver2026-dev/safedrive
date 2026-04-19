@@ -1,27 +1,48 @@
-name: Debug & Ingest OSM
-on:
-  workflow_dispatch: # Permite que você rode manualmente pelo botão no GitHub
+import duckdb
+import os
 
-jobs:
-  debug_osm:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+def descoberta_total():
+    print("🔎 INICIANDO VARREDURA COMPLETA DO PBF (SEM FILTROS)")
+    
+    con = duckdb.connect()
+    con.execute("SET extension_directory='./duckdb_ext';")
+    con.execute("INSTALL spatial; LOAD spatial;")
+    
+    pbf_path = "sudeste.osm.pbf"
+    
+    if not os.path.exists(pbf_path):
+        print("❌ Arquivo não encontrado.")
+        return
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    # 1. DESCOBRINDO O DICIONÁRIO DE CHAVES (TUDO O QUE EXISTE)
+    print("\n--- 📚 DICIONÁRIO DE TODAS AS KEYS PRESENTES ---")
+    # Este comando 'desembrulha' o mapa de tags e lista as chaves mais comuns
+    try:
+        query_keys = f"""
+            SELECT 
+                key, 
+                count(*) as frequencia
+            FROM (
+                SELECT unnest(map_keys(tags)) as key 
+                FROM ST_Read('{pbf_path}')
+            ) 
+            GROUP BY key 
+            ORDER BY frequencia DESC 
+            LIMIT 50
+        """
+        keys_df = con.execute(query_keys).pl()
+        print(keys_df)
+    except Exception as e:
+        print(f"Erro na varredura de chaves: {e}")
 
-      - name: Install Dependencies
-        run: |
-          pip install duckdb polars pyarrow
+    # 2. AMOSTRAGEM BRUTA DE REGISTROS
+    print("\n--- 🧪 AMOSTRA BRUTA (OS PRIMEIROS 10 REGISTROS DO ARQUIVO) ---")
+    try:
+        # Mostra o ID, nome e o mapa completo de tags para você ver a estrutura
+        raw_sample = con.execute(f"SELECT osm_id, name, tags FROM ST_Read('{pbf_path}') LIMIT 10").pl()
+        print(raw_sample)
+    except Exception as e:
+        print(f"Erro na amostragem: {e}")
 
-      - name: Download OSM PBF (Sudeste)
-        run: |
-          # Baixando direto do Geofabrik para o runner
-          curl -L https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.osm.pbf -o sudeste.osm.pbf
-
-      - name: Run Diagnostic & Metadata Extraction
-        run: python scripts/debug_osm_pbf.py
+if __name__ == "__main__":
+    descoberta_total()
