@@ -55,7 +55,7 @@ class ArquitetoSafeDriver:
         for f in arquivos:
             local_path = os.path.join(BRONZE_DIR, f)
             if not os.path.exists(local_path):
-                print(f"   -> {f}")
+                print(f"   -> Baixando: {f}")
                 self.s3.download_file(self.bucket, f"datalake/bronze/malha_raw/{f}", local_path)
 
     # ==========================================
@@ -70,13 +70,27 @@ class ArquitetoSafeDriver:
         pdf = df_pl.to_pandas()
         gdf = gpd.GeoDataFrame(pdf, geometry=gpd.points_from_xy(pdf['LON'], pdf['LAT']), crs="EPSG:4326")
         
+        # Join Espacial
         joined = gpd.sjoin(gdf, municipios[['NM_MUN', 'geometry']], how="left", predicate="within")
         
-        erros = joined[joined['NM_MUN_left'] != joined['NM_MUN_right']].shape[0] if 'NM_MUN_left' in joined.columns else 0
+        # 🛠️ VERIFICAÇÃO DINÂMICA: Previne o KeyError do GeoPandas
+        coluna_municipio = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
+        
+        if 'NM_MUN_left' in joined.columns:
+            erros = joined[joined['NM_MUN_left'] != joined[coluna_municipio]].shape[0]
+        else:
+            erros = 0 # Enriquecimento de dados puro
+            
         self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
         
-        joined["NM_MUN_REAL"] = joined["NM_MUN_right"].fillna("FORA DA AREA DE COBERTURA")
-        return pl.from_pandas(joined.drop(columns=["geometry", "index_right"]))
+        # Atribui o nome validado
+        joined["NM_MUN_REAL"] = joined[coluna_municipio].fillna("FORA DA AREA DE COBERTURA")
+        
+        # Limpeza segura de colunas
+        colunas_remover = ["geometry", "index_right", "NM_MUN", "NM_MUN_left", "NM_MUN_right"]
+        colunas_existentes = [c for c in colunas_remover if c in joined.columns]
+        
+        return pl.from_pandas(joined.drop(columns=colunas_existentes))
 
     # ==========================================
     # 📍 MALHA VIARIA (GEO + INFRA ESTRUTURA)
@@ -86,14 +100,19 @@ class ArquitetoSafeDriver:
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        # LOCALIZAR E EXTRAIR JSON INDEPENDENTE DA PASTA INTERNA
+        # EXTRAÇÃO INTELIGENTE DO JSON
         json_path = None
+        print("   -> Lendo estrutura interna do ZIP de Faces...")
         with zipfile.ZipFile(faces_zip, 'r') as z:
             for filename in z.namelist():
                 if filename.endswith('.json'):
+                    print(f"   -> Ficheiro extraído: {filename}")
                     z.extract(filename, BRONZE_DIR)
                     json_path = os.path.join(BRONZE_DIR, filename)
                     break
+                    
+        if not json_path:
+            raise Exception("ERRO CRITICO: Arquivo JSON não encontrado dentro do SP_Faces_2022.zip")
         
         query_faces = f"""
             SELECT 
@@ -102,6 +121,7 @@ class ArquitetoSafeDriver:
                 ST_Y(ST_Centroid(geom)) as LAT,
                 ST_X(ST_Centroid(geom)) as LON
             FROM ST_Read('{json_path}')
+            WHERE NM_LOG IS NOT NULL
         """
         df_faces = self.con.execute(query_faces).pl()
         
@@ -121,15 +141,20 @@ class ArquitetoSafeDriver:
         """
         df_osm = self.con.execute(query_osm).pl()
 
+        # OTIMIZACAO FINAL E GRAVACAO
         df_final = df_faces.with_columns([
             pl.col("LOGRADOURO").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
         ]).unique(subset=["H3_INDEX", "LOGRADOURO"]).rename({"NM_MUN_REAL": "MUNICIPIO"}).sort("H3_INDEX")
 
         caminho = f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet"
-        df_final.write_parquet(caminho, compression="zstd", statistics=True)
+        df_final.write_parquet(caminho, compression="zstd", compression_level=3, statistics=True, use_pyarrow=True)
         self.audit_log["CAMADAS"]["VIARIA"] = {"REGISTROS": df_final.height}
-        if os.path.exists(json_path): os.remove(json_path)
+        
+        # Limpeza do disco
+        if os.path.exists(json_path): 
+            os.remove(json_path)
+            print("🧹 Ficheiro JSON temporário apagado.")
 
     # ==========================================
     # 👥 MALHA SOCIAL
@@ -149,7 +174,8 @@ class ArquitetoSafeDriver:
             ])
             .unique(subset=["ID_SETOR"]).sort("ID_SETOR")
         )
-        df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet", compression="zstd")
+        caminho = f"{PRATA_DIR}/MALHA_SOCIAL.parquet"
+        df_final.write_parquet(caminho, compression="zstd", compression_level=3, statistics=True, use_pyarrow=True)
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
     # ==========================================
@@ -173,11 +199,12 @@ class ArquitetoSafeDriver:
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
         ]).group_by(["H3_INDEX", "CATEGORIA"]).agg(pl.len().alias("QTD")).sort("H3_INDEX")
 
-        df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
+        caminho = f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet"
+        df_final.write_parquet(caminho, compression="zstd", compression_level=3, statistics=True, use_pyarrow=True)
         self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": df_final.height}
 
     def upload_r2(self):
-        print("🚀 SUBINDO PARA R2...")
+        print("🚀 SUBINDO PARA O R2...")
         with open(f"{AUDIT_DIR}/AUDITORIA_PRATA.json", "w", encoding="utf-8") as f:
             json.dump(self.audit_log, f, indent=4, ensure_ascii=False)
         
@@ -186,6 +213,8 @@ class ArquitetoSafeDriver:
                 local_path = os.path.join(root, file)
                 key = f"datalake/prata/malha_geo_infra_social/{file}"
                 if file.endswith('.json'): key = f"datalake/prata/auditoria/{file}"
+                
+                print(f"   -> Upload: {key}")
                 self.s3.upload_file(local_path, self.bucket, key)
 
     def executar(self):
@@ -194,6 +223,7 @@ class ArquitetoSafeDriver:
         self.processar_social()
         self.processar_estabelecimentos()
         self.upload_r2()
+        print("✅ CAMADA PRATA MESTRE CONCLUIDA COM SUCESSO.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
