@@ -32,7 +32,7 @@ class ArquitetoSafeDriver:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # CONFIGURACAO PARA EVITAR ERROS DE BUFFER NO OSM E BINDER
+        # 🛡️ PROTECAO DE AMBIENTE: EVITA "TOO MANY FEATURES" E ERROS DE BINDER NO OSM
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
         
@@ -55,13 +55,7 @@ class ArquitetoSafeDriver:
 osm_id=yes
 attributes=name
 other_tags=yes
-
 [lines]
-osm_id=yes
-attributes=name
-other_tags=yes
-
-[multipolygons]
 osm_id=yes
 attributes=name
 other_tags=yes
@@ -95,6 +89,7 @@ other_tags=yes
         gdf = gpd.GeoDataFrame(pdf, geometry=gpd.points_from_xy(pdf['LON'], pdf['LAT']), crs="EPSG:4326")
         joined = gpd.sjoin(gdf, municipios[['NM_MUN', 'geometry']], how="left", predicate="within")
         
+        # 🛠️ CORREÇÃO DINÂMICA DE COLUNAS (FIM DO KEYERROR)
         coluna_mun = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
         erros = joined[joined['NM_MUN_left'] != joined[coluna_mun]].shape[0] if 'NM_MUN_left' in joined.columns else 0
         self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
@@ -121,6 +116,7 @@ other_tags=yes
         df_faces = self.con.execute(query_faces).pl()
         df_faces = self.validar_municipio_real(df_faces)
 
+        # 🚀 EXTRAÇÃO INFRAESTRUTURA OSM COM FILTRO OTIMIZADO
         print("   -> Extraindo Infraestrutura do OSM...")
         query_osm = f"""
             SELECT 
@@ -147,13 +143,11 @@ other_tags=yes
         print("👥 PROCESSANDO MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
         
+        # 🛠️ CORREÇÃO DE PARSING (FIM DO ERRO DE ".")
         df = pl.read_csv(
-            csv_path, 
-            separator=";", 
-            encoding="latin1", 
+            csv_path, separator=";", encoding="latin1", 
             schema_overrides={"CD_SETOR": pl.Utf8},
-            null_values=["."],
-            infer_schema_length=10000
+            null_values=["."], infer_schema_length=10000
         )
         
         df_final = (
@@ -173,24 +167,17 @@ other_tags=yes
         print("🛍️ PROCESSANDO MALHA ESTABELECIMENTOS...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        # 🛠️ CORRECAO DO BINDER ERROR: Uso de Subquery e nomes explicitos
+        # 🛠️ CORREÇÃO BINDER ERROR: Uso de CTE para definir aliases antes do filtro
         query = f"""
-            WITH RAW_DATA AS (
+            WITH RAW_EST AS (
                 SELECT 
                     COALESCE(regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
-                             regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CAT_BRUTA,
-                    name as NOME_BRUTO, 
-                    lat as LAT_ORIG, 
-                    lon as LON_ORIG
+                             regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CAT,
+                    name as NOME_RAW, lat as L_AT, lon as L_ON
                 FROM ST_Read('{osm_path}', layer='points')
             )
-            SELECT 
-                CAT_BRUTA as CATEGORIA, 
-                NOME_BRUTO as NOME, 
-                LAT_ORIG as LAT, 
-                LON_ORIG as LON 
-            FROM RAW_DATA 
-            WHERE CAT_BRUTA IS NOT NULL AND CAT_BRUTA != ''
+            SELECT CAT as CATEGORIA, NOME_RAW as NOME, L_AT as LAT, L_ON as LON 
+            FROM RAW_EST WHERE CAT IS NOT NULL AND CAT != ''
         """
         df = self.con.execute(query).pl()
         
