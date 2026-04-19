@@ -25,4 +25,4 @@ jobs:
         run: pip install boto3 polars duckdb h3 geopandas shapely pyarrow zstandard
 
       - name: Executar Arquitetura Prata
-        run: python autobot/prata/malha_geo_infra_social/build_prata_mestre.py
+        run: python autobot/prata/malha_geografica/malha_geo_infra_social/build_prata_mestre.py
