@@ -10,17 +10,16 @@ import zipfile
 from datetime import datetime
 
 # ==========================================
-# CONFIGURACOES DE ARQUITETURA SAFEDRIVER
+# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
 # ==========================================
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
 PRATA_DIR = "data_prata"
-# A variável AUDIT_DIR foi removida para unificar a saída na mesma pasta
 
 def normalizar_string(valor):
     if valor is None or valor == "" or str(valor).upper() in ["NULL", "NAN", ".", "N/A"]: 
         return "NAO INFORMADO"
-    # REMOVE ACENTOS E CONVERTE PARA MAIUSCULAS
+    # REMOVE ACENTOS E CONVERTE PARA MAIÚSCULAS
     texto = str(valor)
     texto = "".join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
     return texto.upper().strip()
@@ -31,7 +30,7 @@ class ArquitetoSafeDriver:
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # CONFIGURACAO DE AMBIENTE PARA OSM
+        # CONFIGURAÇÃO DE AMBIENTE PARA OSM
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
         
@@ -45,23 +44,25 @@ class ArquitetoSafeDriver:
         self.con.execute("INSTALL spatial; LOAD spatial;")
 
     def gerar_configuracao_osm(self):
-        ini_content = "[points]\nosm_id=yes\nattributes=name\nother_tags=yes\n[lines]\nosm_id=yes\nattributes=name\nother_tags=yes"
-        with open("osmconf.ini", "w") as f: f.write(ini_content)
+        ini_content = "[points]\nosm_id=yes\nattributes=name\nother_tags=yes\n[lines]\nosm_id=yes\nattributes=name\nother_tags=yes\n[multipolygons]\nosm_id=yes\nattributes=name\nother_tags=yes"
+        with open("osmconf.ini", "w", encoding="utf-8") as f: 
+            f.write(ini_content)
         os.environ["OSM_CONFIG_FILE"] = os.path.abspath("osmconf.ini")
 
     def download_bronze(self):
-        print("📥 BAIXANDO ATIVOS DA CAMADA BRONZE (R2)...")
+        print("📥 A DESCARREGAR ATIVOS DA CAMADA BRONZE (R2)...")
         arquivos = ["Agregados_por_setores_basico_BR_20250417.csv", "SP_Faces_2022.zip", "sp-latest.osm.pbf", 
                     "SP_Municipios_2022.shp", "SP_Municipios_2022.dbf", "SP_Municipios_2022.shx", "SP_Municipios_2022.prj"]
         for f in arquivos:
             local = os.path.join(BRONZE_DIR, f)
-            if not os.path.exists(local): self.s3.download_file(self.bucket, f"datalake/bronze/malha_raw/{f}", local)
+            if not os.path.exists(local): 
+                self.s3.download_file(self.bucket, f"datalake/bronze/malha_raw/{f}", local)
 
     # ==========================================
-    # 🧠 MOTOR DE NORMALIZACAO E AUDITORIA
+    # 🧠 MOTOR DE NORMALIZAÇÃO E AUDITORIA
     # ==========================================
     def normalizar_e_validar_espacial(self, df_pl):
-        print("🛡️ NORMALIZANDO E VALIDANDO INTEGRIDADE ESPACIAL...")
+        print("🛡️ A NORMALIZAR E VALIDAR INTEGRIDADE ESPACIAL...")
         mun_path = f"{BRONZE_DIR}/SP_Municipios_2022.shp"
         municipios = gpd.read_file(mun_path).to_crs("EPSG:4326")
         municipios["NM_MUN"] = municipios["NM_MUN"].apply(normalizar_string)
@@ -72,7 +73,7 @@ class ArquitetoSafeDriver:
         
         coluna_mun = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
         
-        # REGISTRA AUDITORIA DE ERROS MUNICIPAIS
+        # REGISTA AUDITORIA DE ERROS MUNICIPAIS
         erros = joined[joined['NM_MUN_left'] != joined[coluna_mun]].shape[0] if 'NM_MUN_left' in joined.columns else 0
         self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
         
@@ -83,10 +84,10 @@ class ArquitetoSafeDriver:
         return pl.from_pandas(joined.drop(columns=cols_existentes))
 
     # ==========================================
-    # 📍 ETAPA 1: NORMALIZACAO DA MALHA VIARIA
+    # 📍 ETAPA 1: NORMALIZAÇÃO DA MALHA VIÁRIA
     # ==========================================
     def normalizar_viaria(self):
-        print("📍 NORMALIZANDO MALHA VIARIA ESTADUAL EM LOTE...")
+        print("📍 A NORMALIZAR MALHA VIÁRIA ESTADUAL EM LOTE...")
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
@@ -97,7 +98,7 @@ class ArquitetoSafeDriver:
                     z.extract(f, BRONZE_DIR)
                     json_paths.append(os.path.join(BRONZE_DIR, f))
 
-        print(f"   -> {len(json_paths)} ficheiros municipais de ruas encontrados. Iniciando processamento espacial...")
+        print(f"   -> {len(json_paths)} ficheiros municipais de ruas encontrados. A iniciar processamento espacial...")
 
         lista_df_faces = []
         for path in json_paths:
@@ -113,7 +114,7 @@ class ArquitetoSafeDriver:
 
         df_faces = self.normalizar_e_validar_espacial(df_faces)
 
-        print("   -> Extraindo infraestrutura viária de todo o OSM...")
+        print("   -> A extrair infraestrutura viária de todo o OSM...")
         q_osm = f"""
             SELECT * FROM (
                 SELECT 
@@ -125,7 +126,7 @@ class ArquitetoSafeDriver:
         """
         df_osm = self.con.execute(q_osm).pl()
 
-        print("   -> Indexando por H3 e removendo duplicados estaduais...")
+        print("   -> A indexar por H3 e a remover duplicados estaduais...")
         df_final = df_faces.with_columns([
             pl.col("RUA").map_elements(normalizar_string, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
@@ -139,10 +140,10 @@ class ArquitetoSafeDriver:
                 os.remove(path)
 
     # ==========================================
-    # 👥 ETAPA 2: NORMALIZACAO DA MALHA SOCIAL
+    # 👥 ETAPA 2: NORMALIZAÇÃO DA MALHA SOCIAL
     # ==========================================
     def normalizar_social(self):
-        print("👥 NORMALIZANDO MALHA SOCIAL...")
+        print("👥 A NORMALIZAR MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
         df = pl.read_csv(csv_path, separator=";", encoding="latin1", schema_overrides={"CD_SETOR": pl.Utf8}, null_values=["."], infer_schema_length=10000)
         
@@ -157,22 +158,47 @@ class ArquitetoSafeDriver:
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
     # ==========================================
-    # 🛍️ ETAPA 3: NORMALIZACAO DA MALHA COMERCIAL
+    # 🛍️ ETAPA 3: NORMALIZAÇÃO DA MALHA COMERCIAL (CORRIGIDA)
     # ==========================================
     def normalizar_comercial(self):
-        print("🛍️ NORMALIZANDO MALHA COMERCIAL...")
+        print("🛍️ A NORMALIZAR MALHA COMERCIAL (PONTOS + POLÍGONOS)...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
         q = f"""
-            SELECT * FROM (
+            WITH POIS AS (
+                -- 1. PONTOS COMERCIAIS E DE SERVIÇO
                 SELECT 
-                    COALESCE(regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
-                             regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CAT, 
+                    COALESCE(
+                        regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
+                        regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1),
+                        regexp_extract(other_tags, '"leisure"=>"([^"]+)"', 1),
+                        regexp_extract(other_tags, '"office"=>"([^"]+)"', 1),
+                        regexp_extract(other_tags, '"healthcare"=>"([^"]+)"', 1)
+                    ) as CAT, 
                     name, 
                     ST_Y(geom) as LAT, 
                     ST_X(geom) as LON 
                 FROM ST_Read('{osm_path}', layer='points') 
-            ) WHERE CAT IS NOT NULL AND CAT != ''
+
+                UNION ALL
+
+                -- 2. POLÍGONOS COMERCIAIS (Shoppings, Parques, Hospitais, etc.)
+                SELECT 
+                    COALESCE(
+                        regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
+                        regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1),
+                        regexp_extract(other_tags, '"leisure"=>"([^"]+)"', 1),
+                        regexp_extract(other_tags, '"office"=>"([^"]+)"', 1),
+                        regexp_extract(other_tags, '"healthcare"=>"([^"]+)"', 1)
+                    ) as CAT, 
+                    name, 
+                    ST_Y(ST_Centroid(geom)) as LAT, 
+                    ST_X(ST_Centroid(geom)) as LON 
+                FROM ST_Read('{osm_path}', layer='multipolygons')
+            )
+            SELECT CAT, name, LAT, LON 
+            FROM POIS 
+            WHERE CAT IS NOT NULL AND CAT != ''
         """
         df = self.con.execute(q).pl()
         
@@ -186,14 +212,14 @@ class ArquitetoSafeDriver:
         self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": df_final.height}
 
     def upload_final(self):
-        print("🚀 GERANDO AUDITORIA E SUBINDO PARA R2...")
+        print("🚀 A GERAR AUDITORIA E A SUBIR PARA O R2...")
         
-        # 📄 CRIA O ARQUIVO FISICO DA AUDITORIA DIRETAMENTE NA PRATA_DIR
+        # CRIA O FICHEIRO FÍSICO DA AUDITORIA DIRETAMENTE NA PRATA_DIR
         audit_file = f"{PRATA_DIR}/AUDITORIA_PRATA.json"
         with open(audit_file, "w", encoding="utf-8") as f:
             json.dump(self.audit_log, f, indent=4, ensure_ascii=False)
             
-        # UPLOAD SIMPLIFICADO: TUDO VAI PARA A MESMA PASTA NO DATALAKE
+        # UPLOAD SIMPLIFICADO
         for root, dirs, files in os.walk(PRATA_DIR):
             for f in files:
                 local = os.path.join(root, f)
