@@ -72,9 +72,13 @@ class ArquitetoSafeDriver:
         joined = gpd.sjoin(gdf, municipios[['NM_MUN', 'geometry']], how="left", predicate="within")
         
         coluna_mun = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
+        
+        # REGISTRA AUDITORIA DE ERROS MUNICIPAIS
+        erros = joined[joined['NM_MUN_left'] != joined[coluna_mun]].shape[0] if 'NM_MUN_left' in joined.columns else 0
+        self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
+        
         joined["MUNICIPIO_VALIDADO"] = joined[coluna_mun].fillna("FORA DA AREA")
         
-        # LIMPEZA FINAL DA NORMALIZACAO
         cols_remover = ["geometry", "index_right", "NM_MUN", "NM_MUN_left", "NM_MUN_right"]
         cols_existentes = [c for c in cols_remover if c in joined.columns]
         return pl.from_pandas(joined.drop(columns=cols_existentes))
@@ -87,28 +91,34 @@ class ArquitetoSafeDriver:
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        # EXTRAIR JSON
         json_path = ""
         with zipfile.ZipFile(faces_zip, 'r') as z:
             for f in z.namelist():
                 if f.endswith('.json'): z.extract(f, BRONZE_DIR); json_path = os.path.join(BRONZE_DIR, f); break
 
-        # QUERY NORMALIZADA FACES
         q_faces = f"SELECT CD_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{json_path}') WHERE NM_LOG IS NOT NULL"
         df_faces = self.con.execute(q_faces).pl()
         df_faces = self.normalizar_e_validar_espacial(df_faces)
 
-        # QUERY NORMALIZADA OSM
-        q_osm = f"SELECT COALESCE(regexp_extract(other_tags, '\"highway\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as TIPO_VIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{osm_path}', layer='lines') WHERE other_tags LIKE '%\"highway\"=>%'"
+        # 🛡️ BLINDAGEM DO BINDER ERROR: USO DE SUBQUERY (CTE)
+        q_osm = f"""
+            SELECT * FROM (
+                SELECT 
+                    COALESCE(regexp_extract(other_tags, '"highway"=>"([^"]+)"', 1), 'NAO INFORMADO') as TIPO_VIA, 
+                    ST_Y(ST_Centroid(geom)) as LAT, 
+                    ST_X(ST_Centroid(geom)) as LON 
+                FROM ST_Read('{osm_path}', layer='lines')
+            ) WHERE TIPO_VIA != 'NAO INFORMADO'
+        """
         df_osm = self.con.execute(q_osm).pl()
 
-        # INDEXACAO H3 E LIMPEZA
         df_final = df_faces.with_columns([
             pl.col("RUA").map_elements(normalizar_string, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
         ]).unique(subset=["H3_INDEX", "RUA"]).sort("H3_INDEX")
 
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet", compression="zstd")
+        self.audit_log["CAMADAS"]["VIARIA"] = {"REGISTROS": df_final.height}
         if os.path.exists(json_path): os.remove(json_path)
 
     # ==========================================
@@ -127,6 +137,7 @@ class ArquitetoSafeDriver:
         ]).unique(subset=["CD_SETOR"]).sort("CD_SETOR")
         
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet", compression="zstd")
+        self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
     # ==========================================
     # 🛍️ ETAPA 3: NORMALIZACAO DA MALHA COMERCIAL
@@ -135,16 +146,17 @@ class ArquitetoSafeDriver:
         print("🛍️ NORMALIZANDO MALHA COMERCIAL...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        # 🛠️ CORREÇÃO DO BINDER ERROR: Extraindo coordenadas usando as funções espaciais ST_Y e ST_X direto da 'geom'
+        # 🛡️ BLINDAGEM DO BINDER ERROR: USO DE SUBQUERY (CTE) E FUNCOES ST_Y/ST_X
         q = f"""
-            SELECT 
-                COALESCE(regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
-                         regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CAT, 
-                name, 
-                ST_Y(geom) as LAT, 
-                ST_X(geom) as LON 
-            FROM ST_Read('{osm_path}', layer='points') 
-            WHERE other_tags LIKE '%"shop"=>%' OR other_tags LIKE '%"amenity"=>%'
+            SELECT * FROM (
+                SELECT 
+                    COALESCE(regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
+                             regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CAT, 
+                    name, 
+                    ST_Y(geom) as LAT, 
+                    ST_X(geom) as LON 
+                FROM ST_Read('{osm_path}', layer='points') 
+            ) WHERE CAT IS NOT NULL AND CAT != ''
         """
         df = self.con.execute(q).pl()
         
@@ -155,9 +167,16 @@ class ArquitetoSafeDriver:
         ]).group_by(["H3_INDEX", "CATEGORIA"]).agg(pl.len().alias("QTD")).sort("H3_INDEX")
         
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
+        self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": df_final.height}
 
     def upload_final(self):
-        print("🚀 SUBINDO ENTIDADES NORMALIZADAS PARA R2...")
+        print("🚀 GERANDO AUDITORIA E SUBINDO PARA R2...")
+        
+        # 📄 CRIA O ARQUIVO FISICO DA AUDITORIA
+        audit_file = f"{AUDIT_DIR}/AUDITORIA_PRATA.json"
+        with open(audit_file, "w", encoding="utf-8") as f:
+            json.dump(self.audit_log, f, indent=4, ensure_ascii=False)
+            
         for root, dirs, files in os.walk(PRATA_DIR):
             for f in files:
                 local = os.path.join(root, f)
@@ -171,7 +190,7 @@ class ArquitetoSafeDriver:
         self.normalizar_social()
         self.normalizar_comercial()
         self.upload_final()
-        print("✅ TODAS AS ENTIDADES FORAM NORMALIZADAS E ESTAO PRONTAS PARA O JOIN.")
+        print("✅ TODAS AS ENTIDADES FORAM NORMALIZADAS, AUDITADAS E ESTAO PRONTAS.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
