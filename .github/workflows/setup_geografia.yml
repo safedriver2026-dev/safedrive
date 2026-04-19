@@ -1,75 +1,87 @@
-name: "SafeDriver [01]: Ingestao Bronze (Faces, OSM Sudeste e Trajetos)"
+name: "SafeDriver [01]: Ingestao Bronze (Boto3 Edition)"
 
 on:
-  workflow_dispatch: # Execucao manual
+  workflow_dispatch:
+
+env:
+  R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+  R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
 jobs:
-  ingest_bronze:
+  ingestao-bronze:
     runs-on: ubuntu-latest
-    
-    env:
-      # URLs das Fontes de Dados
-      URL_FACES_JSON: "https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022_censo_demografico/json/SP_faces_de_logradouros_2022_json.zip"
-      URL_OSM_SUDESTE: "https://download.geofabrik.de/south-america/brazil/sudeste-latest.osm.pbf"
-      URL_TRAJETOS: "https://ftp.ibge.gov.br/Cadastro_Nacional_de_Enderecos_para_Fins_Estatisticos/Censo_Demografico_2022/Trajetos_dos_Recenseadores/35_SAO_PAULO.zip"
-      
-      # Secrets brutos
-      R2_ENDPOINT_RAW: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_KEY_ID_RAW: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_RAW: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET_RAW: ${{ secrets.R2_BUCKET_NAME }}
 
     steps:
-      - name: "Checkout do Repositorio"
+      - name: Passo 1 - Checkout do código
         uses: actions/checkout@v4
 
-      - name: "Limpar Secrets e Configurar AWS CLI"
+      - name: Passo 2 - Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Passo 3 - Instalar Dependências
+        run: pip install boto3 requests
+
+      - name: Passo 4 - Download das Fontes e Upload para R2
         run: |
-          # O xargs remove espacos e caracteres invisiveis
-          CLEAN_KEY=$(echo "${{ env.R2_KEY_ID_RAW }}" | xargs)
-          CLEAN_SECRET=$(echo "${{ env.R2_SECRET_RAW }}" | xargs)
-          CLEAN_ENDPOINT=$(echo "${{ env.R2_ENDPOINT_RAW }}" | xargs)
-          CLEAN_BUCKET=$(echo "${{ env.R2_BUCKET_RAW }}" | xargs)
+          python -c "
+          import boto3, os, requests
           
-          # Configura as credenciais no runner
-          aws configure set aws_access_key_id $CLEAN_KEY
-          aws configure set aws_secret_access_key $CLEAN_SECRET
-          aws configure set default.region auto
+          # Configuração do Cliente R2 (Seguindo seu padrão de sucesso)
+          s3 = boto3.client('s3', 
+                            endpoint_url=os.getenv('R2_ENDPOINT_URL').strip(), 
+                            aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID').strip(), 
+                            aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY').strip())
           
-          # Grava no GITHUB_ENV para os passos seguintes
-          echo "CLEAN_ENDPOINT=$CLEAN_ENDPOINT" >> $GITHUB_ENV
-          echo "CLEAN_BUCKET=$CLEAN_BUCKET" >> $GITHUB_ENV
+          bucket = os.getenv('R2_BUCKET_NAME').strip()
+          
+          def download_and_upload(url, r2_key):
+              print(f'📥 Baixando: {url}')
+              local_file = url.split('/')[-1]
+              
+              # Download com stream para não estourar a RAM do Runner
+              with requests.get(url, stream=True) as r:
+                  r.raise_for_status()
+                  with open(local_file, 'wb') as f:
+                      for chunk in r.iter_content(chunk_size=8192):
+                          f.write(chunk)
+              
+              print(f'🚀 Subindo para R2: {r2_key}')
+              s3.upload_file(local_file, bucket, r2_key)
+              os.remove(local_file)
+              print(f'✅ Concluído: {r2_key}')
 
-      - name: "Criar Estrutura de Dados"
-        run: mkdir -p data_raw
+          # Lista de Alvos para a Camada Bronze
+          targets = [
+              {
+                  'url': 'https://geoftp.ibge.gov.br/recortes_para_fins_estatisticos/malha_de_setores_censitarios/censo_2022/base_de_faces_de_logradouros_versao_2022_censo_demografico/json/SP_faces_de_logradouros_2022_json.zip',
+                  'key': 'datalake/bronze/malha_raw/SP_Faces_2022.zip'
+              },
+              {
+                  'url': 'https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.osm.pbf',
+                  'key': 'datalake/bronze/malha_raw/sudeste-latest.osm.pbf'
+              },
+              {
+                  'url': 'https://ftp.ibge.gov.br/Cadastro_Nacional_de_Enderecos_para_Fins_Estatisticos/Censo_Demografico_2022/Trajetos_dos_Recenseadores/35_SAO_PAULO.zip',
+                  'key': 'datalake/bronze/malha_raw/35_SAO_PAULO_Trajetos.zip'
+              }
+          ]
 
-      - name: "Ingestao: Faces de Logradouro (IBGE JSON)"
-        run: wget -L "${{ env.URL_FACES_JSON }}" -O data_raw/SP_Faces_2022.zip
+          for target in targets:
+              download_and_upload(target['url'], target['key'])
+          "
 
-      - name: "Ingestao: OSM Sudeste (Geofabrik)"
-        run: wget -L "${{ env.URL_OSM_SUDESTE }}" -O data_raw/sudeste-latest.osm.pbf
-
-      - name: "Ingestao: Trajetos dos Recenseadores (IBGE)"
-        run: wget -L "${{ env.URL_TRAJETOS }}" -O data_raw/35_SAO_PAULO_Trajetos.zip
-
-      - name: "Sincronizar Bronze no R2 (malha_raw)"
+      - name: Passo 5 - Notificação de Sucesso (Discord)
+        if: success()
         run: |
-          # Aceder as variaveis via $ (shell) evita erros de validacao de contexto do GitHub
-          aws s3 sync data_raw/ s3://$CLEAN_BUCKET/datalake/bronze/malha_raw/ \
-          --endpoint-url $CLEAN_ENDPOINT
-
-      - name: "Notificacao Discord"
-        if: always()
-        run: |
-          STATUS="${{ job.status }}"
-          if [ "$STATUS" == "success" ]; then
-            WEBHOOK=$(echo "${{ secrets.DISCORD_SUCESSO }}" | xargs)
-            MSG="SafeDriver Bronze Ingestao: Sucesso! Dados sincronizados no R2."
-          else
-            WEBHOOK=$(echo "${{ secrets.DISCORD_ERRO }}" | xargs)
-            MSG="SafeDriver Bronze Ingestao: Erro detectado. Verifique os logs."
-          fi
-          
-          if [ ! -z "$WEBHOOK" ]; then
-            curl -H "Content-Type: application/json" -X POST -d "{\"content\": \"$MSG\"}" $WEBHOOK
-          fi
+          python -c "
+          import os, requests
+          webhook = os.getenv('DISCORD_OK', '').strip()
+          if webhook:
+              requests.post(webhook, json={'content': '🚀 **SafeDriver Bronze**: Ingestão via Boto3 concluída com sucesso!'})
+          "
+        env:
+          DISCORD_OK: ${{ secrets.DISCORD_SUCESSO }}
