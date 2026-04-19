@@ -1,6 +1,6 @@
 name: Discovery SafeDriver OSM
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Botão manual no GitHub
 
 jobs:
   discovery:
@@ -14,20 +14,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Tools
+      - name: Install DuckDB
         run: pip install duckdb polars
 
       - name: Download Real PBF
         run: |
-          # O segredo é o -L e o User-Agent
-          wget -L --user-agent="Mozilla/5.0" https://download.geofabrik.de/south-america/brazil/sudeste-latest-free.osm.pbf -O data.osm.pbf
-          ls -lh data.osm.pbf # Aqui tem que aparecer ~800MB no log
+          # Usando wget com User-Agent para o Geofabrik não bloquear o runner
+          wget -L --user-agent="Mozilla/5.0" https://download.geofabrik.de/south-america/brazil/sudeste-latest.osm.pbf -O data.osm.pbf
+          
+          # Validação de tamanho: Se for < 100MB, o download falhou
+          FILESIZE=$(stat -c%s "data.osm.pbf")
+          echo "Tamanho do arquivo: $FILESIZE bytes"
+          if [ $FILESIZE -lt 100000000 ]; then
+            echo "❌ Erro: Download incompleto. Geofabrik bloqueou a requisição."
+            exit 1
+          fi
 
       - name: Deep Discovery Script
         run: python scripts/discovery.py
-
-      - name: Upload Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: osm-dictionary-report
-          path: reports/
