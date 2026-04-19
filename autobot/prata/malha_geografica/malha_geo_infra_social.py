@@ -32,10 +32,9 @@ class ArquitetoSafeDriver:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # 🛠️ GERA O ARQUIVO DE CONFIGURAÇÃO OSM ANTES DE INICIAR O DUCKDB
+        # GERA CONFIGURACAO OSM PARA O GDAL (CORRECAO DE BINDER ERROR)
         self.gerar_configuracao_osm()
         
-        # CONFIGURACAO R2 (BOTO3)
         self.s3 = boto3.client('s3',
             endpoint_url=os.getenv('R2_ENDPOINT_URL', '').strip(),
             aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID', '').strip(),
@@ -43,45 +42,40 @@ class ArquitetoSafeDriver:
         )
         self.bucket = os.getenv('R2_BUCKET_NAME', '').strip()
         
-        # MOTOR ESPACIAL DUCKDB
         self.con = duckdb.connect()
         self.con.execute("INSTALL spatial; LOAD spatial;")
 
     def gerar_configuracao_osm(self):
         print("⚙️ INJETANDO CONFIGURACOES DO OPENSTREETMAP (osmconf.ini)...")
-        # Cria um arquivo ini mínimo obrigatório para o GDAL ler PBF sem explodir
-        # O all_tags=yes garante que as colunas fiquem armazenadas em 'other_tags'
         ini_content = """
 [points]
 osm_id=yes
 attributes=name
-all_tags=yes
+other_tags=yes
 
 [lines]
 osm_id=yes
 attributes=name
-all_tags=yes
+other_tags=yes
 
 [multipolygons]
 osm_id=yes
 attributes=name
-all_tags=yes
+other_tags=yes
 
 [multilinestrings]
 osm_id=yes
 attributes=name
-all_tags=yes
+other_tags=yes
 
 [other_relations]
 osm_id=yes
 attributes=name
-all_tags=yes
+other_tags=yes
 """
         ini_path = os.path.abspath("osmconf.ini")
         with open(ini_path, "w", encoding="utf-8") as f:
             f.write(ini_content)
-        
-        # Força o sistema do Linux (GitHub Actions) a apontar para o nosso arquivo novo
         os.environ["OSM_CONFIG_FILE"] = ini_path
 
     def download_bronze(self):
@@ -98,9 +92,6 @@ all_tags=yes
                 print(f"   -> Baixando: {f}")
                 self.s3.download_file(self.bucket, f"datalake/bronze/malha_raw/{f}", local_path)
 
-    # ==========================================
-    # 🧠 MOTOR DE INTELIGENCIA: VALIDACAO MUNICIPAL
-    # ==========================================
     def validar_municipio_real(self, df_pl):
         print("🛡️ EXECUTANDO AUDITORIA ESPACIAL: CROSS-CHECK DE MUNICIPIOS...")
         mun_path = f"{BRONZE_DIR}/SP_Municipios_2022.shp"
@@ -109,27 +100,19 @@ all_tags=yes
 
         pdf = df_pl.to_pandas()
         gdf = gpd.GeoDataFrame(pdf, geometry=gpd.points_from_xy(pdf['LON'], pdf['LAT']), crs="EPSG:4326")
-        
         joined = gpd.sjoin(gdf, municipios[['NM_MUN', 'geometry']], how="left", predicate="within")
         
-        coluna_municipio = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
+        # VERIFICACAO DINAMICA DE COLUNA (CORRECAO DE KEYERROR)
+        coluna_mun = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
         
-        if 'NM_MUN_left' in joined.columns:
-            erros = joined[joined['NM_MUN_left'] != joined[coluna_municipio]].shape[0]
-        else:
-            erros = 0 
-            
+        erros = joined[joined['NM_MUN_left'] != joined[coluna_mun]].shape[0] if 'NM_MUN_left' in joined.columns else 0
         self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
-        joined["NM_MUN_REAL"] = joined[coluna_municipio].fillna("FORA DA AREA DE COBERTURA")
+        joined["NM_MUN_REAL"] = joined[coluna_mun].fillna("FORA DA AREA DE COBERTURA")
         
         colunas_remover = ["geometry", "index_right", "NM_MUN", "NM_MUN_left", "NM_MUN_right"]
-        colunas_existentes = [c for c in colunas_remover if c in joined.columns]
-        
-        return pl.from_pandas(joined.drop(columns=colunas_existentes))
+        cols_existentes = [c for c in colunas_remover if c in joined.columns]
+        return pl.from_pandas(joined.drop(columns=cols_existentes))
 
-    # ==========================================
-    # 📍 MALHA VIARIA (GEO + INFRA ESTRUTURA)
-    # ==========================================
     def processar_viaria(self):
         print("📍 PROCESSANDO MALHA VIARIA (GEO + INFRA)...")
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
@@ -143,32 +126,12 @@ all_tags=yes
                     z.extract(filename, BRONZE_DIR)
                     json_path = os.path.join(BRONZE_DIR, filename)
                     break
-                    
-        if not json_path:
-            raise Exception("ERRO CRITICO: Arquivo JSON não encontrado dentro do SP_Faces_2022.zip")
         
-        query_faces = f"""
-            SELECT 
-                CD_SETOR AS ID_SETOR,
-                trim(NM_TIP_LOG || ' ' || NM_LOG) as LOGRADOURO,
-                ST_Y(ST_Centroid(geom)) as LAT,
-                ST_X(ST_Centroid(geom)) as LON
-            FROM ST_Read('{json_path}')
-            WHERE NM_LOG IS NOT NULL
-        """
+        query_faces = f"SELECT CD_SETOR AS ID_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as LOGRADOURO, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{json_path}') WHERE NM_LOG IS NOT NULL"
         df_faces = self.con.execute(query_faces).pl()
         df_faces = self.validar_municipio_real(df_faces)
 
-        query_osm = f"""
-            SELECT 
-                COALESCE(regexp_extract(other_tags, '"highway"=>"([^"]+)"', 1), 'NAO INFORMADO') as TIPO_VIA,
-                COALESCE(regexp_extract(other_tags, '"maxspeed"=>"([^"]+)"', 1), 'NAO INFORMADO') as VELOCIDADE_MAXIMA,
-                COALESCE(regexp_extract(other_tags, '"surface"=>"([^"]+)"', 1), 'NAO INFORMADO') as PAVIMENTO,
-                COALESCE(regexp_extract(other_tags, '"lit"=>"([^"]+)"', 1), 'NAO INFORMADO') as ILUMINACAO,
-                ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON
-            FROM ST_Read('{osm_path}', layer='lines')
-            WHERE TIPO_VIA != 'NAO INFORMADO'
-        """
+        query_osm = f"SELECT COALESCE(regexp_extract(other_tags, '\"highway\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as TIPO_VIA, COALESCE(regexp_extract(other_tags, '\"maxspeed\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as VELOCIDADE_MAXIMA, COALESCE(regexp_extract(other_tags, '\"surface\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as PAVIMENTO, COALESCE(regexp_extract(other_tags, '\"lit\"=>\"([^\"]+)\"', 1), 'NAO INFORMADO') as ILUMINACAO, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{osm_path}', layer='lines') WHERE TIPO_VIA != 'NAO INFORMADO'"
         df_osm = self.con.execute(query_osm).pl()
 
         df_final = df_faces.with_columns([
@@ -176,73 +139,45 @@ all_tags=yes
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
         ]).unique(subset=["H3_INDEX", "LOGRADOURO"]).rename({"NM_MUN_REAL": "MUNICIPIO"}).sort("H3_INDEX")
 
-        caminho = f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet"
-        df_final.write_parquet(caminho, compression="zstd", compression_level=3, statistics=True, use_pyarrow=True)
+        df_final.write_parquet(f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["VIARIA"] = {"REGISTROS": df_final.height}
-        
-        if os.path.exists(json_path): 
-            os.remove(json_path)
-            print("🧹 Ficheiro JSON temporário apagado.")
+        if os.path.exists(json_path): os.remove(json_path)
 
-    # ==========================================
-    # 👥 MALHA SOCIAL
-    # ==========================================
     def processar_social(self):
         print("👥 PROCESSANDO MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
         df = pl.read_csv(csv_path, separator=";", encoding="latin1", dtypes={"CD_SETOR": pl.Utf8})
-        
-        df_final = (
-            df.filter(pl.col("CD_SETOR").str.starts_with("35"))
-            .select([
-                pl.col("CD_SETOR").alias("ID_SETOR"),
-                pl.col("NM_MUN").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("MUNICIPIO"),
-                pl.col("NM_BAIRRO").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("BAIRRO"),
-                pl.col("v0001").cast(pl.Int32).fill_null(0).alias("POPULACAO")
-            ])
-            .unique(subset=["ID_SETOR"]).sort("ID_SETOR")
-        )
-        caminho = f"{PRATA_DIR}/MALHA_SOCIAL.parquet"
-        df_final.write_parquet(caminho, compression="zstd", compression_level=3, statistics=True, use_pyarrow=True)
+        df_final = df.filter(pl.col("CD_SETOR").str.starts_with("35")).select([
+            pl.col("CD_SETOR").alias("ID_SETOR"),
+            pl.col("NM_MUN").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("MUNICIPIO"),
+            pl.col("NM_BAIRRO").map_elements(limpar_texto, return_dtype=pl.Utf8).alias("BAIRRO"),
+            pl.col("v0001").cast(pl.Int32).fill_null(0).alias("POPULACAO")
+        ]).unique(subset=["ID_SETOR"]).sort("ID_SETOR")
+        df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
-    # ==========================================
-    # 🛍️ MALHA ESTABELECIMENTOS
-    # ==========================================
     def processar_estabelecimentos(self):
         print("🛍️ PROCESSANDO MALHA ESTABELECIMENTOS...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
-        query = f"""
-            SELECT 
-                COALESCE(regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
-                         regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1)) as CATEGORIA,
-                name as NOME, lat as LAT, lon as LON
-            FROM ST_Read('{osm_path}', layer='points')
-            WHERE CATEGORIA != ''
-        """
+        query = "SELECT COALESCE(regexp_extract(other_tags, '\"shop\"=>\"([^\"]+)\"', 1), regexp_extract(other_tags, '\"amenity\"=>\"([^\"]+)\"', 1)) as CATEGORIA, name as NOME, lat as LAT, lon as LON FROM ST_Read('" + osm_path + "', layer='points') WHERE CATEGORIA != ''"
         df = self.con.execute(query).pl()
         df_final = df.with_columns([
             pl.col("CATEGORIA").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.col("NOME").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
         ]).group_by(["H3_INDEX", "CATEGORIA"]).agg(pl.len().alias("QTD")).sort("H3_INDEX")
-
-        caminho = f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet"
-        df_final.write_parquet(caminho, compression="zstd", compression_level=3, statistics=True, use_pyarrow=True)
+        df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": df_final.height}
 
     def upload_r2(self):
         print("🚀 SUBINDO PARA O R2...")
         with open(f"{AUDIT_DIR}/AUDITORIA_PRATA.json", "w", encoding="utf-8") as f:
             json.dump(self.audit_log, f, indent=4, ensure_ascii=False)
-        
         for root, dirs, files in os.walk(PRATA_DIR):
             for file in files:
                 local_path = os.path.join(root, file)
                 key = f"datalake/prata/malha_geo_infra_social/{file}"
                 if file.endswith('.json'): key = f"datalake/prata/auditoria/{file}"
-                
-                print(f"   -> Upload: {key}")
                 self.s3.upload_file(local_path, self.bucket, key)
 
     def executar(self):
@@ -251,7 +186,7 @@ all_tags=yes
         self.processar_social()
         self.processar_estabelecimentos()
         self.upload_r2()
-        print("✅ CAMADA PRATA MESTRE CONCLUIDA COM SUCESSO.")
+        print("✅ PIPELINE CONCLUIDO.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
