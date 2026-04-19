@@ -30,6 +30,10 @@ class ArquitetoSafeDriver:
         self.audit_log = {"DATA_EXECUCAO": datetime.now().isoformat(), "AUDITORIA_QUALIDADE": {}, "CAMADAS": {}}
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(AUDIT_DIR, exist_ok=True)
+        os.makedirs(BRONZE_DIR, exist_ok=True)
+        
+        # 🛠️ GERA O ARQUIVO DE CONFIGURAÇÃO OSM ANTES DE INICIAR O DUCKDB
+        self.gerar_configuracao_osm()
         
         # CONFIGURACAO R2 (BOTO3)
         self.s3 = boto3.client('s3',
@@ -43,9 +47,45 @@ class ArquitetoSafeDriver:
         self.con = duckdb.connect()
         self.con.execute("INSTALL spatial; LOAD spatial;")
 
+    def gerar_configuracao_osm(self):
+        print("⚙️ INJETANDO CONFIGURACOES DO OPENSTREETMAP (osmconf.ini)...")
+        # Cria um arquivo ini mínimo obrigatório para o GDAL ler PBF sem explodir
+        # O all_tags=yes garante que as colunas fiquem armazenadas em 'other_tags'
+        ini_content = """
+[points]
+osm_id=yes
+attributes=name
+all_tags=yes
+
+[lines]
+osm_id=yes
+attributes=name
+all_tags=yes
+
+[multipolygons]
+osm_id=yes
+attributes=name
+all_tags=yes
+
+[multilinestrings]
+osm_id=yes
+attributes=name
+all_tags=yes
+
+[other_relations]
+osm_id=yes
+attributes=name
+all_tags=yes
+"""
+        ini_path = os.path.abspath("osmconf.ini")
+        with open(ini_path, "w", encoding="utf-8") as f:
+            f.write(ini_content)
+        
+        # Força o sistema do Linux (GitHub Actions) a apontar para o nosso arquivo novo
+        os.environ["OSM_CONFIG_FILE"] = ini_path
+
     def download_bronze(self):
         print("📥 BAIXANDO ATIVOS DA CAMADA BRONZE (R2)...")
-        os.makedirs(BRONZE_DIR, exist_ok=True)
         arquivos = [
             "Agregados_por_setores_basico_BR_20250417.csv",
             "SP_Faces_2022.zip",
@@ -70,23 +110,18 @@ class ArquitetoSafeDriver:
         pdf = df_pl.to_pandas()
         gdf = gpd.GeoDataFrame(pdf, geometry=gpd.points_from_xy(pdf['LON'], pdf['LAT']), crs="EPSG:4326")
         
-        # Join Espacial
         joined = gpd.sjoin(gdf, municipios[['NM_MUN', 'geometry']], how="left", predicate="within")
         
-        # 🛠️ VERIFICAÇÃO DINÂMICA: Previne o KeyError do GeoPandas
         coluna_municipio = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
         
         if 'NM_MUN_left' in joined.columns:
             erros = joined[joined['NM_MUN_left'] != joined[coluna_municipio]].shape[0]
         else:
-            erros = 0 # Enriquecimento de dados puro
+            erros = 0 
             
         self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
-        
-        # Atribui o nome validado
         joined["NM_MUN_REAL"] = joined[coluna_municipio].fillna("FORA DA AREA DE COBERTURA")
         
-        # Limpeza segura de colunas
         colunas_remover = ["geometry", "index_right", "NM_MUN", "NM_MUN_left", "NM_MUN_right"]
         colunas_existentes = [c for c in colunas_remover if c in joined.columns]
         
@@ -100,13 +135,11 @@ class ArquitetoSafeDriver:
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        # EXTRAÇÃO INTELIGENTE DO JSON
         json_path = None
         print("   -> Lendo estrutura interna do ZIP de Faces...")
         with zipfile.ZipFile(faces_zip, 'r') as z:
             for filename in z.namelist():
                 if filename.endswith('.json'):
-                    print(f"   -> Ficheiro extraído: {filename}")
                     z.extract(filename, BRONZE_DIR)
                     json_path = os.path.join(BRONZE_DIR, filename)
                     break
@@ -124,11 +157,8 @@ class ArquitetoSafeDriver:
             WHERE NM_LOG IS NOT NULL
         """
         df_faces = self.con.execute(query_faces).pl()
-        
-        # VALIDACAO CRUZADA PARA CORRIGIR MUNICIPIO
         df_faces = self.validar_municipio_real(df_faces)
 
-        # UNIFICACAO COM INFRAESTRUTURA OSM
         query_osm = f"""
             SELECT 
                 COALESCE(regexp_extract(other_tags, '"highway"=>"([^"]+)"', 1), 'NAO INFORMADO') as TIPO_VIA,
@@ -141,7 +171,6 @@ class ArquitetoSafeDriver:
         """
         df_osm = self.con.execute(query_osm).pl()
 
-        # OTIMIZACAO FINAL E GRAVACAO
         df_final = df_faces.with_columns([
             pl.col("LOGRADOURO").map_elements(limpar_texto, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
@@ -151,7 +180,6 @@ class ArquitetoSafeDriver:
         df_final.write_parquet(caminho, compression="zstd", compression_level=3, statistics=True, use_pyarrow=True)
         self.audit_log["CAMADAS"]["VIARIA"] = {"REGISTROS": df_final.height}
         
-        # Limpeza do disco
         if os.path.exists(json_path): 
             os.remove(json_path)
             print("🧹 Ficheiro JSON temporário apagado.")
