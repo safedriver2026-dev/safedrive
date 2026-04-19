@@ -1,4 +1,4 @@
-name: "Safedriver - Malha Geografica Prata"
+name: "SafeDriver [03]: Camada Prata"
 
 on:
   workflow_dispatch:
