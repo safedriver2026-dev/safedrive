@@ -1,13 +1,12 @@
 name: "SafeDriver: Camada Prata Malha"
 
 on:
-  workflow_dispatch: # Permite execução manual pelo painel do GitHub
+  workflow_dispatch:
 
 jobs:
   build-silver:
     runs-on: ubuntu-latest
     
-    # Define o ambiente com as variáveis secretas
     env:
       # Cloudflare R2
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -16,8 +15,10 @@ jobs:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       
       # BigQuery & Segurança (LGPD Compliance)
-      BQ_PROJECT_ID: "safe-driver-fc3a9"
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
+      LGPD_SALT: ${{ secrets.LGPD_SALT }}
 
     steps:
       - name: Checkout do Repositório
@@ -26,7 +27,7 @@ jobs:
       - name: Configurar Ambiente Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Versão atualizada para evitar avisos do Google
+          python-version: '3.11'
 
       - name: Autenticar no Google Cloud (BigQuery)
         uses: google-github-actions/auth@v2
@@ -42,24 +43,20 @@ jobs:
 
       - name: Executar Pipeline Camada Prata
         run: |
-          # Define o PYTHONPATH para garantir que o Python encontra os teus módulos internos
           export PYTHONPATH=$PYTHONPATH:$(pwd)
-          
-          # 🚀 CAMINHO CORRIGIDO: Apontando para a pasta real do teu projeto
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-      # --- NOTIFICAÇÕES DE OBSERVABILIDADE ---
-      
+      # Notificações usando as tuas Secrets exatas
       - name: Notificar Falha no Discord
         if: failure()
         run: |
           curl -H "Content-Type: application/json" \
-          -d '{"content": "🚨 **[SafeDriver] FALHA CRÍTICA:** A pipeline da Camada Prata falhou. Lucas, verifica os logs no GitHub Actions!"}' \
+          -d '{"content": "🚨 **[SafeDriver] FALHA CRÍTICA:** A pipeline da Camada Prata falhou!"}' \
           ${{ secrets.DISCORD_ERRO }}
 
       - name: Notificar Sucesso no Discord
         if: success()
         run: |
           curl -H "Content-Type: application/json" \
-          -d '{"content": "✅ **[SafeDriver] SUCESSO:** Camada Prata processada, pseudonimizada (Salt+Pepper) e guardada no R2."}' \
+          -d '{"content": "✅ **[SafeDriver] SUCESSO:** Camada Prata processada e guardada no R2."}' \
           ${{ secrets.DISCORD_SUCESSO }}
