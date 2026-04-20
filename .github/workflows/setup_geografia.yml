@@ -2,12 +2,17 @@ name: "SafeDriver: Camada Prata Malha"
 
 on:
   workflow_dispatch:
-
 env:
+  # Cloudflare R2
   R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
   R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
   R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+  
+  # BigQuery & Segurança
+  BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+  BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+  LGPD_SALT: ${{ secrets.LGPD_SALT }}
 
 jobs:
   build-silver:
@@ -24,7 +29,8 @@ jobs:
       - name: Autenticar no Google Cloud (BigQuery)
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+          # Usando o nome exato da sua secret
+          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
       - name: Instalar Dependências
         run: >
@@ -33,3 +39,17 @@ jobs:
 
       - name: Executar Arquitetura Prata
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
+
+      - name: Notificar Falha no Discord
+        if: failure()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "🚨 **[SafeDriver] FALHA CRÍTICA:** A pipeline da Camada Prata (Malha Geo) falhou. Verifique os logs no GitHub Actions."}' \
+          ${{ secrets.DISCORD_ERRO }}
+
+      - name: Notificar Sucesso no Discord
+        if: success()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "✅ **[SafeDriver] SUCESSO:** A Camada Prata (Malha Geo) foi processada, anonimizada e guardada no Datalake."}' \
+          ${{ secrets.DISCORD_SUCESSO }}
