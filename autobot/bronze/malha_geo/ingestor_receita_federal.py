@@ -7,15 +7,15 @@ from datetime import datetime
 
 class IngestorSafeDriverBronze:
     def __init__(self):
-        # Configurações de Nuvem
+        # 1. Configurações de Nuvem (GCP + Cloudflare R2)
         self.project_id = os.getenv('BQ_PROJECT_ID', 'safe-driver-fc3a9')
         self.client = bigquery.Client(project=self.project_id)
         
-        # Configurações de Segurança
+        # 2. Segurança LGPD (Salt e Pepper para o Hashing)
         self.salt = os.getenv('LGPD_SALT', 'default_salt')
         self.pepper = os.getenv('LGPD_PEPPER', 'default_pepper')
         
-        # Configurações R2 Cloudflare
+        # 3. Conexão R2 (S3 API)
         self.s3_client = boto3.client('s3',
             region_name='auto',
             endpoint_url=os.getenv('R2_ENDPOINT_URL', '').strip(),
@@ -26,13 +26,16 @@ class IngestorSafeDriverBronze:
         self.r2_path = "datalake/bronze/malha_raw/CNPJ_SP_HISTORICO.parquet"
 
     def gerar_hash_lgpd(self, cnpj):
+        """Cria um ID único e irreversível para proteger o dado sensível"""
         base_string = f"{str(cnpj)}{self.salt}{self.pepper}"
         return hashlib.sha256(base_string.encode()).hexdigest()
 
     def obter_query_ingestao(self):
         """
-        Query Agnóstica: O CAST AS STRING em todas as colunas impede que o motor do BigQuery 
-        ou do Pandas tente inferir tipos de dados, garantindo uma Bronze 100% Raw (Texto).
+        Query de Captura Total (Snapshot):
+        - CAST AS STRING: Garante agnostismo de tipos para a Prata.
+        - Filtro de Situação: Puxa TODAS as Ativas ('02') e quem fechou de 2022 em diante.
+        - Otimização: Foca apenas em SP para manter o custo zero na cota mensal de 1TB.
         """
         return """
         SELECT 
@@ -49,43 +52,47 @@ class IngestorSafeDriverBronze:
         INNER JOIN `basedosdados.br_bd_diretorios_brasil.cep` AS t2 
             ON t1.cep = t2.cep
         WHERE t1.sigla_uf = 'SP' 
-          AND t1.data_inicio_atividade >= '2015-01-01' 
+          AND (
+               t1.situacao_cadastral = '02' -- Empresas abertas (independente da idade)
+               OR t1.data_situacao_cadastral >= '2022-01-01' -- Histórico para calcular o Delta
+          )
           AND t1.cnae_fiscal_principal IS NOT NULL
           AND t2.centroide IS NOT NULL
         """
 
     def executar(self):
-        print(f"🚀 [BRONZE] Extração Carga Full Agnóstica - Projeto: {self.project_id}")
+        print(f"🚀 [BRONZE] Iniciando Snapshot Total (Agnóstico) - Projeto: {self.project_id}")
         
         try:
-            # 1. Download veloz do BigQuery
+            # 1. Extração via BigQuery Storage API (Alta Velocidade)
             query_job = self.client.query(self.obter_query_ingestao())
             df_pandas = query_job.to_dataframe()
             
-            # 2. Forçar tipagem global para Utf8 (String) no Polars
+            # 2. Conversão para Polars e Blindagem de Tipos (All to Utf8)
             df = pl.from_pandas(df_pandas).select(pl.all().cast(pl.Utf8))
             
-            print(f"🛡️ [LGPD] Anonimizando {len(df)} registros...")
+            print(f"🛡️ [LGPD] Anonimizando {len(df)} registros para o Datalake...")
             
-            # 3. Proteção (One-Way Hash)
+            # 3. Aplicação do Hashing e Descarte do CNPJ Real
             df_bronze = df.with_columns([
                 pl.col("cnpj").map_elements(self.gerar_hash_lgpd, return_dtype=pl.Utf8).alias("ID_PROTEGIDO")
             ]).drop("cnpj")
 
-            # 4. Salvar e Sobrescrever (Esmagamento) no R2
-            temp_file = "bronze_temp.parquet"
+            # 4. Persistência em Parquet e Upload para o R2
+            temp_file = "bronze_master_snapshot.parquet"
             df_bronze.write_parquet(temp_file)
             
-            print("📤 [R2] Substituindo histórico anterior pelo snapshot Raw mais recente...")
+            print(f"📤 [R2] Enviando Snapshot Master para o Cloudflare...")
             self.s3_client.upload_file(temp_file, self.bucket_name, self.r2_path)
             
+            # Limpeza de rastro local
             if os.path.exists(temp_file):
                 os.remove(temp_file)
                 
-            print(f"✅ [SUCESSO] Camada Bronze Agnóstica atualizada: {len(df_bronze)} linhas.")
+            print(f"✅ [SUCESSO] Bronze completa atualizada: {len(df_bronze)} estabelecimentos capturados.")
 
         except Exception as e:
-            print(f"❌ [ERRO CRÍTICO] Falha na pipeline: {str(e)}")
+            print(f"❌ [ERRO] Falha crítica na ingestão: {str(e)}")
             raise e
 
 if __name__ == "__main__":
