@@ -3,6 +3,7 @@ import requests
 import polars as pl
 import boto3
 import time
+import hashlib
 from datetime import datetime
 
 class IngestorCnpjBronze:
@@ -19,15 +20,16 @@ class IngestorCnpjBronze:
         )
         self.bucket_name = os.getenv('R2_BUCKET_NAME', '').strip()
         
-        # 3. Caminho Exato no R2 e Local Temporário
+        # 3. Caminhos de Arquivo
         self.r2_path = "datalake/bronze/malha_raw/CNPJ_SP_PROTEGIDO.parquet"
         self.local_temp_path = "temp_bronze.parquet"
+        self.input_csv_path = "data_raw/cnpjs_input.csv"
         
         self.br_api_url = "https://brasilapi.com.br/api/cep/v2/"
 
     def classificar_impacto_urbano(self, cnae_principal):
         """Inteligência de classificação urbana baseada nos primeiros dígitos do CNAE"""
-        cnae_str = str(cnae_principal)
+        cnae_str = str(cnae_principal).strip()
         prefixo = cnae_str[:2]
         
         if prefixo in ["47", "56", "96"]: 
@@ -42,32 +44,62 @@ class IngestorCnpjBronze:
     def capturar_coordenadas(self, cep):
         """Busca Lat/Lon do CEP via BrasilAPI"""
         cep_limpo = "".join(filter(str.isdigit, str(cep)))
+        if not cep_limpo:
+            return None, None
+            
         try:
             response = requests.get(f"{self.br_api_url}{cep_limpo}", timeout=10)
             if response.status_code == 200:
                 coords = response.json().get('location', {}).get('coordinates', {})
                 return coords.get('latitude'), coords.get('longitude')
         except Exception as e:
-            print(f"Erro na API para o CEP {cep}: {e}")
+            print(f"   [Erro API] Falha ao buscar CEP {cep_limpo}: {e}")
         return None, None
+
+    def gerar_hash_lgpd(self, cnpj):
+        """Gera um Hash SHA-256 consistente e seguro para o CNPJ"""
+        cnpj_limpo = "".join(filter(str.isdigit, str(cnpj)))
+        base_string = f"{cnpj_limpo}{self.salt}{self.pepper}"
+        return hashlib.sha256(base_string.encode('utf-8')).hexdigest()
+
+    def carregar_dados_entrada(self):
+        """Tenta ler um CSV real; se falhar, usa os dados de fallback/teste"""
+        if os.path.exists(self.input_csv_path):
+            print(f"📄 Lendo base de entrada: {self.input_csv_path}")
+            try:
+                # O CSV deve ter colunas nomeadas: cnpj, cep, cnae
+                df = pl.read_csv(self.input_csv_path)
+                return df.to_dicts()
+            except Exception as e:
+                print(f"❌ Erro ao ler CSV: {e}. Abortando.")
+                return []
+        else:
+            print(f"⚠️ Arquivo {self.input_csv_path} não encontrado. Rodando base de teste padrão.")
+            return [
+                {"cnpj": "12345678000199", "cep": "09725000", "cnae": "47113"},
+                {"cnpj": "98765432000100", "cep": "09850550", "cnae": "52117"}
+            ]
 
     def processar_lista(self, lista_estabelecimentos):
         """Processa a lista, aplica LGPD e gera o Parquet"""
-        print(f"Iniciando processamento de {len(lista_estabelecimentos)} registros...")
+        if not lista_estabelecimentos:
+            print("Nenhum dado para processar.")
+            return
+
+        print(f"⚙️ Iniciando processamento de {len(lista_estabelecimentos)} registros...")
         dados_processados = []
 
         for item in lista_estabelecimentos:
-            cnpj = str(item.get('cnpj', ''))
-            cep = str(item.get('cep', ''))
+            cnpj = item.get('cnpj', '')
+            cep = item.get('cep', '')
             cnae = item.get('cnae', '')
 
             # 1. Captura a Coordenada
             lat, lon = self.capturar_coordenadas(cep)
             
             if lat and lon:
-                # 2. Proteção LGPD (Hash)
-                base_hash = f"{cnpj}{self.salt}{self.pepper}"
-                hash_protegido = pl.Series([base_hash]).hash().cast(pl.Utf8)[0]
+                # 2. Proteção LGPD (Hash Criptográfico)
+                hash_protegido = self.gerar_hash_lgpd(cnpj)
 
                 # 3. Classificação de Impacto
                 categoria = self.classificar_impacto_urbano(cnae)
@@ -79,10 +111,14 @@ class IngestorCnpjBronze:
                     "LON": lon
                 })
             else:
-                print(f"⚠️ Coordenada não encontrada para o CEP: {cep}")
+                print(f"   ⚠️ Coordenada não encontrada ou CEP inválido: {cep}")
             
-            # Rate limit gentil
+            # Rate limit gentil (2 requisições por segundo para não ser bloqueado na API gratuita)
             time.sleep(0.5)
+
+        if not dados_processados:
+            print("❌ Nenhum dado válido gerado. Cancelando upload.")
+            return
 
         # 4. Criar DataFrame Polars e Salvar Localmente
         df_bronze = pl.DataFrame(dados_processados)
@@ -110,11 +146,6 @@ class IngestorCnpjBronze:
                 os.remove(self.local_temp_path)
 
 if __name__ == "__main__":
-    # Exemplo de uso - Substitua esta lista pelos seus dados reais
-    lista_teste = [
-        {"cnpj": "12345678000199", "cep": "09725000", "cnae": "47113"}, # Varejo (SBC)
-        {"cnpj": "98765432000100", "cep": "09850550", "cnae": "52117"}  # Galpão (SBC)
-    ]
-    
     ingestor = IngestorCnpjBronze()
-    ingestor.processar_lista(lista_teste)
+    dados_entrada = ingestor.carregar_dados_entrada()
+    ingestor.processar_lista(dados_entrada)
