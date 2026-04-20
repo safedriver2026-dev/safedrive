@@ -47,7 +47,7 @@ class ArquitetoSafeDriver:
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # 🔐 SEGURANÇA E AMBIENTE (Puxando 100% das Secrets)
+        # 🔐 SEGURANÇA E AMBIENTE
         self.project_id = os.getenv('BQ_PROJECT_ID')
         self.dataset_id = os.getenv('BQ_DATASET_ID')
         self.bq_client = bigquery.Client(project=self.project_id)
@@ -74,7 +74,7 @@ class ArquitetoSafeDriver:
         os.environ["OSM_CONFIG_FILE"] = os.path.abspath("osmconf.ini")
 
     def download_bronze(self):
-        print("📥 A DESCARREGAR ATIVOS DA CAMADA BRONZE (R2)...")
+        print("📥 DESCARREGANDO ATIVOS DA CAMADA BRONZE (R2)...")
         ficheiros = ["Agregados_por_setores_basico_BR_20250417.csv", "SP_Faces_2022.zip", 
                      "sp-latest.osm.pbf", "SP_Municipios_2022.shp", "SP_Municipios_2022.dbf", 
                      "SP_Municipios_2022.shx", "SP_Municipios_2022.prj"]
@@ -95,7 +95,7 @@ class ArquitetoSafeDriver:
         return pl.from_pandas(joined.drop(columns=["geometry", "index_right"]))
 
     def normalizar_viaria(self):
-        print("📍 A PROCESSAR MALHA VIÁRIA...")
+        print("📍 PROCESSANDO MALHA VIÁRIA...")
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
         json_paths = []
         with zipfile.ZipFile(faces_zip, 'r') as z:
@@ -105,7 +105,7 @@ class ArquitetoSafeDriver:
                     json_paths.append(os.path.join(BRONZE_DIR, f))
         lista_df = []
         for path in json_paths:
-            df = self.con.execute(f"SELECT trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{path}') WHERE NM_LOG IS NOT NULL").pl()
+            df = self.con.execute(f"SELECT CD_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{path}') WHERE NM_LOG IS NOT NULL").pl()
             lista_df.append(df)
         df_final = self.normalizar_e_validar_espacial(pl.concat(lista_df))
         df_final = df_final.with_columns([
@@ -119,7 +119,17 @@ class ArquitetoSafeDriver:
         print("👥 A NORMALIZAR MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
         enc = descobrir_encoding(csv_path)
-        df = pl.read_csv(csv_path, separator=";", encoding=enc, schema_overrides={"CD_SETOR": pl.Utf8}, infer_schema_length=10000)
+        
+        # 🛡️ BLINDAGEM RESTAURADA: null_values=["."] resolve o erro do CD_SIT
+        df = pl.read_csv(
+            csv_path, 
+            separator=";", 
+            encoding=enc, 
+            schema_overrides={"CD_SETOR": pl.Utf8}, 
+            infer_schema_length=10000,
+            null_values=["."] 
+        )
+        
         df_final = df.filter(pl.col("CD_SETOR").str.starts_with("35")).select([
             pl.col("CD_SETOR"),
             pl.col("NM_MUN").map_elements(normalizar_string, return_dtype=pl.Utf8).alias("MUNICIPIO"),
@@ -128,7 +138,7 @@ class ArquitetoSafeDriver:
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet")
 
     def normalizar_comercial(self):
-        print("🛍️ EXECUTAR DATA FUSION (BQ + OSM) COM PSEUDONIMIZAÇÃO...")
+        print("🛍️ EXECUTAR DATA FUSION (BQ + OSM)...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         query_bq = """
             SELECT e.nome_fantasia as NOME_BRUTO,
@@ -150,7 +160,6 @@ class ArquitetoSafeDriver:
 
         df_unido = pl.concat([df_bq, df_osm]).with_columns([
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX"),
-            # 🔐 CRIPTOGRAFIA COMPLETA: Nome + Salt Personalizado + Pepper Global
             pl.concat_str([
                 pl.col("NOME_BRUTO").fill_null("SEM_NOME"),
                 pl.lit(self.lgpd_salt),
@@ -162,7 +171,7 @@ class ArquitetoSafeDriver:
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet")
 
     def upload_final(self):
-        print("🚀 A SUBIR PARA R2...")
+        print("🚀 SUBINDO PARA R2...")
         for root, _, files in os.walk(PRATA_DIR):
             for f in files:
                 self.s3.upload_file(os.path.join(root, f), self.bucket, f"datalake/prata/malha_geo_infra_social/{f}")
