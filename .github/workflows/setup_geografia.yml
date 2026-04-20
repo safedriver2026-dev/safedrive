@@ -1,4 +1,4 @@
-name: "SafeDriver [03]: Camada Prata"
+name: "SafeDriver: Camada Prata Malha"
 
 on:
   workflow_dispatch:
@@ -16,13 +16,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Instalar Dependencias
-        run: pip install boto3 polars duckdb h3 geopandas shapely pyarrow zstandard
+      - name: Autenticar no Google Cloud (BigQuery)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+      - name: Instalar Dependências
+        run: >
+          pip install boto3 polars duckdb h3 geopandas shapely pyarrow zstandard 
+          google-cloud-bigquery charset-normalizer pandas db-dtypes
 
       - name: Executar Arquitetura Prata
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
