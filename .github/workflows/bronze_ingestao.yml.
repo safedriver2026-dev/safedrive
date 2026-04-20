@@ -1,6 +1,10 @@
 name: "SafeDriver: Ingestão Bronze (CNPJ/CEP)"
 
 on:
+  push:
+    branches:
+      - main
+      - master
   workflow_dispatch:
     inputs:
       descricao:
@@ -39,7 +43,6 @@ jobs:
 
       - name: Executar Ingestor e Protetor (Bronze)
         run: |
-          # Garante que o diretório de destino existe antes de rodar
           mkdir -p data_raw
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python autobot/bronze/malha_geo/ingestor_cnpj.py
