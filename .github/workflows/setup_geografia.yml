@@ -8,13 +8,14 @@ jobs:
     runs-on: ubuntu-latest
     
     env:
-      # Cloudflare R2
+      # Mapeamos as secrets do R2 para as variáveis padrão do AWS CLI
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: "auto" # O R2 exige isso ou uma região genérica
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       
-      # BigQuery & Segurança (LGPD Compliance)
+      # BigQuery & Segurança
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
       BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
@@ -34,19 +35,32 @@ jobs:
         with:
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
+      # 🚀 PASSO NOVO: Baixar Camada Bronze via CLI (Muito mais rápido)
+      - name: Download Camada Bronze (R2)
+        run: |
+          echo "📥 A sincronizar diretório data_raw com o R2..."
+          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ data_raw/ \
+            --endpoint-url $R2_ENDPOINT_URL
+
       - name: Instalar Dependências de Engenharia
         run: |
           pip install --upgrade pip
-          pip install boto3 polars duckdb h3 geopandas shapely pyarrow zstandard \
-                      google-cloud-bigquery google-cloud-bigquery-storage \
-                      charset-normalizer pandas db-dtypes
+          # Repare que tirei o boto3 daqui, já não precisamos dele!
+          pip install polars duckdb h3 geopandas shapely pyarrow zstandard \
+                      google-cloud-bigquery charset-normalizer pandas db-dtypes requests
 
       - name: Executar Pipeline Camada Prata
         run: |
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-      # Notificações usando as tuas Secrets exatas
+      # 🚀 PASSO NOVO: Subir Camada Prata via CLI
+      - name: Upload Camada Prata (R2)
+        run: |
+          echo "🚀 A sincronizar diretório data_prata com o R2..."
+          aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/malha_geo_infra_social/ \
+            --endpoint-url $R2_ENDPOINT_URL
+
       - name: Notificar Falha no Discord
         if: failure()
         run: |
