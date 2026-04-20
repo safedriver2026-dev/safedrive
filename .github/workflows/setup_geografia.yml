@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - 'scripts/processar_prata.py'
+      - 'scripts/malha_geo_infra_social.py'
 
 jobs:
   build-and-run:
