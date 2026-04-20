@@ -11,7 +11,9 @@ import charset_normalizer
 from datetime import datetime
 from google.cloud import bigquery
 
-
+# ==========================================
+# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
+# ==========================================
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
 PRATA_DIR = "data_prata"
@@ -19,7 +21,7 @@ PRATA_DIR = "data_prata"
 def normalizar_string(valor):
     if valor is None or valor == "" or str(valor).upper() in ["NULL", "NAN", ".", "N/A"]: 
         return "NAO INFORMADO"
-  
+    
     texto = str(valor)
     texto = "".join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
     return texto.upper().strip()
@@ -52,9 +54,10 @@ class ArquitetoSafeDriver:
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
+        # 🔐 SEGURANÇA E AMBIENTE (Atualizado para Pepper)
         project_id = os.getenv('BQ_PROJECT_ID', 'safe-driver-fc3a9')
         self.bq_client = bigquery.Client(project=project_id)
-        self.lgpd_salt = os.getenv('LGPD_SALT', 'safedriver_salt_default_123')
+        self.lgpd_pepper = os.getenv('LGPD_PEPPER', 'safedriver_pepper_default_123')
         
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
@@ -87,7 +90,6 @@ class ArquitetoSafeDriver:
             if not os.path.exists(local): 
                 self.s3.download_file(self.bucket, f"datalake/bronze/malha_raw/{f}", local)
 
-    
     def normalizar_e_validar_espacial(self, df_pl):
         print("🛡️ A NORMALIZAR E VALIDAR INTEGRIDADE ESPACIAL...")
         mun_path = f"{BRONZE_DIR}/SP_Municipios_2022.shp"
@@ -179,24 +181,18 @@ class ArquitetoSafeDriver:
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
     def normalizar_comercial(self):
-        print("EXECUTAR DATA FUSION...")
+        print("🛍️ EXECUTAR DATA FUSION (PSEUDONIMIZAÇÃO LGPD)...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-      
         query_bq = """
             SELECT 
                 nome_fantasia as NOME_BRUTO,
                 CASE 
-                    
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 5) = '84248' THEN 'SEGURANCA_DELEGACIA'
-                    
-                   
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('47') THEN 'VAREJO_COMERCIO'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('56') THEN 'ALIMENTACAO_BAR'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('64') THEN 'FINANCEIRO_BANCO'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('85') THEN 'EDUCACAO'
-                    
-                   
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 1) IN ('1', '2', '3') THEN 'INDUSTRIA_FABRICA'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('46') THEN 'ATACADO_GALPAO'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('52') THEN 'LOGISTICA_ARMAZEM'
@@ -214,7 +210,6 @@ class ArquitetoSafeDriver:
               )
         """
         
-   
         query_osm = f"""
             SELECT 'POSTO_OSM' as NOME_BRUTO, 'SEGURANCA_DELEGACIA' as CATEGORIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
             FROM ST_Read('{osm_path}', layer='points') WHERE other_tags LIKE '%"amenity"=>"police"%'
@@ -224,32 +219,30 @@ class ArquitetoSafeDriver:
         """
         
         try:
-            print(" infraestrutura BQ...")
+            print("   -> 📡 A ler infraestrutura BQ...")
             df_bq = pl.from_pandas(self.bq_client.query(query_bq).to_dataframe())
             
-            print(" postos comunitários OSM...")
+            print("   -> 🗺️ A ler postos comunitários OSM...")
             df_osm = self.con.execute(query_osm).pl()
             
-     
-            print("   -> 🧬 A fundir, anonimizar e indexar para H3...")
+            print("   -> 🧬 A fundir, pseudonimizar e indexar para H3...")
             df_unido = pl.concat([df_bq, df_osm]).with_columns([
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
                     h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s
                 ])).alias("H3_INDEX"),
                 
+                # 🔐 Pseudonimização usando o Pepper injetado via Actions
                 pl.concat_str([
                     pl.col("NOME_BRUTO").fill_null("SEM_NOME"),
-                    pl.lit(self.lgpd_salt)
-                ]).hash().cast(pl.Utf8).alias("HASH_ENTIDADE")
+                    pl.lit(self.lgpd_pepper)
+                ]).hash().cast(pl.Utf8).alias("HASH_PSEUDONIMIZADO")
             ])
             
             df_unido = df_unido.drop(["NOME_BRUTO", "LAT", "LON"])
             
-            
-            print("remover sobreposição de esquadras...")
+            print("   -> 🧹 A remover sobreposição de esquadras...")
             df_seguranca = df_unido.filter(pl.col("CATEGORIA") == "SEGURANCA_DELEGACIA").unique(subset=["H3_INDEX"])
             df_outros = df_unido.filter(pl.col("CATEGORIA") != "SEGURANCA_DELEGACIA")
-            
             
             df_final = pl.concat([df_seguranca, df_outros]).group_by(["H3_INDEX", "CATEGORIA"]).agg([
                 pl.len().alias("QTD_TOTAL")
@@ -266,7 +259,7 @@ class ArquitetoSafeDriver:
             self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": 0, "STATUS": f"ERRO: {e}"}
 
     def upload_final(self):
-        print("A GERAR AUDITORIA UNIFICADA E A SUBIR PARA R2...")
+        print("🚀 A GERAR AUDITORIA UNIFICADA E A SUBIR PARA R2...")
         
         audit_file = f"{PRATA_DIR}/AUDITORIA_PRATA.json"
         with open(audit_file, "w", encoding="utf-8") as f:
@@ -284,7 +277,7 @@ class ArquitetoSafeDriver:
         self.normalizar_social()
         self.normalizar_comercial()
         self.upload_final()
-        print(" PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ SEGURA E OTIMIZADA.")
+        print("✅ PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ SEGURA E OTIMIZADA.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
