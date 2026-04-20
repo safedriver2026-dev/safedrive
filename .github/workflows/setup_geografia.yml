@@ -1,4 +1,4 @@
-name: "SafeDriver: Pipeline Malha"
+name: "SafeDriver: Pipeline Malha Anual (Big Data)"
 
 on:
   workflow_dispatch:
@@ -6,71 +6,25 @@ on:
       job:
         description: 'O que deseja rodar?'
         required: true
-        default: 'prata'
+        default: 'tudo'
         type: choice
         options:
-          - 'bronze_rfb'
-          - 'prata'
+          - 'bronze_rfb_trigger'
+          - 'prata_anual'
           - 'tudo'
   schedule:
-    # Roda automaticamente todo dia 15 do mês, às 03:00 da manhã (Arquitetura Custo Zero)
-    - cron: '0 3 15 * *'
+    # 🚀 Execução ANUAL: Todo dia 01 de Janeiro às 03:00 AM
+    - cron: '0 3 1 1 *'
 
 jobs:
-  # --- CAMADA BRONZE (INGESTÃO VIA BIGQUERY) ---
+  # --- CAMADA BRONZE: DISPARO DO EXPORT NO BIGQUERY ---
   ingestao-bronze:
-    if: github.event_name == 'schedule' || github.event.inputs.job == 'bronze_rfb' || github.event.inputs.job == 'tudo'
+    if: github.event_name == 'schedule' || github.event.inputs.job == 'bronze_rfb_trigger' || github.event.inputs.job == 'tudo'
     runs-on: ubuntu-latest
     env:
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: "auto"
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
-      LGPD_SALT: ${{ secrets.LGPD_SALT }}
     steps:
       - uses: actions/checkout@v4
-      
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          
-      - name: Autenticar no Google Cloud (BigQuery)
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
-          
-      - name: Instalar Dependências Bronze (Modo Turbo)
-        run: |
-          pip install --upgrade pip
-          pip install polars boto3 pyarrow google-cloud-bigquery google-cloud-bigquery-storage pandas db-dtypes
-          
-      - name: Ingestão Oficial RFB (BigQuery Storage API)
-        run: |
-          echo "🚀 Iniciando extração de alta performance do BigQuery..."
-          export PYTHONPATH=$PYTHONPATH:$(pwd)
-          python autobot/bronze/malha_geo/ingestor_receita_federal.py
-
-  # --- CAMADA PRATA (PROCESSAMENTO) ---
-  build-silver:
-    runs-on: ubuntu-latest
-    needs: [ingestao-bronze]
-    if: |
-      always() && 
-      (github.event_name == 'schedule' || github.event.inputs.job == 'prata' || github.event.inputs.job == 'tudo') &&
-      (needs.ingestao-bronze.result == 'success' || needs.ingestao-bronze.result == 'skipped')
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: "auto"
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-    steps:
-      - uses: actions/checkout@v4
-      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -80,31 +34,71 @@ jobs:
         with:
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
           
-      - name: Download Camada Bronze (R2)
-        run: |
-          echo "📥 Sincronizando arquivos da Bronze para processamento..."
-          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ data_raw/ --endpoint-url $R2_ENDPOINT_URL
+      - name: Instalar Google Client
+        run: pip install google-cloud-bigquery
 
-      - name: Instalar Dependências e Rodar Prata
+      - name: Disparar SQL Export (BigQuery -> GCS)
         run: |
-          pip install --upgrade pip
-          pip install polars duckdb h3 geopandas shapely pyarrow google-cloud-bigquery google-cloud-bigquery-storage pandas db-dtypes requests charset-normalizer
+          echo "📨 Solicitando exportação de 171M de linhas para o GCS..."
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          python autobot/bronze/malha_geo/ingestor_receita_federal.py
+
+  # --- CAMADA PRATA: PROCESSAMENTO DOS SHARDS (171M ROWS) ---
+  build-silver:
+    runs-on: ubuntu-latest
+    needs: [ingestao-bronze]
+    if: |
+      always() && 
+      (github.event_name == 'schedule' || github.event.inputs.job == 'prata_anual' || github.event.inputs.job == 'tudo') &&
+      (needs.ingestao-bronze.result == 'success' || needs.ingestao-bronze.result == 'skipped')
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Autenticar no Google Cloud (GCS Access)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
+
+      - name: Configurar GCloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download Shards da Bronze (GCS -> Runner)
+        run: |
+          echo "📥 Baixando 3.447 arquivos em paralelo via GCloud..."
+          mkdir -p data_raw
+          gcloud storage cp -m "gs://safedriver/datalake/bronze/malha_raw/CNPJ_SP_HISTORICO_*.parquet" data_raw/
+
+      - name: Instalar Motores de Processamento (Polars + DuckDB)
+        run: |
+          pip install polars duckdb h3 pyarrow charset-normalizer
+          
+      - name: Executar Prata (Streaming Mode)
+        run: |
+          echo "⚙️ Iniciando processamento de Big Data..."
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-      - name: Upload Camada Prata (R2)
+      - name: Upload Camada Prata para o R2 (Egress Zero)
         run: |
-          echo "🚀 Subindo resultados para a Prata no R2..."
+          echo "📤 Subindo agregados anuais para o cofre R2..."
           aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/malha_geo_infra_social/ --endpoint-url $R2_ENDPOINT_URL
 
-      - name: Notificação Final
+      - name: Notificação Discord
         if: always()
         run: |
           if [ "${{ job.status }}" == "success" ]; then
-            MSG="✅ **[SafeDriver]** Pipeline finalizada com sucesso! Prata atualizada no R2."
+            MSG="✅ **[SafeDriver]** Snapshot Anual concluído! 171M de registros processados."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[SafeDriver]** Erro crítico na Pipeline!"
+            MSG="🚨 **[SafeDriver]** Falha no Snapshot Anual! Verifique os logs de memória."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
