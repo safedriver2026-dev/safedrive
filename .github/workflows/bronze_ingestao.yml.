@@ -2,28 +2,22 @@ name: "SafeDriver: Ingestão Bronze (CNPJ/CEP)"
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ "main" ] # O truque para forçar o GitHub a reconhecer o ficheiro logo no primeiro commit
   workflow_dispatch:
-    inputs:
-      descricao:
-        description: 'Descrição do motivo da carga (opcional)'
-        required: false
-        default: 'Carga manual de estabelecimentos'
 
 jobs:
   ingestao-bronze:
     runs-on: ubuntu-latest
     
     env:
-      # Cloudflare R2 - Credenciais para o Boto3 dentro do Python
+      # Mapeamos as secrets do R2 para as variáveis padrão do AWS CLI
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: "auto"
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       
-      # Segurança LGPD (Salt e Pepper para o Hash)
+      # Segurança LGPD
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
       LGPD_SALT: ${{ secrets.LGPD_SALT }}
 
@@ -36,27 +30,27 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar Dependências de Ingestão
+      - name: Instalar Dependências de Engenharia
         run: |
           pip install --upgrade pip
           pip install requests polars boto3 pyarrow
 
-      - name: Executar Ingestor e Protetor (Bronze)
+      - name: Executar Pipeline Ingestão Bronze
         run: |
           mkdir -p data_raw
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python autobot/bronze/malha_geo/ingestor_cnpj.py
 
-      - name: Notificar Sucesso no Discord
-        if: success()
-        run: |
-          curl -H "Content-Type: application/json" \
-          -d '{"content": "✅ **[SafeDriver] BRONZE ATUALIZADA:** Novo cache de CNPJs protegido e enviado para o R2."}' \
-          ${{ secrets.DISCORD_SUCESSO }}
-
       - name: Notificar Falha no Discord
         if: failure()
         run: |
           curl -H "Content-Type: application/json" \
-          -d '{"content": "🚨 **[SafeDriver] ERRO NA BRONZE:** Falha ao processar ingestão via API ou upload para o R2."}' \
+          -d '{"content": "🚨 **[SafeDriver] FALHA CRÍTICA:** A pipeline de Ingestão da Bronze falhou!"}' \
           ${{ secrets.DISCORD_ERRO }}
+
+      - name: Notificar Sucesso no Discord
+        if: success()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "✅ **[SafeDriver] SUCESSO:** Camada Bronze atualizada com CNPJs protegidos no R2."}' \
+          ${{ secrets.DISCORD_SUCESSO }}
