@@ -31,20 +31,20 @@ class IngestorSafeDriverBronze:
 
     def obter_query_ingestao(self):
         """
-        A Query 'Bulletproof'.
-        Traz todos os ativos e inativos desde 2015 para garantir o Delta perfeito na Camada Prata.
+        Query Agnóstica: O CAST AS STRING em todas as colunas impede que o motor do BigQuery 
+        ou do Pandas tente inferir tipos de dados, garantindo uma Bronze 100% Raw (Texto).
         """
         return """
         SELECT 
-            t1.cnpj,
-            t1.cnae_fiscal_principal,
-            t1.data_inicio_atividade,
-            t1.data_situacao_cadastral,
-            t1.situacao_cadastral,
-            t1.identificador_matriz_filial,
-            t1.cep,
-            ST_Y(t2.centroide) AS lat,
-            ST_X(t2.centroide) AS lon
+            CAST(t1.cnpj AS STRING) AS cnpj,
+            CAST(t1.cnae_fiscal_principal AS STRING) AS cnae_fiscal_principal,
+            CAST(t1.data_inicio_atividade AS STRING) AS data_inicio_atividade,
+            CAST(t1.data_situacao_cadastral AS STRING) AS data_situacao_cadastral,
+            CAST(t1.situacao_cadastral AS STRING) AS situacao_cadastral,
+            CAST(t1.identificador_matriz_filial AS STRING) AS identificador_matriz_filial,
+            CAST(t1.cep AS STRING) AS cep,
+            CAST(ST_Y(t2.centroide) AS STRING) AS lat,
+            CAST(ST_X(t2.centroide) AS STRING) AS lon
         FROM `basedosdados.br_me_cnpj.estabelecimentos` AS t1
         INNER JOIN `basedosdados.br_bd_diretorios_brasil.cep` AS t2 
             ON t1.cep = t2.cep
@@ -55,31 +55,34 @@ class IngestorSafeDriverBronze:
         """
 
     def executar(self):
-        print(f"🚀 [BRONZE] Extração Carga Full (Idempotente) - Projeto: {self.project_id}")
+        print(f"🚀 [BRONZE] Extração Carga Full Agnóstica - Projeto: {self.project_id}")
         
         try:
-            # 1. Download veloz (requer google-cloud-bigquery-storage)
+            # 1. Download veloz do BigQuery
             query_job = self.client.query(self.obter_query_ingestao())
-            df = pl.from_pandas(query_job.to_dataframe())
+            df_pandas = query_job.to_dataframe()
+            
+            # 2. Forçar tipagem global para Utf8 (String) no Polars
+            df = pl.from_pandas(df_pandas).select(pl.all().cast(pl.Utf8))
             
             print(f"🛡️ [LGPD] Anonimizando {len(df)} registros...")
             
-            # 2. Proteção (One-Way Hash)
+            # 3. Proteção (One-Way Hash)
             df_bronze = df.with_columns([
                 pl.col("cnpj").map_elements(self.gerar_hash_lgpd, return_dtype=pl.Utf8).alias("ID_PROTEGIDO")
             ]).drop("cnpj")
 
-            # 3. Salvar e Sobrescrever (Esmagamento) no R2
+            # 4. Salvar e Sobrescrever (Esmagamento) no R2
             temp_file = "bronze_temp.parquet"
             df_bronze.write_parquet(temp_file)
             
-            print("📤 [R2] Substituindo histórico anterior pelo snapshot mais recente...")
+            print("📤 [R2] Substituindo histórico anterior pelo snapshot Raw mais recente...")
             self.s3_client.upload_file(temp_file, self.bucket_name, self.r2_path)
             
             if os.path.exists(temp_file):
                 os.remove(temp_file)
                 
-            print(f"✅ [SUCESSO] Camada Bronze atualizada: {len(df_bronze)} linhas.")
+            print(f"✅ [SUCESSO] Camada Bronze Agnóstica atualizada: {len(df_bronze)} linhas.")
 
         except Exception as e:
             print(f"❌ [ERRO CRÍTICO] Falha na pipeline: {str(e)}")
