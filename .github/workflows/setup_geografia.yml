@@ -1,31 +1,31 @@
-name: "SafeDriver: Pipeline Multicamadas (Bronze & Prata)"
+name: "SafeDriver: Pipeline Multicamadas Escalável"
 
 on:
   workflow_dispatch:
     inputs:
       job:
-        description: 'Qual etapa você deseja monitorar/executar?'
+        description: 'Selecione a etapa ou o módulo:'
         required: true
         default: 'tudo'
         type: choice
         options:
-          - 'BRONZE_A_RECEITA'  # BigQuery -> R2 (Anual)
-          - 'BRONZE_B_CRIMES'   # SSP-SP -> R2 (Mensal)
-          - 'PRATA_PROCESS'     # Bronze -> Processamento -> Prata
+          - 'BRONZE_RECEITA'    # Módulo Anual (Big Data)
+          - 'BRONZE_CRIMES'     # Módulo Mensal (SSP-SP)
+          - 'PRATA_PROCESS'     # Módulo de Transformação (Polars)
           - 'tudo'
   schedule:
-    # 🚀 Execução ANUAL: Meia-noite do dia 01 de Janeiro
-    - cron: '0 0 1 1 *'
+    # 🚀 Otimizado: Roda todo dia 01 do mês para pegar os crimes.
+    # A malha da Receita (Anual) será controlada pela lógica interna do Python.
+    - cron: '0 0 1 * *'
 
 jobs:
   # ==========================================================
-  # CAMADA BRONZE-A: DADOS DA RECEITA FEDERAL (BIG DATA)
+  # CAMADA BRONZE: CAPTURA DE DADOS CRUS (EXTRATORAS)
   # ==========================================================
-  bronze-a-receita:
-    if: |
-      github.event_name == 'schedule' || 
-      github.event.inputs.job == 'BRONZE_A_RECEITA' || 
-      github.event.inputs.job == 'tudo'
+  
+  # Módulo A: Receita Federal (BigQuery -> R2)
+  bronze-receita:
+    if: contains(fromJSON('["BRONZE_RECEITA", "tudo"]'), github.event.inputs.job) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     env:
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
@@ -36,33 +36,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: "[BRONZE-A] Autenticar Google Cloud"
+        with: { python-version: '3.11' }
+      - name: "[BRONZE-A] Auth e Ingestão BQ"
         uses: google-github-actions/auth@v2
-        with:
-          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
-
-      - name: "[BRONZE-A] Instalar Dependências"
-        run: pip install google-cloud-bigquery google-cloud-storage boto3
-
-      - name: "[BRONZE-A] Check BigQuery & Sincronia R2"
+        with: { credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}' }
+      - name: "[BRONZE-A] Sync GCS -> R2"
         run: |
+          pip install google-cloud-bigquery google-cloud-storage boto3
           python autobot/bronze/malha_geo/ingestor_receita_federal.py check
           mkdir -p data_raw
-          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "GCS vazio"
+          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "Vazio"
           aws s3 sync data_raw/ s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ --endpoint-url $R2_ENDPOINT_URL
           python autobot/bronze/malha_geo/ingestor_receita_federal.py clean
 
-  # ==========================================================
-  # CAMADA BRONZE-B: DADOS DE CRIMES (APENAS SSP-SP)
-  # ==========================================================
-  bronze-b-crimes:
-    if: |
-      github.event_name == 'schedule' || 
-      github.event.inputs.job == 'BRONZE_B_CRIMES' || 
-      github.event.inputs.job == 'tudo'
+  # Módulo B: Crimes SSP-SP (Web -> R2)
+  bronze-crimes:
+    if: contains(fromJSON('["BRONZE_CRIMES", "tudo"]'), github.event.inputs.job) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -72,26 +61,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: "[BRONZE-B] Instalar Dependências (Fix Calamine)"
+        with: { python-version: '3.10' }
+      - name: "[BRONZE-B] Ingestão SSP-SP"
         run: |
-          pip install --upgrade pip
           pip install boto3 requests polars h3 python-calamine fsspec pyarrow
-
-      - name: "[BRONZE-B] Executar Ingestão SSP-SP"
-        run: python autobot/malha_geo/ingestao_crimes_bronze.py
+          python autobot/reg_crimes/ingestao_crimes_bronze.py
 
   # ==========================================================
-  # CAMADA PRATA: PROCESSAMENTO E REFINAMENTO (TRUSTED)
+  # CAMADA PRATA: PROCESSAMENTO E ENRIQUECIMENTO (TRUSTED)
   # ==========================================================
   camada-prata:
-    needs: [bronze-a-receita, bronze-b-crimes]
+    # Precisa das bronzes, mas ignora se elas forem "skipped" (puladas)
+    needs: [bronze-receita, bronze-crimes]
     if: |
       always() && 
-      (github.event_name == 'schedule' || github.event.inputs.job == 'PRATA_PROCESS' || github.event.inputs.job == 'tudo') &&
-      (needs.bronze-a-receita.result != 'failure' && needs.bronze-b-crimes.result != 'failure')
+      contains(fromJSON('["PRATA_PROCESS", "tudo"]'), github.event.inputs.job) &&
+      (needs.bronze-receita.result != 'failure' && needs.bronze-crimes.result != 'failure')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -101,33 +86,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: "[PRATA] Download Bronze (R2 -> Runner)"
+        with: { python-version: '3.11' }
+      
+      - name: "[PRATA] Download Bronze (R2 -> Local)"
         run: |
           mkdir -p data_raw
-          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ data_raw/ --endpoint-url $R2_ENDPOINT_URL
+          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/ data_raw/ --endpoint-url $R2_ENDPOINT_URL
 
-      - name: "[PRATA] Motor Polars: Processamento 171M Linhas"
+      - name: "[PRATA] Motor Polars: Malha e Infra Social"
         run: |
           pip install polars duckdb h3 pyarrow python-calamine
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-      - name: "[PRATA] Upload Trusted: Runner -> R2"
-        run: |
-          aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/malha_geo_infra_social/ --endpoint-url $R2_ENDPOINT_URL
+      - name: "[PRATA] Upload Trusted -> R2"
+        run: aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/ --endpoint-url $R2_ENDPOINT_URL
 
   # ==========================================================
-  # NOTIFICAÇÃO FINAL
+  # MONITORAMENTO E NOTIFICAÇÃO
   # ==========================================================
   notificacao:
     needs: [camada-prata]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: "[FIM] Notificar Discord"
+      - name: "[FIM] Webhook Discord"
         run: |
-          MSG="🚀 **[SafeDriver]** Pipeline finalizado! Status: ${{ needs.camada-prata.result }}"
-          URL="${{ secrets.DISCORD_WEBHOOK }}"
-          curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
+          MSG="🚀 **[SafeDriver]** Workflow Finalizado! Job Selecionado: ${{ github.event.inputs.job || 'Schedule' }} | Status: ${{ needs.camada-prata.result }}"
+          curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" ${{ secrets.DISCORD_WEBHOOK }}
