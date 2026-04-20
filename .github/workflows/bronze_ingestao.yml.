@@ -1,12 +1,54 @@
-name: "Teste de Vida do Actions"
+name: "SafeDriver: Ingestão Bronze (CNPJ/CEP)"
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
-  teste-simples:
+  build-bronze:
     runs-on: ubuntu-latest
+    
+    env:
+      # Mapeamos as secrets do R2 para as variáveis padrão do AWS CLI
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: "auto"
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      
+      # Segurança LGPD
+      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
+      LGPD_SALT: ${{ secrets.LGPD_SALT }}
+
     steps:
-      - name: Dizer Olá
-        run: echo "🚀 O GitHub Actions está vivo e a funcionar perfeitamente!"
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Ambiente Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependências de Engenharia
+        run: |
+          pip install --upgrade pip
+          pip install requests polars boto3 pyarrow
+
+      - name: Executar Pipeline Ingestão Bronze
+        run: |
+          mkdir -p data_raw
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          python autobot/bronze/malha_geo/ingestor_cnpj.py
+
+      - name: Notificar Falha no Discord
+        if: failure()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "🚨 **[SafeDriver] FALHA CRÍTICA:** A pipeline de Ingestão da Bronze falhou!"}' \
+          ${{ secrets.DISCORD_ERRO }}
+
+      - name: Notificar Sucesso no Discord
+        if: success()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "✅ **[SafeDriver] SUCESSO:** Camada Bronze atualizada com CNPJs protegidos no R2."}' \
+          ${{ secrets.DISCORD_SUCESSO }}
