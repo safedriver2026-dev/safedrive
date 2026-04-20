@@ -1,0 +1,35 @@
+name: SafeDriver - Ingestão Mensal de Crimes
+
+on:
+  schedule:
+    # Roda todo dia 1 de cada mês à meia-noite (UTC)
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    # Permite que você rode manualmente pelo botão "Run workflow" no GitHub
+
+jobs:
+  executar_ingestao:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # Otimiza as próximas execuções
+
+      - name: Instalar dependências
+        run: |
+          pip install boto3 requests polars h3 calamine fsspec
+
+      - name: Executar Script de Ingestão
+        env:
+          # Pegando as credenciais dos "Secrets" do seu repositório
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python autobot/malha_geo/ingestao_crimes_bronze.py
