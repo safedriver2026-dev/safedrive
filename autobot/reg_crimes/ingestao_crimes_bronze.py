@@ -12,6 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from typing import Optional
 
+# Configuração de Log profissional
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - [%(levelname)s] - %(message)s'
@@ -23,19 +24,17 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Configurações LGPD (Pegando as chaves que você definiu no seu YML)
-    PEPPER = os.getenv("LGPD_PEPPER", "default_pepper")
-    SALT = os.getenv("LGPD_SALT", "default_salt")
+    # Chaves LGPD via GitHub Secrets (Cruciais para a segurança do Hash)
+    PEPPER = os.getenv("LGPD_PEPPER", "default_pepper_key")
+    SALT = os.getenv("LGPD_SALT", "default_salt_key")
 
+    # Colunas necessárias para análise e anonimização
     COLUNAS_ALVO = [
-        "MUNICIPIO", "CIDADE", "NOME_MUNICIPIO", "BAIRRO", "LOGRADOURO",
+        "NUM_BO", "MUNICIPIO", "BAIRRO", "LOGRADOURO",
         "DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "HORA_OCORRENCIA_BO", 
         "DESC_PERIODO", "RUBRICA", "LATITUDE", "LONGITUDE", 
         "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"
     ]
-    
-    # Colunas que serão anonimizadas para cumprir a LGPD
-    COLUNAS_SENSIVEIS = ["LOGRADOURO"] 
     
     ANCORAS_CABECALHO = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "LATITUDE", "DESC_PERIODO"}
     PADRAO_LIMPEZA = r"(?i)PRESENTE TABELA|FINALIDADE ESCLARECER|CAMPOS CONTIDOS|BASE DE DADOS"
@@ -61,11 +60,18 @@ class IngestorSafeDriver:
         s.mount("https://", HTTPAdapter(max_retries=retries))
         return s
 
-    def _anonimizar_valor(self, valor: str) -> str:
-        """Aplica Hash SHA-256 com Salt e Pepper para anonimizar dados sensíveis."""
-        if not valor or valor == "None": return "ANONIMIZADO"
-        semente = f"{self.config.PEPPER}{valor}{self.config.SALT}".encode()
-        return hashlib.sha256(semente).hexdigest()
+    def _gerar_hash_lgpd(self, logradouro: str, id_bo: str) -> str:
+        """
+        Gera um Hash Único por Registro: Pepper + Logradouro + ID_BO + Salt.
+        Isso garante que dois crimes na mesma rua tenham hashes diferentes,
+        protegendo contra ataques de correlação e cumprindo a LGPD.
+        """
+        if not logradouro or str(logradouro).upper() in ["NONE", "NULL", "NAN"]:
+            return "LOCAL_ANONIMIZADO"
+        
+        # O 'tempero' (Salt) é o próprio ID do B.O. para garantir unicidade por linha
+        payload = f"{self.config.PEPPER}{logradouro}{id_bo}{self.config.SALT}".encode('utf-8')
+        return hashlib.sha256(payload).hexdigest()
 
     def _get_tamanho_remoto(self, url):
         try:
@@ -86,9 +92,11 @@ class IngestorSafeDriver:
             return h3.latlng_to_cell(lat, lon, self.config.RESOLUCAO_H3)
         except: return None
 
-    def _processar_planilha(self, bytes_excel: bytes) -> Optional[pl.DataFrame]:
+    def _processar_e_proteger(self, bytes_excel: bytes) -> Optional[pl.DataFrame]:
+        """Processa o Excel e aplica a anonimização determinística por B.O."""
         fluxo = io.BytesIO(bytes_excel)
         dfs = []
+        
         for aba in range(1, 4):
             try:
                 preview = pl.read_excel(fluxo, sheet_id=aba, engine="calamine", has_header=False, read_options={"n_rows": 50})
@@ -98,6 +106,7 @@ class IngestorSafeDriver:
                     if len([v for v in vals if v in self.config.ANCORAS_CABECALHO]) >= 3:
                         idx_header = i
                         break
+                
                 if idx_header is not None:
                     df = pl.read_excel(fluxo, sheet_id=aba, engine="calamine", read_options={"skip_rows": idx_header})
                     df.columns = [c.upper().strip() for c in df.columns]
@@ -106,24 +115,28 @@ class IngestorSafeDriver:
                     df = df.filter(~pl.any_horizontal(pl.all().str.contains(self.config.PADRAO_LIMPEZA)))
                     dfs.append(df)
             except: continue
-        
+
         if not dfs: return None
         
-        df_final = pl.concat(dfs, how="diagonal").with_columns([
+        df_final = pl.concat(dfs, how="diagonal")
+
+        # 1. Tratamento de Coordenadas
+        df_final = df_final.with_columns([
             pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
         ])
 
-        # --- CAMADA LGPD: Anonimização de Dados Sensíveis ---
-        logger.info("Aplicando camadas de proteção LGPD...")
-        for col in self.config.COLUNAS_SENSIVEIS:
-            if col in df_final.columns:
-                # Usamos map_elements para aplicar o hash de forma escalável
-                df_final = df_final.with_columns(
-                    pl.col(col).map_elements(self._anonimizar_valor, return_dtype=pl.String).alias(f"{col}_HASH")
-                ).drop(col) # Removemos o dado original em texto claro
+        # 2. Camada LGPD: Anonimização com Unicidade
+        logger.info("🔒 Aplicando criptografia SHA-256 (Pepper + Logradouro + NUM_BO + Salt)")
+        df_final = df_final.with_columns(
+            pl.struct(["LOGRADOURO", "NUM_BO"]).map_elements(
+                lambda x: self._gerar_hash_lgpd(x["LOGRADOURO"], x["NUM_BO"]),
+                return_dtype=pl.String
+            ).alias("HASH_LOCAL_UNICO")
+        ).drop(["LOGRADOURO", "NUM_BO"]) # Remove os dados sensíveis originais imediatamente
 
-        # Cálculo H3 (Feito APÓS a anonimização do texto, usando as coordenadas originais)
+        # 3. Enriquecimento Geoespacial (H3)
+        # Calculamos H3 para as coordenadas únicas para otimizar performance
         geo_map = df_final.select(["LATITUDE", "LONGITUDE"]).unique().to_dicts()
         for d in geo_map:
             d["H3_INDEX"] = self._calcular_h3(d["LATITUDE"], d["LONGITUDE"])
@@ -131,36 +144,43 @@ class IngestorSafeDriver:
         return df_final.join(pl.DataFrame(geo_map), on=["LATITUDE", "LONGITUDE"], how="left")
 
     def rodar_ano(self, ano: int):
-        path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
-        path_prata = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
+        # O arquivo nasce na Bronze já protegido e em formato Parquet
+        path_bronze_protegida = f"datalake/bronze/crimes_protected/ssp_protected_{ano}.parquet"
         url = self.config.URL_BASE_SSP.format(ano=ano)
         
         tamanho_remoto = self._get_tamanho_remoto(url)
-        tamanho_local = self._get_tamanho_local(path_bronze)
+        tamanho_local = self._get_tamanho_local(path_bronze_protegida)
 
+        # Só baixa se o arquivo na SSP for maior que o que temos (novas ocorrências)
         if tamanho_remoto > 0 and tamanho_remoto <= tamanho_local:
-            logger.info(f"[{ano}] Bronze atualizada ({tamanho_local/1024/1024:.2f} MB). Pulando...")
+            logger.info(f"[{ano}] Datalake atualizado ({tamanho_local/1024/1024:.2f} MB).")
             return
 
-        logger.info(f"[{ano}] Iniciando ciclo de ingestão e proteção de dados...")
+        logger.info(f"[{ano}] Novo conteúdo detectado. Iniciando processamento seguro...")
         try:
             res = self.sessao.get(url, timeout=400)
             if res.status_code == 200:
-                self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze, Body=res.content)
-                df = self._processar_planilha(res.content)
-                if df is not None:
+                # O processamento acontece em RAM. Nada sensível é escrito em disco antes do Hash.
+                df_protegido = self._processar_e_proteger(res.content)
+                
+                if df_protegido is not None:
                     buffer = io.BytesIO()
-                    df.write_parquet(buffer, compression="lz4")
-                    self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_prata, Body=buffer.getvalue())
-                    logger.info(f"✅ [{ano}] Processado com proteção LGPD e salvo na Prata.")
+                    df_protegido.write_parquet(buffer, compression="lz4")
+                    
+                    # Salva no R2 já anonimizado
+                    self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze_protegida, Body=buffer.getvalue())
+                    logger.info(f"✅ [{ano}] Sucesso: Camada Bronze Protegida (Parquet) atualizada.")
+
         except Exception as e:
-            logger.error(f"Erro no ciclo do ano {ano}: {e}")
+            logger.error(f"❌ Erro no ciclo do ano {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     ano_atual = datetime.now().year
-    anos = range(2022, ano_atual + 1)
     
-    logger.info(f"🚀 SafeDriver Autobot: Zeladoria e LGPD (2022 -> {ano_atual})")
-    for ano in anos:
+    # Varredura completa de 2022 até o presente
+    anos_ciclo = range(2022, ano_atual + 1)
+    logger.info(f"🚀 SafeDriver Autobot Iniciado | Período: 2022 - {ano_atual}")
+    
+    for ano in anos_ciclo:
         ingestor.rodar_ano(ano)
