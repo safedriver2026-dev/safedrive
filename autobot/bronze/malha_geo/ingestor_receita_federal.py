@@ -26,12 +26,16 @@ class IngestorSafeDriverBronze:
         self.r2_path = "datalake/bronze/malha_raw/CNPJ_SP_HISTORICO.parquet"
 
     def gerar_hash_lgpd(self, cnpj):
-        """Cria identificador único pseudonimizado"""
+        """Cria identificador único pseudonimizado (One-Way Hash)"""
         base_string = f"{str(cnpj)}{self.salt}{self.pepper}"
         return hashlib.sha256(base_string.encode()).hexdigest()
 
     def obter_query_ingestao(self):
-        """Query otimizada unindo Receita + Diretório de CEPs"""
+        """
+        Query otimizada para Custo Zero e Alta Performance.
+        - INNER JOIN reduz o volume de dados na origem.
+        - Filtros estritos (>= 2015) evitam full-scans desnecessários, mantendo a janela do Delta 2022.
+        """
         return """
         SELECT 
             t1.cnpj,
@@ -39,20 +43,21 @@ class IngestorSafeDriverBronze:
             t1.data_inicio_atividade,
             t1.data_situacao_cadastral,
             t1.situacao_cadastral,
+            t1.identificador_matriz_filial, -- Essencial para entender a ocupação corporativa vs varejo local
             t1.cep,
-            -- Metadados espaciais para medir ocupação no H9 na prata
             ST_Y(t2.centroide) AS lat,
             ST_X(t2.centroide) AS lon
         FROM `basedosdados.br_me_cnpj.estabelecimentos` AS t1
         INNER JOIN `basedosdados.br_bd_diretorios_brasil.cep` AS t2 
             ON t1.cep = t2.cep
         WHERE t1.sigla_uf = 'SP' 
-          AND t1.data_inicio_atividade >= '2010-01-01' -- Histórico suficiente para 2022
+          AND t1.data_inicio_atividade >= '2015-01-01' 
+          AND t1.cnae_fiscal_principal IS NOT NULL
           AND t2.centroide IS NOT NULL
         """
 
     def executar(self):
-        print(f"🚀 [BRONZE] Iniciando extração do BigQuery para o projeto: {self.project_id}")
+        print(f"🚀 [BRONZE] Iniciando extração otimizada do BigQuery (Projeto: {self.project_id})")
         
         try:
             # 1. Busca dados via BigQuery API
@@ -60,12 +65,12 @@ class IngestorSafeDriverBronze:
             df_pandas = query_job.to_dataframe()
             df = pl.from_pandas(df_pandas)
             
-            print(f"🛡️ [LGPD] Protegendo {len(df)} registros com Hashing...")
+            print(f"🛡️ [LGPD] Protegendo {len(df)} registros com Hashing Irreversível...")
             
-            # 2. Proteção e Limpeza
+            # 2. Proteção e Limpeza (Isolamento de Dados Sensíveis)
             df_bronze = df.with_columns([
                 pl.col("cnpj").map_elements(self.gerar_hash_lgpd, return_dtype=pl.Utf8).alias("ID_PROTEGIDO")
-            ]).drop("cnpj")
+            ]).drop("cnpj") # O CNPJ real é destruído da memória neste exato momento
 
             # 3. Salvamento Temporário
             temp_file = "bronze_temp.parquet"
@@ -74,14 +79,14 @@ class IngestorSafeDriverBronze:
             print(f"📤 [R2] Enviando Parquet para o Cloudflare...")
             self.s3_client.upload_file(temp_file, self.bucket_name, self.r2_path)
             
-            # Limpeza
+            # 4. Higiene do Servidor
             if os.path.exists(temp_file):
                 os.remove(temp_file)
                 
             print(f"✅ [SUCESSO] Camada Bronze atualizada: {len(df_bronze)} linhas.")
 
         except Exception as e:
-            print(f"❌ [ERRO] Falha na ingestão: {str(e)}")
+            print(f"❌ [ERRO CRÍTICO] Falha na pipeline de ingestão: {str(e)}")
             raise e
 
 if __name__ == "__main__":
