@@ -51,7 +51,7 @@ jobs:
         run: |
           # Garante que o Python encontra os módulos
           export PYTHONPATH=$PYTHONPATH:$(pwd)
-          python scripts/processar_prata.py
+          python scripts/malha_geo_infra_social.py
 
       - name: Notificar Sucesso no Discord (Opcional)
         if: success()
