@@ -7,11 +7,11 @@ import h3
 import unicodedata
 import geopandas as gpd
 import zipfile
+import charset_normalizer
 from datetime import datetime
+from google.cloud import bigquery
 
-# ==========================================
-# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
-# ==========================================
+
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
 PRATA_DIR = "data_prata"
@@ -19,18 +19,43 @@ PRATA_DIR = "data_prata"
 def normalizar_string(valor):
     if valor is None or valor == "" or str(valor).upper() in ["NULL", "NAN", ".", "N/A"]: 
         return "NAO INFORMADO"
-    # REMOVE ACENTOS E CONVERTE PARA MAIÚSCULAS
+  
     texto = str(valor)
     texto = "".join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
     return texto.upper().strip()
 
+
+def descobrir_encoding(caminho_arquivo):
+    """Lê o cabeçalho do ficheiro binário e infere a codificação para evitar corrupção de strings."""
+    try:
+        with open(caminho_arquivo, 'rb') as f:
+            amostra_bytes = f.read(100000)
+        resultado = charset_normalizer.detect(amostra_bytes)
+        encoding_detectado = resultado['encoding']
+        
+        if not encoding_detectado:
+            return 'utf-8'
+            
+        print(f"   [Sensor] Encoding '{encoding_detectado}' detetado para {os.path.basename(caminho_arquivo)}")
+        return encoding_detectado
+    except Exception as e:
+        print(f"   [Aviso] Falha ao detetar encoding de {caminho_arquivo}: {e}. A assumir utf-8.")
+        return 'utf-8'
+
 class ArquitetoSafeDriver:
     def __init__(self):
-        self.audit_log = {"DATA_EXECUCAO": datetime.now().isoformat(), "AUDITORIA_QUALIDADE": {}, "CAMADAS": {}}
+        self.audit_log = {
+            "DATA_EXECUCAO": datetime.now().isoformat(), 
+            "AUDITORIA_QUALIDADE": {"ERROS_MUNICIPAIS_CORRIGIDOS": 0}, 
+            "CAMADAS": {}
+        }
+        
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # CONFIGURAÇÃO DE AMBIENTE PARA OSM
+
+        self.bq_client = bigquery.Client(project='safe-driver-fc3a9')
+        
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
         
@@ -40,6 +65,7 @@ class ArquitetoSafeDriver:
             aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY', '').strip()
         )
         self.bucket = os.getenv('R2_BUCKET_NAME', '').strip()
+        
         self.con = duckdb.connect()
         self.con.execute("INSTALL spatial; LOAD spatial;")
 
@@ -51,20 +77,26 @@ class ArquitetoSafeDriver:
 
     def download_bronze(self):
         print("📥 A DESCARREGAR ATIVOS DA CAMADA BRONZE (R2)...")
-        arquivos = ["Agregados_por_setores_basico_BR_20250417.csv", "SP_Faces_2022.zip", "sp-latest.osm.pbf", 
-                    "SP_Municipios_2022.shp", "SP_Municipios_2022.dbf", "SP_Municipios_2022.shx", "SP_Municipios_2022.prj"]
-        for f in arquivos:
+        ficheiros = [
+            "Agregados_por_setores_basico_BR_20250417.csv", "SP_Faces_2022.zip", 
+            "sp-latest.osm.pbf", "SP_Municipios_2022.shp", "SP_Municipios_2022.dbf", 
+            "SP_Municipios_2022.shx", "SP_Municipios_2022.prj"
+        ]
+        for f in ficheiros:
             local = os.path.join(BRONZE_DIR, f)
             if not os.path.exists(local): 
                 self.s3.download_file(self.bucket, f"datalake/bronze/malha_raw/{f}", local)
 
-    # ==========================================
-    # 🧠 MOTOR DE NORMALIZAÇÃO E AUDITORIA
-    # ==========================================
+   
     def normalizar_e_validar_espacial(self, df_pl):
         print("🛡️ A NORMALIZAR E VALIDAR INTEGRIDADE ESPACIAL...")
         mun_path = f"{BRONZE_DIR}/SP_Municipios_2022.shp"
-        municipios = gpd.read_file(mun_path).to_crs("EPSG:4326")
+        dbf_path = f"{BRONZE_DIR}/SP_Municipios_2022.dbf"
+        
+        # Sensor dinâmico para garantir integridade dos acentos
+        encoding_dinamico = descobrir_encoding(dbf_path)
+        
+        municipios = gpd.read_file(mun_path, encoding=encoding_dinamico).to_crs("EPSG:4326")
         municipios["NM_MUN"] = municipios["NM_MUN"].apply(normalizar_string)
 
         pdf = df_pl.to_pandas()
@@ -73,9 +105,9 @@ class ArquitetoSafeDriver:
         
         coluna_mun = 'NM_MUN_right' if 'NM_MUN_right' in joined.columns else 'NM_MUN'
         
-        # REGISTA AUDITORIA DE ERROS MUNICIPAIS
-        erros = joined[joined['NM_MUN_left'] != joined[coluna_mun]].shape[0] if 'NM_MUN_left' in joined.columns else 0
-        self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] = erros
+        if 'NM_MUN_left' in joined.columns:
+            erros = joined[joined['NM_MUN_left'] != joined[coluna_mun]].shape[0]
+            self.audit_log["AUDITORIA_QUALIDADE"]["ERROS_MUNICIPAIS_CORRIGIDOS"] += erros
         
         joined["MUNICIPIO_VALIDADO"] = joined[coluna_mun].fillna("FORA DA AREA")
         
@@ -83,13 +115,9 @@ class ArquitetoSafeDriver:
         cols_existentes = [c for c in cols_remover if c in joined.columns]
         return pl.from_pandas(joined.drop(columns=cols_existentes))
 
-    # ==========================================
-    # 📍 ETAPA 1: NORMALIZAÇÃO DA MALHA VIÁRIA
-    # ==========================================
     def normalizar_viaria(self):
-        print("📍 A NORMALIZAR MALHA VIÁRIA ESTADUAL EM LOTE...")
+        print("📍 A PROCESSAR MALHA VIÁRIA ESTADUAL EM LOTE...")
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
-        osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
         json_paths = []
         with zipfile.ZipFile(faces_zip, 'r') as z:
@@ -98,54 +126,50 @@ class ArquitetoSafeDriver:
                     z.extract(f, BRONZE_DIR)
                     json_paths.append(os.path.join(BRONZE_DIR, f))
 
-        print(f"   -> {len(json_paths)} ficheiros municipais de ruas encontrados. A iniciar processamento espacial...")
-
         lista_df_faces = []
         for path in json_paths:
-            q_faces = f"SELECT CD_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{path}') WHERE NM_LOG IS NOT NULL"
+            q_faces = f"""
+                SELECT CD_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, 
+                ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
+                FROM ST_Read('{path}') WHERE NM_LOG IS NOT NULL
+            """
             try:
                 df = self.con.execute(q_faces).pl()
                 lista_df_faces.append(df)
             except Exception as e:
-                print(f"   -> Aviso: Erro ao ler a geometria de {path}: {e}")
+                print(f"⚠️ Erro ao ler {path}: {e}")
 
         df_faces = pl.concat(lista_df_faces)
         lista_df_faces.clear()
 
         df_faces = self.normalizar_e_validar_espacial(df_faces)
 
-        print("   -> A extrair infraestrutura viária de todo o OSM...")
-        q_osm = f"""
-            SELECT * FROM (
-                SELECT 
-                    COALESCE(regexp_extract(other_tags, '"highway"=>"([^"]+)"', 1), 'NAO INFORMADO') as TIPO_VIA, 
-                    ST_Y(ST_Centroid(geom)) as LAT, 
-                    ST_X(ST_Centroid(geom)) as LON 
-                FROM ST_Read('{osm_path}', layer='lines')
-            ) WHERE TIPO_VIA != 'NAO INFORMADO'
-        """
-        df_osm = self.con.execute(q_osm).pl()
-
-        print("   -> A indexar por H3 e a remover duplicados estaduais...")
         df_final = df_faces.with_columns([
             pl.col("RUA").map_elements(normalizar_string, return_dtype=pl.Utf8),
-            pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
+            pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
+                h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s
+            ])).alias("H3_INDEX")
         ]).unique(subset=["H3_INDEX", "RUA"]).sort("H3_INDEX")
 
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["VIARIA"] = {"REGISTROS": df_final.height}
         
+     
         for path in json_paths:
-            if os.path.exists(path):
-                os.remove(path)
+            if os.path.exists(path): os.remove(path)
 
-    # ==========================================
-    # 👥 ETAPA 2: NORMALIZAÇÃO DA MALHA SOCIAL
-    # ==========================================
+  
     def normalizar_social(self):
         print("👥 A NORMALIZAR MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
-        df = pl.read_csv(csv_path, separator=";", encoding="latin1", schema_overrides={"CD_SETOR": pl.Utf8}, null_values=["."], infer_schema_length=10000)
+        
+        encoding_dinamico = descobrir_encoding(csv_path)
+        
+        df = pl.read_csv(
+            csv_path, separator=";", encoding=encoding_dinamico, 
+            schema_overrides={"CD_SETOR": pl.Utf8}, 
+            null_values=["."], infer_schema_length=10000
+        )
         
         df_final = df.filter(pl.col("CD_SETOR").str.starts_with("35")).select([
             pl.col("CD_SETOR"),
@@ -157,71 +181,90 @@ class ArquitetoSafeDriver:
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
-    # ==========================================
-    # 🛍️ ETAPA 3: NORMALIZAÇÃO DA MALHA COMERCIAL (CORRIGIDA)
-    # ==========================================
+ 
     def normalizar_comercial(self):
-        print("🛍️ A NORMALIZAR MALHA COMERCIAL (PONTOS + POLÍGONOS)...")
+        print("🛍️ A EXECUTAR DATA FUSION (BIGQUERY + OSM)...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        q = f"""
-            WITH POIS AS (
-                -- 1. PONTOS COMERCIAIS E DE SERVIÇO
-                SELECT 
-                    COALESCE(
-                        regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
-                        regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1),
-                        regexp_extract(other_tags, '"leisure"=>"([^"]+)"', 1),
-                        regexp_extract(other_tags, '"office"=>"([^"]+)"', 1),
-                        regexp_extract(other_tags, '"healthcare"=>"([^"]+)"', 1)
-                    ) as CAT, 
-                    name, 
-                    ST_Y(geom) as LAT, 
-                    ST_X(geom) as LON 
-                FROM ST_Read('{osm_path}', layer='points') 
-
-                UNION ALL
-
-                -- 2. POLÍGONOS COMERCIAIS (Shoppings, Parques, Hospitais, etc.)
-                SELECT 
-                    COALESCE(
-                        regexp_extract(other_tags, '"shop"=>"([^"]+)"', 1), 
-                        regexp_extract(other_tags, '"amenity"=>"([^"]+)"', 1),
-                        regexp_extract(other_tags, '"leisure"=>"([^"]+)"', 1),
-                        regexp_extract(other_tags, '"office"=>"([^"]+)"', 1),
-                        regexp_extract(other_tags, '"healthcare"=>"([^"]+)"', 1)
-                    ) as CAT, 
-                    name, 
-                    ST_Y(ST_Centroid(geom)) as LAT, 
-                    ST_X(ST_Centroid(geom)) as LON 
-                FROM ST_Read('{osm_path}', layer='multipolygons')
-            )
-            SELECT CAT, name, LAT, LON 
-            FROM POIS 
-            WHERE CAT IS NOT NULL AND CAT != ''
+      
+        query_bq = """
+            SELECT 
+                CASE 
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 5) = '84248' THEN 'SEGURANCA_DELEGACIA'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('47') THEN 'VAREJO_COMERCIO'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('56') THEN 'ALIMENTACAO_BAR'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('64') THEN 'FINANCEIRO_BANCO'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('85') THEN 'EDUCACAO'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 1) IN ('1', '2', '3') THEN 'INDUSTRIA_FABRICA'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('46') THEN 'ATACADO_GALPAO'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('52') THEN 'LOGISTICA_ARMAZEM'
+                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('69', '70', '82') THEN 'ESCRITORIO_CORPORATIVO'
+                    ELSE 'OUTROS'
+                END as CATEGORIA,
+                latitude as LAT,
+                longitude as LON
+            FROM `basedosdados.br_me_cnpj.estabelecimentos`
+            WHERE sigla_uf = 'SP' AND latitude IS NOT NULL
+              AND (
+                  SUBSTR(cnae_fiscal_principal, 1, 5) = '84248'
+                  OR SUBSTR(cnae_fiscal_principal, 1, 2) IN ('47', '56', '64', '85', '46', '52', '69', '70', '82')
+                  OR SUBSTR(cnae_fiscal_principal, 1, 1) IN ('1', '2', '3')
+              )
         """
-        df = self.con.execute(q).pl()
         
-        df_final = df.with_columns([
-            pl.col("CAT").map_elements(normalizar_string, return_dtype=pl.Utf8).alias("CATEGORIA"),
-            pl.col("name").map_elements(normalizar_string, return_dtype=pl.Utf8).alias("NOME"),
-            pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
-        ]).group_by(["H3_INDEX", "CATEGORIA"]).agg(pl.len().alias("QTD")).sort("H3_INDEX")
+      
+        query_osm = f"""
+            SELECT 'SEGURANCA_DELEGACIA' as CATEGORIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
+            FROM ST_Read('{osm_path}', layer='points') WHERE other_tags LIKE '%"amenity"=>"police"%'
+            UNION ALL
+            SELECT 'SEGURANCA_DELEGACIA' as CATEGORIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
+            FROM ST_Read('{osm_path}', layer='multipolygons') WHERE other_tags LIKE '%"amenity"=>"police"%'
+        """
         
-        df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
-        self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": df_final.height}
+        try:
+            print(" infraestrutura BQ...")
+            df_bq = pl.from_pandas(self.bq_client.query(query_bq).to_dataframe())
+            
+            print(" postos comunitários OSM...")
+            df_osm = self.con.execute(query_osm).pl()
+            
+         
+            print("   -> 🧬 A fundir bases e a converter para H3...")
+            df_unido = pl.concat([df_bq, df_osm]).with_columns([
+                pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
+                    h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s
+                ])).alias("H3_INDEX")
+            ])
+            
+         
+            print("   -> 🧹 A remover sobreposição de esquadras...")
+            df_seguranca = df_unido.filter(pl.col("CATEGORIA") == "SEGURANCA_DELEGACIA").unique(subset=["H3_INDEX"])
+            df_outros = df_unido.filter(pl.col("CATEGORIA") != "SEGURANCA_DELEGACIA")
+            
+            # 5. Agregação Final
+            df_final = pl.concat([df_seguranca, df_outros]).group_by(["H3_INDEX", "CATEGORIA"]).agg([
+                pl.len().alias("QTD_TOTAL")
+            ]).sort("H3_INDEX")
+            
+            df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
+            self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {
+                "REGISTROS": df_final.height, 
+                "STATUS": "DATA FUSION CONCLUÍDO (BQ + OSM)"
+            }
+            
+        except Exception as e:
+            print(f"❌ Erro no processo de Data Fusion: {e}")
+            self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": 0, "STATUS": f"ERRO: {e}"}
 
     def upload_final(self):
-        print("🚀 A GERAR AUDITORIA E A SUBIR PARA O R2...")
+        print("🚀 A GERAR AUDITORIA UNIFICADA E A SUBIR PARA R2...")
         
-        # CRIA O FICHEIRO FÍSICO DA AUDITORIA DIRETAMENTE NA PRATA_DIR
         audit_file = f"{PRATA_DIR}/AUDITORIA_PRATA.json"
         with open(audit_file, "w", encoding="utf-8") as f:
             json.dump(self.audit_log, f, indent=4, ensure_ascii=False)
             
-        # UPLOAD SIMPLIFICADO
-        for root, dirs, files in os.walk(PRATA_DIR):
-            for f in files:
+        for root, dirs, ficheiros in os.walk(PRATA_DIR):
+            for f in ficheiros:
                 local = os.path.join(root, f)
                 key = f"datalake/prata/malha_geo_infra_social/{f}"
                 self.s3.upload_file(local, self.bucket, key)
@@ -232,7 +275,7 @@ class ArquitetoSafeDriver:
         self.normalizar_social()
         self.normalizar_comercial()
         self.upload_final()
-        print("✅ TODAS AS ENTIDADES FORAM NORMALIZADAS, AUDITADAS E ESTÃO PRONTAS.")
+        print("✅ PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ BLINDADA E OTIMIZADA.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
