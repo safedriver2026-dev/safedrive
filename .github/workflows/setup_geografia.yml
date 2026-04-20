@@ -2,6 +2,7 @@ name: "SafeDriver: Camada Prata Malha"
 
 on:
   workflow_dispatch:
+
 env:
   # Cloudflare R2
   R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
@@ -9,19 +10,19 @@ env:
   R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
   
-  # BigQuery & Segurança
+  # BigQuery & Segurança (LGPD Compliance)
   BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
   BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-  LGPD_SALT: ${{ secrets.LGPD_SALT }}
+  LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}  # Chave global para hashing seguro
 
 jobs:
   build-silver:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout do Repositório
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Configurar Ambiente Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -29,17 +30,17 @@ jobs:
       - name: Autenticar no Google Cloud (BigQuery)
         uses: google-github-actions/auth@v2
         with:
-          # Usando o nome exato da sua secret
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
-      - name: Instalar Dependências
+      - name: Instalar Dependências de Engenharia
         run: >
           pip install boto3 polars duckdb h3 geopandas shapely pyarrow zstandard 
           google-cloud-bigquery charset-normalizer pandas db-dtypes
 
-      - name: Executar Arquitetura Prata
+      - name: Executar Pipeline Camada Prata
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
+    
       - name: Notificar Falha no Discord
         if: failure()
         run: |
@@ -51,5 +52,5 @@ jobs:
         if: success()
         run: |
           curl -H "Content-Type: application/json" \
-          -d '{"content": "✅ **[SafeDriver] SUCESSO:** A Camada Prata (Malha Geo) foi processada, anonimizada e guardada no Datalake."}' \
+          -d '{"content": "✅ **[SafeDriver] SUCESSO:** A Camada Prata foi processada, pseudonimizada com Pepper e guardada no Datalake."}' \
           ${{ secrets.DISCORD_SUCESSO }}
