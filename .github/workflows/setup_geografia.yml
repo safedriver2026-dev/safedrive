@@ -4,20 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: 'O que você deseja executar?'
+        description: 'Selecione o que deseja executar:'
         required: true
         default: 'tudo'
         type: choice
         options:
-          - 'BRONZE_RECEITA'    # Módulo Isolado
-          - 'BRONZE_CRIMES'     # Módulo Isolado
-          - 'BRONZE_COMPLETA'   # Toda a Camada Bronze
-          - 'PRATA_PROCESS'     # Só o Processamento
-          - 'tudo'              # Tudo do início ao fim
+          - 'BRONZE_RECEITA'    # Módulo Isolado: Receita Federal
+          - 'BRONZE_CRIMES'     # Módulo Isolado: Crimes SSP-SP
+          - 'BRONZE_COMPLETA'   # Toda a Camada Bronze (A + B)
+          - 'PRATA_PROCESS'     # Só o Processamento (Crimes + Malha)
+          - 'tudo'              # Fluxo completo (Bronze -> Prata)
 
 jobs:
   # ==========================================================
-  # 1. CAMADA BRONZE: CAPTURA DE DADOS CRUS (RAW)
+  # 1. CAMADA BRONZE: INGESTÃO DE DADOS CRUS (RAW)
   # ==========================================================
   camada-bronze:
     if: |
@@ -28,37 +28,42 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+      - name: 🔍 Checkout do Código
+        uses: actions/checkout@v4
 
-      # --- MÓDULO: RECEITA FEDERAL ---
-      - name: "[AUTH] Google Cloud"
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # --- MÓDULO: RECEITA FEDERAL (BRONZE-A) ---
+      - name: "🔑 [AUTH] Google Cloud"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
-      - name: "[BRONZE-A] Ingestão Receita Federal"
+      - name: "📦 [BRONZE-A] Ingestão Receita Federal"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
         run: |
           pip install google-cloud-bigquery google-cloud-storage boto3
           python autobot/bronze/malha_geo/ingestor_receita_federal.py check
           mkdir -p data_raw
-          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "Vazio"
+          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "GCS vazio"
           aws s3 sync data_raw/ s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ --endpoint-url $R2_ENDPOINT_URL
           python autobot/bronze/malha_geo/ingestor_receita_federal.py clean
 
-      # --- MÓDULO: CRIMES ---
-      - name: "[BRONZE-B] Ingestão SSP-SP (Web -> R2 Raw)"
+      # --- MÓDULO: CRIMES (BRONZE-B) ---
+      - name: "📦 [BRONZE-B] Ingestão SSP-SP (XLSX Raw)"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_CRIMES'
         run: |
-          pip install boto3 requests polars python-calamine fsspec
+          pip install boto3 requests polars python-calamine fsspec pyarrow h3
           python autobot/reg_crimes/ingestao_crimes_bronze.py
 
   # ==========================================================
@@ -66,6 +71,7 @@ jobs:
   # ==========================================================
   camada-prata:
     needs: [camada-bronze]
+    # Roda se a Bronze passar ou se for disparada manualmente/isolada
     if: |
       always() && 
       (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_PROCESS') &&
@@ -79,43 +85,47 @@ jobs:
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
       LGPD_SALT: ${{ secrets.LGPD_SALT }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+      - name: 🔍 Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       
-      - name: "[PRATA] Download Bronze -> Local"
+      - name: "📥 [PRATA] Download Bronze -> Local"
         run: |
           mkdir -p data_bronze
           aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/ data_bronze/ --endpoint-url $R2_ENDPOINT_URL
 
-      - name: "[PRATA] Processamento Crimes (Anonimização + H3)"
+      - name: "🛡️ [PRATA] Processamento Crimes (Anonimização + H3)"
         run: |
           pip install boto3 polars h3 pyarrow python-calamine fsspec
           python autobot/reg_crimes/processamento_crimes_prata.py
 
-      - name: "[PRATA] Processamento Malha e Infra Social"
+      - name: "⚙️ [PRATA] Processamento Malha e Infra Social"
         run: |
           pip install polars duckdb h3 pyarrow
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-      - name: "[PRATA] Upload Trusted -> R2"
+      - name: "📤 [PRATA] Upload Trusted -> R2"
         run: aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/ --endpoint-url $R2_ENDPOINT_URL
 
   # ==========================================================
-  # 3. NOTIFICAÇÃO
+  # 3. MONITORAMENTO E NOTIFICAÇÃO
   # ==========================================================
   notificacao:
     needs: [camada-prata]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: "[FIM] Feedback Discord"
+      - name: "📢 [FIM] Feedback ao Discord"
         run: |
           if [ "${{ needs.camada-prata.result }}" == "success" ]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Pipeline finalizado: ${{ github.event.inputs.job }}"
+            MSG="✅ **[SafeDriver]** Sucesso na execução: ${{ github.event.inputs.job }}. Camadas atualizadas!"
           else
             URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Erro na execução de: ${{ github.event.inputs.job }}"
+            MSG="🚨 **[SafeDriver]** Erro crítico na execução: ${{ github.event.inputs.job }}. Verifique os logs."
           fi
           curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
