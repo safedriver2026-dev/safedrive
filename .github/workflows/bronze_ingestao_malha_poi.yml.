@@ -1,0 +1,41 @@
+name: "SafeDriver: Ingestão Bronze Oficial (RFB)"
+
+on:
+  workflow_dispatch: # Execução manual para não estourar banda do GitHub
+
+jobs:
+  download-rfb:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      LGPD_SALT: ${{ secrets.LGPD_SALT }}
+      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Baixar Dados da Receita (Estabelecimentos Parte 0)
+        run: |
+          echo "📥 Baixando arquivo oficial (aprox 500MB)..."
+          wget https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2024-04/Estabelecimentos0.zip
+          unzip Estabelecimentos0.zip
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependências
+        run: pip install polars boto3 pyarrow
+
+      - name: Processar e Proteger (Bronze)
+        run: |
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          python autobot/bronze/malha_geo/ingestor_receita_federal.py
+
+      - name: Limpeza de Disco
+        run: rm *.csv *.zip
