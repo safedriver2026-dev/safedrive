@@ -1,0 +1,59 @@
+name: "SafeDriver: Ingestão Bronze (CNPJ/CEP)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      descricao:
+        description: 'Descrição do motivo da carga (opcional)'
+        required: false
+        default: 'Carga manual de estabelecimentos'
+
+jobs:
+  ingestao-bronze:
+    runs-on: ubuntu-latest
+    
+    env:
+      # Cloudflare R2 - Credenciais para o Boto3 dentro do Python
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      
+      # Segurança LGPD (Salt e Pepper para o Hash)
+      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
+      LGPD_SALT: ${{ secrets.LGPD_SALT }}
+
+    steps:
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Ambiente Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependências de Ingestão
+        run: |
+          pip install --upgrade pip
+          pip install requests polars boto3 pyarrow
+
+      - name: Executar Ingestor e Protetor (Bronze)
+        run: |
+          # Garante que o diretório de destino existe antes de rodar
+          mkdir -p data_raw
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          python autobot/bronze/malha_geo/ingestor_cnpj.py
+
+      - name: Notificar Sucesso no Discord
+        if: success()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "✅ **[SafeDriver] BRONZE ATUALIZADA:** Novo cache de CNPJs protegido e enviado para o R2."}' \
+          ${{ secrets.DISCORD_SUCESSO }}
+
+      - name: Notificar Falha no Discord
+        if: failure()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "🚨 **[SafeDriver] ERRO NA BRONZE:** Falha ao processar ingestão via API ou upload para o R2."}' \
+          ${{ secrets.DISCORD_ERRO }}
