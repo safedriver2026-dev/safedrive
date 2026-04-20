@@ -28,7 +28,6 @@ def descobrir_encoding(caminho_arquivo):
             amostra_bytes = f.read(100000)
         resultado = charset_normalizer.detect(amostra_bytes)
         encoding_detectado = resultado['encoding'] or 'utf-8'
-        print(f"   [Sensor] Encoding '{encoding_detectado}' detectado para {os.path.basename(caminho_arquivo)}")
         return encoding_detectado
     except:
         return 'utf-8'
@@ -36,12 +35,8 @@ def descobrir_encoding(caminho_arquivo):
 class ArquitetoSafeDriverPrata:
     def __init__(self):
         os.makedirs(PRATA_DIR, exist_ok=True)
-        
-        # Inicia DuckDB com suporte Espacial
         self.con = duckdb.connect()
         self.con.execute("INSTALL spatial; LOAD spatial;")
-        
-        # Configuração para o DuckDB ler arquivos do OpenStreetMap corretamente
         self.gerar_configuracao_osm()
 
     def gerar_configuracao_osm(self):
@@ -51,9 +46,7 @@ class ArquitetoSafeDriverPrata:
         os.environ["OSM_CONFIG_FILE"] = os.path.abspath("osmconf.ini")
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
 
-    # ==========================================
-    # 1. MALHA GEOGRÁFICA (VIÁRIA)
-    # ==========================================
+    # --- MALHA VIÁRIA E SOCIAL MANTIDAS ---
     def normalizar_e_validar_espacial(self, df_pl):
         mun_path = f"{BRONZE_DIR}/SP_Municipios_2022.shp"
         dbf_path = f"{BRONZE_DIR}/SP_Municipios_2022.dbf"
@@ -68,62 +61,39 @@ class ArquitetoSafeDriverPrata:
     def normalizar_viaria(self):
         print("📍 [PRATA] PROCESSANDO MALHA VIÁRIA...")
         faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
-        
-        if not os.path.exists(faces_zip):
-            print(f"⚠️ Arquivo {faces_zip} não encontrado. Pulando malha viária.")
-            return
-
+        if not os.path.exists(faces_zip): return
         json_paths = []
         with zipfile.ZipFile(faces_zip, 'r') as z:
             for f in z.namelist():
                 if f.endswith('.json'): 
-                    z.extract(f, BRONZE_DIR)
-                    json_paths.append(os.path.join(BRONZE_DIR, f))
-        
+                    z.extract(f, BRONZE_DIR); json_paths.append(os.path.join(BRONZE_DIR, f))
         lista_df = []
         for path in json_paths:
             df = self.con.execute(f"SELECT CD_SETOR, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON FROM ST_Read('{path}') WHERE NM_LOG IS NOT NULL").pl()
             lista_df.append(df)
-            
         df_final = self.normalizar_e_validar_espacial(pl.concat(lista_df))
         df_final = df_final.with_columns([
             pl.col("RUA").map_elements(normalizar_string, return_dtype=pl.Utf8),
             pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
         ]).unique(subset=["H3_INDEX", "RUA"])
-        
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet")
         for path in json_paths: os.remove(path)
-        print("✅ Malha Viária finalizada.")
 
-    # ==========================================
-    # 2. MALHA SOCIAL (DEMOGRÁFICA IBGE)
-    # ==========================================
     def normalizar_social(self):
         print("👥 [PRATA] PROCESSANDO MALHA DEMOGRÁFICA...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
-        
-        if not os.path.exists(csv_path):
-            print(f"⚠️ Arquivo {csv_path} não encontrado. Pulando malha social.")
-            return
-
+        if not os.path.exists(csv_path): return
         enc = descobrir_encoding(csv_path)
-        df = pl.read_csv(
-            csv_path, separator=";", encoding=enc, 
-            schema_overrides={"CD_SETOR": pl.Utf8}, 
-            infer_schema_length=10000, null_values=["."] 
-        )
-        
+        df = pl.read_csv(csv_path, separator=";", encoding=enc, schema_overrides={"CD_SETOR": pl.Utf8}, infer_schema_length=10000, null_values=["."])
         df_final = df.filter(pl.col("CD_SETOR").str.starts_with("35")).select([
             pl.col("CD_SETOR"),
             pl.col("NM_MUN").map_elements(normalizar_string, return_dtype=pl.Utf8).alias("MUNICIPIO"),
             pl.col("v0001").cast(pl.Int32).fill_null(0).alias("POPULACAO")
         ])
-        
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet")
-        print("✅ Malha Demográfica finalizada.")
 
     # ==========================================
-    # 3. MALHA COMERCIAL (VITALIDADE E DESERTOS)
+    # 3. MALHA COMERCIAL (O XERIFE DOS TIPOS)
     # ==========================================
     def classificar_impacto(self, cnae_col):
         prefixo = cnae_col.str.slice(0, 2)
@@ -135,16 +105,22 @@ class ArquitetoSafeDriverPrata:
         )
 
     def normalizar_comercial(self):
-        print("🛍️ [PRATA] PROCESSANDO MALHA COMERCIAL (HISTÓRICA)...")
+        print("🛍️ [PRATA] PROCESSANDO MALHA COMERCIAL (CONVERSÃO DE TIPOS)...")
         path_bronze = f"{BRONZE_DIR}/CNPJ_SP_HISTORICO.parquet"
-        
-        if not os.path.exists(path_bronze):
-            print(f"⚠️ Arquivo {path_bronze} não encontrado. Pulando malha comercial.")
-            return
+        if not os.path.exists(path_bronze): return
 
-        lf = pl.scan_parquet(path_bronze).drop_nulls(subset=["lat", "lon"])
+        # 1. Carregar Bronze Agnóstica (Strings)
+        lf = pl.scan_parquet(path_bronze)
 
-        # Correção: nomes exatos das colunas trazidas da Bronze
+        # 2. Tipagem Forte: Convertendo o que era String para o tipo correto
+        lf = lf.with_columns([
+            pl.col("lat").cast(pl.Float64, strict=False),
+            pl.col("lon").cast(pl.Float64, strict=False),
+            pl.col("data_inicio_atividade").str.to_date("%Y-%m-%d", strict=False),
+            pl.col("data_situacao_cadastral").str.to_date("%Y-%m-%d", strict=False)
+        ]).drop_nulls(subset=["lat", "lon"]) # Limpa nulos espaciais após conversão
+
+        # 3. Processamento Geo-Comercial
         lf = lf.with_columns([
             self.classificar_impacto(pl.col("cnae_fiscal_principal")).alias("CATEGORIA"),
             pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([
@@ -152,15 +128,18 @@ class ArquitetoSafeDriverPrata:
             ])).alias("H3_INDEX")
         ])
 
-        # Correção: Utilizando date() puro e nome de coluna corrigido
-        filtro_2022 = (pl.col("data_inicio_atividade") <= date(2022, 12, 31)) & \
-                      ((pl.col("data_situacao_cadastral").is_null()) | (pl.col("data_situacao_cadastral") > date(2022, 12, 31)))
+        # 4. Snapshots para Ouro
+        data_corte = date(2022, 12, 31)
+        
+        filtro_2022 = (pl.col("data_inicio_atividade") <= data_corte) & \
+                      ((pl.col("data_situacao_cadastral").is_null()) | (pl.col("data_situacao_cadastral") > data_corte))
         
         filtro_atual = (pl.col("situacao_cadastral") == "02")
 
         agg_2022 = (lf.filter(filtro_2022).group_by(["H3_INDEX", "CATEGORIA"]).agg(pl.len().alias("QTD_2022")))
         agg_atual = (lf.filter(filtro_atual).group_by(["H3_INDEX", "CATEGORIA"]).agg(pl.len().alias("QTD_ATUAL")))
 
+        # 5. Join e preenchimento de vazios
         df_prata = agg_2022.join(agg_atual, on=["H3_INDEX", "CATEGORIA"], how="outer").collect()
         
         df_prata = df_prata.with_columns([
@@ -169,14 +148,14 @@ class ArquitetoSafeDriverPrata:
         ]).drop_nulls(subset=["H3_INDEX"])
 
         df_prata.write_parquet(f"{PRATA_DIR}/MALHA_COMERCIAL_LIMPA.parquet")
-        print("✅ Malha Comercial finalizada.")
+        print(f"✅ Malha Comercial finalizada: {len(df_prata)} hexágonos únicos.")
 
     def executar(self):
-        print(f"⚙️ INICIANDO ARQUITETURA PRATA (TRIPLA MALHA) - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print(f"⚙️ INICIANDO PRATA AGNÓSTICA - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         self.normalizar_viaria()
         self.normalizar_social()
         self.normalizar_comercial()
-        print("✅ PROCESSAMENTO TOTAL DA PRATA FINALIZADO COM SUCESSO.")
+        print("✅ PROCESSAMENTO TOTAL DA PRATA FINALIZADO.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriverPrata().executar()
