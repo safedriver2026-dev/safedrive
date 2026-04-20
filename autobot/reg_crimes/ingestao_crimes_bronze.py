@@ -12,7 +12,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from typing import Optional
 
-# Configuração de Log profissional
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - [%(levelname)s] - %(message)s'
@@ -24,11 +23,9 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Chaves LGPD via GitHub Secrets (Cruciais para a segurança do Hash)
     PEPPER = os.getenv("LGPD_PEPPER", "default_pepper_key")
     SALT = os.getenv("LGPD_SALT", "default_salt_key")
 
-    # Colunas necessárias para análise e anonimização
     COLUNAS_ALVO = [
         "NUM_BO", "MUNICIPIO", "BAIRRO", "LOGRADOURO",
         "DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "HORA_OCORRENCIA_BO", 
@@ -61,15 +58,8 @@ class IngestorSafeDriver:
         return s
 
     def _gerar_hash_lgpd(self, logradouro: str, id_bo: str) -> str:
-        """
-        Gera um Hash Único por Registro: Pepper + Logradouro + ID_BO + Salt.
-        Isso garante que dois crimes na mesma rua tenham hashes diferentes,
-        protegendo contra ataques de correlação e cumprindo a LGPD.
-        """
         if not logradouro or str(logradouro).upper() in ["NONE", "NULL", "NAN"]:
             return "LOCAL_ANONIMIZADO"
-        
-        # O 'tempero' (Salt) é o próprio ID do B.O. para garantir unicidade por linha
         payload = f"{self.config.PEPPER}{logradouro}{id_bo}{self.config.SALT}".encode('utf-8')
         return hashlib.sha256(payload).hexdigest()
 
@@ -93,10 +83,8 @@ class IngestorSafeDriver:
         except: return None
 
     def _processar_e_proteger(self, bytes_excel: bytes) -> Optional[pl.DataFrame]:
-        """Processa o Excel e aplica a anonimização determinística por B.O."""
         fluxo = io.BytesIO(bytes_excel)
         dfs = []
-        
         for aba in range(1, 4):
             try:
                 preview = pl.read_excel(fluxo, sheet_id=aba, engine="calamine", has_header=False, read_options={"n_rows": 50})
@@ -106,7 +94,6 @@ class IngestorSafeDriver:
                     if len([v for v in vals if v in self.config.ANCORAS_CABECALHO]) >= 3:
                         idx_header = i
                         break
-                
                 if idx_header is not None:
                     df = pl.read_excel(fluxo, sheet_id=aba, engine="calamine", read_options={"skip_rows": idx_header})
                     df.columns = [c.upper().strip() for c in df.columns]
@@ -117,26 +104,24 @@ class IngestorSafeDriver:
             except: continue
 
         if not dfs: return None
-        
         df_final = pl.concat(dfs, how="diagonal")
 
-        # 1. Tratamento de Coordenadas
+        # 1. Coordenadas
         df_final = df_final.with_columns([
             pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
         ])
 
-        # 2. Camada LGPD: Anonimização com Unicidade
-        logger.info("🔒 Aplicando criptografia SHA-256 (Pepper + Logradouro + NUM_BO + Salt)")
+        # 2. LGPD (Hash Único por BO)
+        logger.info("🔒 Gerando identificadores anônimos (LGPD)...")
         df_final = df_final.with_columns(
             pl.struct(["LOGRADOURO", "NUM_BO"]).map_elements(
                 lambda x: self._gerar_hash_lgpd(x["LOGRADOURO"], x["NUM_BO"]),
                 return_dtype=pl.String
             ).alias("HASH_LOCAL_UNICO")
-        ).drop(["LOGRADOURO", "NUM_BO"]) # Remove os dados sensíveis originais imediatamente
+        ).drop(["LOGRADOURO", "NUM_BO"])
 
-        # 3. Enriquecimento Geoespacial (H3)
-        # Calculamos H3 para as coordenadas únicas para otimizar performance
+        # 3. H3
         geo_map = df_final.select(["LATITUDE", "LONGITUDE"]).unique().to_dicts()
         for d in geo_map:
             d["H3_INDEX"] = self._calcular_h3(d["LATITUDE"], d["LONGITUDE"])
@@ -144,32 +129,34 @@ class IngestorSafeDriver:
         return df_final.join(pl.DataFrame(geo_map), on=["LATITUDE", "LONGITUDE"], how="left")
 
     def rodar_ano(self, ano: int):
-        # O arquivo nasce na Bronze já protegido e em formato Parquet
-        path_bronze_protegida = f"datalake/bronze/crimes_protected/ssp_protected_{ano}.parquet"
-        url = self.config.URL_BASE_SSP.format(ano=ano)
+        # Definição clara dos caminhos conforme seu pedido
+        path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
+        path_prata = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
         
+        url = self.config.URL_BASE_SSP.format(ano=ano)
         tamanho_remoto = self._get_tamanho_remoto(url)
-        tamanho_local = self._get_tamanho_local(path_bronze_protegida)
+        tamanho_local = self._get_tamanho_local(path_bronze)
 
-        # Só baixa se o arquivo na SSP for maior que o que temos (novas ocorrências)
         if tamanho_remoto > 0 and tamanho_remoto <= tamanho_local:
-            logger.info(f"[{ano}] Datalake atualizado ({tamanho_local/1024/1024:.2f} MB).")
+            logger.info(f"[{ano}] Bronze já está atualizada. Pulando...")
             return
 
-        logger.info(f"[{ano}] Novo conteúdo detectado. Iniciando processamento seguro...")
         try:
+            logger.info(f"[{ano}] Baixando arquivo da SSP-SP...")
             res = self.sessao.get(url, timeout=400)
-            if res.status_code == 200:
-                # O processamento acontece em RAM. Nada sensível é escrito em disco antes do Hash.
-                df_protegido = self._processar_e_proteger(res.content)
-                
-                if df_protegido is not None:
-                    buffer = io.BytesIO()
-                    df_protegido.write_parquet(buffer, compression="lz4")
-                    
-                    # Salva no R2 já anonimizado
-                    self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze_protegida, Body=buffer.getvalue())
-                    logger.info(f"✅ [{ano}] Sucesso: Camada Bronze Protegida (Parquet) atualizada.")
+            if res.status_code != 200: return
+
+            # --- SALVANDO NA BRONZE (RAW) ---
+            self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze, Body=res.content)
+            logger.info(f"📁 [{ano}] Arquivo original salvo em bronze/crimes_raw")
+
+            # --- PROCESSANDO E SALVANDO NA PRATA (TRUSTED) ---
+            df_trusted = self._processar_e_proteger(res.content)
+            if df_trusted is not None:
+                buffer = io.BytesIO()
+                df_trusted.write_parquet(buffer, compression="lz4")
+                self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_prata, Body=buffer.getvalue())
+                logger.info(f"✨ [{ano}] Camada Prata gerada com sucesso em crimes_trusted")
 
         except Exception as e:
             logger.error(f"❌ Erro no ciclo do ano {ano}: {e}")
@@ -177,10 +164,8 @@ class IngestorSafeDriver:
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     ano_atual = datetime.now().year
+    anos = range(2022, ano_atual + 1)
     
-    # Varredura completa de 2022 até o presente
-    anos_ciclo = range(2022, ano_atual + 1)
-    logger.info(f"🚀 SafeDriver Autobot Iniciado | Período: 2022 - {ano_atual}")
-    
-    for ano in anos_ciclo:
+    logger.info(f"🚀 SafeDriver: Bronze (Raw) & Prata (Trusted) | 2022 - {ano_atual}")
+    for ano in anos:
         ingestor.rodar_ano(ano)
