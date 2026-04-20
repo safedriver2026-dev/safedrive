@@ -6,7 +6,7 @@ import unicodedata
 import geopandas as gpd
 import zipfile
 import charset_normalizer
-from datetime import datetime
+from datetime import date, datetime
 
 # ==========================================
 # CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
@@ -144,15 +144,17 @@ class ArquitetoSafeDriverPrata:
 
         lf = pl.scan_parquet(path_bronze).drop_nulls(subset=["lat", "lon"])
 
+        # Correção: nomes exatos das colunas trazidas da Bronze
         lf = lf.with_columns([
-            self.classificar_impacto(pl.col("cnae_principal")).alias("CATEGORIA"),
+            self.classificar_impacto(pl.col("cnae_fiscal_principal")).alias("CATEGORIA"),
             pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([
                 h3.latlng_to_cell(x["lat"], x["lon"], H3_RES) for x in s
             ])).alias("H3_INDEX")
         ])
 
-        filtro_2022 = (pl.col("data_inicio_atividade") <= datetime(2022, 12, 31)) & \
-                      ((pl.col("data_situacao").is_null()) | (pl.col("data_situacao") > datetime(2022, 12, 31)))
+        # Correção: Utilizando date() puro e nome de coluna corrigido
+        filtro_2022 = (pl.col("data_inicio_atividade") <= date(2022, 12, 31)) & \
+                      ((pl.col("data_situacao_cadastral").is_null()) | (pl.col("data_situacao_cadastral") > date(2022, 12, 31)))
         
         filtro_atual = (pl.col("situacao_cadastral") == "02")
 
