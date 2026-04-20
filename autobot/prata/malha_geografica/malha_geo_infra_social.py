@@ -11,7 +11,9 @@ import charset_normalizer
 from datetime import datetime
 from google.cloud import bigquery
 
-
+# ==========================================
+# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
+# ==========================================
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
 PRATA_DIR = "data_prata"
@@ -52,11 +54,11 @@ class ArquitetoSafeDriver:
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-      
+        # 🔐 SEGURANÇA E AMBIENTE (BigQuery + LGPD Pepper)
         project_id = os.getenv('BQ_PROJECT_ID', 'safe-driver-fc3a9')
         self.bq_client = bigquery.Client(project=project_id)
         
-      
+        # O Pepper global secreto injetado pelo GitHub Actions
         self.lgpd_pepper = os.getenv('LGPD_PEPPER', 'safedriver_pepper_default_123')
         
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
@@ -184,7 +186,7 @@ class ArquitetoSafeDriver:
         print("🛍️ EXECUTAR DATA FUSION (BQ INNER JOIN CEP + OSM)...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
-        # O SUPER JOIN: Resolve o erro da latitude usando a base de CEPs geolocalizados
+        # O SUPER JOIN corrigido: Extrai ST_Y e ST_X da coluna 'centroide'
         query_bq = """
             SELECT 
                 e.nome_fantasia as NOME_BRUTO,
@@ -200,13 +202,13 @@ class ArquitetoSafeDriver:
                     WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('69', '70', '82') THEN 'ESCRITORIO_CORPORATIVO'
                     ELSE 'OUTROS'
                 END as CATEGORIA,
-                c.latitude as LAT,
-                c.longitude as LON
+                ST_Y(c.centroide) as LAT,
+                ST_X(c.centroide) as LON
             FROM `basedosdados.br_me_cnpj.estabelecimentos` e
             INNER JOIN `basedosdados.br_bd_diretorios_brasil.cep` c
                 ON e.cep = c.cep
             WHERE e.sigla_uf = 'SP' 
-              AND c.latitude IS NOT NULL
+              AND c.centroide IS NOT NULL
               AND (
                   SUBSTR(e.cnae_fiscal_principal, 1, 5) = '84248'
                   OR SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('47', '56', '64', '85', '46', '52', '69', '70', '82')
@@ -223,7 +225,7 @@ class ArquitetoSafeDriver:
         """
         
         try:
-            print("   -> 📡 A cruzir CNPJs com a malha de CEPs no BigQuery...")
+            print("   -> 📡 A cruzar CNPJs com a malha de CEPs (GEOGRAPHY) no BigQuery...")
             df_bq = pl.from_pandas(self.bq_client.query(query_bq).to_dataframe())
             
             print("   -> 🗺️ A ler postos comunitários OSM...")
@@ -231,30 +233,29 @@ class ArquitetoSafeDriver:
             
             print("   -> 🧬 A gerar H3 e Criptografia (Geo-Salt + Pepper)...")
             
-            # 1. Primeiro convertemos para H3 (o nosso Geo-Salt)
+            # 1. H3 Indexing (O nosso Geo-Salt)
             df_h3 = pl.concat([df_bq, df_osm]).with_columns([
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
                     h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s
                 ])).alias("H3_INDEX")
             ])
             
-            # 2. Agora aplicamos a Pseudonimização LGPD combinando tudo
+            # 2. Pseudonimização LGPD
             df_unido = df_h3.with_columns([
                 pl.concat_str([
                     pl.col("NOME_BRUTO").fill_null("SEM_NOME"),
-                    pl.col("H3_INDEX"), # O Geo-Salt (Específico por localização)
-                    pl.lit(self.lgpd_pepper) # O Pepper (Global do GitHub)
+                    pl.col("H3_INDEX"),
+                    pl.lit(self.lgpd_pepper)
                 ]).hash().cast(pl.Utf8).alias("HASH_PSEUDONIMIZADO")
             ])
             
-            # 3. Purga os dados originais da memória
             df_unido = df_unido.drop(["NOME_BRUTO", "LAT", "LON"])
             
             print("   -> 🧹 A aplicar desduplicação espacial de segurança...")
             df_seguranca = df_unido.filter(pl.col("CATEGORIA") == "SEGURANCA_DELEGACIA").unique(subset=["H3_INDEX"])
             df_outros = df_unido.filter(pl.col("CATEGORIA") != "SEGURANCA_DELEGACIA")
             
-            # 4. Agregação Final para a Feature Store (apenas contagens numéricas por categoria)
+            # 3. Agregação Final Feature Store
             df_final = pl.concat([df_seguranca, df_outros]).group_by(["H3_INDEX", "CATEGORIA"]).agg([
                 pl.len().alias("QTD_TOTAL")
             ]).sort("H3_INDEX")
@@ -288,7 +289,7 @@ class ArquitetoSafeDriver:
         self.normalizar_social()
         self.normalizar_comercial()
         self.upload_final()
-        print("PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ BLINDADA E OTIMIZADA.")
+        print("✅ PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ BLINDADA E OTIMIZADA.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
