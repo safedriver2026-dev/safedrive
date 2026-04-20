@@ -9,20 +9,18 @@ on:
         default: 'tudo'
         type: choice
         options:
-          - 'BRONZE_RECEITA'    # BigQuery -> R2 (Anual)
-          - 'BRONZE_CRIMES'     # SSP-SP -> R2 (Mensal)
-          - 'PRATA_PROCESS'     # Bronze -> Processamento -> Prata
+          - 'BRONZE'         # Ingestão Raw (Receita + Crimes)
+          - 'PRATA'          # Processamento Trusted (LGPD + H3)
           - 'tudo'
   schedule:
-    # 🚀 Execução automática no dia 01 de cada mês
     - cron: '0 0 1 * *'
 
 jobs:
   # ==========================================================
-  # CAMADA BRONZE-A: RECEITA FEDERAL (BIG DATA)
+  # 1. CAMADA BRONZE: INGESTÃO DE DADOS CRUS (RAW)
   # ==========================================================
-  bronze-receita:
-    if: contains(fromJSON('["BRONZE_RECEITA", "tudo"]'), github.event.inputs.job) || github.event_name == 'schedule'
+  camada-bronze:
+    if: contains(fromJSON('["BRONZE", "tudo"]'), github.event.inputs.job) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     env:
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
@@ -36,78 +34,66 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
 
-      - name: "[BRONZE-A] Autenticar Google Cloud"
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
-
-      - name: "[BRONZE-A] Sincronização GCS -> R2"
+      # --- ETAPA A: RECEITA FEDERAL ---
+      - name: "[BRONZE-A] Ingestão Receita Federal (GCS -> R2)"
         run: |
           pip install google-cloud-bigquery google-cloud-storage boto3
           python autobot/bronze/malha_geo/ingestor_receita_federal.py check
           mkdir -p data_raw
-          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "GCS vazio"
+          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "Vazio"
           aws s3 sync data_raw/ s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ --endpoint-url $R2_ENDPOINT_URL
           python autobot/bronze/malha_geo/ingestor_receita_federal.py clean
+        uses: google-github-actions/auth@v2
+        with: { credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}' }
 
-  # ==========================================================
-  # CAMADA BRONZE-B: CRIMES SSP-SP (PRIVACY-FIRST)
-  # ==========================================================
-  bronze-crimes:
-    if: contains(fromJSON('["BRONZE_CRIMES", "tudo"]'), github.event.inputs.job) || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    env:
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
-      LGPD_SALT: ${{ secrets.LGPD_SALT }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.10' }
-
-      - name: "[BRONZE-B] Ingestão com Anonimização LGPD"
+      # --- ETAPA B: CRIMES ---
+      - name: "[BRONZE-B] Ingestão SSP-SP (Web -> R2 Raw)"
         run: |
-          pip install boto3 requests polars h3 python-calamine fsspec pyarrow
+          pip install boto3 requests polars python-calamine
           python autobot/reg_crimes/ingestao_crimes_bronze.py
 
   # ==========================================================
-  # CAMADA PRATA: PROCESSAMENTO POLARS (TRUSTED)
+  # 2. CAMADA PRATA: TRANSFORMAÇÃO E LGPD (TRUSTED)
   # ==========================================================
   camada-prata:
-    needs: [bronze-receita, bronze-crimes]
+    needs: [camada-bronze]
     if: |
       always() && 
-      contains(fromJSON('["PRATA_PROCESS", "tudo"]'), github.event.inputs.job) &&
-      (needs.bronze-receita.result != 'failure' && needs.bronze-crimes.result != 'failure')
+      contains(fromJSON('["PRATA", "tudo"]'), github.event.inputs.job) &&
+      (needs.camada-bronze.result != 'failure')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
+      LGPD_SALT: ${{ secrets.LGPD_SALT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       
-      - name: "[PRATA] Download Camadas Bronze -> Local"
+      - name: "[PRATA] Sincronizar Bronze para o Runner"
         run: |
-          mkdir -p data_raw
-          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/ data_raw/ --endpoint-url $R2_ENDPOINT_URL
+          mkdir -p data_bronze
+          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/ data_bronze/ --endpoint-url $R2_ENDPOINT_URL
 
-      - name: "[PRATA] Processamento Polars (171M Linhas)"
+      - name: "[PRATA] Processamento Crimes (Anonimização + H3)"
         run: |
-          pip install polars duckdb h3 pyarrow python-calamine
+          pip install boto3 polars h3 pyarrow python-calamine fsspec
+          python autobot/reg_crimes/processamento_crimes_prata.py
+
+      - name: "[PRATA] Processamento Malha e Infra Social"
+        run: |
+          pip install polars duckdb h3 pyarrow
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
       - name: "[PRATA] Upload Trusted -> R2"
         run: aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/ --endpoint-url $R2_ENDPOINT_URL
 
   # ==========================================================
-  # MONITORAMENTO E NOTIFICAÇÃO (DISCORD)
+  # 3. NOTIFICAÇÃO
   # ==========================================================
   notificacao:
     needs: [camada-prata]
@@ -117,10 +103,10 @@ jobs:
       - name: "[FIM] Enviar Feedback ao Discord"
         run: |
           if [ "${{ needs.camada-prata.result }}" == "success" ]; then
-            MSG="✅ **[SafeDriver]** Pipeline concluído com sucesso! Camadas Bronze e Prata atualizadas e anonimizadas."
+            MSG="✅ **[SafeDriver]** Pipeline concluído! Bronze capturada e Prata protegida (LGPD)."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[SafeDriver]** Falha no Pipeline! Verifique os logs no GitHub Actions."
+            MSG="🚨 **[SafeDriver]** Falha detectada. Verifique os logs do GitHub Actions."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
