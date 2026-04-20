@@ -12,14 +12,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from typing import Optional
 
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - [%(levelname)s] - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ConfiguracaoIngestao:
-    # Captura das variáveis com fallback para None para facilitar o debug
+    # Nomes batendo com o YAML
     NOME_BUCKET = os.getenv("R2_BUCKET_NAME")
     ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL")
     ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
@@ -42,21 +39,14 @@ class ConfiguracaoIngestao:
 class IngestorSafeDriver:
     def __init__(self):
         self.config = ConfiguracaoIngestao()
-        self._validar_credenciais()
+        self._validar_ambiente()
         self.s3 = self._inicializar_s3()
         self.sessao = self._inicializar_http()
 
-    def _validar_credenciais(self):
-        """Verifica se as chaves essenciais estão presentes"""
-        faltantes = []
-        if not self.config.ACCESS_KEY: faltantes.append("R2_ACCESS_KEY_ID")
-        if not self.config.SECRET_KEY: faltantes.append("R2_SECRET_ACCESS_KEY")
-        if not self.config.ENDPOINT_URL: faltantes.append("R2_ENDPOINT_URL")
-        
-        if faltantes:
-            msg = f"❌ Erro de Configuração: As seguintes variáveis estão vazias: {', '.join(faltantes)}"
-            logger.error(msg)
-            raise ValueError(msg)
+    def _validar_ambiente(self):
+        """Impede o erro de 'length 0' logo no início"""
+        if not self.config.ACCESS_KEY or len(self.config.ACCESS_KEY) == 0:
+            raise ValueError("❌ R2_ACCESS_KEY_ID não encontrada no ambiente!")
 
     def _inicializar_s3(self):
         return boto3.client(
@@ -91,29 +81,24 @@ class IngestorSafeDriver:
         dfs = []
         for aba in range(1, 4):
             try:
-                preview = pl.read_excel(fluxo, sheet_id=aba, engine="calamine", has_header=False, read_options={"n_rows": 50})
-                idx_header = None
-                for i, linha in enumerate(preview.iter_rows()):
-                    vals = [str(c).upper() for c in linha if c is not None]
-                    if len([v for v in vals if v in self.config.ANCORAS_CABECALHO]) >= 3:
-                        idx_header = i
-                        break
-                if idx_header is not None:
-                    df = pl.read_excel(fluxo, sheet_id=aba, engine="calamine", read_options={"skip_rows": idx_header})
-                    df.columns = [c.upper().strip() for c in df.columns]
-                    cols = [c for c in df.columns if c in self.config.COLUNAS_ALVO]
-                    df = df.select(cols).with_columns(pl.all().cast(pl.String))
-                    dfs.append(df)
+                # O motor calamine é essencial para o XLSX da SSP
+                df = pl.read_excel(fluxo, sheet_id=aba, engine="calamine")
+                df.columns = [c.upper().strip() for c in df.columns]
+                cols = [c for c in df.columns if c in self.config.COLUNAS_ALVO]
+                df = df.select(cols).with_columns(pl.all().cast(pl.String))
+                dfs.append(df)
             except: continue
 
         if not dfs: return None
         df_final = pl.concat(dfs, how="diagonal")
 
+        # 1. Coordenadas
         df_final = df_final.with_columns([
             pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
             pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
         ])
 
+        # 2. LGPD
         df_final = df_final.with_columns(
             pl.struct(["LOGRADOURO", "NUM_BO"]).map_elements(
                 lambda x: self._gerar_hash_lgpd(x["LOGRADOURO"], x["NUM_BO"]),
@@ -121,6 +106,7 @@ class IngestorSafeDriver:
             ).alias("HASH_LOCAL_UNICO")
         ).drop(["LOGRADOURO", "NUM_BO"])
 
+        # 3. H3
         geo_map = df_final.select(["LATITUDE", "LONGITUDE"]).unique().to_dicts()
         for d in geo_map:
             d["H3_INDEX"] = self._calcular_h3(d["LATITUDE"], d["LONGITUDE"])
@@ -133,19 +119,21 @@ class IngestorSafeDriver:
         url = self.config.URL_BASE_SSP.format(ano=ano)
 
         try:
-            logger.info(f"[{ano}] Baixando arquivo da SSP-SP...")
+            logger.info(f"[{ano}] Iniciando download...")
             res = self.sessao.get(url, timeout=400)
             if res.status_code != 200: return
 
+            # Bronze
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze, Body=res.content)
-            logger.info(f"📁 [{ano}] Raw salvo.")
+            logger.info(f"📁 [{ano}] Bronze salva.")
 
+            # Prata
             df_trusted = self._processar_e_proteger(res.content)
             if df_trusted is not None:
                 buffer = io.BytesIO()
                 df_trusted.write_parquet(buffer, compression="lz4")
                 self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_prata, Body=buffer.getvalue())
-                logger.info(f"✨ [{ano}] Prata gerada.")
+                logger.info(f"✨ [{ano}] Prata salva.")
 
         except Exception as e:
             logger.error(f"❌ Erro no ciclo do ano {ano}: {e}")
