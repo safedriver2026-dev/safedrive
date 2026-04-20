@@ -1,131 +1,145 @@
-name: "SafeDriver: Pipeline Multicamadas Escalável"
+import os
+import boto3
+import requests
+import logging
+import io
+import polars as pl
+import h3
+import hashlib
+from botocore.config import Config
+from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from typing import Optional
 
-on:
-  workflow_dispatch:
-    inputs:
-      job:
-        description: 'Selecione o que deseja executar:'
-        required: true
-        default: 'tudo'
-        type: choice
-        options:
-          - 'BRONZE_RECEITA'    # Módulo Isolado: Receita Federal
-          - 'BRONZE_CRIMES'     # Módulo Isolado: Crimes SSP-SP
-          - 'BRONZE_COMPLETA'   # Toda a Camada Bronze (A + B)
-          - 'PRATA_PROCESS'     # Só o Processamento (Crimes + Malha)
-          - 'tudo'              # Fluxo completo (Bronze -> Prata)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logger = logging.getLogger(__name__)
 
-jobs:
-  # ==========================================================
-  # 1. CAMADA BRONZE: INGESTÃO DE DADOS CRUS (RAW)
-  # ==========================================================
-  camada-bronze:
-    if: |
-      github.event.inputs.job == 'tudo' || 
-      github.event.inputs.job == 'BRONZE_COMPLETA' || 
-      github.event.inputs.job == 'BRONZE_RECEITA' || 
-      github.event.inputs.job == 'BRONZE_CRIMES'
-    runs-on: ubuntu-latest
-    env:
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-    steps:
-      - name: 🔍 Checkout do Código
-        uses: actions/checkout@v4
+class ConfiguracaoIngestao:
+    # Nomes batendo com o YAML
+    NOME_BUCKET = os.getenv("R2_BUCKET_NAME")
+    ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL")
+    ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
+    SECRET_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+    
+    PEPPER = os.getenv("LGPD_PEPPER", "default_pepper")
+    SALT = os.getenv("LGPD_SALT", "default_salt")
 
-      - name: 🐍 Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+    RESOLUCAO_H3 = 9
+    
+    COLUNAS_ALVO = [
+        "NUM_BO", "MUNICIPIO", "CIDADE", "NOME_MUNICIPIO", "BAIRRO", "LOGRADOURO",
+        "DATA_OCORRENCIA_BO", "DATA_OCORRENCIA", "HORA_OCORRENCIA_BO", 
+        "DESC_PERIODO", "RUBRICA", "LATITUDE", "LONGITUDE", 
+        "DESCR_TIPOLOCAL", "DESCR_SUBTIPOLOCAL"
+    ]
+    ANCORAS_CABECALHO = {"LOGRADOURO", "MUNICIPIO", "RUBRICA", "LATITUDE", "DESC_PERIODO"}
 
-      # --- MÓDULO: RECEITA FEDERAL (BRONZE-A) ---
-      - name: "🔑 [AUTH] Google Cloud"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
+class IngestorSafeDriver:
+    def __init__(self):
+        self.config = ConfiguracaoIngestao()
+        self._validar_ambiente()
+        self.s3 = self._inicializar_s3()
+        self.sessao = self._inicializar_http()
 
-      - name: "📦 [BRONZE-A] Ingestão Receita Federal"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
-        run: |
-          pip install google-cloud-bigquery google-cloud-storage boto3
-          python autobot/bronze/malha_geo/ingestor_receita_federal.py check
-          mkdir -p data_raw
-          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "GCS vazio"
-          aws s3 sync data_raw/ s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ --endpoint-url $R2_ENDPOINT_URL
-          python autobot/bronze/malha_geo/ingestor_receita_federal.py clean
+    def _validar_ambiente(self):
+        """Impede o erro de 'length 0' logo no início"""
+        if not self.config.ACCESS_KEY or len(self.config.ACCESS_KEY) == 0:
+            raise ValueError("❌ R2_ACCESS_KEY_ID não encontrada no ambiente!")
 
-      # --- MÓDULO: CRIMES (BRONZE-B) ---
-      - name: "📦 [BRONZE-B] Ingestão SSP-SP (XLSX Raw)"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_CRIMES'
-        run: |
-          pip install boto3 requests polars python-calamine fsspec pyarrow h3
-          python autobot/reg_crimes/ingestao_crimes_bronze.py
+    def _inicializar_s3(self):
+        return boto3.client(
+            's3', 
+            endpoint_url=self.config.ENDPOINT_URL.strip().rstrip('/'),
+            aws_access_key_id=self.config.ACCESS_KEY.strip(),
+            aws_secret_access_key=self.config.SECRET_KEY.strip(),
+            config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+        )
 
-  # ==========================================================
-  # 2. CAMADA PRATA: TRANSFORMAÇÃO E LGPD (TRUSTED)
-  # ==========================================================
-  camada-prata:
-    needs: [camada-bronze]
-    # Roda se a Bronze passar ou se for disparada manualmente/isolada
-    if: |
-      always() && 
-      (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_PROCESS') &&
-      (needs.camada-bronze.result != 'failure')
-    runs-on: ubuntu-latest
-    env:
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
-      LGPD_SALT: ${{ secrets.LGPD_SALT }}
-    steps:
-      - name: 🔍 Checkout do Código
-        uses: actions/checkout@v4
+    def _inicializar_http(self):
+        s = requests.Session()
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        s.mount("https://", HTTPAdapter(max_retries=retries))
+        return s
 
-      - name: 🐍 Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      
-      - name: "📥 [PRATA] Download Bronze -> Local"
-        run: |
-          mkdir -p data_bronze
-          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/ data_bronze/ --endpoint-url $R2_ENDPOINT_URL
+    def _gerar_hash_lgpd(self, logradouro: str, id_bo: str) -> str:
+        if not logradouro or str(logradouro).upper() in ["NONE", "NULL", "NAN"]:
+            return "LOCAL_ANONIMIZADO"
+        payload = f"{self.config.PEPPER}{logradouro}{id_bo}{self.config.SALT}".encode('utf-8')
+        return hashlib.sha256(payload).hexdigest()
 
-      - name: "🛡️ [PRATA] Processamento Crimes (Anonimização + H3)"
-        run: |
-          pip install boto3 polars h3 pyarrow python-calamine fsspec
-          python autobot/reg_crimes/processamento_crimes_prata.py
+    def _calcular_h3(self, lat, lon):
+        try:
+            lat, lon = float(lat), float(lon)
+            if lat == 0 or lon == 0 or abs(lat) > 90 or abs(lon) > 180: return None
+            return h3.latlng_to_cell(lat, lon, self.config.RESOLUCAO_H3)
+        except: return None
 
-      - name: "⚙️ [PRATA] Processamento Malha e Infra Social"
-        run: |
-          pip install polars duckdb h3 pyarrow
-          python autobot/prata/malha_geografica/malha_geo_infra_social.py
+    def _processar_e_proteger(self, bytes_excel: bytes) -> Optional[pl.DataFrame]:
+        fluxo = io.BytesIO(bytes_excel)
+        dfs = []
+        for aba in range(1, 4):
+            try:
+                # O motor calamine é essencial para o XLSX da SSP
+                df = pl.read_excel(fluxo, sheet_id=aba, engine="calamine")
+                df.columns = [c.upper().strip() for c in df.columns]
+                cols = [c for c in df.columns if c in self.config.COLUNAS_ALVO]
+                df = df.select(cols).with_columns(pl.all().cast(pl.String))
+                dfs.append(df)
+            except: continue
 
-      - name: "📤 [PRATA] Upload Trusted -> R2"
-        run: aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/ --endpoint-url $R2_ENDPOINT_URL
+        if not dfs: return None
+        df_final = pl.concat(dfs, how="diagonal")
 
-  # ==========================================================
-  # 3. MONITORAMENTO E NOTIFICAÇÃO
-  # ==========================================================
-  notificacao:
-    needs: [camada-prata]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: "📢 [FIM] Feedback ao Discord"
-        run: |
-          if [ "${{ needs.camada-prata.result }}" == "success" ]; then
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Sucesso na execução: ${{ github.event.inputs.job }}. Camadas atualizadas!"
-          else
-            URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Erro crítico na execução: ${{ github.event.inputs.job }}. Verifique os logs."
-          fi
-          curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
+        # 1. Coordenadas
+        df_final = df_final.with_columns([
+            pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
+            pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
+        ])
+
+        # 2. LGPD
+        df_final = df_final.with_columns(
+            pl.struct(["LOGRADOURO", "NUM_BO"]).map_elements(
+                lambda x: self._gerar_hash_lgpd(x["LOGRADOURO"], x["NUM_BO"]),
+                return_dtype=pl.String
+            ).alias("HASH_LOCAL_UNICO")
+        ).drop(["LOGRADOURO", "NUM_BO"])
+
+        # 3. H3
+        geo_map = df_final.select(["LATITUDE", "LONGITUDE"]).unique().to_dicts()
+        for d in geo_map:
+            d["H3_INDEX"] = self._calcular_h3(d["LATITUDE"], d["LONGITUDE"])
+        
+        return df_final.join(pl.DataFrame(geo_map), on=["LATITUDE", "LONGITUDE"], how="left")
+
+    def rodar_ano(self, ano: int):
+        path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
+        path_prata = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
+        url = self.config.URL_BASE_SSP.format(ano=ano)
+
+        try:
+            logger.info(f"[{ano}] Iniciando download...")
+            res = self.sessao.get(url, timeout=400)
+            if res.status_code != 200: return
+
+            # Bronze
+            self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze, Body=res.content)
+            logger.info(f"📁 [{ano}] Bronze salva.")
+
+            # Prata
+            df_trusted = self._processar_e_proteger(res.content)
+            if df_trusted is not None:
+                buffer = io.BytesIO()
+                df_trusted.write_parquet(buffer, compression="lz4")
+                self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_prata, Body=buffer.getvalue())
+                logger.info(f"✨ [{ano}] Prata salva.")
+
+        except Exception as e:
+            logger.error(f"❌ Erro no ciclo do ano {ano}: {e}")
+
+if __name__ == "__main__":
+    ingestor = IngestorSafeDriver()
+    ano_atual = datetime.now().year
+    for ano in range(2022, ano_atual + 1):
+        ingestor.rodar_ano(ano)
