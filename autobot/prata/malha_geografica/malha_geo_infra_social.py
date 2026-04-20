@@ -24,7 +24,6 @@ def normalizar_string(valor):
     texto = "".join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
     return texto.upper().strip()
 
-
 def descobrir_encoding(caminho_arquivo):
     """Lê o cabeçalho do ficheiro binário e infere a codificação para evitar corrupção de strings."""
     try:
@@ -53,8 +52,9 @@ class ArquitetoSafeDriver:
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-
-        self.bq_client = bigquery.Client(project='safe-driver-fc3a9')
+        project_id = os.getenv('BQ_PROJECT_ID', 'safe-driver-fc3a9')
+        self.bq_client = bigquery.Client(project=project_id)
+        self.lgpd_salt = os.getenv('LGPD_SALT', 'safedriver_salt_default_123')
         
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
         self.gerar_configuracao_osm()
@@ -87,13 +87,12 @@ class ArquitetoSafeDriver:
             if not os.path.exists(local): 
                 self.s3.download_file(self.bucket, f"datalake/bronze/malha_raw/{f}", local)
 
-   
+    
     def normalizar_e_validar_espacial(self, df_pl):
         print("🛡️ A NORMALIZAR E VALIDAR INTEGRIDADE ESPACIAL...")
         mun_path = f"{BRONZE_DIR}/SP_Municipios_2022.shp"
         dbf_path = f"{BRONZE_DIR}/SP_Municipios_2022.dbf"
         
-        # Sensor dinâmico para garantir integridade dos acentos
         encoding_dinamico = descobrir_encoding(dbf_path)
         
         municipios = gpd.read_file(mun_path, encoding=encoding_dinamico).to_crs("EPSG:4326")
@@ -154,11 +153,9 @@ class ArquitetoSafeDriver:
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["VIARIA"] = {"REGISTROS": df_final.height}
         
-     
         for path in json_paths:
             if os.path.exists(path): os.remove(path)
 
-  
     def normalizar_social(self):
         print("👥 A NORMALIZAR MALHA SOCIAL...")
         csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
@@ -181,20 +178,25 @@ class ArquitetoSafeDriver:
         df_final.write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet", compression="zstd")
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
- 
     def normalizar_comercial(self):
-        print("🛍️ A EXECUTAR DATA FUSION (BIGQUERY + OSM)...")
+        print("EXECUTAR DATA FUSION...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
       
         query_bq = """
             SELECT 
+                nome_fantasia as NOME_BRUTO,
                 CASE 
+                    
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 5) = '84248' THEN 'SEGURANCA_DELEGACIA'
+                    
+                   
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('47') THEN 'VAREJO_COMERCIO'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('56') THEN 'ALIMENTACAO_BAR'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('64') THEN 'FINANCEIRO_BANCO'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('85') THEN 'EDUCACAO'
+                    
+                   
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 1) IN ('1', '2', '3') THEN 'INDUSTRIA_FABRICA'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('46') THEN 'ATACADO_GALPAO'
                     WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('52') THEN 'LOGISTICA_ARMAZEM'
@@ -212,12 +214,12 @@ class ArquitetoSafeDriver:
               )
         """
         
-      
+   
         query_osm = f"""
-            SELECT 'SEGURANCA_DELEGACIA' as CATEGORIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
+            SELECT 'POSTO_OSM' as NOME_BRUTO, 'SEGURANCA_DELEGACIA' as CATEGORIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
             FROM ST_Read('{osm_path}', layer='points') WHERE other_tags LIKE '%"amenity"=>"police"%'
             UNION ALL
-            SELECT 'SEGURANCA_DELEGACIA' as CATEGORIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
+            SELECT 'POSTO_OSM' as NOME_BRUTO, 'SEGURANCA_DELEGACIA' as CATEGORIA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON 
             FROM ST_Read('{osm_path}', layer='multipolygons') WHERE other_tags LIKE '%"amenity"=>"police"%'
         """
         
@@ -228,20 +230,27 @@ class ArquitetoSafeDriver:
             print(" postos comunitários OSM...")
             df_osm = self.con.execute(query_osm).pl()
             
-         
-            print("   -> 🧬 A fundir bases e a converter para H3...")
+     
+            print("   -> 🧬 A fundir, anonimizar e indexar para H3...")
             df_unido = pl.concat([df_bq, df_osm]).with_columns([
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
                     h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s
-                ])).alias("H3_INDEX")
+                ])).alias("H3_INDEX"),
+                
+                pl.concat_str([
+                    pl.col("NOME_BRUTO").fill_null("SEM_NOME"),
+                    pl.lit(self.lgpd_salt)
+                ]).hash().cast(pl.Utf8).alias("HASH_ENTIDADE")
             ])
             
-         
-            print("   -> 🧹 A remover sobreposição de esquadras...")
+            df_unido = df_unido.drop(["NOME_BRUTO", "LAT", "LON"])
+            
+            
+            print("remover sobreposição de esquadras...")
             df_seguranca = df_unido.filter(pl.col("CATEGORIA") == "SEGURANCA_DELEGACIA").unique(subset=["H3_INDEX"])
             df_outros = df_unido.filter(pl.col("CATEGORIA") != "SEGURANCA_DELEGACIA")
             
-            # 5. Agregação Final
+            
             df_final = pl.concat([df_seguranca, df_outros]).group_by(["H3_INDEX", "CATEGORIA"]).agg([
                 pl.len().alias("QTD_TOTAL")
             ]).sort("H3_INDEX")
@@ -249,7 +258,7 @@ class ArquitetoSafeDriver:
             df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
             self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {
                 "REGISTROS": df_final.height, 
-                "STATUS": "DATA FUSION CONCLUÍDO (BQ + OSM)"
+                "STATUS": "SECURE DATA FUSION (LGPD COMPLIANT)"
             }
             
         except Exception as e:
@@ -257,7 +266,7 @@ class ArquitetoSafeDriver:
             self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {"REGISTROS": 0, "STATUS": f"ERRO: {e}"}
 
     def upload_final(self):
-        print("🚀 A GERAR AUDITORIA UNIFICADA E A SUBIR PARA R2...")
+        print("A GERAR AUDITORIA UNIFICADA E A SUBIR PARA R2...")
         
         audit_file = f"{PRATA_DIR}/AUDITORIA_PRATA.json"
         with open(audit_file, "w", encoding="utf-8") as f:
@@ -275,7 +284,7 @@ class ArquitetoSafeDriver:
         self.normalizar_social()
         self.normalizar_comercial()
         self.upload_final()
-        print("✅ PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ BLINDADA E OTIMIZADA.")
+        print(" PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ SEGURA E OTIMIZADA.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
