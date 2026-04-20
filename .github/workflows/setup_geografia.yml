@@ -9,26 +9,24 @@ on:
         default: 'tudo'
         type: choice
         options:
-          - 'BRONZE_RECEITA'    # Módulo Anual (Big Data)
-          - 'BRONZE_CRIMES'     # Módulo Mensal (SSP-SP)
-          - 'PRATA_PROCESS'     # Módulo de Transformação (Polars)
+          - 'BRONZE_RECEITA'    # BigQuery -> R2 (Anual)
+          - 'BRONZE_CRIMES'     # SSP-SP -> R2 (Mensal)
+          - 'PRATA_PROCESS'     # Bronze -> Processamento -> Prata
           - 'tudo'
   schedule:
-    # 🚀 Otimizado: Roda todo dia 01 do mês para pegar os crimes.
-    # A malha da Receita (Anual) será controlada pela lógica interna do Python.
+    # 🚀 Execução automática no dia 01 de cada mês
     - cron: '0 0 1 * *'
 
 jobs:
   # ==========================================================
-  # CAMADA BRONZE: CAPTURA DE DADOS CRUS (EXTRATORAS)
+  # CAMADA BRONZE-A: RECEITA FEDERAL (BIG DATA)
   # ==========================================================
-  
-  # Módulo A: Receita Federal (BigQuery -> R2)
   bronze-receita:
     if: contains(fromJSON('["BRONZE_RECEITA", "tudo"]'), github.event.inputs.job) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     env:
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -37,19 +35,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - name: "[BRONZE-A] Auth e Ingestão BQ"
+
+      - name: "[BRONZE-A] Autenticar Google Cloud"
         uses: google-github-actions/auth@v2
-        with: { credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}' }
-      - name: "[BRONZE-A] Sync GCS -> R2"
+        with:
+          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
+
+      - name: "[BRONZE-A] Sincronização GCS -> R2"
         run: |
           pip install google-cloud-bigquery google-cloud-storage boto3
           python autobot/bronze/malha_geo/ingestor_receita_federal.py check
           mkdir -p data_raw
-          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "Vazio"
+          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "GCS vazio"
           aws s3 sync data_raw/ s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ --endpoint-url $R2_ENDPOINT_URL
           python autobot/bronze/malha_geo/ingestor_receita_federal.py clean
 
-  # Módulo B: Crimes SSP-SP (Web -> R2)
+  # ==========================================================
+  # CAMADA BRONZE-B: CRIMES SSP-SP (PRIVACY-FIRST)
+  # ==========================================================
   bronze-crimes:
     if: contains(fromJSON('["BRONZE_CRIMES", "tudo"]'), github.event.inputs.job) || github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -58,20 +61,22 @@ jobs:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
+      LGPD_SALT: ${{ secrets.LGPD_SALT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.10' }
-      - name: "[BRONZE-B] Ingestão SSP-SP"
+
+      - name: "[BRONZE-B] Ingestão com Anonimização LGPD"
         run: |
           pip install boto3 requests polars h3 python-calamine fsspec pyarrow
           python autobot/reg_crimes/ingestao_crimes_bronze.py
 
   # ==========================================================
-  # CAMADA PRATA: PROCESSAMENTO E ENRIQUECIMENTO (TRUSTED)
+  # CAMADA PRATA: PROCESSAMENTO POLARS (TRUSTED)
   # ==========================================================
   camada-prata:
-    # Precisa das bronzes, mas ignora se elas forem "skipped" (puladas)
     needs: [bronze-receita, bronze-crimes]
     if: |
       always() && 
@@ -88,12 +93,12 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       
-      - name: "[PRATA] Download Bronze (R2 -> Local)"
+      - name: "[PRATA] Download Camadas Bronze -> Local"
         run: |
           mkdir -p data_raw
           aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/ data_raw/ --endpoint-url $R2_ENDPOINT_URL
 
-      - name: "[PRATA] Motor Polars: Malha e Infra Social"
+      - name: "[PRATA] Processamento Polars (171M Linhas)"
         run: |
           pip install polars duckdb h3 pyarrow python-calamine
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
@@ -102,14 +107,20 @@ jobs:
         run: aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/ --endpoint-url $R2_ENDPOINT_URL
 
   # ==========================================================
-  # MONITORAMENTO E NOTIFICAÇÃO
+  # MONITORAMENTO E NOTIFICAÇÃO (DISCORD)
   # ==========================================================
   notificacao:
     needs: [camada-prata]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: "[FIM] Webhook Discord"
+      - name: "[FIM] Enviar Feedback ao Discord"
         run: |
-          MSG="🚀 **[SafeDriver]** Workflow Finalizado! Job Selecionado: ${{ github.event.inputs.job || 'Schedule' }} | Status: ${{ needs.camada-prata.result }}"
-          curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" ${{ secrets.DISCORD_WEBHOOK }}
+          if [ "${{ needs.camada-prata.result }}" == "success" ]; then
+            MSG="✅ **[SafeDriver]** Pipeline concluído com sucesso! Camadas Bronze e Prata atualizadas e anonimizadas."
+            URL="${{ secrets.DISCORD_SUCESSO }}"
+          else
+            MSG="🚨 **[SafeDriver]** Falha no Pipeline! Verifique os logs no GitHub Actions."
+            URL="${{ secrets.DISCORD_ERRO }}"
+          fi
+          curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
