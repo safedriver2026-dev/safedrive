@@ -1,21 +1,23 @@
-name: "SafeDriver: Pipeline Camada Prata"
+name: "SafeDriver: Camada Prata Malha"
 
 on:
-  workflow_dispatch: # Permite rodar manualmente
-  push:
-    branches:
-      - main
-    paths:
-      - 'scripts/malha_geo_infra_social.py'
+  workflow_dispatch: # Permite execução manual pelo painel do GitHub
 
 jobs:
-  build-and-run:
+  build-silver:
     runs-on: ubuntu-latest
     
-    # Definição de permissões para segurança do GITHUB_TOKEN
-    permissions:
-      contents: read
-      id-token: write
+    # Define o ambiente com as variáveis secretas
+    env:
+      # Cloudflare R2
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      
+      # BigQuery & Segurança (LGPD Compliance)
+      BQ_PROJECT_ID: "safe-driver-fc3a9"
+      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
 
     steps:
       - name: Checkout do Repositório
@@ -24,12 +26,11 @@ jobs:
       - name: Configurar Ambiente Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Atualizado para evitar depreciação do Google
+          python-version: '3.11' # Versão atualizada para evitar avisos do Google
 
       - name: Autenticar no Google Cloud (BigQuery)
         uses: google-github-actions/auth@v2
         with:
-          # A sua Secret com o JSON da Service Account
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
       - name: Instalar Dependências de Engenharia
@@ -39,23 +40,26 @@ jobs:
                       google-cloud-bigquery google-cloud-bigquery-storage \
                       charset-normalizer pandas db-dtypes
 
-      - name: Executar Pipeline de Engenharia de Dados (Camada Prata)
-        env:
-          # 🔐 SEGURANÇA: Injeção das chaves via Secrets (Nada de hardcoded!)
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          BQ_PROJECT_ID: "safe-driver-fc3a9" # ID do seu projeto corrigido
-          LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }} # A sua "Pimenta" para o Hash
+      - name: Executar Pipeline Camada Prata
         run: |
-          # Garante que o Python encontra os módulos
+          # Define o PYTHONPATH para garantir que o Python encontra os teus módulos internos
           export PYTHONPATH=$PYTHONPATH:$(pwd)
-          python scripts/malha_geo_infra_social.py
+          
+          # 🚀 CAMINHO CORRIGIDO: Apontando para a pasta real do teu projeto
+          python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-      - name: Notificar Sucesso no Discord (Opcional)
+      # --- NOTIFICAÇÕES DE OBSERVABILIDADE ---
+      
+      - name: Notificar Falha no Discord
+        if: failure()
+        run: |
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "🚨 **[SafeDriver] FALHA CRÍTICA:** A pipeline da Camada Prata falhou. Lucas, verifica os logs no GitHub Actions!"}' \
+          ${{ secrets.DISCORD_ERRO }}
+
+      - name: Notificar Sucesso no Discord
         if: success()
         run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{"content": "🚀 **SafeDriver**: Camada Prata processada e blindada com sucesso no R2!"}' \
-          ${{ secrets.DISCORD_WEBHOOK }}
+          curl -H "Content-Type: application/json" \
+          -d '{"content": "✅ **[SafeDriver] SUCESSO:** Camada Prata processada, pseudonimizada (Salt+Pepper) e guardada no R2."}' \
+          ${{ secrets.DISCORD_SUCESSO }}
