@@ -8,12 +8,13 @@ from datetime import datetime
 
 class IngestorCnpjBronze:
     def __init__(self):
-        # 1. Configurações de Segurança (LGPD)
+        # 1. Configuracoes de Seguranca (LGPD)
         self.salt = os.getenv('LGPD_SALT', 'default_salt')
         self.pepper = os.getenv('LGPD_PEPPER', 'default_pepper')
         
-        # 2. Configurações do R2 Cloudflare
+        # 2. Configuracoes do R2 Cloudflare
         self.s3_client = boto3.client('s3',
+            region_name='auto',
             endpoint_url=os.getenv('R2_ENDPOINT_URL', '').strip(),
             aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID', '').strip(),
             aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY', '').strip()
@@ -28,14 +29,14 @@ class IngestorCnpjBronze:
         self.br_api_url = "https://brasilapi.com.br/api/cep/v2/"
 
     def classificar_impacto_urbano(self, cnae_principal):
-        """Inteligência de classificação urbana baseada nos primeiros dígitos do CNAE"""
+        """Inteligencia de classificacao urbana baseada nos primeiros digitos do CNAE"""
         cnae_str = str(cnae_principal).strip()
         prefixo = cnae_str[:2]
         
         if prefixo in ["47", "56", "96"]: 
-            return "VAREJO_COMERCIO" # Geradores de Movimento
+            return "VAREJO_COMERCIO"
         if prefixo in ["49", "52", "10", "11"]: 
-            return "INDUSTRIA_GALPAO" # Desertos Urbanos
+            return "INDUSTRIA_GALPAO"
         if prefixo in ["84"]:
             return "SEGURANCA_DELEGACIA"
             
@@ -65,16 +66,15 @@ class IngestorCnpjBronze:
     def carregar_dados_entrada(self):
         """Tenta ler um CSV real; se falhar, usa os dados de fallback/teste"""
         if os.path.exists(self.input_csv_path):
-            print(f"📄 Lendo base de entrada: {self.input_csv_path}")
+            print(f"Lendo base de entrada: {self.input_csv_path}")
             try:
-                # O CSV deve ter colunas nomeadas: cnpj, cep, cnae
                 df = pl.read_csv(self.input_csv_path)
                 return df.to_dicts()
             except Exception as e:
-                print(f"❌ Erro ao ler CSV: {e}. Abortando.")
+                print(f"Erro ao ler CSV: {e}. Abortando.")
                 return []
         else:
-            print(f"⚠️ Arquivo {self.input_csv_path} não encontrado. Rodando base de teste padrão.")
+            print(f"Arquivo {self.input_csv_path} nao encontrado. Rodando base de teste padrao.")
             return [
                 {"cnpj": "12345678000199", "cep": "09725000", "cnae": "47113"},
                 {"cnpj": "98765432000100", "cep": "09850550", "cnae": "52117"}
@@ -86,7 +86,7 @@ class IngestorCnpjBronze:
             print("Nenhum dado para processar.")
             return
 
-        print(f"⚙️ Iniciando processamento de {len(lista_estabelecimentos)} registros...")
+        print(f"Iniciando processamento de {len(lista_estabelecimentos)} registros...")
         dados_processados = []
 
         for item in lista_estabelecimentos:
@@ -94,14 +94,10 @@ class IngestorCnpjBronze:
             cep = item.get('cep', '')
             cnae = item.get('cnae', '')
 
-            # 1. Captura a Coordenada
             lat, lon = self.capturar_coordenadas(cep)
             
             if lat and lon:
-                # 2. Proteção LGPD (Hash Criptográfico)
                 hash_protegido = self.gerar_hash_lgpd(cnpj)
-
-                # 3. Classificação de Impacto
                 categoria = self.classificar_impacto_urbano(cnae)
 
                 dados_processados.append({
@@ -111,37 +107,33 @@ class IngestorCnpjBronze:
                     "LON": lon
                 })
             else:
-                print(f"   ⚠️ Coordenada não encontrada ou CEP inválido: {cep}")
+                print(f"   Coordenada nao encontrada ou CEP invalido: {cep}")
             
-            # Rate limit gentil (2 requisições por segundo para não ser bloqueado na API gratuita)
             time.sleep(0.5)
 
         if not dados_processados:
-            print("❌ Nenhum dado válido gerado. Cancelando upload.")
+            print("Nenhum dado valido gerado. Cancelando upload.")
             return
 
-        # 4. Criar DataFrame Polars e Salvar Localmente
         df_bronze = pl.DataFrame(dados_processados)
         df_bronze.write_parquet(self.local_temp_path)
-        print(f"✅ Arquivo Parquet gerado localmente com {len(df_bronze)} linhas válidas.")
+        print(f"Arquivo Parquet gerado localmente com {len(df_bronze)} linhas validas.")
         
-        # 5. Enviar para o R2 no caminho exato
         self.enviar_para_r2()
 
     def enviar_para_r2(self):
         """Envia o arquivo protegido para o datalake no Cloudflare"""
         try:
-            print(f"🚀 Enviando para o R2 no caminho: {self.r2_path} ...")
+            print(f"Enviando para o R2 no caminho: {self.r2_path} ...")
             self.s3_client.upload_file(
                 Filename=self.local_temp_path,
                 Bucket=self.bucket_name,
                 Key=self.r2_path
             )
-            print("✅ Upload concluído com sucesso!")
+            print("Upload concluido com sucesso!")
         except Exception as e:
-            print(f"❌ Erro ao enviar para o R2: {e}")
+            print(f"Erro ao enviar para o R2: {e}")
         finally:
-            # Limpa o ficheiro temporário local para segurança
             if os.path.exists(self.local_temp_path):
                 os.remove(self.local_temp_path)
 
