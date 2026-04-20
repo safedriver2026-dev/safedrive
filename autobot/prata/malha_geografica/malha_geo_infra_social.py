@@ -11,9 +11,7 @@ import charset_normalizer
 from datetime import datetime
 from google.cloud import bigquery
 
-# ==========================================
-# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
-# ==========================================
+
 H3_RES = 9 
 BRONZE_DIR = "data_raw"
 PRATA_DIR = "data_prata"
@@ -27,7 +25,7 @@ def normalizar_string(valor):
     return texto.upper().strip()
 
 def descobrir_encoding(caminho_arquivo):
-    """Lê o cabeçalho do ficheiro binário e infere a codificação para evitar corrupção de strings."""
+    """Sensor inteligente para inferir codificação e evitar corrupção de strings."""
     try:
         with open(caminho_arquivo, 'rb') as f:
             amostra_bytes = f.read(100000)
@@ -54,9 +52,11 @@ class ArquitetoSafeDriver:
         os.makedirs(PRATA_DIR, exist_ok=True)
         os.makedirs(BRONZE_DIR, exist_ok=True)
         
-        # 🔐 SEGURANÇA E AMBIENTE (Atualizado para Pepper)
+      
         project_id = os.getenv('BQ_PROJECT_ID', 'safe-driver-fc3a9')
         self.bq_client = bigquery.Client(project=project_id)
+        
+      
         self.lgpd_pepper = os.getenv('LGPD_PEPPER', 'safedriver_pepper_default_123')
         
         os.environ["OGR_INTERLEAVED_READING"] = "YES"
@@ -181,32 +181,36 @@ class ArquitetoSafeDriver:
         self.audit_log["CAMADAS"]["SOCIAL"] = {"REGISTROS": df_final.height}
 
     def normalizar_comercial(self):
-        print("🛍️ EXECUTAR DATA FUSION (PSEUDONIMIZAÇÃO LGPD)...")
+        print("🛍️ EXECUTAR DATA FUSION (BQ INNER JOIN CEP + OSM)...")
         osm_path = f"{BRONZE_DIR}/sp-latest.osm.pbf"
         
+        # O SUPER JOIN: Resolve o erro da latitude usando a base de CEPs geolocalizados
         query_bq = """
             SELECT 
-                nome_fantasia as NOME_BRUTO,
+                e.nome_fantasia as NOME_BRUTO,
                 CASE 
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 5) = '84248' THEN 'SEGURANCA_DELEGACIA'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('47') THEN 'VAREJO_COMERCIO'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('56') THEN 'ALIMENTACAO_BAR'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('64') THEN 'FINANCEIRO_BANCO'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('85') THEN 'EDUCACAO'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 1) IN ('1', '2', '3') THEN 'INDUSTRIA_FABRICA'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('46') THEN 'ATACADO_GALPAO'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('52') THEN 'LOGISTICA_ARMAZEM'
-                    WHEN SUBSTR(cnae_fiscal_principal, 1, 2) IN ('69', '70', '82') THEN 'ESCRITORIO_CORPORATIVO'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 5) = '84248' THEN 'SEGURANCA_DELEGACIA'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('47') THEN 'VAREJO_COMERCIO'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('56') THEN 'ALIMENTACAO_BAR'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('64') THEN 'FINANCEIRO_BANCO'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('85') THEN 'EDUCACAO'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 1) IN ('1', '2', '3') THEN 'INDUSTRIA_FABRICA'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('46') THEN 'ATACADO_GALPAO'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('52') THEN 'LOGISTICA_ARMAZEM'
+                    WHEN SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('69', '70', '82') THEN 'ESCRITORIO_CORPORATIVO'
                     ELSE 'OUTROS'
                 END as CATEGORIA,
-                latitude as LAT,
-                longitude as LON
-            FROM `basedosdados.br_me_cnpj.estabelecimentos`
-            WHERE sigla_uf = 'SP' AND latitude IS NOT NULL
+                c.latitude as LAT,
+                c.longitude as LON
+            FROM `basedosdados.br_me_cnpj.estabelecimentos` e
+            INNER JOIN `basedosdados.br_bd_diretorios_brasil.cep` c
+                ON e.cep = c.cep
+            WHERE e.sigla_uf = 'SP' 
+              AND c.latitude IS NOT NULL
               AND (
-                  SUBSTR(cnae_fiscal_principal, 1, 5) = '84248'
-                  OR SUBSTR(cnae_fiscal_principal, 1, 2) IN ('47', '56', '64', '85', '46', '52', '69', '70', '82')
-                  OR SUBSTR(cnae_fiscal_principal, 1, 1) IN ('1', '2', '3')
+                  SUBSTR(e.cnae_fiscal_principal, 1, 5) = '84248'
+                  OR SUBSTR(e.cnae_fiscal_principal, 1, 2) IN ('47', '56', '64', '85', '46', '52', '69', '70', '82')
+                  OR SUBSTR(e.cnae_fiscal_principal, 1, 1) IN ('1', '2', '3')
               )
         """
         
@@ -219,31 +223,38 @@ class ArquitetoSafeDriver:
         """
         
         try:
-            print("   -> 📡 A ler infraestrutura BQ...")
+            print("   -> 📡 A cruzir CNPJs com a malha de CEPs no BigQuery...")
             df_bq = pl.from_pandas(self.bq_client.query(query_bq).to_dataframe())
             
             print("   -> 🗺️ A ler postos comunitários OSM...")
             df_osm = self.con.execute(query_osm).pl()
             
-            print("   -> 🧬 A fundir, pseudonimizar e indexar para H3...")
-            df_unido = pl.concat([df_bq, df_osm]).with_columns([
+            print("   -> 🧬 A gerar H3 e Criptografia (Geo-Salt + Pepper)...")
+            
+            # 1. Primeiro convertemos para H3 (o nosso Geo-Salt)
+            df_h3 = pl.concat([df_bq, df_osm]).with_columns([
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
                     h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s
-                ])).alias("H3_INDEX"),
-                
-                # 🔐 Pseudonimização usando o Pepper injetado via Actions
+                ])).alias("H3_INDEX")
+            ])
+            
+            # 2. Agora aplicamos a Pseudonimização LGPD combinando tudo
+            df_unido = df_h3.with_columns([
                 pl.concat_str([
                     pl.col("NOME_BRUTO").fill_null("SEM_NOME"),
-                    pl.lit(self.lgpd_pepper)
+                    pl.col("H3_INDEX"), # O Geo-Salt (Específico por localização)
+                    pl.lit(self.lgpd_pepper) # O Pepper (Global do GitHub)
                 ]).hash().cast(pl.Utf8).alias("HASH_PSEUDONIMIZADO")
             ])
             
+            # 3. Purga os dados originais da memória
             df_unido = df_unido.drop(["NOME_BRUTO", "LAT", "LON"])
             
-            print("   -> 🧹 A remover sobreposição de esquadras...")
+            print("   -> 🧹 A aplicar desduplicação espacial de segurança...")
             df_seguranca = df_unido.filter(pl.col("CATEGORIA") == "SEGURANCA_DELEGACIA").unique(subset=["H3_INDEX"])
             df_outros = df_unido.filter(pl.col("CATEGORIA") != "SEGURANCA_DELEGACIA")
             
+            # 4. Agregação Final para a Feature Store (apenas contagens numéricas por categoria)
             df_final = pl.concat([df_seguranca, df_outros]).group_by(["H3_INDEX", "CATEGORIA"]).agg([
                 pl.len().alias("QTD_TOTAL")
             ]).sort("H3_INDEX")
@@ -251,7 +262,7 @@ class ArquitetoSafeDriver:
             df_final.write_parquet(f"{PRATA_DIR}/MALHA_ESTABELECIMENTOS.parquet", compression="zstd")
             self.audit_log["CAMADAS"]["ESTABELECIMENTOS"] = {
                 "REGISTROS": df_final.height, 
-                "STATUS": "SECURE DATA FUSION (LGPD COMPLIANT)"
+                "STATUS": "DATA FUSION CONCLUÍDO (SALT+PEPPER LGPD)"
             }
             
         except Exception as e:
@@ -277,7 +288,7 @@ class ArquitetoSafeDriver:
         self.normalizar_social()
         self.normalizar_comercial()
         self.upload_final()
-        print("✅ PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ SEGURA E OTIMIZADA.")
+        print("PIPELINE FINALIZADO COM SUCESSO. A CAMADA PRATA ESTÁ BLINDADA E OTIMIZADA.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriver().executar()
