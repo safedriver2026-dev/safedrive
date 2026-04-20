@@ -12,13 +12,18 @@ on:
           - 'bronze_rfb'
           - 'prata'
           - 'tudo'
+  schedule:
+    # Roda automaticamente todo dia 15 do mês, às 03:00 da manhã (Arquitetura Custo Zero)
+    - cron: '0 3 15 * *'
 
 jobs:
-  # --- CAMADA BRONZE (INGESTÃO) ---
+  # --- CAMADA BRONZE (INGESTÃO VIA BIGQUERY) ---
   ingestao-bronze:
-    if: github.event.inputs.job == 'bronze_rfb' || github.event.inputs.job == 'tudo'
+    # Roda se for agendado (cron) OU se escolhido manualmente no workflow_dispatch
+    if: github.event_name == 'schedule' || github.event.inputs.job == 'bronze_rfb' || github.event.inputs.job == 'tudo'
     runs-on: ubuntu-latest
     env:
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: "auto"
@@ -28,16 +33,24 @@ jobs:
       LGPD_SALT: ${{ secrets.LGPD_SALT }}
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Ingestão Oficial RFB
+          
+      - name: Autenticar no Google Cloud (BigQuery)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
+          
+      - name: Instalar Dependências Bronze
         run: |
-          echo "📥 Baixando dados da Receita Federal..."
-          wget https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/2024-04/Estabelecimentos0.zip
-          unzip Estabelecimentos0.zip
-          mv *.ESTABELE* dados_rfb.csv
-          pip install polars boto3 pyarrow requests
+          pip install --upgrade pip
+          pip install polars boto3 pyarrow google-cloud-bigquery pandas db-dtypes
+          
+      - name: Ingestão Oficial RFB (BigQuery API)
+        run: |
+          echo "🚀 Iniciando extração otimizada do BigQuery..."
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python autobot/bronze/malha_geo/ingestor_receita_federal.py
 
@@ -45,10 +58,10 @@ jobs:
   build-silver:
     runs-on: ubuntu-latest
     needs: [ingestao-bronze]
-    # Este 'if' garante que o job rode se selecionado, idependente se o anterior foi pulado
+    # Roda se for agendado OU se escolhido manualmente, DESDE QUE a Bronze não tenha falhado
     if: |
       always() && 
-      (github.event.inputs.job == 'prata' || github.event.inputs.job == 'tudo') &&
+      (github.event_name == 'schedule' || github.event.inputs.job == 'prata' || github.event.inputs.job == 'tudo') &&
       (needs.ingestao-bronze.result == 'success' || needs.ingestao-bronze.result == 'skipped')
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -57,14 +70,13 @@ jobs:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-      LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
-      LGPD_SALT: ${{ secrets.LGPD_SALT }}
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+          
       - name: Autenticar no Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -77,6 +89,7 @@ jobs:
 
       - name: Instalar Dependências e Rodar Prata
         run: |
+          pip install --upgrade pip
           pip install polars duckdb h3 geopandas shapely pyarrow google-cloud-bigquery pandas db-dtypes requests charset-normalizer
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
@@ -90,10 +103,10 @@ jobs:
         if: always()
         run: |
           if [ "${{ job.status }}" == "success" ]; then
-            MSG="✅ **[SafeDriver]** Pipeline Prata concluída com sucesso!"
+            MSG="✅ **[SafeDriver]** Pipeline finalizada com sucesso! Prata atualizada no R2."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[SafeDriver]** Erro crítico na Pipeline Prata!"
+            MSG="🚨 **[SafeDriver]** Erro crítico na Pipeline!"
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
