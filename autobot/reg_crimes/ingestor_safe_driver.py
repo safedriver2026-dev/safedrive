@@ -10,6 +10,7 @@ import re
 import botocore.exceptions
 import polars as pl
 import h3
+import fastexcel
 from botocore.config import Config
 from datetime import datetime
 
@@ -27,7 +28,7 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Mapeamento Ultra Flexível para capturar colunas de 2022 a 2026
+    # Mapeamento Flexível (RegEx) para encontrar as colunas em qualquer ano
     MAPA_COLUNAS = {
         "NUM_BO": [r"NUM.*BO", r"N.MERO.*BO", r"BO_NUMERO"],
         "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN"],
@@ -63,26 +64,25 @@ class IngestorSafeDriver:
             return True
         except: return False
 
-    def _resolver_mapeamento(self, colunas):
-        """Varre os nomes das colunas e retorna o mapeamento {NomeOriginal: NomeAlvo}."""
+    def _resolver_mapeamento(self, lista_colunas):
+        """Mapeia os nomes originais encontrados para os nomes padrão do SafeDriver."""
         mapeamento = {}
         for alvo, padroes in self.config.MAPA_COLUNAS.items():
-            for col in colunas:
-                col_str = str(col).upper().strip()
+            for i, nome_col in enumerate(lista_colunas):
+                col_limpa = str(nome_col).upper().strip()
                 for p in padroes:
-                    if re.search(p, col_str):
-                        mapeamento[col] = alvo
+                    if re.search(p, col_limpa):
+                        mapeamento[nome_col] = alvo
                         break
-                if col in mapeamento: break
+                if nome_col in mapeamento: break
         return mapeamento
 
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
-        # 1. LAT/LON para Float (Trata string com vírgula e extrai apenas o número)
+        # Tratamento de coordenadas e filtro de SP
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
         ])
-        # 2. Filtro: Se não tem coordenada válida em SP, não serve
         return df.filter((pl.col("LATITUDE").is_not_null()) & (pl.col("LATITUDE") < -10))
 
     def extrair_bronze(self, ano: int):
@@ -97,7 +97,7 @@ class IngestorSafeDriver:
                 self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path, Body=res.content)
                 logger.info(f"✅ Bronze {ano} salva.")
             else: logger.error(f"❌ Falha SSP {ano}: {res.status_code}")
-        except Exception as e: logger.error(f"❌ Erro Download {ano}: {e}")
+        except Exception as e: logger.error(f"❌ Falha no Download {ano}: {e}")
 
     def processar_prata(self, ano: int):
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
@@ -110,82 +110,76 @@ class IngestorSafeDriver:
         try:
             logger.info(f"🥈 Iniciando Garimpo de Abas no arquivo de {ano}...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
-            excel_data = obj['Body'].read()
+            excel_bytes = obj['Body'].read() # Lemos como bytes puros
             
-            # CORREÇÃO: fastexcel.read_excel (não read_xlsx)
-            import fastexcel
-            excel_reader = fastexcel.read_excel(io.BytesIO(excel_data))
-            abas_disponiveis = excel_reader.sheet_names
+            # CORREÇÃO: Usar bytes diretamente em vez de BytesIO para fastexcel
+            excel_reader = fastexcel.read_excel(excel_bytes)
+            abas = excel_reader.sheet_names
             
             list_dfs = []
 
-            for nome_aba in abas_disponiveis:
-                # Pula abas de metadados
+            for nome_aba in abas:
+                # Pula abas de legenda/capa
                 if any(x in nome_aba.upper() for x in ["CAPA", "DICIONARIO", "LEGENDA", "CAMPOS"]):
                     continue
 
                 try:
-                    # Lemos as primeiras 20 linhas para achar o cabeçalho real
-                    df_scan = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"has_header": False, "n_rows": 20})
+                    # Scan de cabeçalho: Lemos as primeiras 30 linhas da aba para achar o "topo" real
+                    # CORREÇÃO: Usar bytes diretamente para pl.read_excel
+                    df_scan = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", read_options={"has_header": False, "n_rows": 30})
                     
-                    row_index_header = None
-                    mapeamento_aba = {}
+                    row_header_idx = None
+                    mapping_found = {}
 
                     for i, row in enumerate(df_scan.iter_rows()):
-                        row_values = [str(val).upper().strip() for val in row]
-                        # Tenta encontrar o mapeamento nessa linha específica
-                        teste_map = self._resolver_mapeamento(row_values)
+                        row_values = [str(v).upper().strip() for v in row]
+                        mapping_found = self._resolver_mapeamento(row_values)
                         
-                        # Se acharmos Latitude e Longitude, essa linha é o cabeçalho
-                        if any(re.search(r"LATITUDE", str(k)) for k in teste_map.keys()) or "LATITUDE" in teste_map.values():
-                            if "LATITUDE" in teste_map.values() and "LONGITUDE" in teste_map.values():
-                                row_index_header = i
-                                break
+                        # Se acharmos Latitude e Longitude nessa linha, ela é o cabeçalho!
+                        if "LATITUDE" in mapping_found.values() and "LONGITUDE" in mapping_found.values():
+                            row_header_idx = i
+                            break
                     
-                    if row_index_header is not None:
-                        logger.info(f"   🎯 Aba '{nome_aba}': Cabeçalho na linha {row_index_header + 1}")
+                    if row_header_idx is not None:
+                        logger.info(f"   🎯 Aba '{nome_aba}': Cabeçalho na linha {row_header_idx + 1}")
                         
-                        # Lê a aba inteira agora sabendo onde o cabeçalho está
-                        df_mes = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": row_index_header})
+                        # Agora lemos a aba inteira pulando as linhas inúteis
+                        df_mes = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": row_header_idx})
                         
-                        # Resolve o mapeamento final com os nomes reais das colunas
+                        # Refazemos o mapeamento com os nomes reais das colunas lidas
                         map_final = self._resolver_mapeamento(df_mes.columns)
                         
+                        # Garantimos que colunas essenciais foram mapeadas
                         if "LATITUDE" in map_final.values():
                             df_mes = df_mes.select(list(map_final.keys())).rename(map_final)
                             df_mes = df_mes.with_columns(pl.all().cast(pl.Utf8))
                             list_dfs.append(df_mes)
                 except Exception as e:
-                    logger.warning(f"   ⚠️ Erro ao processar aba {nome_aba}: {e}")
+                    logger.warning(f"   ⚠️ Erro na aba {nome_aba}: {e}")
 
             if not list_dfs:
-                raise ValueError(f"Não foi possível localizar dados de crimes em nenhuma aba de {ano}.")
+                raise ValueError(f"Não encontramos dados de crimes em nenhuma das {len(abas)} abas do arquivo de {ano}.")
 
-            # Unifica todos os meses
+            # Concatena todos os meses encontrados
             df_final = pl.concat(list_dfs, how="diagonal")
             df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD
+            # LGPD e H3
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
                 pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
-                pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
-            ])
-
-            # H3
-            res_h3 = self.config.RESOLUCAO_H3
-            df_final = df_final.with_columns(
+                pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
                 pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], res_h3),
+                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3),
                     return_dtype=pl.Utf8
                 ).alias("H3_INDEX")
-            )
+            ])
 
-            # Upload Parquet
+            # Upload final
             buf = io.BytesIO()
             df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} salva: {df_final.height} crimes consolidados.")
+            logger.info(f"✨ Prata {ano} salva: {df_final.height} linhas.")
 
         except Exception as e:
             logger.error(f"💥 Erro fatal no processamento de {ano}: {e}")
