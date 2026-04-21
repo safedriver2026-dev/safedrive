@@ -43,12 +43,13 @@ class ArquitetoSafeDriverPrata:
     def processar_malha_geografica(self):
         print("🗺️ [PRATA] A construir Malha Geográfica (Vias)...")
         try:
-            zip_path = os.path.join(self.bronze_dir, "SP_Faces_2022.zip")
+            # Busca recursiva no diretório
+            zip_paths = glob.glob(os.path.join(self.bronze_dir, "**", "SP_Faces_2022.zip"), recursive=True)
             
-            if not os.path.exists(zip_path):
-                raise FileNotFoundError(f"Arquivo {zip_path} não encontrado no diretório local.")
+            if not zip_paths:
+                raise FileNotFoundError("Arquivo SP_Faces_2022.zip não encontrado no diretório local.")
 
-            with zipfile.ZipFile(zip_path, 'r') as z:
+            with zipfile.ZipFile(zip_paths[0], 'r') as z:
                 z.extractall(self.bronze_dir)
 
             # Extração Espacial com DuckDB
@@ -58,7 +59,7 @@ class ArquitetoSafeDriverPrata:
                     trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, 
                     ST_Y(ST_Centroid(geom)) as LAT, 
                     ST_X(ST_Centroid(geom)) as LON
-                FROM ST_Read('{self.bronze_dir}/*.json')
+                FROM ST_Read('{self.bronze_dir}/**/*.json')
                 WHERE NM_LOG IS NOT NULL
             """
             df_geo = self.con.execute(query).pl()
@@ -94,14 +95,14 @@ class ArquitetoSafeDriverPrata:
     def processar_malha_social(self):
         print("👥 [PRATA] A construir Malha Social/Demográfica...")
         try:
-            csv_path = glob.glob(os.path.join(self.bronze_dir, "Agregados_por_setores_basico*.csv"))
+            csv_paths = glob.glob(os.path.join(self.bronze_dir, "**", "Agregados_por_setores_basico*.csv"), recursive=True)
             
-            if not csv_path:
+            if not csv_paths:
                 raise FileNotFoundError("CSV de Setores Censitários não encontrado.")
                 
             # Leitura Inteligente e Proteção da Chave Primária
             df_social = pl.read_csv(
-                csv_path[0], separator=";", null_values=["."],
+                csv_paths[0], separator=";", null_values=["."],
                 infer_schema_length=10000, 
                 schema_overrides={"CD_SETOR": pl.Utf8, "CD_MUN": pl.Utf8, "CD_BAIRRO": pl.Utf8}
             ).filter(pl.col("CD_SETOR").str.starts_with("35")) # Filtra SP
@@ -144,13 +145,13 @@ class ArquitetoSafeDriverPrata:
     def processar_malha_infraestrutura(self):
         print("🏗️ [PRATA] A construir Malha de Infraestrutura (Comércio)...")
         try:
-            pattern = os.path.join(self.bronze_dir, "CNPJ_SP_HISTORICO_LOTE_*.parquet")
-            arquivos = glob.glob(pattern)
+            pattern = os.path.join(self.bronze_dir, "**", "CNPJ_SP_HISTORICO_LOTE_*.parquet")
+            arquivos = glob.glob(pattern, recursive=True)
             
             if not arquivos:
                 raise FileNotFoundError("Nenhum lote de CNPJ encontrado.")
 
-            df_infra = pl.read_parquet(pattern)
+            df_infra = pl.read_parquet(arquivos)
 
             df_infra = df_infra.drop_nulls(subset=["lat", "lon"]).with_columns([
                 pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([
