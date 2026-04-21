@@ -98,10 +98,9 @@ jobs:
           pip install boto3 polars pyarrow
           python autobot/ouro/processador_ouro_safedriver.py
 
-  # --- CAMADA TREINO: Machine Learning & SHAP ---
+ # --- TREINAMENTO DE IA: CatBoost & SHAP ---
   camada-treino:
     needs: [camada-ouro]
-    # Este job roda se a Ouro tiver sucesso OU se você disparar 'TREINAR_IA' manualmente (pulando o resto)
     if: |
       always() && 
       (needs.camada-ouro.result == 'success' || needs.camada-ouro.result == 'skipped') &&
@@ -116,15 +115,19 @@ jobs:
     steps:
       - name: 🔍 Checkout do Código
         uses: actions/checkout@v4
+
       - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: "⚙️ Instalar Bibliotecas de IA"
-        run: pip install boto3 polars pandas catboost scikit-learn shap requests
+        run: |
+          # ADICIONADO PYARROW AQUI
+          pip install boto3 polars pyarrow pandas catboost scikit-learn shap requests
+
       - name: "🧠 [TREINO] Executar Treinador e SHAP"
         run: python autobot/ml/treinador_safe_driver.py
-
   # --- NOTIFICAÇÃO ---
   notificacao:
     needs: [camada-bronze, camada-prata, camada-ouro, camada-treino]
