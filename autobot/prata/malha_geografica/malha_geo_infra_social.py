@@ -51,23 +51,16 @@ class ArquitetoSafeDriverPrata:
         return re.sub(r'[^a-zA-Z0-9\s]', '', texto).upper().strip()
 
     def _buscar_arquivo_flexivel(self, padrao):
-        # Primeiro, lista o que tem na pasta para o log do GitHub Actions
-        conteudo = os.listdir(self.bronze_dir)
-        print(f"📂 Conteúdo de {self.bronze_dir}: {conteudo}", flush=True)
-        
-        # Busca recursiva e case-insensitive
+        print(f"📂 Buscando por: {padrao} em {self.bronze_dir}...", flush=True)
         arqs = glob.glob(f"**/{padrao}", recursive=True)
         if not arqs:
-            # Tenta busca manual se o glob falhar por case sensitivity
-            for f in conteudo:
-                if padrao.replace("*", "").lower() in f.lower():
-                    return os.path.join(self.bronze_dir, f)
-            raise FileNotFoundError(f"Arquivo ({padrao}) ausente no diretório {self.bronze_dir}!")
+            conteudo = os.listdir(self.bronze_dir)
+            print(f"⚠️ Não encontrado. Conteúdo atual da pasta: {conteudo}")
+            raise FileNotFoundError(f"Arquivo ({padrao}) ausente!")
         return arqs[0]
 
     def download_r2(self):
-        print("Sincronizando Bronze (IBGE + OSM + CNPJ)...", flush=True)
-        # Alinhado com os nomes reais dos arquivos no seu R2
+        print("📥 Sincronizando Bronze do R2...", flush=True)
         targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
@@ -76,18 +69,16 @@ class ArquitetoSafeDriverPrata:
                 if any(t in key for t in targets):
                     dest = os.path.join(self.bronze_dir, key.split('/')[-1])
                     if not os.path.exists(dest):
-                        print(f"📥 Baixando: {key} -> {dest}")
+                        print(f"   -> Baixando: {key}")
                         self.s3.download_file(self.bucket, key, dest)
-        print("✅ Bronze carregada localmente.", flush=True)
+        print("✅ Bronze carregada localmente.")
 
     def processar(self):
-        print("🚀 Iniciando Processamento da Malha Híbrida...", flush=True)
+        print("🚀 Processando Malha Híbrida Hierárquica...", flush=True)
         try:
-            # 1. REFERÊNCIA SOCIAL (NM_MUN e NM_BAIRRO)
+            # 1. REFERÊNCIA SOCIAL (De-para de CD_SETOR para Nomes)
             print("--- Lendo Censo (Agregados) ---")
             csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
-            
-            # Forçamos o separador ; e ignoramos erros de linha para garantir a leitura
             df_social_raw = pl.read_csv(csv_f, separator=";", encoding="latin1", infer_schema_length=10000, ignore_errors=True)
             
             df_ref_nomes = df_social_raw.select([
@@ -99,25 +90,29 @@ class ArquitetoSafeDriverPrata:
                 pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
             ])
 
-            # 2. GEOMETRIAS (IBGE Faces)
+            # 2. GEOMETRIAS (Faces de Logradouros)
             print("--- Extraindo Geometrias IBGE ---")
             zip_f = self._buscar_arquivo_flexivel("SP_Faces_2022.zip")
             with zipfile.ZipFile(zip_f, 'r') as z: z.extractall(self.bronze_dir)
             
             json_files = glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True)
-            if not json_files: raise Exception("Nenhum arquivo JSON extraído do ZIP do IBGE!")
-
-            sqls = [f"""
-                SELECT CAST(CD_SETOR AS VARCHAR) as CD_SETOR,
-                       trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, 
-                       ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON, 
-                       TRY_CAST(TOT_RES AS FLOAT) as TOT_RES 
-                FROM ST_Read('{str(f).replace("\\", "/")}')
-            """ for f in json_files]
+            sqls = []
+            for f in json_files:
+                # CORREÇÃO: Tratar o path fora da f-string para evitar SyntaxError no Python 3.11
+                f_path_sql = str(f).replace("\\", "/")
+                sqls.append(f"""
+                    SELECT 
+                        CAST(CD_SETOR AS VARCHAR) as CD_SETOR,
+                        trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, 
+                        ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON, 
+                        TRY_CAST(TOT_RES AS FLOAT) as TOT_RES 
+                    FROM ST_Read('{f_path_sql}')
+                """)
             
             df_faces = self.con.execute(" UNION ALL ".join(sqls)).pl()
             
-            # Join e H3
+            # 3. CONSTRUÇÃO DA MALHA
+            print("--- Vinculando Nomes e Gerando H3 ---")
             df_vias_completo = df_faces.join(df_ref_nomes, on="CD_SETOR", how="left").with_columns([
                 pl.col("CIDADE").fill_null("NAO INFORMADO"),
                 pl.col("BAIRRO").fill_null("NAO INFORMADO"),
@@ -125,7 +120,7 @@ class ArquitetoSafeDriverPrata:
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             ])
 
-            # Exportação Hierárquica
+            # Exportação 1: Hierarquia de Vias
             df_hierarquico = (
                 df_vias_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST"))
                 .group_by(["CIDADE", "BAIRRO"]).agg(pl.struct([pl.col("RUA"), pl.col("H3_LIST")]).alias("LOGRADOUROS"))
@@ -133,13 +128,13 @@ class ArquitetoSafeDriverPrata:
             )
             df_hierarquico.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
 
-            # Micro-População
+            # Exportação 2: Micro-População (H3 Flat)
             df_vias_completo.group_by("H3_INDEX").agg(pl.sum("TOT_RES").alias("MICRO_POPULACAO_H3")).write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
 
-            # Social Macro
+            # Exportação 3: Social Macro (Censo)
             df_social_raw.select([pl.col("CD_SETOR").cast(pl.Utf8), "NM_MUN", "NM_BAIRRO", "v0001", "v0002"]).write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet")
 
-            # 3. INFRAESTRUTURA (CNPJ)
+            # 4. INFRAESTRUTURA (CNAEs)
             pqs_infra = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             if pqs_infra:
                 print("--- Processando Infraestrutura ---")
@@ -153,7 +148,7 @@ class ArquitetoSafeDriverPrata:
                 df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
 
             self.auditoria["STATUS"] = "SUCESSO"
-            print("✨ Malha Prata Finalizada!")
+            print("✨ Pipeline de Malha Prata Finalizado com Sucesso!")
         except Exception as e:
             self.auditoria["STATUS"] = f"ERRO: {str(e)}"
             print(f"❌ Erro Crítico: {e}")
@@ -161,14 +156,13 @@ class ArquitetoSafeDriverPrata:
     def finalizar(self):
         r2_dest_path = "datalake/prata/malha_trusted"
         with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: json.dump(self.auditoria, f, indent=4)
+        print(f"📤 Exportando Malha para R2...")
         for f in os.listdir(self.prata_dir):
             if f.endswith((".parquet", ".json")):
                 self.s3.upload_file(os.path.join(self.prata_dir, f), self.bucket, f"{r2_dest_path}/{f}")
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverPrata()
-    # ESTE ERA O PROBLEMA: No GitHub Actions, cada job é uma máquina nova. 
-    # Você precisa baixar os arquivos da Bronze antes de processar!
     app.download_r2() 
     app.processar()
     app.finalizar()
