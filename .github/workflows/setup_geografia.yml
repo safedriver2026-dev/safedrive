@@ -12,9 +12,11 @@ on:
           - 'BRONZE_RECEITA'
           - 'BRONZE_CRIMES'
           - 'BRONZE_COMPLETA'
-          - 'PRATA_CRIMES'    # <--- NOVO: Roda apenas a prata dos crimes
-          - 'PRATA_MAPA'      # <--- NOVO: Roda apenas a prata da malha/cnae
-          - 'PRATA_COMPLETA'  # <--- NOVO: Roda toda a prata
+          - 'PRATA_CRIMES'
+          - 'PRATA_MAPA'
+          - 'PRATA_COMPLETA'
+          - 'FLUXO_CRIMES'    # <--- NOVO: Bronze + Prata de Crimes
+          - 'FLUXO_MAPA'      # <--- NOVO: Bronze + Prata de Mapa/Receita
           - 'tudo'
 
 jobs:
@@ -22,7 +24,8 @@ jobs:
   camada-bronze:
     if: |
       github.event.inputs.job == 'tudo' || 
-      startsWith(github.event.inputs.job, 'BRONZE_')
+      startsWith(github.event.inputs.job, 'BRONZE_') ||
+      startsWith(github.event.inputs.job, 'FLUXO_')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -39,13 +42,13 @@ jobs:
           python-version: '3.11'
 
       - name: "🔑 [AUTH] Google Cloud"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
+        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA' || github.event.inputs.job == 'FLUXO_MAPA'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
       - name: "📦 [BRONZE-A] Malha Receita (GCS -> R2)"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
+        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA' || github.event.inputs.job == 'FLUXO_MAPA'
         run: |
           pip install google-cloud-storage boto3
           curl https://rclone.org/install.sh | sudo bash
@@ -62,7 +65,7 @@ jobs:
           rclone --config ./rclone.conf copy gcs:safedriver/datalake/bronze/malha_raw r2:$R2_BUCKET_NAME/datalake/bronze/malha_raw -P
 
       - name: "📦 [BRONZE-B] Crimes SSP (Web -> R2)"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_CRIMES'
+        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: |
           pip install boto3 requests
           python autobot/reg_crimes/ingestor_safe_driver.py bronze
@@ -73,7 +76,7 @@ jobs:
     if: |
       always() && 
       (needs.camada-bronze.result == 'success' || needs.camada-bronze.result == 'skipped') &&
-      (github.event.inputs.job == 'tudo' || startsWith(github.event.inputs.job, 'PRATA_'))
+      (github.event.inputs.job == 'tudo' || startsWith(github.event.inputs.job, 'PRATA_') || startsWith(github.event.inputs.job, 'FLUXO_'))
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -95,13 +98,11 @@ jobs:
         run: pip install boto3 polars h3 pyarrow python-calamine fsspec
 
       - name: "🛡️ [PRATA-A] Processamento Crimes"
-        # Executa APENAS se o input for crimes, completa ou tudo
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES'
+        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
       - name: "🏗️ [PRATA-B] Malha Geo & Infra"
-        # Executa APENAS se o input for mapa, completa ou tudo
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA'
+        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
   # --- NOTIFICAÇÃO: Avalia o Pipeline Inteiro ---
