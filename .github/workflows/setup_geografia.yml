@@ -54,7 +54,7 @@ jobs:
           pip install google-cloud-storage boto3
           curl -s https://rclone.org/install.sh | sudo bash
           
-          # BLINDAGEM CONTRA ESPAÇOS: Remove espaços, tabs e quebras de linha dos secrets
+          # BLINDAGEM CONTRA ESPAÇOS: Higieniza os segredos antes do uso
           CLEAN_ENDPOINT=$(echo "$R2_ENDPOINT_URL" | tr -d ' \n\r\t')
           CLEAN_ACCESS=$(echo "$R2_ACCESS_KEY_ID" | tr -d ' \n\r\t')
           CLEAN_SECRET=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d ' \n\r\t')
@@ -118,7 +118,7 @@ jobs:
           echo "⚙️ 1. Configurando Conexão R2 (com proteção de chaves)..."
           curl -s https://rclone.org/install.sh | sudo bash
           
-          # BLINDAGEM CONTRA ESPAÇOS E QUEBRAS DE LINHA FANTASMAS NOS SECRETS
+          # BLINDAGEM CONTRA ESPAÇOS: Higieniza os segredos antes do uso
           CLEAN_ENDPOINT=$(echo "$R2_ENDPOINT_URL" | tr -d ' \n\r\t')
           CLEAN_ACCESS=$(echo "$R2_ACCESS_KEY_ID" | tr -d ' \n\r\t')
           CLEAN_SECRET=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d ' \n\r\t')
@@ -138,7 +138,7 @@ jobs:
           mkdir -p ./data_raw ./data_prata
           
           echo "🔎 3. Super Diagnóstico R2..."
-          rclone --config ./rclone.conf lsd r2: || echo "⚠️ Falha ao ler a raiz r2:"
+          rclone --config ./rclone.conf lsd r2: || echo "⚠️ Falha ao ler r2:"
           rclone --config ./rclone.conf ls r2:$CLEAN_BUCKET/ | head -n 15 || echo "⚠️ Falha ao ler o bucket: $CLEAN_BUCKET"
           
           echo "📥 4. Download Inteligente (Busca Wildcard em todo o Bucket)..."
