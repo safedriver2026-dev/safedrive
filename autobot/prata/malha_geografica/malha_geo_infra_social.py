@@ -17,7 +17,7 @@ from botocore.config import Config
 from pathlib import Path
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (AGGREGATED INFRA ENGINE)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (MALHA TRUSTED ENGINE)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -42,7 +42,7 @@ class ArquitetoSafeDriverPrata:
             config=Config(signature_version='s3v4', retries={'max_attempts': 3})
         )
 
-        # Config DuckDB
+        # Configuração DuckDB Engine
         self.con = duckdb.connect(database=':memory:')
         self.con.execute(f"PRAGMA memory_limit='4GB';")
         self.con.execute(f"PRAGMA temp_directory='{self.temp_dir}';")
@@ -53,6 +53,9 @@ class ArquitetoSafeDriverPrata:
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now())}
 
+    # ==========================================
+    # UTILITÁRIOS
+    # ==========================================
     def _buscar_arquivo_seguro(self, padrao, nome):
         arqs = glob.glob(f"{self.bronze_dir}/**/{padrao}", recursive=True)
         if not arqs: raise FileNotFoundError(f"⚠️ {nome} ({padrao}) ausente!")
@@ -75,11 +78,15 @@ class ArquitetoSafeDriverPrata:
     def _garantir_osmconf(self):
         path = os.path.join(self.bronze_dir, "osmconf.ini")
         if not os.path.exists(path):
-            with open(path, "w") as f: f.write("[lines]\nosm_id=yes\nattributes=name,highway\n")
+            with open(path, "w") as f: 
+                f.write("[lines]\nosm_id=yes\nattributes=name,highway\n")
         return path.replace("\\", "/")
 
+    # ==========================================
+    # WORKFLOW PRINCIPAL
+    # ==========================================
     def download_r2(self):
-        print("📥 Sincronizando Bronze...", flush=True)
+        print("📥 Sincronizando Bronze para Processamento...", flush=True)
         targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
@@ -89,11 +96,11 @@ class ArquitetoSafeDriverPrata:
                     dest = os.path.join(self.bronze_dir, key.split('/')[-1])
                     if not os.path.exists(dest):
                         self.s3.download_file(self.bucket, key, dest)
-        print("✅ Bronze sincronizada.", flush=True)
+        print("✅ Sincronização concluída.", flush=True)
 
     def processar(self):
         # 1. GEO (IBGE + OSM)
-        print("🗺️ Malha Geográfica...", flush=True)
+        print("🗺️ Malha Geográfica (Vias)...", flush=True)
         try:
             zip_f = self._buscar_arquivo_seguro("SP_Faces_2022.zip", "IBGE Faces")
             if not glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True):
@@ -103,32 +110,33 @@ class ArquitetoSafeDriverPrata:
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OSM PBF")
             conf = self._garantir_osmconf()
 
-            # FIX: Processar caminhos fora da f-string para evitar erro de backslash
+            # Evita erro de backslash em f-string (Python < 3.12)
             sqls = []
             for f in json_files:
-                f_clean = f.replace("\\", "/")
-                sqls.append(f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f_clean}')")
-            
-            union_ibge = " UNION ALL ".join(sqls)
+                f_path = str(f).replace("\\", "/")
+                sqls.append(f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f_path}')")
             
             query = f"""
                 SELECT name as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
                 FROM ST_Read('{osm_pbf}', layer='lines', open_options=['CONFIG_FILE={conf}', 'INTERLEAVED_READING=YES']) 
                 WHERE highway IS NOT NULL AND name IS NOT NULL
-                UNION ALL {union_ibge}
+                UNION ALL {" UNION ALL ".join(sqls)}
             """
             df = self.con.execute(query).pl()
             
+            # Mapeamento H3 L9
             coords = df.select(["LAT", "LON"]).unique()
-            coords = coords.with_columns(pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX"))
-            df = df.join(coords, on=["LAT", "LON"], how="left").select(["RUA", "H3_INDEX"]).unique()
+            coords = coords.with_columns(pl.struct(["LAT", "LON"]).map_batches(
+                lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])
+            ).alias("H3_INDEX"))
             
+            df = df.join(coords, on=["LAT", "LON"], how="left").select(["RUA", "H3_INDEX"]).unique()
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
             self.auditoria["GEO"] = "OK"
         except Exception as e: self.auditoria["GEO"] = str(e)
 
         # 2. SOCIAL
-        print("👥 Malha Social...", flush=True)
+        print("👥 Malha Social (Censo)...", flush=True)
         try:
             csv_f = self._buscar_arquivo_seguro("Agregados_por_setores_basico*.csv", "Censo")
             enc, sep = self._analisar_csv_dinamicamente(csv_f)
@@ -138,20 +146,27 @@ class ArquitetoSafeDriverPrata:
             self.auditoria["SOCIAL"] = "OK"
         except Exception as e: self.auditoria["SOCIAL"] = str(e)
 
-        # 3. INFRA (AGREGAÇÃO POR H3)
-        print("🏗️ Malha Infra (Agregando por H3)...", flush=True)
+        # 3. INFRA (Agregada por H3)
+        print("🏗️ Malha Infra (Consolidando Empresas por Setor)...", flush=True)
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             lf = pl.scan_parquet(pqs)
             
-            lf = lf.select(["lat", "lon", "cnae_fiscal_principal"]) \
-                   .filter(pl.col("lat").is_not_null()) \
-                   .with_columns(
-                       pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")
-                   )
+            # Identificação dinâmica de colunas (cnpj vs id_protegido)
+            schema = lf.collect_schema().names()
+            colunas_infra = [c for c in ["lat", "lon", "cnae_fiscal_principal"] if c in schema]
+            
+            lf = lf.select(colunas_infra).filter(pl.col("lat").is_not_null())
+            
+            # Agrupamento por Setor Econômico (CNAE Divisão)
+            lf = lf.with_columns(
+                pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")
+            )
 
-            df_reduced = lf.group_by(["lat", "lon", "CNAE_DIV"]).count().collect(engine="streaming")
+            # Redução Massiva via Streaming
+            df_reduced = lf.group_by(["lat", "lon", "CNAE_DIV"]).len().collect(engine="streaming")
 
+            # Indexação H3
             unique_coords = df_reduced.select(["lat", "lon"]).unique()
             unique_coords = unique_coords.with_columns(
                 pl.struct(["lat", "lon"]).map_batches(
@@ -159,27 +174,38 @@ class ArquitetoSafeDriverPrata:
                 ).alias("H3_INDEX")
             )
             
+            # Pivot Final: Transforma linhas de comércio em colunas de features
             df_infra = df_reduced.join(unique_coords, on=["lat", "lon"])
-            
-            df_pivot = df_infra.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("count").alias("TOTAL")) \
+            df_pivot = df_infra.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("len").alias("TOTAL")) \
                                .pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV") \
                                .fill_null(0)
 
+            # Padronização de nomes das colunas de Infra
             df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
 
             df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
-            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos"
-            print(f"   ✅ Infra Agregada: {df_pivot.height} hexágonos processados.", flush=True)
+            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos processados"
             
         except Exception as e: self.auditoria["INFRA"] = f"ERRO: {str(e)}"
 
     def finalizar(self):
-        proj = os.getenv("BQ_PROJECT_ID", "safedriver").strip()
-        with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: json.dump(self.auditoria, f, indent=4)
+        projeto = os.getenv("BQ_PROJECT_ID", "safedriver").strip()
+        # DESTINO REQUISITADO: malha_trusted
+        r2_dest_path = f"{projeto}/datalake/prata/malha_trusted"
+        
+        # Auditoria Final
+        with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: 
+            json.dump(self.auditoria, f, indent=4)
+        
+        print(f"📤 Subindo arquivos processados para {r2_dest_path}...", flush=True)
         for f in os.listdir(self.prata_dir):
-            if f.endswith(".parquet"):
-                self.s3.upload_file(os.path.join(self.prata_dir, f), self.bucket, f"{proj}/datalake/prata/malhas/{f}")
-        print("\n📊 PIPELINE FINALIZADO:", json.dumps(self.auditoria, indent=4), flush=True)
+            if f.endswith((".parquet", ".json")):
+                local_file = os.path.join(self.prata_dir, f)
+                remote_file = f"{r2_dest_path}/{f}"
+                self.s3.upload_file(local_file, self.bucket, remote_file)
+        
+        print("\n📊 PIPELINE PRATA FINALIZADO COM SUCESSO!", flush=True)
+        print(json.dumps(self.auditoria, indent=4))
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverPrata()
