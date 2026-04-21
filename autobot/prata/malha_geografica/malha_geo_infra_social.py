@@ -10,11 +10,12 @@ import json
 import glob
 import re
 import hashlib
+import urllib.request # Importante para baixar o osmconf.ini
 from datetime import datetime
 from botocore.config import Config
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (POLARS EXTREME + OSM)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (POLARS EXTREME + OSM + IA ESPACIAL)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -24,7 +25,6 @@ class ArquitetoSafeDriverPrata:
         os.makedirs(self.bronze_dir, exist_ok=True)
         os.makedirs(self.prata_dir, exist_ok=True)
         
-        # Conexão Boto3 Blindada
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -39,17 +39,15 @@ class ArquitetoSafeDriverPrata:
 
         self.pepper = os.getenv("LGPD_PEPPER", "safedriver_seguranca_padrao_2026").strip()
         
-        # Conexão DuckDB (Usada apenas para ler a geometria espacial do SP_Faces e do OSM PBF)
         self.con = duckdb.connect(database=':memory:')
         self.con.execute("INSTALL spatial; LOAD spatial;")
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now()), "CAMADAS": {}}
 
     # ==========================================
-    # MOTORES DE PERFORMANCE E LIMPEZA
+    # MOTORES DE PERFORMANCE, LIMPEZA E IA
     # ==========================================
     def aplicar_lgpd(self, df: pl.DataFrame, colunas_sensiveis: list) -> pl.DataFrame:
-        """Aplica Hash SHA-256 irreversível com Pepper em colunas sensíveis (ex: Razões Sociais com CPF)."""
         colunas_presentes = [c for c in colunas_sensiveis if c in df.columns]
         if not colunas_presentes: return df
             
@@ -62,21 +60,15 @@ class ArquitetoSafeDriverPrata:
         return df.with_columns(exprs)
 
     def _normalizar(self, valor):
-        """Motor base que arranca acentos e deixa maiúsculo."""
         if not valor or str(valor).upper() in ["NULL", "NAN", "."]: return "NAO INFORMADO"
         t = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
         return re.sub(r'[^a-zA-Z0-9\s]', '', t).upper().strip()
 
     def normalizar_strings_global(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Encontra TODAS as colunas de texto (Bairro, Logradouro, Município, etc.) e aplica a limpeza.
-        Usa "Unique Join" para não estourar o limite de tempo do GitHub Actions.
-        """
         string_cols = df.select(cs.string()).columns
         if not string_cols: return df
         
         print(f"   🧹 [Limpeza] Normalizando textos para Maiúsculas e sem acento: {string_cols}", flush=True)
-        
         for col in string_cols:
             unique_df = df.select(pl.col(col).unique().alias(col)).drop_nulls()
             mapped_df = unique_df.with_columns(
@@ -89,7 +81,6 @@ class ArquitetoSafeDriverPrata:
         return df
 
     def aplicar_h3_otimizado(self, df: pl.DataFrame, lat_col="lat", lon_col="lon") -> pl.DataFrame:
-        """Calcula o H3 utilizando a mesma técnica de Otimização de Coordenadas Únicas."""
         print("   📍 [H3] Calculando malha hexagonal (Modo Otimizado)...", flush=True)
         coords_unicas = df.select([lat_col, lon_col]).drop_nulls().unique()
         
@@ -100,13 +91,50 @@ class ArquitetoSafeDriverPrata:
         )
         return df.join(coords_unicas, on=[lat_col, lon_col], how="left")
 
+    def completar_por_vizinhanca_h3(self, df: pl.DataFrame, colunas_alvo: list) -> pl.DataFrame:
+        """
+        Magia Espacial: Olha para o H3_INDEX e preenche Bairro e Município vazios
+        baseando-se no vizinho mais comum dentro do mesmo hexágono.
+        """
+        string_cols = [c for c in colunas_alvo if c in df.columns]
+        if not string_cols: return df
+
+        print(f"   🪄 [IA Espacial] Inferindo valores vazios em {string_cols} usando o contexto do H3...", flush=True)
+
+        aggs = []
+        for col in string_cols:
+            # Encontra a 'Moda' (valor mais comum) no hexágono ignorando os nulos
+            moda = (pl.col(col)
+                    .filter((pl.col(col).is_not_null()) & (pl.col(col) != "NAO INFORMADO"))
+                    .mode()
+                    .first()
+                    .alias(f"{col}_INFERIDO"))
+            aggs.append(moda)
+
+        # Cria um dicionário de conhecimentos do H3
+        dict_h3 = df.group_by("H3_INDEX").agg(aggs)
+        
+        # Junta com os dados e substitui os "NAO INFORMADOS" pela dedução da inteligência
+        df = df.join(dict_h3, on="H3_INDEX", how="left")
+
+        exprs = []
+        for col in string_cols:
+            exprs.append(
+                pl.when((pl.col(col).is_null()) | (pl.col(col) == "NAO INFORMADO"))
+                .then(pl.col(f"{col}_INFERIDO"))
+                .otherwise(pl.col(col))
+                .fill_null("NAO INFORMADO") # Fallback de segurança
+                .alias(col)
+            )
+
+        return df.with_columns(exprs).drop([f"{c}_INFERIDO" for c in string_cols])
+
     # ==========================================
     # WORKFLOW DE EXECUÇÃO
     # ==========================================
     def download_r2(self):
         print("📥 Buscando arquivos na Bronze via Boto3...", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
-        # OSM PBF adicionado à lista de downloads
         targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         
         encontrados = 0
@@ -138,24 +166,33 @@ class ArquitetoSafeDriverPrata:
         try:
             zip_f = glob.glob(f"{self.bronze_dir}/**/SP_Faces_2022.zip", recursive=True)[0]
             with zipfile.ZipFile(zip_f, 'r') as z: z.extractall(self.bronze_dir)
-            
             osm_pbf = glob.glob(f"{self.bronze_dir}/**/sp-latest.osm.pbf", recursive=True)[0]
             
-            # União das duas bases usando DuckDB puro para leitura espacial
+            # --- CORREÇÃO DO OSMCONF.INI ---
+            osmconf_path = os.path.join(self.bronze_dir, "osmconf.ini")
+            if not os.path.exists(osmconf_path):
+                print("   ⚙️ Baixando driver de tradução do OSM (osmconf.ini)...", flush=True)
+                urllib.request.urlretrieve("https://raw.githubusercontent.com/OSGeo/gdal/master/ogr/ogrsf_frmts/osm/data/osmconf.ini", osmconf_path)
+            
+            # Trazendo RUA, MUNICIPIO e BAIRRO
             query = f"""
                 SELECT 
                     CAST(osm_id AS VARCHAR) as CD_FACE,
                     name as RUA, 
+                    CAST(NULL AS VARCHAR) as NM_MUN,
+                    CAST(NULL AS VARCHAR) as NM_BAIRRO,
                     CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, 
                     CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
-                FROM ST_Read('{osm_pbf}', layer='lines')
+                FROM ST_Read('{osm_pbf}', layer='lines', open_options=['CONFIG_FILE={osmconf_path}'])
                 WHERE highway IS NOT NULL AND name IS NOT NULL
                 
                 UNION ALL
                 
                 SELECT 
-                    CD_FACE,
+                    CAST(CD_FACE AS VARCHAR) as CD_FACE,
                     trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, 
+                    CAST(NM_MUN AS VARCHAR) as NM_MUN,
+                    CAST(NM_BAIRRO AS VARCHAR) as NM_BAIRRO,
                     CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, 
                     CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
                 FROM ST_Read('{self.bronze_dir}/**/*.json')
@@ -163,13 +200,14 @@ class ArquitetoSafeDriverPrata:
             """
             df = self.con.execute(query).pl()
             
-            # Limpeza Global e H3 via Polars
             df = self.normalizar_strings_global(df)
             df = self.aplicar_h3_otimizado(df, lat_col="LAT", lon_col="LON")
             
-            # Remoção de Duplicatas (Garante que a mesma rua no mesmo H3 não conte em dobro)
-            df = df.unique(subset=["RUA", "H3_INDEX"])
+            # --- APLICANDO A IA DE CONTEXTO ---
+            # Preenche Bairro e Município (especialmente do OSM) baseando-se no H3
+            df = self.completar_por_vizinhanca_h3(df, ["NM_MUN", "NM_BAIRRO"])
             
+            df = df.unique(subset=["RUA", "H3_INDEX"])
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
             self.auditoria["CAMADAS"]["GEO"] = {"STATUS": "OK", "LINHAS": df.height}
             print(f"   ✅ Geo Concluído: {df.height} linhas.", flush=True)
@@ -191,7 +229,6 @@ class ArquitetoSafeDriverPrata:
             ])
             
             df = self.normalizar_strings_global(df)
-            
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet", compression="zstd")
             self.auditoria["CAMADAS"]["SOCIAL"] = {"STATUS": "OK", "LINHAS": df.height}
             print(f"   ✅ Social Concluído: {df.height} linhas.", flush=True)
@@ -202,14 +239,16 @@ class ArquitetoSafeDriverPrata:
         print("🏗️ Processando Malha Infra/Comércio...", flush=True)
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
-            df = pl.read_parquet(pqs)
-            df = df.filter(pl.col("lat").is_not_null() & pl.col("lon").is_not_null())
+            df = pl.read_parquet(pqs).filter(pl.col("lat").is_not_null() & pl.col("lon").is_not_null())
             
             colunas_perigosas = ["cnpj", "cnpj_basico", "razao_social", "nome_fantasia", "cpf_responsavel", "nome_socio"]
             df = self.aplicar_lgpd(df, colunas_perigosas)
             
             df = self.normalizar_strings_global(df)
             df = self.aplicar_h3_otimizado(df, lat_col="lat", lon_col="lon")
+            
+            # --- APLICANDO A IA DE CONTEXTO ---
+            df = self.completar_por_vizinhanca_h3(df, ["municipio", "bairro"])
             
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA.parquet", compression="zstd")
             self.auditoria["CAMADAS"]["INFRA"] = {"STATUS": "OK", "LINHAS": df.height}
