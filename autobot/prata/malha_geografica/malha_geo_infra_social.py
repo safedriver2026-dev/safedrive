@@ -10,11 +10,13 @@ import json
 import glob
 import re
 import hashlib
+import csv
+import urllib.request
 from datetime import datetime
 from botocore.config import Config
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (BLINDADA + OSM + IA)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (POLARS EXTREME + OSM + IA)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -24,7 +26,6 @@ class ArquitetoSafeDriverPrata:
         os.makedirs(self.bronze_dir, exist_ok=True)
         os.makedirs(self.prata_dir, exist_ok=True)
         
-        # Conexão Boto3 Segura
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -34,35 +35,62 @@ class ArquitetoSafeDriverPrata:
             's3', endpoint_url=endpoint,
             aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
             aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
-            config=Config(signature_version='s3v4', retries={'max_attempts': 3}) # Retentativas em caso de falha de rede
+            config=Config(signature_version='s3v4', retries={'max_attempts': 3})
         )
 
         self.pepper = os.getenv("LGPD_PEPPER", "safedriver_seguranca_padrao_2026").strip()
         
-        # Motor DuckDB Blindado contra falta de RAM
         self.con = duckdb.connect(database=':memory:')
-        self.con.execute("PRAGMA memory_limit='6GB';") # Protege o GitHub Actions de ser morto por OOM (Out Of Memory)
+        self.con.execute("PRAGMA memory_limit='6GB';")
         
-        # Instalação com tratamento de erro (caso o servidor de extensões do DuckDB caia)
         try:
             self.con.execute("INSTALL spatial; LOAD spatial;")
         except Exception as e:
-            raise RuntimeError(f"Falha crítica ao carregar extensão espacial do DuckDB. Verifique a rede: {e}")
+            raise RuntimeError(f"Falha crítica ao carregar extensão espacial do DuckDB: {e}")
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now()), "CAMADAS": {}}
 
     # ==========================================
-    # UTILITÁRIOS DE SEGURANÇA E PREVENÇÃO
+    # UTILITÁRIOS E AUTO-DETECÇÃO (SNIFFER)
     # ==========================================
     def _buscar_arquivo_seguro(self, padrao, nome_amigavel):
-        """Evita o erro IndexError caso o arquivo não seja encontrado."""
         arquivos = glob.glob(f"{self.bronze_dir}/**/{padrao}", recursive=True)
         if not arquivos:
-            raise FileNotFoundError(f"⚠️ Arquivo obrigatório não encontrado: {nome_amigavel} (Padrão: {padrao})")
+            raise FileNotFoundError(f"⚠️ Arquivo não encontrado: {nome_amigavel} (Padrão: {padrao})")
         return arquivos[0]
 
+    def _analisar_csv_dinamicamente(self, file_path):
+        """Descobre dinamicamente o Encoding e o Separador do arquivo, sem forçar padrões."""
+        print(f"   🔎 [Auto-Detect] Inspecionando estrutura do CSV...", flush=True)
+        encodings = ['utf-8', 'windows-1252', 'iso-8859-1', 'latin1']
+        
+        # 1. Descobrir Encoding testando os bytes brutos
+        encoding_correto = 'utf-8'
+        with open(file_path, 'rb') as f:
+            amostra_bytes = f.read(50000) # Lemos uma amostra segura
+            
+        for enc in encodings:
+            try:
+                amostra_bytes.decode(enc)
+                encoding_correto = enc
+                break
+            except UnicodeDecodeError:
+                continue
+                
+        # 2. Descobrir Separador usando IA da biblioteca CSV
+        separador = ";"
+        try:
+            amostra_texto = amostra_bytes.decode(encoding_correto)
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(amostra_texto)
+            separador = dialect.delimiter
+        except Exception:
+            pass # Mantém o fallback
+
+        print(f"   ✅ [Auto-Detect] Estrutura Mapeada -> Encoding: {encoding_correto.upper()} | Separador: '{separador}'", flush=True)
+        return encoding_correto, separador
+
     def _garantir_osmconf_offline(self):
-        """Escreve o ficheiro osmconf.ini diretamente no disco, evitando depender de downloads externos."""
         osmconf_path = os.path.join(self.bronze_dir, "osmconf.ini")
         if not os.path.exists(osmconf_path):
             print("   ⚙️ Gerando driver de tradução do OSM (osmconf.ini) offline...", flush=True)
@@ -114,7 +142,6 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
                 df = df.join(mapped_df, on=col, how="left")
                 df = df.with_columns(pl.col(f"{col}_norm").fill_null("NAO INFORMADO").alias(col)).drop(f"{col}_norm")
             df = df.with_columns(pl.col(col).cast(pl.Categorical)) 
-            
         return df
 
     def aplicar_h3_otimizado(self, df: pl.DataFrame, lat_col="lat", lon_col="lon") -> pl.DataFrame:
@@ -135,7 +162,6 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
         if not string_cols or "H3_INDEX" not in df.columns: return df
 
         print(f"   🪄 [IA Espacial] Inferindo valores vazios em {string_cols} usando o contexto do H3...", flush=True)
-
         aggs = []
         for col in string_cols:
             moda = (pl.col(col)
@@ -157,7 +183,6 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
                 .fill_null("NAO INFORMADO")
                 .alias(col)
             )
-
         return df.with_columns(exprs).drop([f"{c}_INFERIDO" for c in string_cols])
 
     # ==========================================
@@ -178,9 +203,6 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
                     print(f"   ⬇️ Baixando: {filename}", flush=True)
                     self.s3.download_file(self.bucket, key, dest)
                     encontrados += 1
-        
-        if encontrados == 0:
-            raise FileNotFoundError("⚠️ Nenhum ficheiro alvo foi encontrado no Bucket R2!")
         print(f"✅ Download finalizado: {encontrados} arquivos.", flush=True)
 
     def upload_r2(self):
@@ -200,14 +222,19 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
         try:
             zip_f = self._buscar_arquivo_seguro("SP_Faces_2022.zip", "IBGE Faces ZIP")
             
-            # Evita extrair duas vezes se o script rodar novamente localmente
-            if not glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True):
+            json_files = glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True)
+            if not json_files:
                 with zipfile.ZipFile(zip_f, 'r') as z: 
                     z.extractall(self.bronze_dir)
+                json_files = glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True)
             
-            arquivo_ibge_faces = self._buscar_arquivo_seguro("*.json", "IBGE Faces JSON")
+            if not json_files:
+                raise FileNotFoundError("Não foi possível encontrar ficheiros .json do IBGE após extrair o ZIP!")
+            
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OpenStreetMap PBF")
             osmconf_path = self._garantir_osmconf_offline()
+            
+            json_list_sql = "[" + ", ".join([f"'{f}'" for f in json_files]) + "]"
             
             query = f"""
                 SELECT 
@@ -225,11 +252,11 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
                 SELECT 
                     CAST(ibge.CD_FACE AS VARCHAR) as CD_FACE,
                     trim(ibge.NM_TIP_LOG || ' ' || ibge.NM_LOG) as RUA, 
-                    CAST(ibge.NM_MUN AS VARCHAR) as NM_MUN,
-                    CAST(ibge.NM_BAIRRO AS VARCHAR) as NM_BAIRRO,
+                    CAST(NULL AS VARCHAR) as NM_MUN,
+                    CAST(NULL AS VARCHAR) as NM_BAIRRO,
                     CAST(ST_Y(ST_Centroid(ibge.geom)) AS FLOAT) as LAT, 
                     CAST(ST_X(ST_Centroid(ibge.geom)) AS FLOAT) as LON
-                FROM ST_Read('{arquivo_ibge_faces}') AS ibge
+                FROM ST_Read({json_list_sql}) AS ibge
                 WHERE ibge.NM_LOG IS NOT NULL
             """
             df = self.con.execute(query).pl()
@@ -250,7 +277,18 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
         print("👥 Processando Malha Social...", flush=True)
         try:
             csv_f = self._buscar_arquivo_seguro("Agregados_por_setores_basico*.csv", "Setores Censitários CSV")
-            df = pl.read_csv(csv_f, separator=";", null_values=["."], infer_schema_length=10000, schema_overrides={"CD_SETOR": pl.Utf8, "CD_MUN": pl.Utf8}).filter(pl.col("CD_SETOR").str.starts_with("35"))
+            
+            # --- O PULO DO GATO: Autodetecção Dinâmica sem forçar padrão ---
+            encoding_real, separador_real = self._analisar_csv_dinamicamente(csv_f)
+            
+            df = pl.read_csv(
+                csv_f, 
+                separator=separador_real, 
+                null_values=["."], 
+                infer_schema_length=10000, 
+                encoding=encoding_real, 
+                schema_overrides={"CD_SETOR": pl.Utf8, "CD_MUN": pl.Utf8}
+            ).filter(pl.col("CD_SETOR").str.starts_with("35"))
             
             cols = ["CD_SETOR", "NM_MUN", "NM_BAIRRO", "AREA_KM2", "CD_TIPO", "v0001", "v0002"]
             df = df.select([c for c in cols if c in df.columns]).with_columns([
