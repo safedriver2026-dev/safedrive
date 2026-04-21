@@ -34,7 +34,7 @@ class MigradorAgregador:
         self.prefixo_antigo = "datalake/bronze/malha_raw/comercio/"
         self.prefixo_novo = "datalake/bronze/malha_raw/"
         
-        # Lote de 100 arquivos de 4MB (Gera 1 arquivo de ~400MB)
+        # Lote de 100 arquivos de 4MB (Gera 1 arquivo de ~400MB na RAM)
         self.TAMANHO_LOTE = 100 
 
     def espremer_e_agregar(self):
@@ -93,21 +93,40 @@ class MigradorAgregador:
             
             df_blocao = pl.concat(lista_dfs, how="diagonal")
             
-            # --- COMPRESSÃO ---
+            # --- 1. TRATAMENTO NUMÉRICO E DATAS (Evita o erro de tipagem) ---
+            colunas_tratadas = []
+            
+            # Trata Latitude e Longitude
+            for col in ["lat", "lon"]:
+                if col in df_blocao.columns:
+                    if df_blocao.schema[col] in [pl.Utf8, pl.String]:
+                        colunas_tratadas.append(
+                            pl.col(col).str.strip_chars().str.replace(",", ".").cast(pl.Float32, strict=False)
+                        )
+                    else:
+                        colunas_tratadas.append(pl.col(col).cast(pl.Float32, strict=False))
+            
+            # Trata a Data
+            if "data_inicio_atividade" in df_blocao.columns:
+                colunas_tratadas.append(pl.col("data_inicio_atividade").str.to_date("%Y-%m-%d", strict=False))
+
+            if colunas_tratadas:
+                df_blocao = df_blocao.with_columns(colunas_tratadas)
+
+            # --- 2. LIMPEZA ---
+            # Se não tem coordenada, não serve pro mapa H3
+            if "lat" in df_blocao.columns and "lon" in df_blocao.columns:
+                df_blocao = df_blocao.drop_nulls(subset=["lat", "lon"])
+            
+            # --- 3. COMPRESSÃO DE TEXTO RESTANTE ---
             colunas_texto = [col for col, dtype in zip(df_blocao.columns, df_blocao.dtypes) if dtype in (pl.Utf8, pl.String)]
             if colunas_texto:
                 df_blocao = df_blocao.with_columns([pl.col(c).cast(pl.Categorical) for c in colunas_texto])
-            
-            if "lat" in df_blocao.columns and "lon" in df_blocao.columns:
-                df_blocao = df_blocao.with_columns([
-                    pl.col("lat").cast(pl.Float32, strict=False),
-                    pl.col("lon").cast(pl.Float32, strict=False)
-                ])
 
+            # --- 4. UPLOAD E LIMPEZA (ZSTD) ---
             out_buffer = io.BytesIO()
             df_blocao.write_parquet(out_buffer, compression="zstd", compression_level=9, use_pyarrow=True)
             
-            # --- UPLOAD E LIMPEZA ---
             new_key = f"{self.prefixo_novo}CNPJ_SP_HISTORICO_LOTE_{str(lote_id).zfill(3)}.parquet"
             self.s3.put_object(Bucket=self.bucket, Key=new_key, Body=out_buffer.getvalue())
             
