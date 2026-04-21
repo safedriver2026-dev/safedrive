@@ -17,7 +17,6 @@ on:
           - 'PRATA_COMPLETA'
           - 'FLUXO_CRIMES'
           - 'FLUXO_MAPA'
-          - 'ORGANIZAR_PROJETO_R2'
           - 'tudo'
 
 jobs:
@@ -29,6 +28,7 @@ jobs:
       startsWith(github.event.inputs.job, 'FLUXO_')
     runs-on: ubuntu-latest
     env:
+      # Secrets Cloudflare R2
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -87,13 +87,15 @@ jobs:
       (github.event.inputs.job == 'tudo' || startsWith(github.event.inputs.job, 'PRATA_') || startsWith(github.event.inputs.job, 'FLUXO_'))
     runs-on: ubuntu-latest
     env:
+      # Secrets R2 e BigQuery
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+      # Secret LGPD
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
-      LGPD_SALT: ${{ secrets.LGPD_SALT }}
     steps:
       - name: 🔍 Checkout do Código
         uses: actions/checkout@v4
@@ -107,7 +109,7 @@ jobs:
         run: |
           pip install boto3 polars h3 pyarrow requests duckdb
 
-      - name: "🛡️ [PRATA-A] Processamento Crimes"
+      - name: "🛡️ [PRATA-A] Processamento Crimes e LGPD"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
@@ -116,45 +118,31 @@ jobs:
         run: |
           echo "🚀 Iniciando motor híbrido (I/O Boto3 + Compute DuckDB/Polars)..."
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
-
-  # --- JOB DE ORGANIZAÇÃO ---
-  organizacao-r2:
-    if: github.event.inputs.job == 'ORGANIZAR_PROJETO_R2'
-    runs-on: ubuntu-latest
-    env:
-      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-    steps:
-      - name: 🔍 Checkout
-        uses: actions/checkout@v4
-
-      - name: 🐍 Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: "⚙️ Instalar Dependências"
-        run: pip install boto3
-
-      - name: "🚚 Mover Blocos para Pasta do Projeto"
-        run: python autobot/organizador_r2.py
+          
+          # Validador de Auditoria
+          if grep -q '"QUALIDADE_GERAL": "FALHA_CRITICA"' ./data_prata/AUDITORIA_PRATA.json; then
+            echo "❌ ERRO CRÍTICO ENCONTRADO NA AUDITORIA DA PRATA. PARANDO PIPELINE."
+            cat ./data_prata/AUDITORIA_PRATA.json
+            exit 1
+          fi
 
   # --- NOTIFICAÇÃO ---
   notificacao:
-    needs: [camada-bronze, camada-prata, organizacao-r2]
+    needs: [camada-bronze, camada-prata]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: "📢 Feedback para o Discord"
         run: |
-          if [[ "${{ needs.camada-bronze.result }}" != "failure" && "${{ needs.camada-prata.result }}" != "failure" && "${{ needs.organizacao-r2.result }}" != "failure" && "${{ needs.camada-bronze.result }}" != "cancelled" && "${{ needs.camada-prata.result }}" != "cancelled" && "${{ needs.organizacao-r2.result }}" != "cancelled" ]]; then
+          PRATA_RESULT="${{ needs.camada-prata.result }}"
+          BRONZE_RESULT="${{ needs.camada-bronze.result }}"
+          
+          if [[ ("$PRATA_RESULT" == "success" || "$PRATA_RESULT" == "skipped") && ("$BRONZE_RESULT" == "success" || "$BRONZE_RESULT" == "skipped") ]]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Pipeline de Produção finalizado com sucesso: ${{ github.event.inputs.job }}"
+            MSG="✅ **[SafeDriver]** Pipeline de Produção finalizado com sucesso!\nJob executado: \`${{ github.event.inputs.job }}\`"
           else
             URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Falha detetada no pipeline: ${{ github.event.inputs.job }}"
+            MSG="🚨 **[SafeDriver]** Falha detetada no pipeline!\nVerifique os logs no GitHub Actions. Job: \`${{ github.event.inputs.job }}\`"
           fi
-          curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
+          
+          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
