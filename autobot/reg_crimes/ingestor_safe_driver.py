@@ -40,7 +40,8 @@ class ConfiguracaoIngestao:
         "RUBRICA": [r"RUBRICA", r"NATUREZA", r"DESCR_RUBRICA"],
         "LATITUDE": [r"LATITUDE", r"LAT.*GEO", r"^LAT$", r"COORDENADA_X", r"LATITUD"],
         "LONGITUDE": [r"LONGITUDE", r"LON.*GEO", r"^LON$", r"COORDENADA_Y", r"LONGITUD"],
-        "PERIODO_NATIVO": [r"DESC.*PERIODO", r"PERIODO", r"DS_PERIODO"]
+        "DESCR_TIPOLOCAL": [r"TIPOLOCAL", r"LOCAL_OCORR", r"DESCR_TIPOLOCAL", r"LOCAL"],
+        "PERIODO_NATIVO": [r"DESC.*PERIODO", r"PERIODO", r"DS_PERIODO", r"DESC_PERIODO_OCORRENCIA"]
     }
 
 class IngestorSafeDriver:
@@ -48,7 +49,7 @@ class IngestorSafeDriver:
         self.config = ConfiguracaoIngestao()
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
-        self.df_malha = None
+        self.df_lookup_vias = None
 
     def _notificar_discord(self, msg):
         if self.config.WEBHOOK_DISCORD:
@@ -63,13 +64,23 @@ class IngestorSafeDriver:
                             aws_secret_access_key=self.config.SECRET_KEY.strip(), config=Config(signature_version='s3v4'))
 
     def _carregar_malha_referencia(self):
-        """Carrega a malha de vias para resgate espacial por chave composta."""
+        """Carrega a malha hierárquica e a 'achata' para busca otimizada."""
         try:
+            logger.info("🗺️ Baixando Malha Geográfica para resgate...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
-            self.df_malha = pl.read_parquet(io.BytesIO(obj['Body'].read())).select([
-                pl.col("RUA"), pl.col("BAIRRO"), pl.col("MUNICIPIO"), pl.col("H3_INDEX")
-            ]).unique(subset=["RUA", "BAIRRO", "MUNICIPIO"])
-            logger.info("🗺️ Malha de Referência (Vias) carregada com Sucesso.")
+            df_hierarquico = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+            
+            # Transforma a estrutura aninhada (Cidade > Bairro > Logradouro) em tabela plana de busca
+            self.df_lookup_vias = (
+                df_hierarquico
+                .explode("BAIRROS").unnest("BAIRROS")
+                .explode("LOGRADOUROS").unnest("LOGRADOUROS")
+                # Pegamos o primeiro H3 da lista como referência principal da rua
+                .with_columns(pl.col("H3_LIST").list.first().alias("H3_INDEX"))
+                .select(["CIDADE", "BAIRRO", "RUA", "H3_INDEX"])
+                .unique()
+            )
+            logger.info(f"✅ Malha achatada com sucesso: {self.df_lookup_vias.height} logradouros mapeados.")
         except Exception as e:
             logger.error(f"❌ Erro ao carregar malha: {e}. Resgate espacial desativado.")
 
@@ -92,11 +103,39 @@ class IngestorSafeDriver:
                         break
         return mapeamento
 
+    def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Aplica resgate em cascata usando a Malha de Referência."""
+        if self.df_lookup_vias is None: return df
+        
+        # Nível 1: Precisão Total (Cidade + Bairro + Rua)
+        df = df.join(
+            self.df_lookup_vias,
+            left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO"],
+            right_on=["CIDADE", "BAIRRO", "RUA"],
+            how="left"
+        ).with_columns(
+            pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))
+        ).drop("H3_INDEX_right")
+
+        # Nível 2: Recuperação por Cidade + Rua (Caso o nome do bairro divirja entre SSP e IBGE)
+        df_fallback = self.df_lookup_vias.unique(subset=["CIDADE", "RUA"]).select(["CIDADE", "RUA", "H3_INDEX"])
+        df = df.join(
+            df_fallback,
+            left_on=["MUNICIPIO", "LOGRADOURO"],
+            right_on=["CIDADE", "RUA"],
+            how="left"
+        ).with_columns(
+            pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))
+        ).drop("H3_INDEX_right")
+        
+        return df
+
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
         total_entrada = df.height
         
         # 1. Normalização de Texto
-        cols_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO", "HORAOCORRENCIA", "PERIODO_NATIVO"]]
+        cols_ignorar = ["LATITUDE", "LONGITUDE", "NUM_BO", "HORAOCORRENCIA", "PERIODO_NATIVO"]
+        cols_texto = [c for c in df.columns if c not in cols_ignorar]
         for col in cols_texto:
             df = df.with_columns(pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
 
@@ -116,44 +155,34 @@ class IngestorSafeDriver:
             .alias("SAZON_PERIODO")
         ).drop(["_hr", "PERIODO_NATIVO"])
 
-        # 3. Coordenadas e H3 via GPS Original
+        # 3. Coordenadas e H3 via GPS (Considerando 0 como nulo)
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
-        ])
-
-        df = df.with_columns(
+        ]).with_columns(
             pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3) if x["LATITUDE"] is not None else None,
+                lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3) if x["LATITUDE"] and x["LATITUDE"] != 0 else None,
                 return_dtype=pl.Utf8
             ).alias("H3_INDEX")
         )
 
-        # 4. Resgate Geográfico por Chave Composta (Rua + Bairro + Cidade)
-        if self.df_malha is not None:
-            df = df.join(
-                self.df_malha,
-                left_on=["LOGRADOURO", "BAIRRO", "MUNICIPIO"],
-                right_on=["RUA", "BAIRRO", "MUNICIPIO"],
-                how="left"
-            ).with_columns(
-                pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))
-            ).drop("H3_INDEX_right")
+        # 4. Resgate Hierárquico via Malha
+        df = self._resgatar_espacial(df)
 
-        # 5. FILTRO DE EXCLUSÃO RÍGIDA (Só passa o que tem Espaço e Tempo)
+        # 5. EXCLUSÃO RÍGIDA (Só passa dado com Local e Tempo)
         df_limpo = df.filter(pl.col("H3_INDEX").is_not_null() & pl.col("SAZON_PERIODO").is_not_null())
         
         # Estatísticas de Resgate
-        bo_com_gps = df.filter(pl.col("LATITUDE").is_not_null()).height
+        bo_com_gps = df.filter(pl.col("LATITUDE").is_not_null() & (pl.col("LATITUDE") != 0)).height
         bo_salvos = df_limpo.height - bo_com_gps
         
         report = (
-            f"🥈 **[SafeDriver] Prata SSP: Relatório de Qualidade**\n"
+            f"🥈 **[SafeDriver] Prata SSP: Qualidade dos Dados**\n"
             f"```ml\n"
-            f"• Ingestão Total: {total_entrada}\n"
-            f"• GPS Original: {bo_com_gps}\n"
-            f"• Salvos via Chave Composta: {bo_salvos}\n"
-            f"• Descartados (Falta Dados): {total_entrada - df_limpo.height}\n"
+            f"• Registros Processados: {total_entrada}\n"
+            f"• GPS Original Válido: {bo_com_gps}\n"
+            f"• Salvos via Malha (Resgate): {bo_salvos}\n"
+            f"• Descartados (Irrecuperáveis): {total_entrada - df_limpo.height}\n"
             f"• Base Trusted Final: {df_limpo.height}\n"
             f"```"
         )
@@ -175,7 +204,7 @@ class IngestorSafeDriver:
         path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
 
         try:
-            if self.df_malha is None: self._carregar_malha_referencia()
+            if self.df_lookup_vias is None: self._carregar_malha_referencia()
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             excel_bytes = obj['Body'].read()
             excel_reader = fastexcel.read_excel(excel_bytes)
@@ -201,16 +230,15 @@ class IngestorSafeDriver:
             df_final = pl.concat(list_dfs, how="diagonal")
             df_final = self._limpar_e_tipar(df_final)
             
-            # Anonimização e Upload
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
                 pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
             ])
             buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} (SSP Trusted) finalizada.")
+            logger.info(f"✨ Prata {ano} finalizada.")
 
-        except Exception as e: logger.error(f"💥 Erro fatal no processamento {ano}: {e}")
+        except Exception as e: logger.error(f"💥 Erro fatal {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
