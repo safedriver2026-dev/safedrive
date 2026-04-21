@@ -17,7 +17,7 @@ on:
           - 'PRATA_COMPLETA'
           - 'FLUXO_CRIMES'
           - 'FLUXO_MAPA'
-          - 'MIGRACAO_ESPREMER_R2'  # <--- NOVO: Roda o agregador de pequenos arquivos
+          - 'ORGANIZAR_PROJETO_R2' # <--- OPÇÃO PARA MOVER OS BLOCÕES
           - 'tudo'
 
 jobs:
@@ -106,15 +106,16 @@ jobs:
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-  # --- JOB DE MANUTENÇÃO: Agregar e Comprimir R2 ---
-  migracao-r2:
-    if: github.event.inputs.job == 'MIGRACAO_ESPREMER_R2'
+  # --- JOB DE ORGANIZAÇÃO: Mover Blocões para a pasta do Projeto ---
+  organizacao-r2:
+    if: github.event.inputs.job == 'ORGANIZAR_PROJETO_R2'
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }} # Nome da pasta do projeto (ex: safedriver)
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -124,22 +125,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: "⚙️ Instalar Dependências"
-        run: pip install boto3 polars pyarrow
+      - name: "⚙️ Instalar Boto3"
+        run: pip install boto3
 
-      - name: "🗜️ Espremer e Agregar Lotes no R2"
-        # ATENÇÃO: Ajuste o caminho abaixo para onde você salvou o arquivo migrador_agregador.py
-        run: python autobot/migrador_agregador.py
+      - name: "🚚 Mover Blocos para Pasta do Projeto"
+        # O script organizador_r2.py deve estar na pasta autobot/
+        run: python autobot/organizador_r2.py
 
   # --- NOTIFICAÇÃO: Avalia o Pipeline Inteiro ---
   notificacao:
-    needs: [camada-bronze, camada-prata, migracao-r2]
+    needs: [camada-bronze, camada-prata, organizacao-r2]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: "📢 Discord Feedback"
         run: |
-          if [[ "${{ needs.camada-bronze.result }}" != "failure" && "${{ needs.camada-prata.result }}" != "failure" && "${{ needs.migracao-r2.result }}" != "failure" && "${{ needs.camada-bronze.result }}" != "cancelled" && "${{ needs.camada-prata.result }}" != "cancelled" && "${{ needs.migracao-r2.result }}" != "cancelled" ]]; then
+          if [[ "${{ needs.camada-bronze.result }}" != "failure" && "${{ needs.camada-prata.result }}" != "failure" && "${{ needs.organizacao-r2.result }}" != "failure" && "${{ needs.camada-bronze.result }}" != "cancelled" && "${{ needs.camada-prata.result }}" != "cancelled" && "${{ needs.organizacao-r2.result }}" != "cancelled" ]]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
             MSG="✅ **[SafeDriver]** Pipeline finalizado com sucesso: ${{ github.event.inputs.job }}"
           else
