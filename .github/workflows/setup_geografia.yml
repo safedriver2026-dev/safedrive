@@ -16,6 +16,7 @@ on:
           - 'tudo'
 
 jobs:
+  # --- CAMADA BRONZE: Ingestão Pura (GCS/SSP -> R2) ---
   camada-bronze:
     if: |
       github.event.inputs.job == 'tudo' || 
@@ -24,13 +25,10 @@ jobs:
       github.event.inputs.job == 'BRONZE_CRIMES'
     runs-on: ubuntu-latest
     env:
-      # PADRONIZAÇÃO: Nomes que o Python vai ler via os.getenv
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -41,36 +39,43 @@ jobs:
           python-version: '3.11'
 
       - name: "🔑 [AUTH] Google Cloud"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
+        if: contains(github.event.inputs.job, 'RECEITA') || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
 
-      - name: "📦 [BRONZE-A] Ingestão Receita"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA'
+      - name: "📦 [BRONZE-A] Malha Receita (GCS -> R2)"
+        if: contains(github.event.inputs.job, 'RECEITA') || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA'
         run: |
-          pip install google-cloud-bigquery google-cloud-storage boto3
-          python autobot/bronze/malha_geo/ingestor_receita_federal.py check
-          mkdir -p data_raw
-          gcloud storage cp "gs://safedriver/datalake/bronze/malha_raw/*.parquet" data_raw/ || echo "GCS vazio"
-          aws s3 sync data_raw/ s3://$R2_BUCKET_NAME/datalake/bronze/malha_raw/ --endpoint-url $R2_ENDPOINT_URL
-          python autobot/bronze/malha_geo/ingestor_receita_federal.py clean
+          pip install google-cloud-storage boto3
+          # Sincronização direta de Nuvem para Nuvem via rclone ou aws cli
+          # Usando rclone para garantir resiliência em grandes volumes (3GB)
+          curl https://rclone.org/install.sh | sudo bash
+          cat <<EOF > rclone.conf
+          [gcs]
+          type = google cloud storage
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          endpoint = $R2_ENDPOINT_URL
+          EOF
+          rclone --config ./rclone.conf copy gcs:safedriver/datalake/bronze/malha_raw r2:$R2_BUCKET_NAME/datalake/bronze/malha_raw -P
 
-      - name: "📦 [BRONZE-B] Ingestão SSP-SP"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_CRIMES'
-        env:
-          LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
-          LGPD_SALT: ${{ secrets.LGPD_SALT }}
+      - name: "📦 [BRONZE-B] Crimes SSP (Web -> R2)"
+        if: contains(github.event.inputs.job, 'CRIMES') || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA'
         run: |
-          pip install boto3 requests polars python-calamine fsspec pyarrow h3
+          pip install boto3 requests
+          # Chama o novo script que tem o loop de retentativa inteligente
           python autobot/reg_crimes/ingestao_crimes_bronze.py
 
+  # --- CAMADA PRATA: Transformação e LGPD (Bronze R2 -> Prata R2) ---
   camada-prata:
-    needs: [camada-bronze]
+    # needs: [camada-bronze] -> Removido para permitir rodar Prata de forma avulsa
     if: |
       always() && 
-      (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_PROCESS') &&
-      (needs.camada-bronze.result != 'failure')
+      (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_PROCESS')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -88,19 +93,16 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: "📥 [PRATA] Download Bronze"
-        run: |
-          mkdir -p data_bronze
-          aws s3 sync s3://$R2_BUCKET_NAME/datalake/bronze/ data_bronze/ --endpoint-url $R2_ENDPOINT_URL
+      - name: "⚙️ Instalar Motores de Performance"
+        run: pip install boto3 polars h3 pyarrow python-calamine fsspec
 
-      - name: "🛡️ [PRATA] Processamento"
-        run: |
-          pip install boto3 polars h3 pyarrow python-calamine fsspec
-          python autobot/reg_crimes/processamento_crimes_prata.py
-          python autobot/prata/malha_geografica/malha_geo_infra_social.py
+      - name: "🛡️ [PRATA] Processamento Crimes"
+        # O script agora lê da Bronze no R2 e grava na Prata no R2
+        run: python autobot/reg_crimes/processamento_crimes_prata.py
 
-      - name: "📤 [PRATA] Upload Trusted"
-        run: aws s3 sync data_prata/ s3://$R2_BUCKET_NAME/datalake/prata/ --endpoint-url $R2_ENDPOINT_URL
+      - name: "🏗️ [PRATA] Malha Geo & Infra"
+        # Processa os CNAEs agregando por H3 para reduzir os 3GB
+        run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
   notificacao:
     needs: [camada-prata]
@@ -111,9 +113,9 @@ jobs:
         run: |
           if [ "${{ needs.camada-prata.result }}" == "success" ]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Sucesso: ${{ github.event.inputs.job }}"
+            MSG="✅ **[SafeDriver]** Pipeline finalizado: ${{ github.event.inputs.job }}"
           else
             URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Erro: ${{ github.event.inputs.job }}"
+            MSG="🚨 **[SafeDriver]** Falha no job: ${{ github.event.inputs.job }}"
           fi
           curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
