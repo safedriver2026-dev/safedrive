@@ -86,6 +86,7 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
       LGPD_SALT: ${{ secrets.LGPD_SALT }}
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }} # Inserido para o novo job da Malha
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -97,16 +98,38 @@ jobs:
       
       - name: "⚙️ Instalar Motores de Performance"
         run: |
-          # Adicionado 'requests' aqui para garantir que a Prata consiga validar arquivos se necessário
-          pip install boto3 polars h3 pyarrow python-calamine fsspec requests
+          # Adicionado 'duckdb' para o processamento espacial das faces
+          pip install boto3 polars h3 pyarrow python-calamine fsspec requests duckdb
 
       - name: "🛡️ [PRATA-A] Processamento Crimes"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
-      - name: "🏗️ [PRATA-B] Malha Geo & Infra"
+      - name: "🏗️ [PRATA-B] Malha Geo & Infra (Desacoplado)"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
-        run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
+        run: |
+          echo "⚙️ 1. Configurando Conexão R2..."
+          curl -s https://rclone.org/install.sh | sudo bash
+          cat <<EOF > rclone.conf
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          endpoint = $R2_ENDPOINT_URL
+          EOF
+          
+          echo "📁 2. Criando Doca Local..."
+          mkdir -p ./data_raw ./data_prata
+          
+          echo "📥 3. Download da Bronze (Apenas Malhas)..."
+          rclone --config ./rclone.conf copy r2:$R2_BUCKET_NAME/$BQ_PROJECT_ID/datalake/bronze/malha_raw ./data_raw -P
+          
+          echo "🧠 4. Executando Motor de Processamento (Python)..."
+          python autobot/prata/malha_geografica/malha_geo_infra_social.py
+          
+          echo "📤 5. Upload da Prata (Arquivos + Auditoria)..."
+          rclone --config ./rclone.conf copy ./data_prata r2:$R2_BUCKET_NAME/$BQ_PROJECT_ID/datalake/prata/malhas -P
 
   # --- JOB DE ORGANIZAÇÃO ---
   organizacao-r2:
