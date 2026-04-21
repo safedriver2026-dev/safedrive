@@ -12,12 +12,13 @@ import re
 import hashlib
 import csv
 import urllib.request
+import io
 from datetime import datetime
 from botocore.config import Config
 from pathlib import Path
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (MALHA TRUSTED V8)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (MALHA TRUSTED V9 - FINAL)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -30,6 +31,7 @@ class ArquitetoSafeDriverPrata:
         os.makedirs(self.prata_dir, exist_ok=True)
         os.makedirs(self.temp_dir, exist_ok=True)
         
+        # Conexão R2
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -52,11 +54,8 @@ class ArquitetoSafeDriverPrata:
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now())}
 
-    # ==========================================
-    # UTILITÁRIOS DE NORMALIZAÇÃO (SIMÉTRICO AOS CRIMES)
-    # ==========================================
     def _normalizar_texto(self, valor):
-        """Remove acentos, caracteres especiais e deixa em maiúsculo."""
+        """Padronização Universal (Sincronizada com Crimes)"""
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
             return "NAO INFORMADO"
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
@@ -88,9 +87,6 @@ class ArquitetoSafeDriverPrata:
                 f.write("[lines]\nosm_id=yes\nattributes=name,highway\n")
         return path.replace("\\", "/")
 
-    # ==========================================
-    # WORKFLOW
-    # ==========================================
     def download_r2(self):
         print("📥 Sincronizando Bronze...", flush=True)
         targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
@@ -98,6 +94,7 @@ class ArquitetoSafeDriverPrata:
         for p in pag.paginate(Bucket=self.bucket):
             for obj in p.get('Contents', []):
                 key = obj['Key']
+                # Garante que ignora prefixos antigos se existirem
                 if any(t in key for t in targets):
                     dest = os.path.join(self.bronze_dir, key.split('/')[-1])
                     if not os.path.exists(dest):
@@ -116,10 +113,7 @@ class ArquitetoSafeDriverPrata:
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OSM PBF")
             conf = self._garantir_osmconf()
 
-            sqls = []
-            for f in json_files:
-                f_path = str(f).replace("\\", "/")
-                sqls.append(f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f_path}')")
+            sqls = [f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f.replace('\\','/')}')" for f in json_files]
             
             query = f"""
                 SELECT name as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
@@ -129,7 +123,7 @@ class ArquitetoSafeDriverPrata:
             """
             df = self.con.execute(query).pl()
             
-            # Normaliza nomes de ruas
+            # Normalização de Nomes na Malha
             df = df.with_columns(pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
             
             coords = df.select(["LAT", "LON"]).unique()
@@ -149,7 +143,6 @@ class ArquitetoSafeDriverPrata:
             enc, sep = self._analisar_csv_dinamicamente(csv_f)
             df = pl.read_csv(csv_f, separator=sep, encoding=enc, null_values=["."], infer_schema_length=10000).filter(pl.col("CD_SETOR").cast(pl.Utf8).str.starts_with("35"))
             
-            # Normaliza Municipio e Bairro do Censo
             df = df.with_columns([
                 pl.col("NM_MUN").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
                 pl.col("NM_BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
@@ -188,12 +181,12 @@ class ArquitetoSafeDriverPrata:
 
             df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
             df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
-            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos processados"
+            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos"
             
         except Exception as e: self.auditoria["INFRA"] = str(e)
 
     def finalizar(self):
-        # CAMINHO IGUAL AO DE CRIMES: Subpasta malha_trusted dentro da Prata
+        # FIX: Endereçamento direto, removendo prefixo de projeto
         r2_dest_path = "datalake/prata/malha_trusted"
         
         with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: 
@@ -203,6 +196,7 @@ class ArquitetoSafeDriverPrata:
         for f in os.listdir(self.prata_dir):
             if f.endswith((".parquet", ".json")):
                 local_file = os.path.join(self.prata_dir, f)
+                # Garante que o caminho no R2 seja limpo
                 remote_file = f"{r2_dest_path}/{f}"
                 self.s3.upload_file(local_file, self.bucket, remote_file)
         
