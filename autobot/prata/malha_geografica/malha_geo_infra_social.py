@@ -17,7 +17,7 @@ from botocore.config import Config
 from pathlib import Path
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (MALHA TRUSTED ENGINE)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (MALHA TRUSTED V7)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -42,7 +42,7 @@ class ArquitetoSafeDriverPrata:
             config=Config(signature_version='s3v4', retries={'max_attempts': 3})
         )
 
-        # Configuração DuckDB Engine
+        # Configuração DuckDB (4GB RAM)
         self.con = duckdb.connect(database=':memory:')
         self.con.execute(f"PRAGMA memory_limit='4GB';")
         self.con.execute(f"PRAGMA temp_directory='{self.temp_dir}';")
@@ -53,9 +53,6 @@ class ArquitetoSafeDriverPrata:
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now())}
 
-    # ==========================================
-    # UTILITÁRIOS
-    # ==========================================
     def _buscar_arquivo_seguro(self, padrao, nome):
         arqs = glob.glob(f"{self.bronze_dir}/**/{padrao}", recursive=True)
         if not arqs: raise FileNotFoundError(f"⚠️ {nome} ({padrao}) ausente!")
@@ -82,11 +79,8 @@ class ArquitetoSafeDriverPrata:
                 f.write("[lines]\nosm_id=yes\nattributes=name,highway\n")
         return path.replace("\\", "/")
 
-    # ==========================================
-    # WORKFLOW PRINCIPAL
-    # ==========================================
     def download_r2(self):
-        print("📥 Sincronizando Bronze para Processamento...", flush=True)
+        print("📥 Sincronizando Bronze...", flush=True)
         targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
@@ -96,7 +90,7 @@ class ArquitetoSafeDriverPrata:
                     dest = os.path.join(self.bronze_dir, key.split('/')[-1])
                     if not os.path.exists(dest):
                         self.s3.download_file(self.bucket, key, dest)
-        print("✅ Sincronização concluída.", flush=True)
+        print("✅ Bronze carregada.", flush=True)
 
     def processar(self):
         # 1. GEO (IBGE + OSM)
@@ -110,7 +104,6 @@ class ArquitetoSafeDriverPrata:
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OSM PBF")
             conf = self._garantir_osmconf()
 
-            # Evita erro de backslash em f-string (Python < 3.12)
             sqls = []
             for f in json_files:
                 f_path = str(f).replace("\\", "/")
@@ -124,7 +117,6 @@ class ArquitetoSafeDriverPrata:
             """
             df = self.con.execute(query).pl()
             
-            # Mapeamento H3 L9
             coords = df.select(["LAT", "LON"]).unique()
             coords = coords.with_columns(pl.struct(["LAT", "LON"]).map_batches(
                 lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])
@@ -147,26 +139,19 @@ class ArquitetoSafeDriverPrata:
         except Exception as e: self.auditoria["SOCIAL"] = str(e)
 
         # 3. INFRA (Agregada por H3)
-        print("🏗️ Malha Infra (Consolidando Empresas por Setor)...", flush=True)
+        print("🏗️ Malha Infra (Agregada via Streaming)...", flush=True)
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             lf = pl.scan_parquet(pqs)
             
-            # Identificação dinâmica de colunas (cnpj vs id_protegido)
             schema = lf.collect_schema().names()
             colunas_infra = [c for c in ["lat", "lon", "cnae_fiscal_principal"] if c in schema]
             
             lf = lf.select(colunas_infra).filter(pl.col("lat").is_not_null())
-            
-            # Agrupamento por Setor Econômico (CNAE Divisão)
-            lf = lf.with_columns(
-                pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")
-            )
+            lf = lf.with_columns(pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV"))
 
-            # Redução Massiva via Streaming
             df_reduced = lf.group_by(["lat", "lon", "CNAE_DIV"]).len().collect(engine="streaming")
 
-            # Indexação H3
             unique_coords = df_reduced.select(["lat", "lon"]).unique()
             unique_coords = unique_coords.with_columns(
                 pl.struct(["lat", "lon"]).map_batches(
@@ -174,38 +159,32 @@ class ArquitetoSafeDriverPrata:
                 ).alias("H3_INDEX")
             )
             
-            # Pivot Final: Transforma linhas de comércio em colunas de features
             df_infra = df_reduced.join(unique_coords, on=["lat", "lon"])
             df_pivot = df_infra.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("len").alias("TOTAL")) \
                                .pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV") \
                                .fill_null(0)
 
-            # Padronização de nomes das colunas de Infra
             df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
-
             df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
-            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos processados"
+            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos"
             
-        except Exception as e: self.auditoria["INFRA"] = f"ERRO: {str(e)}"
+        except Exception as e: self.auditoria["INFRA"] = str(e)
 
     def finalizar(self):
-        projeto = os.getenv("BQ_PROJECT_ID", "safedriver").strip()
-        # DESTINO REQUISITADO: malha_trusted
-        r2_dest_path = f"{projeto}/datalake/prata/malha_trusted"
+        # DESTINO CORRIGIDO: daltalake/prata/malha_trusted (Simétrico à Bronze)
+        r2_dest_path = "datalake/prata/malha_trusted"
         
-        # Auditoria Final
         with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: 
             json.dump(self.auditoria, f, indent=4)
         
-        print(f"📤 Subindo arquivos processados para {r2_dest_path}...", flush=True)
+        print(f"📤 Exportando para R2: {r2_dest_path}...", flush=True)
         for f in os.listdir(self.prata_dir):
             if f.endswith((".parquet", ".json")):
                 local_file = os.path.join(self.prata_dir, f)
                 remote_file = f"{r2_dest_path}/{f}"
                 self.s3.upload_file(local_file, self.bucket, remote_file)
         
-        print("\n📊 PIPELINE PRATA FINALIZADO COM SUCESSO!", flush=True)
-        print(json.dumps(self.auditoria, indent=4))
+        print("\n📊 PIPELINE FINALIZADO:", json.dumps(self.auditoria, indent=4), flush=True)
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverPrata()
