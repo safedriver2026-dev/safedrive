@@ -49,7 +49,11 @@ class IngestorSafeDriver:
         self.ano_atual = datetime.now().year
 
     def _inicializar_s3(self):
+        # FIX: Limpeza idêntica à malha para não duplicar o bucket no R2
         endpoint = self.config.ENDPOINT_URL.strip().rstrip('/')
+        if endpoint.endswith(f"/{self.config.NOME_BUCKET}"):
+            endpoint = endpoint[: -len(f"/{self.config.NOME_BUCKET}")]
+            
         return boto3.client(
             's3',
             endpoint_url=endpoint,
@@ -87,8 +91,8 @@ class IngestorSafeDriver:
         return mapeamento
 
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
-        # 1. Normalização das Colunas de Texto (Municipio, Bairro, Rubrica, etc)
-        colunas_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO", "LOGRADOURO"]]
+        # FIX: LOGRADOURO incluído na normalização de texto para que o Join com a Ouro funcione perfeitamente
+        colunas_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO"]]
         
         for col in colunas_texto:
             df = df.with_columns(
@@ -166,14 +170,13 @@ class IngestorSafeDriver:
 
             df_final = pl.concat(list_dfs, how="diagonal")
             
-            # APLICA NORMALIZAÇÃO (MAIÚSCULO E SEM ACENTO)
+            # APLICA NORMALIZAÇÃO (MAIÚSCULO E SEM ACENTO PARA TUDO, INCLUINDO LOGRADOURO)
             df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD (Hash) - Normalizamos o Logradouro ANTES do hash para bater sempre
+            # FIX: Apenas o BO recebe hash para anonimização (LGPD). A rua permanece em texto claro para geocoding!
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
-                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
-                pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{self._normalizar_texto(v)}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
+                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
             ])
 
             # H3
