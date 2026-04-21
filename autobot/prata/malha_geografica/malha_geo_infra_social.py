@@ -25,6 +25,7 @@ class ArquitetoSafeDriverPrata:
         os.makedirs(self.bronze_dir, exist_ok=True)
         os.makedirs(self.prata_dir, exist_ok=True)
         
+        # Conexão Boto3 Blindada
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -39,6 +40,7 @@ class ArquitetoSafeDriverPrata:
 
         self.pepper = os.getenv("LGPD_PEPPER", "safedriver_seguranca_padrao_2026").strip()
         
+        # Conexão DuckDB (Usada apenas para ler a geometria espacial do SP_Faces e do OSM PBF)
         self.con = duckdb.connect(database=':memory:')
         self.con.execute("INSTALL spatial; LOAD spatial;")
         
@@ -48,6 +50,7 @@ class ArquitetoSafeDriverPrata:
     # MOTORES DE PERFORMANCE, LIMPEZA E IA
     # ==========================================
     def aplicar_lgpd(self, df: pl.DataFrame, colunas_sensiveis: list) -> pl.DataFrame:
+        """Aplica Hash SHA-256 irreversível com Pepper em colunas sensíveis (ex: Razões Sociais com CPF)."""
         colunas_presentes = [c for c in colunas_sensiveis if c in df.columns]
         if not colunas_presentes: return df
             
@@ -60,15 +63,18 @@ class ArquitetoSafeDriverPrata:
         return df.with_columns(exprs)
 
     def _normalizar(self, valor):
+        """Motor base que arranca acentos e deixa maiúsculo."""
         if not valor or str(valor).upper() in ["NULL", "NAN", "."]: return "NAO INFORMADO"
         t = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
         return re.sub(r'[^a-zA-Z0-9\s]', '', t).upper().strip()
 
     def normalizar_strings_global(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Encontra TODAS as colunas de texto e aplica a limpeza de forma otimizada."""
         string_cols = df.select(cs.string()).columns
         if not string_cols: return df
         
         print(f"   🧹 [Limpeza] Normalizando textos para Maiúsculas e sem acento: {string_cols}", flush=True)
+        
         for col in string_cols:
             unique_df = df.select(pl.col(col).unique().alias(col)).drop_nulls()
             mapped_df = unique_df.with_columns(
@@ -81,6 +87,7 @@ class ArquitetoSafeDriverPrata:
         return df
 
     def aplicar_h3_otimizado(self, df: pl.DataFrame, lat_col="lat", lon_col="lon") -> pl.DataFrame:
+        """Calcula o H3 utilizando a técnica de Otimização de Coordenadas Únicas."""
         print("   📍 [H3] Calculando malha hexagonal (Modo Otimizado)...", flush=True)
         coords_unicas = df.select([lat_col, lon_col]).drop_nulls().unique()
         
@@ -103,7 +110,6 @@ class ArquitetoSafeDriverPrata:
 
         aggs = []
         for col in string_cols:
-            # Encontra a 'Moda' (valor mais comum) no hexágono ignorando os nulos
             moda = (pl.col(col)
                     .filter((pl.col(col).is_not_null()) & (pl.col(col) != "NAO INFORMADO"))
                     .mode()
@@ -111,10 +117,7 @@ class ArquitetoSafeDriverPrata:
                     .alias(f"{col}_INFERIDO"))
             aggs.append(moda)
 
-        # Cria um dicionário de conhecimentos do H3
         dict_h3 = df.group_by("H3_INDEX").agg(aggs)
-        
-        # Junta com os dados e substitui os "NAO INFORMADOS" pela dedução da inteligência
         df = df.join(dict_h3, on="H3_INDEX", how="left")
 
         exprs = []
@@ -123,7 +126,7 @@ class ArquitetoSafeDriverPrata:
                 pl.when((pl.col(col).is_null()) | (pl.col(col) == "NAO INFORMADO"))
                 .then(pl.col(f"{col}_INFERIDO"))
                 .otherwise(pl.col(col))
-                .fill_null("NAO INFORMADO") # Fallback de segurança
+                .fill_null("NAO INFORMADO")
                 .alias(col)
             )
 
@@ -166,6 +169,13 @@ class ArquitetoSafeDriverPrata:
         try:
             zip_f = glob.glob(f"{self.bronze_dir}/**/SP_Faces_2022.zip", recursive=True)[0]
             with zipfile.ZipFile(zip_f, 'r') as z: z.extractall(self.bronze_dir)
+            
+            # --- CORREÇÃO DO PATH DO IBGE ---
+            json_files = glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True)
+            if not json_files:
+                raise FileNotFoundError("Não foi possível encontrar o ficheiro .json do IBGE após extrair o ZIP!")
+            arquivo_ibge_faces = json_files[0]
+            
             osm_pbf = glob.glob(f"{self.bronze_dir}/**/sp-latest.osm.pbf", recursive=True)[0]
             
             # --- CORREÇÃO DO OSMCONF.INI ---
@@ -174,7 +184,7 @@ class ArquitetoSafeDriverPrata:
                 print("   ⚙️ Baixando driver de tradução do OSM (osmconf.ini)...", flush=True)
                 urllib.request.urlretrieve("https://raw.githubusercontent.com/OSGeo/gdal/master/ogr/ogrsf_frmts/osm/data/osmconf.ini", osmconf_path)
             
-            # Trazendo RUA, MUNICIPIO e BAIRRO
+            # Trazendo RUA, MUNICIPIO e BAIRRO usando o caminho exato para o IBGE
             query = f"""
                 SELECT 
                     CAST(osm_id AS VARCHAR) as CD_FACE,
@@ -195,7 +205,7 @@ class ArquitetoSafeDriverPrata:
                     CAST(NM_BAIRRO AS VARCHAR) as NM_BAIRRO,
                     CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, 
                     CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
-                FROM ST_Read('{self.bronze_dir}/**/*.json')
+                FROM ST_Read('{arquivo_ibge_faces}')
                 WHERE NM_LOG IS NOT NULL
             """
             df = self.con.execute(query).pl()
@@ -204,7 +214,6 @@ class ArquitetoSafeDriverPrata:
             df = self.aplicar_h3_otimizado(df, lat_col="LAT", lon_col="LON")
             
             # --- APLICANDO A IA DE CONTEXTO ---
-            # Preenche Bairro e Município (especialmente do OSM) baseando-se no H3
             df = self.completar_por_vizinhanca_h3(df, ["NM_MUN", "NM_BAIRRO"])
             
             df = df.unique(subset=["RUA", "H3_INDEX"])
