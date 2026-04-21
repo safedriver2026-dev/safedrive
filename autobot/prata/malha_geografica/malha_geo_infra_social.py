@@ -2,7 +2,6 @@ import os
 import boto3
 import duckdb
 import polars as pl
-import polars.selectors as cs
 import h3
 import unicodedata
 import zipfile
@@ -11,7 +10,6 @@ import glob
 import re
 import hashlib
 import csv
-import urllib.request
 from datetime import datetime
 from botocore.config import Config
 from pathlib import Path
@@ -95,7 +93,7 @@ class ArquitetoSafeDriverPrata:
         print("Bronze carregada.", flush=True)
 
     def processar(self):
-        print("Processando Malha Geografica e Micro-Populacao...", flush=True)
+        print("Processando Malha Geografica Hierarquica e Micro-Populacao...", flush=True)
         try:
             zip_f = self._buscar_arquivo_seguro("SP_Faces_2022.zip", "IBGE Faces")
             if not glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True):
@@ -105,50 +103,95 @@ class ArquitetoSafeDriverPrata:
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OSM PBF")
             conf = self._garantir_osmconf()
 
+            # 1. Captura de dados mantendo a hierarquia Cidade > Bairro > Rua
             sqls = []
             for f in json_files:
                 f_path = str(f).replace("\\", "/")
-                sqls.append(f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON, TRY_CAST(TOT_RES AS FLOAT) as TOT_RES FROM ST_Read('{f_path}')")
+                # No IBGE Faces, buscamos a hierarquia completa
+                sqls.append(f"""
+                    SELECT 
+                        COALESCE(NM_MUN, 'NAO INFORMADO') as CIDADE,
+                        COALESCE(NM_BAIRRO, 'NAO INFORMADO') as BAIRRO,
+                        trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, 
+                        CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, 
+                        CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON, 
+                        TRY_CAST(TOT_RES AS FLOAT) as TOT_RES 
+                    FROM ST_Read('{f_path}')
+                """)
             
+            # Query consolidada (OSM entra como 'NAO INFORMADO' para Bairro/Cidade pois exige join espacial)
             query = f"""
-                SELECT name as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON, 0.0 as TOT_RES
+                SELECT 'NAO INFORMADO' as CIDADE, 'NAO INFORMADO' as BAIRRO, name as RUA, 
+                       CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, 
+                       CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON, 0.0 as TOT_RES
                 FROM ST_Read('{osm_pbf}', layer='lines', open_options=['CONFIG_FILE={conf}', 'INTERLEAVED_READING=YES']) 
                 WHERE highway IS NOT NULL AND name IS NOT NULL
                 UNION ALL {" UNION ALL ".join(sqls)}
             """
             df = self.con.execute(query).pl()
             
-            df = df.with_columns(pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
+            # Normalização de texto para as chaves da hierarquia
+            df = df.with_columns([
+                pl.col("CIDADE").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
+                pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
+                pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
+            ])
             
-            coords = df.select(["LAT", "LON"]).unique()
-            coords = coords.with_columns(pl.struct(["LAT", "LON"]).map_batches(
-                lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])
-            ).alias("H3_INDEX"))
+            # Geração dos índices H3
+            df = df.with_columns(
+                pl.struct(["LAT", "LON"]).map_batches(
+                    lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])
+                ).alias("H3_INDEX")
+            )
             
-            df = df.join(coords, on=["LAT", "LON"], how="left")
-            
-            df_vias = df.select(["RUA", "H3_INDEX"]).unique()
-            df_vias.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
+            # --- CONSTRUÇÃO DA MALHA HIERÁRQUICA ---
+            # Agrupamos H3s únicos por Rua, depois aninhamos Ruas em Bairros e Bairros em Cidades
+            df_vias_hierarquico = (
+                df.group_by(["CIDADE", "BAIRRO", "RUA"])
+                .agg(pl.col("H3_INDEX").unique().alias("H3_LIST"))
+                .group_by(["CIDADE", "BAIRRO"])
+                .agg(
+                    pl.struct([
+                        pl.col("RUA"),
+                        pl.col("H3_LIST")
+                    ]).alias("LOGRADOUROS")
+                )
+                .group_by("CIDADE")
+                .agg(
+                    pl.struct([
+                        pl.col("BAIRRO"),
+                        pl.col("LOGRADOUROS")
+                    ]).alias("BAIRROS")
+                )
+            )
 
+            # Salvando a malha mestre hierárquica
+            df_vias_hierarquico.write_parquet(
+                f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", 
+                compression="zstd"
+            )
+
+            # Salvando Micro-População em formato flat (essencial para join direto via H3 na Ouro)
             df_micro_pop = df.group_by("H3_INDEX").agg(pl.sum("TOT_RES").fill_null(0).alias("MICRO_POPULACAO_H3"))
             df_micro_pop.write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet", compression="zstd")
 
-            self.auditoria["GEO_E_MICROPOP"] = "OK"
-        except Exception as e: self.auditoria["GEO_E_MICROPOP"] = str(e)
+            self.auditoria["MALHA_GEOGRAFICA"] = "OK - HIERARQUICA"
+        except Exception as e: 
+            self.auditoria["MALHA_GEOGRAFICA"] = str(e)
+            print(f"Erro no processamento da malha: {e}")
 
+        # --- PROCESSAMENTO SOCIAL E INFRA (Mantido conforme original) ---
         print("Processando Malha Social Macro...", flush=True)
         try:
             csv_f = self._buscar_arquivo_seguro("Agregados_por_setores_basico*.csv", "Censo")
             enc, sep = self._analisar_csv_dinamicamente(csv_f)
-            df = pl.read_csv(csv_f, separator=sep, encoding=enc, null_values=["."], infer_schema_length=10000).filter(pl.col("CD_SETOR").cast(pl.Utf8).str.starts_with("35"))
-            
-            df = df.with_columns([
+            df_social = pl.read_csv(csv_f, separator=sep, encoding=enc, null_values=["."], infer_schema_length=10000).filter(pl.col("CD_SETOR").cast(pl.Utf8).str.starts_with("35"))
+            df_social = df_social.with_columns([
                 pl.col("NM_MUN").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
                 pl.col("NM_BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
             ])
-            
-            df = df.select([c for c in ["CD_SETOR", "NM_MUN", "NM_BAIRRO", "v0001", "v0002"] if c in df.columns])
-            df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet", compression="zstd")
+            df_social = df_social.select([c for c in ["CD_SETOR", "NM_MUN", "NM_BAIRRO", "v0001", "v0002"] if c in df_social.columns])
+            df_social.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet", compression="zstd")
             self.auditoria["SOCIAL_MACRO"] = "OK"
         except Exception as e: self.auditoria["SOCIAL_MACRO"] = str(e)
 
@@ -156,46 +199,30 @@ class ArquitetoSafeDriverPrata:
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             lf = pl.scan_parquet(pqs)
-            
-            schema = lf.collect_schema().names()
-            colunas_infra = [c for c in ["lat", "lon", "cnae_fiscal_principal"] if c in schema]
-            
-            lf = lf.select(colunas_infra).filter(pl.col("lat").is_not_null())
+            lf = lf.select([c for c in ["lat", "lon", "cnae_fiscal_principal"] if c in lf.collect_schema().names()]).filter(pl.col("lat").is_not_null())
             lf = lf.with_columns(pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV"))
-
             df_reduced = lf.group_by(["lat", "lon", "CNAE_DIV"]).len().collect(engine="streaming")
-
-            unique_coords = df_reduced.select(["lat", "lon"]).unique()
-            unique_coords = unique_coords.with_columns(
+            
+            unique_coords = df_reduced.select(["lat", "lon"]).unique().with_columns(
                 pl.struct(["lat", "lon"]).map_batches(
                     lambda s: pl.Series([h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s])
                 ).alias("H3_INDEX")
             )
-            
-            df_infra = df_reduced.join(unique_coords, on=["lat", "lon"])
-            df_pivot = df_infra.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("len").alias("TOTAL")) \
-                               .pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV") \
-                               .fill_null(0)
-
+            df_pivot = df_reduced.join(unique_coords, on=["lat", "lon"]).group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("len").alias("TOTAL")).pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV").fill_null(0)
             df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
             df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
-            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexagonos processados"
-            
+            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexagonos"
         except Exception as e: self.auditoria["INFRA"] = str(e)
 
     def finalizar(self):
         r2_dest_path = "datalake/prata/malha_trusted"
-        
         with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: 
             json.dump(self.auditoria, f, indent=4)
         
-        print(f"Exportando Malha Trusted para R2: {r2_dest_path}...", flush=True)
+        print(f"Exportando Malha Trusted para R2...", flush=True)
         for f in os.listdir(self.prata_dir):
             if f.endswith((".parquet", ".json")):
-                local_file = os.path.join(self.prata_dir, f)
-                remote_file = f"{r2_dest_path}/{f}"
-                self.s3.upload_file(local_file, self.bucket, remote_file)
-        
+                self.s3.upload_file(os.path.join(self.prata_dir, f), self.bucket, f"{r2_dest_path}/{f}")
         print("Pipeline Prata Finalizado!", flush=True)
 
 if __name__ == "__main__":
