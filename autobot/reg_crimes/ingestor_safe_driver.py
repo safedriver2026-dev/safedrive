@@ -4,6 +4,7 @@ import requests
 import logging
 import io
 import time
+import sys
 import polars as pl
 import h3
 import hashlib
@@ -61,56 +62,37 @@ class IngestorSafeDriver:
             return h3.latlng_to_cell(lat, lon, self.config.RESOLUCAO_H3)
         except: return None
 
-    # --- ETAPA 1: BRONZE (INGESTÃO PURA) ---
-    def extrair_bronze(self, ano: int, max_tentativas: int = 0):
-        """
-        Baixa o arquivo da SSP e salva 'as-is' no R2.
-        max_tentativas = 0 significa infinito.
-        """
+    # --- ETAPA 1: BRONZE (DOWNLOAD RESILIENTE) ---
+    def extrair_bronze(self, ano: int):
         url = self.config.URL_BASE_SSP.format(ano=ano)
         path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         tentativa = 1
 
         while True:
             try:
-                logger.info(f"🚀 [{ano}] Tentativa {tentativa}: Baixando...")
-                res = requests.get(url, timeout=600) # Timeout alto para arquivos grandes
-                
+                logger.info(f"🚀 [BRONZE] {ano} - Tentativa {tentativa}")
+                res = requests.get(url, timeout=600)
                 if res.status_code == 200:
-                    self.s3.put_object(
-                        Bucket=self.config.NOME_BUCKET, 
-                        Key=path_bronze, 
-                        Body=res.content
-                    )
-                    logger.info(f"✅ [{ano}] Bronze salva com sucesso no R2.")
+                    self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze, Body=res.content)
+                    logger.info(f"✅ [BRONZE] {ano} salva no R2.")
                     break
-                else:
-                    logger.warning(f"⚠️ [{ano}] Erro HTTP {res.status_code}. Re-tentando em 30s...")
-            
+                logger.warning(f"⚠️ [BRONZE] Status {res.status_code}. Re-tentando...")
             except Exception as e:
-                logger.error(f"❌ [{ano}] Falha na conexão: {e}. Re-tentando...")
-            
-            if 0 < max_tentativas <= tentativa:
-                logger.error(f"🛑 [{ano}] Limite de tentativas atingido.")
-                break
+                logger.error(f"❌ [BRONZE] Falha: {e}")
             
             tentativa += 1
-            time.sleep(30)
+            time.sleep(20)
 
-    # --- ETAPA 2: PRATA (TRANSFORMAÇÃO) ---
+    # --- ETAPA 2: PRATA (TRANSFORMAÇÃO INDEPENDENTE) ---
     def processar_prata(self, ano: int):
-        """
-        Lê o arquivo da Bronze no R2, processa e salva na Prata em Parquet.
-        """
         path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_prata = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
 
         try:
-            logger.info(f"🥈 [{ano}] Lendo Bronze do R2 para processamento...")
+            logger.info(f"🥈 [PRATA] Lendo Bronze {ano} do R2...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze)
             bytes_excel = obj['Body'].read()
 
-            # Processamento Polars
             fluxo = io.BytesIO(bytes_excel)
             dfs = []
             for aba in range(1, 4):
@@ -122,18 +104,15 @@ class IngestorSafeDriver:
                     dfs.append(df)
                 except: continue
 
-            if not dfs:
-                logger.error(f"❌ [{ano}] Nenhuma aba válida encontrada no Excel.")
-                return
+            if not dfs: return
 
             df_final = pl.concat(dfs, how="diagonal")
-
-            # Tratamento Geográfico e LGPD
             df_final = df_final.with_columns([
                 pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0),
                 pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0.0)
             ])
 
+            # LGPD e H3
             df_final = df_final.with_columns(
                 pl.struct(["LOGRADOURO", "NUM_BO"]).map_elements(
                     lambda x: self._gerar_hash_lgpd(x["LOGRADOURO"], x["NUM_BO"]),
@@ -141,27 +120,31 @@ class IngestorSafeDriver:
                 ).alias("HASH_LOCAL_UNICO")
             ).drop(["LOGRADOURO", "NUM_BO"])
 
-            # Cálculo de H3 Otimizado
             geo_map = df_final.select(["LATITUDE", "LONGITUDE"]).unique().to_dicts()
             for d in geo_map:
                 d["H3_INDEX"] = self._calcular_h3(d["LATITUDE"], d["LONGITUDE"])
             
             df_trusted = df_final.join(pl.DataFrame(geo_map), on=["LATITUDE", "LONGITUDE"], how="left")
 
-            # Escrita na Prata
             buffer = io.BytesIO()
             df_trusted.write_parquet(buffer, compression="lz4")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_prata, Body=buffer.getvalue())
-            logger.info(f"✨ [{ano}] Prata gerada e salva com sucesso.")
+            logger.info(f"✨ [PRATA] {ano} finalizada.")
 
         except Exception as e:
-            logger.error(f"❌ [{ano}] Erro ao processar Prata: {e}")
+            logger.error(f"❌ [PRATA] Erro no ano {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     
-    # Exemplo: Rodar Bronze e Prata para os últimos anos
-    for ano in [2024, 2025, 2026]:
-        # Você pode comentar uma das linhas abaixo se quiser rodar só uma etapa
-        ingestor.extrair_bronze(ano) 
-        ingestor.processar_prata(ano)
+    # Gerenciamento via argumento de linha de comando
+    # Uso: python script.py bronze | prata | tudo
+    modo = sys.argv[1].lower() if len(sys.argv) > 1 else "tudo"
+    anos = [2024, 2025, 2026]
+
+    for ano in anos:
+        if modo in ["bronze", "tudo"]:
+            ingestor.extrair_bronze(ano)
+        
+        if modo in ["prata", "tudo"]:
+            ingestor.processar_prata(ano)
