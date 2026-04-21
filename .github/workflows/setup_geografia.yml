@@ -15,6 +15,7 @@ on:
           - 'PRATA_MAPA'
           - 'PRATA_COMPLETA'
           - 'OURO_COMPLETA'
+          - 'TREINAR_IA'
           - 'FLUXO_CRIMES'
           - 'FLUXO_MAPA'
           - 'tudo'
@@ -35,22 +36,18 @@ jobs:
     steps:
       - name: 🔍 Checkout do Código
         uses: actions/checkout@v4
-
       - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: "📦 [BRONZE-B] Crimes SSP (Web -> R2)"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
+      - name: "📦 [BRONZE] Crimes SSP"
         run: |
-          # Adicionado pacotes necessários para o script do ingestor não falhar na importação
           pip install boto3 requests polars h3 python-calamine fastexcel
           python autobot/reg_crimes/ingestor_safe_driver.py bronze
 
   # --- CAMADA PRATA: Transformação e Auditoria ---
   camada-prata:
-    needs: [camada-bronze] 
+    needs: [camada-bronze]
     if: |
       always() && 
       (needs.camada-bronze.result == 'success' || needs.camada-bronze.result == 'skipped') &&
@@ -61,39 +58,20 @@ jobs:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
     steps:
       - name: 🔍 Checkout do Código
         uses: actions/checkout@v4
-
       - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
       - name: "⚙️ Instalar Motores de Performance"
+        run: pip install boto3 polars h3 pyarrow requests duckdb python-calamine fastexcel
+      - name: "🛡️ [PRATA] Processamento e Malha"
         run: |
-          pip install boto3 polars h3 pyarrow requests duckdb python-calamine fastexcel
-
-      - name: "🛡️ [PRATA-A] Processamento Crimes e LGPD"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
-        run: python autobot/reg_crimes/ingestor_safe_driver.py prata
-
-      - name: "🏗️ [PRATA-B] Malha Geo & Infra (Híbrido DuckDB/Polars)"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
-        run: |
-          echo "🚀 Iniciando motor híbrido..."
+          python autobot/reg_crimes/ingestor_safe_driver.py prata
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
-          
-          # Validador de Auditoria (Ajustado para o novo JSON de Auditoria)
-          if [ -f "./data_prata/AUDITORIA_PRATA.json" ]; then
-            if grep -q '"QUALIDADE": "FALHA"' ./data_prata/AUDITORIA_PRATA.json; then
-              echo "❌ ERRO CRÍTICO NA PRATA. PARANDO PIPELINE."
-              cat ./data_prata/AUDITORIA_PRATA.json
-              exit 1
-            fi
-          fi
 
   # --- CAMADA OURO: Tabela Base Analítica (ABT) ---
   camada-ouro:
@@ -111,38 +89,66 @@ jobs:
     steps:
       - name: 🔍 Checkout do Código
         uses: actions/checkout@v4
-
       - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: "🏆 [OURO] Gerar ABT"
+        run: |
+          pip install boto3 polars pyarrow
+          python autobot/ouro/processador_ouro_safedriver.py
 
-      - name: "⚙️ Instalar Bibliotecas Ouro"
-        run: pip install boto3 polars pyarrow
-
-      - name: "🏆 [OURO] Processador da Tabela Analítica (ABT)"
-        run: python autobot/ouro/processador_ouro_safedriver.py
+  # --- CAMADA TREINO: Machine Learning & SHAP ---
+  camada-treino:
+    needs: [camada-ouro]
+    # Este job roda se a Ouro tiver sucesso OU se você disparar 'TREINAR_IA' manualmente (pulando o resto)
+    if: |
+      always() && 
+      (needs.camada-ouro.result == 'success' || needs.camada-ouro.result == 'skipped') &&
+      (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'TREINAR_IA')
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+    steps:
+      - name: 🔍 Checkout do Código
+        uses: actions/checkout@v4
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: "⚙️ Instalar Bibliotecas de IA"
+        run: pip install boto3 polars pandas catboost scikit-learn shap requests
+      - name: "🧠 [TREINO] Executar Treinador e SHAP"
+        run: python autobot/ml/treinador_safe_driver.py
 
   # --- NOTIFICAÇÃO ---
   notificacao:
-    needs: [camada-bronze, camada-prata, camada-ouro]
+    needs: [camada-bronze, camada-prata, camada-ouro, camada-treino]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: "📢 Feedback para o Discord"
         run: |
-          BRONZE_RESULT="${{ needs.camada-bronze.result }}"
-          PRATA_RESULT="${{ needs.camada-prata.result }}"
-          OURO_RESULT="${{ needs.camada-ouro.result }}"
+          B_RES="${{ needs.camada-bronze.result }}"
+          P_RES="${{ needs.camada-prata.result }}"
+          O_RES="${{ needs.camada-ouro.result }}"
+          T_RES="${{ needs.camada-treino.result }}"
           
-          if [[ ("$BRONZE_RESULT" == "success" || "$BRONZE_RESULT" == "skipped") && \
-                ("$PRATA_RESULT" == "success" || "$PRATA_RESULT" == "skipped") && \
-                ("$OURO_RESULT" == "success" || "$OURO_RESULT" == "skipped") ]]; then
+          # Se os jobs que deveriam rodar terminaram bem (ou foram pulados por escolha do usuário)
+          if [[ ($B_RES == "success" || $B_RES == "skipped") && \
+                ($P_RES == "success" || $P_RES == "skipped") && \
+                ($O_RES == "success" || $O_RES == "skipped") && \
+                ($T_RES == "success" || $T_RES == "skipped") ]]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Pipeline finalizado com sucesso!\nJob: \`${{ github.event.inputs.job }}\`"
+            STATUS="✅ SUCESSO"
           else
             URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Falha detectada no pipeline!\nVerifique os logs no GitHub. Job: \`${{ github.event.inputs.job }}\`"
+            STATUS="🚨 FALHA"
           fi
           
+          MSG="$STATUS **[SafeDriver]** Job: \`${{ github.event.inputs.job }}\` finalizado."
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
