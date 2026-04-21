@@ -86,7 +86,7 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
       LGPD_SALT: ${{ secrets.LGPD_SALT }}
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }} # Variável essencial para a Opção B
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -121,15 +121,16 @@ jobs:
           echo "📁 2. Criando Doca Local..."
           mkdir -p ./data_raw ./data_prata
           
-          echo "📥 3. Download da Bronze (Apenas Malhas)..."
-          # Opção B: Rclone aponta para a pasta do projeto (BQ_PROJECT_ID)
-          rclone --config ./rclone.conf copy r2:$R2_BUCKET_NAME/$BQ_PROJECT_ID/datalake/bronze/malha_raw ./data_raw -P
+          echo "🔎 3. Diagnosticando o Bucket (Primeiros 15 arquivos)..."
+          rclone ls r2:$R2_BUCKET_NAME/ | head -n 15
           
-          echo "🧠 4. Executando Motor de Processamento (Python)..."
+          echo "📥 4. Download Inteligente (Busca Wildcard em todo o Bucket)..."
+          rclone --config ./rclone.conf copy r2:$R2_BUCKET_NAME/ ./data_raw --include "**/SP_Faces_2022.zip" --include "**/Agregados_por_setores_basico*.csv" --include "**/CNPJ_SP_HISTORICO_LOTE_*.parquet" -P
+          
+          echo "🧠 5. Executando Motor de Processamento (Python)..."
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
           
-          echo "📤 5. Upload da Prata (Arquivos + Auditoria)..."
-          # Opção B: Upload feito também para dentro da pasta do projeto
+          echo "📤 6. Upload da Prata (Arquivos + Auditoria)..."
           rclone --config ./rclone.conf copy ./data_prata r2:$R2_BUCKET_NAME/$BQ_PROJECT_ID/datalake/prata/malhas -P
 
   # --- JOB DE ORGANIZAÇÃO ---
