@@ -47,7 +47,9 @@ class ArquitetoSafeDriverOuro:
 
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
-            obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
+            obj['Key'] 
+            for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
+            for obj in p.get('Contents', []) 
             if obj['Key'].endswith('.parquet')
         ]
             
