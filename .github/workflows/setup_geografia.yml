@@ -15,8 +15,9 @@ on:
           - 'PRATA_CRIMES'
           - 'PRATA_MAPA'
           - 'PRATA_COMPLETA'
-          - 'FLUXO_CRIMES'    # <--- NOVO: Bronze + Prata de Crimes
-          - 'FLUXO_MAPA'      # <--- NOVO: Bronze + Prata de Mapa/Receita
+          - 'FLUXO_CRIMES'
+          - 'FLUXO_MAPA'
+          - 'MIGRACAO_ESPREMER_R2'  # <--- NOVO: Roda o agregador de pequenos arquivos
           - 'tudo'
 
 jobs:
@@ -105,15 +106,40 @@ jobs:
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
+  # --- JOB DE MANUTENÇÃO: Agregar e Comprimir R2 ---
+  migracao-r2:
+    if: github.event.inputs.job == 'MIGRACAO_ESPREMER_R2'
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - name: 🔍 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: "⚙️ Instalar Dependências"
+        run: pip install boto3 polars pyarrow
+
+      - name: "🗜️ Espremer e Agregar Lotes no R2"
+        # ATENÇÃO: Ajuste o caminho abaixo para onde você salvou o arquivo migrador_agregador.py
+        run: python autobot/migrador_agregador.py
+
   # --- NOTIFICAÇÃO: Avalia o Pipeline Inteiro ---
   notificacao:
-    needs: [camada-bronze, camada-prata]
+    needs: [camada-bronze, camada-prata, migracao-r2]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: "📢 Discord Feedback"
         run: |
-          if [[ "${{ needs.camada-bronze.result }}" != "failure" && "${{ needs.camada-prata.result }}" != "failure" && "${{ needs.camada-bronze.result }}" != "cancelled" && "${{ needs.camada-prata.result }}" != "cancelled" ]]; then
+          if [[ "${{ needs.camada-bronze.result }}" != "failure" && "${{ needs.camada-prata.result }}" != "failure" && "${{ needs.migracao-r2.result }}" != "failure" && "${{ needs.camada-bronze.result }}" != "cancelled" && "${{ needs.camada-prata.result }}" != "cancelled" && "${{ needs.migracao-r2.result }}" != "cancelled" ]]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
             MSG="✅ **[SafeDriver]** Pipeline finalizado com sucesso: ${{ github.event.inputs.job }}"
           else
