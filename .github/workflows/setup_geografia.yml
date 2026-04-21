@@ -28,7 +28,6 @@ jobs:
       startsWith(github.event.inputs.job, 'FLUXO_')
     runs-on: ubuntu-latest
     env:
-      # Secrets Cloudflare R2
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -53,8 +52,6 @@ jobs:
         run: |
           pip install google-cloud-storage boto3
           curl -s https://rclone.org/install.sh | sudo bash
-          
-          # Limpeza de espaços nos secrets para evitar erros de I/O
           CLEAN_ENDPOINT=$(echo "$R2_ENDPOINT_URL" | tr -d ' \n\r\t')
           CLEAN_ACCESS=$(echo "$R2_ACCESS_KEY_ID" | tr -d ' \n\r\t')
           CLEAN_SECRET=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d ' \n\r\t')
@@ -87,14 +84,11 @@ jobs:
       (github.event.inputs.job == 'tudo' || startsWith(github.event.inputs.job, 'PRATA_') || startsWith(github.event.inputs.job, 'FLUXO_'))
     runs-on: ubuntu-latest
     env:
-      # Secrets R2 e BigQuery
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
-      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
-      # Secret LGPD
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
     steps:
       - name: 🔍 Checkout do Código
@@ -107,23 +101,26 @@ jobs:
       
       - name: "⚙️ Instalar Motores de Performance"
         run: |
-          pip install boto3 polars h3 pyarrow requests duckdb
+          # Adicionado python-calamine e fastexcel para leitura de Crimes SSP
+          pip install boto3 polars h3 pyarrow requests duckdb python-calamine fastexcel
 
       - name: "🛡️ [PRATA-A] Processamento Crimes e LGPD"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
-      - name: "🏗️ [PRATA-B] Malha Geo & Infra (100% Python Resiliente)"
+      - name: "🏗️ [PRATA-B] Malha Geo & Infra (Híbrido DuckDB/Polars)"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
         run: |
-          echo "🚀 Iniciando motor híbrido (I/O Boto3 + Compute DuckDB/Polars)..."
+          echo "🚀 Iniciando motor híbrido..."
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
           
-          # Validador de Auditoria
-          if grep -q '"QUALIDADE_GERAL": "FALHA_CRITICA"' ./data_prata/AUDITORIA_PRATA.json; then
-            echo "❌ ERRO CRÍTICO ENCONTRADO NA AUDITORIA DA PRATA. PARANDO PIPELINE."
-            cat ./data_prata/AUDITORIA_PRATA.json
-            exit 1
+          # Validador de Auditoria (Ajustado para o novo JSON de Auditoria)
+          if [ -f "./data_prata/AUDITORIA_PRATA.json" ]; then
+            if grep -q '"QUALIDADE": "FALHA"' ./data_prata/AUDITORIA_PRATA.json; then
+              echo "❌ ERRO CRÍTICO NA PRATA. PARANDO PIPELINE."
+              cat ./data_prata/AUDITORIA_PRATA.json
+              exit 1
+            fi
           fi
 
   # --- NOTIFICAÇÃO ---
@@ -139,10 +136,10 @@ jobs:
           
           if [[ ("$PRATA_RESULT" == "success" || "$PRATA_RESULT" == "skipped") && ("$BRONZE_RESULT" == "success" || "$BRONZE_RESULT" == "skipped") ]]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Pipeline de Produção finalizado com sucesso!\nJob executado: \`${{ github.event.inputs.job }}\`"
+            MSG="✅ **[SafeDriver]** Pipeline finalizado com sucesso!\nJob: \`${{ github.event.inputs.job }}\`"
           else
             URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Falha detetada no pipeline!\nVerifique os logs no GitHub Actions. Job: \`${{ github.event.inputs.job }}\`"
+            MSG="🚨 **[SafeDriver]** Falha detectada no pipeline!\nVerifique os logs no GitHub. Job: \`${{ github.event.inputs.job }}\`"
           fi
           
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
