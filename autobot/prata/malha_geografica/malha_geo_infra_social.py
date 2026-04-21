@@ -7,11 +7,12 @@ import zipfile
 import json
 import glob
 import re
+import hashlib
 from datetime import datetime
 from botocore.config import Config
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (TURBO ENGINE)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (TURBO ENGINE + LGPD)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -33,13 +34,45 @@ class ArquitetoSafeDriverPrata:
             aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
             config=Config(signature_version='s3v4')
         )
+
+        # Chave Secreta LGPD
+        self.pepper = os.getenv("LGPD_PEPPER", "safedriver_seguranca_padrao_2026").strip()
         
-        # O SEGREDO DO DESEMPENHO: Instalar extensão H3 nativa no DuckDB (Escrito em C++)
+        # Motor C++ para cálculos espaciais ultra-rápidos
         self.con = duckdb.connect(database=':memory:')
         self.con.execute("INSTALL spatial; LOAD spatial;")
-        self.con.execute("INSTALL h3; LOAD h3;") # Extensão que vai salvar a sua RAM
+        self.con.execute("INSTALL h3; LOAD h3;") 
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now()), "CAMADAS": {}}
+
+    def aplicar_lgpd(self, df: pl.DataFrame, colunas_sensiveis: list) -> pl.DataFrame:
+        """
+        Aplica Hash SHA-256 irreversível com Pepper em colunas sensíveis (ex: Razão Social MEI que contém CPF).
+        Garante conformidade com a LGPD sem destruir a capacidade de cruzamento (JOIN) no futuro.
+        """
+        colunas_presentes = [c for c in colunas_sensiveis if c in df.columns]
+        if not colunas_presentes:
+            return df
+            
+        print(f"   🛡️ [LGPD] Anonimizando em massa: {colunas_presentes}...", flush=True)
+        
+        def hash_seguro(valor):
+            if valor is None or str(valor).strip() in ["", "NULL", "NAN", "."]: 
+                return "NAO_INFORMADO"
+            texto_base = str(valor).upper().strip() + self.pepper
+            return hashlib.sha256(texto_base.encode('utf-8')).hexdigest()
+
+        # Polars processa a transformação criptográfica de forma otimizada
+        exprs = [
+            pl.col(c).map_elements(hash_seguro, return_dtype=pl.Utf8).alias(c)
+            for c in colunas_presentes
+        ]
+        return df.with_columns(exprs)
+
+    def _normalizar(self, valor):
+        if not valor or str(valor).upper() in ["NULL", "NAN", "."]: return "NAO INFORMADO"
+        t = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
+        return re.sub(r'[^a-zA-Z0-9\s]', '', t).upper().strip()
 
     def download_r2(self):
         print("📥 Buscando arquivos na Bronze via Boto3...", flush=True)
@@ -72,11 +105,6 @@ class ArquitetoSafeDriverPrata:
                 self.s3.upload_file(local_path, self.bucket, r2_path)
         print("✅ Pipeline concluído com sucesso!", flush=True)
 
-    def _normalizar(self, valor):
-        if not valor or str(valor).upper() in ["NULL", "NAN", "."]: return "NAO INFORMADO"
-        t = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
-        return re.sub(r'[^a-zA-Z0-9\s]', '', t).upper().strip()
-
     def processar(self):
         # ==========================================
         # 1. GEO (Cálculo H3 e Extração via DuckDB)
@@ -86,7 +114,6 @@ class ArquitetoSafeDriverPrata:
             zip_f = glob.glob(f"{self.bronze_dir}/**/SP_Faces_2022.zip", recursive=True)[0]
             with zipfile.ZipFile(zip_f, 'r') as z: z.extractall(self.bronze_dir)
             
-            # DuckDB faz a geometria E o cálculo do H3 em frações de segundo
             query = f"""
                 SELECT 
                     CD_FACE,
@@ -118,7 +145,6 @@ class ArquitetoSafeDriverPrata:
         try:
             csv_f = glob.glob(f"{self.bronze_dir}/**/Agregados_por_setores_basico*.csv", recursive=True)[0]
             
-            # Mudança para 'scan_csv' (Modo preguiçoso). Ele só lê na memória o que for essencial.
             df_lazy = pl.scan_csv(csv_f, separator=";", null_values=["."], infer_schema_length=10000, schema_overrides={"CD_SETOR": pl.Utf8, "CD_MUN": pl.Utf8})
             df_lazy = df_lazy.filter(pl.col("CD_SETOR").str.starts_with("35"))
             
@@ -127,7 +153,7 @@ class ArquitetoSafeDriverPrata:
                 pl.col("AREA_KM2").str.replace(",", ".").cast(pl.Float32, strict=False),
                 pl.col("v0001").cast(pl.UInt32, strict=False).fill_null(0).alias("POPULACAO"),
                 pl.col("v0002").cast(pl.UInt32, strict=False).fill_null(0).alias("DOMICILIOS")
-            ]).collect() # O 'collect' dispara o processamento ultra-rápido do Polars
+            ]).collect()
             
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet", compression="zstd")
             self.auditoria["CAMADAS"]["SOCIAL"] = {"STATUS": "OK", "LINHAS": df.height}
@@ -137,11 +163,10 @@ class ArquitetoSafeDriverPrata:
             self.auditoria["CAMADAS"]["SOCIAL"] = {"STATUS": "ERRO", "MSG": str(e)}
 
         # ==========================================
-        # 3. INFRA (O Exterminador de Timeouts)
+        # 3. INFRA (H3 C++ e Proteção LGPD)
         # ==========================================
         print("🏗️ Processando Malha Infra/Comércio...", flush=True)
         try:
-            # DuckDB lê os lotes Parquet diretamente do disco e faz o H3 nativamente
             query_infra = f"""
                 SELECT 
                     *,
@@ -149,10 +174,13 @@ class ArquitetoSafeDriverPrata:
                 FROM read_parquet('{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet')
                 WHERE lat IS NOT NULL AND lon IS NOT NULL
             """
-            # Isto vai correr absurdamente mais rápido que o loop Python
             df = self.con.execute(query_infra).pl()
             
-            # Tipagem defensiva final para reduzir o tamanho do ficheiro gerado
+            # --- BLINDAGEM LGPD APLICADA AOS CNPJS ---
+            # Esconde CPFs vazados em nomes de empresas MEI e o próprio número de registo exato
+            colunas_perigosas = ["cnpj", "cnpj_basico", "razao_social", "nome_fantasia", "cpf_responsavel", "nome_socio"]
+            df = self.aplicar_lgpd(df, colunas_perigosas)
+            
             cat_cols = ["H3_INDEX", "cnae_fiscal_principal", "cep", "municipio", "bairro", "situacao_cadastral"]
             df = df.with_columns(
                 [pl.col(c).cast(pl.Categorical) for c in cat_cols if c in df.columns] + 
@@ -170,6 +198,13 @@ class ArquitetoSafeDriverPrata:
         with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f:
             json.dump(self.auditoria, f, indent=4)
         print("\n📊 AUDITORIA:\n", json.dumps(self.auditoria, indent=4), flush=True)
+
+        # Validador de Saída para o GitHub Actions
+        erros = [v for k, v in self.auditoria["CAMADAS"].items() if v.get("STATUS") == "ERRO"]
+        if erros:
+            self.auditoria["QUALIDADE_GERAL"] = "FALHA_CRITICA"
+            with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f:
+                json.dump(self.auditoria, f, indent=4)
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverPrata()
