@@ -27,7 +27,7 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Mapeamento Ultra Flexível (RegEx)
+    # Mapeamento Ultra Flexível (RegEx) para encontrar as colunas independente do nome
     MAPA_COLUNAS = {
         "NUM_BO": [r"NUM.*BO", r"N.MERO.*BO", r"BO_NUMERO"],
         "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN"],
@@ -67,24 +67,40 @@ class IngestorSafeDriver:
         mapeamento_final = {}
         for alvo, padroes in self.config.MAPA_COLUNAS.items():
             for col in colunas_reais:
+                col_str = str(col).upper().strip()
                 for p in padroes:
-                    if re.search(p, col, re.IGNORECASE):
+                    if re.search(p, col_str, re.IGNORECASE):
                         mapeamento_final[col] = alvo
                         break
                 if col in mapeamento_final: break
         return mapeamento_final
 
+    def _encontrar_cabecalho_real(self, excel_data, sheet_id):
+        """Varre as primeiras 20 linhas da aba para achar onde começa o cabeçalho real."""
+        try:
+            # Lê as primeiras 20 linhas como string para analisar
+            df_teste = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_id, engine="calamine", read_options={"n_rows": 20, "has_header": False})
+            
+            for i, row in enumerate(df_teste.iter_rows()):
+                row_str = [str(cell).upper() for cell in row]
+                # Se encontrarmos pelo menos 3 colunas chaves, essa é a linha do cabeçalho
+                matches = 0
+                for cell in row_str:
+                    if any(re.search(p, cell) for padroes in self.config.MAPA_COLUNAS.values() for p in padroes):
+                        matches += 1
+                
+                if matches >= 4: # Encontrou o cabeçalho
+                    return i
+            return None
+        except:
+            return None
+
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
-        # 1. LAT/LON para Float (Trata string com vírgula e lixo de texto)
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
         ])
-
-        # 2. Filtro: Se não tem coordenada válida, não serve para o SafeDriver
-        return df.filter(
-            (pl.col("LATITUDE").is_not_null()) & (pl.col("LATITUDE") < -10)
-        )
+        return df.filter((pl.col("LATITUDE").is_not_null()) & (pl.col("LATITUDE") < -10))
 
     def extrair_bronze(self, ano: int):
         path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
@@ -109,64 +125,64 @@ class IngestorSafeDriver:
             return
 
         try:
-            logger.info(f"🥈 Analisando estrutura dinâmica de {ano}...")
+            logger.info(f"🥈 Caçando dados na estrutura de {ano}...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             excel_data = obj['Body'].read()
             
-            # POLARS EXTREME: Tenta descobrir quais abas existem
-            # Como polars read_excel com calamine não lista abas facilmente sem carregar, 
-            # vamos iterar por tentativa e erro em um range maior
-            df = None
+            df_final = None
             mapeamento = {}
-            
-            for sheet_idx in range(1, 10): # Tenta até a décima aba
-                try:
-                    # Tenta ler a aba pulando de 0 a 3 linhas (caso a SSP tenha colocado títulos no topo)
-                    for skip in [0, 1, 2, 3]:
-                        temp_df = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine", read_options={"skip_rows": skip})
-                        temp_df.columns = [str(c).upper().strip() for c in temp_df.columns]
-                        mapeamento = self._resolver_colunas_fuzzy(temp_df.columns)
-                        
-                        if "LATITUDE" in mapeamento.values() and "LONGITUDE" in mapeamento.values():
-                            logger.info(f"   🎯 Sucesso! Dados encontrados na ABA {sheet_idx} (pulando {skip} linhas)")
-                            df = temp_df
-                            break
-                    if df is not None: break
-                except Exception:
-                    continue
 
-            if df is None:
-                # Log de debug para você ver o que veio no arquivo
-                logger.error(f"❌ Nenhuma aba de {ano} contém LAT/LON. Verificando cabeçalhos da Aba 1 para debug:")
-                debug_df = pl.read_excel(io.BytesIO(excel_data), sheet_id=1, engine="calamine")
-                logger.info(f"   Colunas encontradas na Aba 1: {debug_df.columns[:15]}")
-                raise ValueError(f"Estrutura irreconhecível em {ano}")
+            # Varre as abas (Sheet IDs em calamine começam em 1)
+            for sheet_idx in range(1, 10):
+                skip_linha = self._encontrar_cabecalho_real(excel_data, sheet_idx)
+                
+                if skip_linha is not None:
+                    logger.info(f"   🎯 Cabeçalho encontrado na Aba {sheet_idx}, linha {skip_linha + 1}")
+                    
+                    # Lê a aba pulando as linhas inúteis da "capa"
+                    df_raw = pl.read_excel(
+                        io.BytesIO(excel_data), 
+                        sheet_id=sheet_idx, 
+                        engine="calamine", 
+                        read_options={"skip_rows": skip_linha}
+                    )
+                    
+                    # Normaliza nomes de colunas encontrados
+                    df_raw.columns = [str(c).upper().strip() for c in df_raw.columns]
+                    mapeamento = self._resolver_colunas_fuzzy(df_raw.columns)
+                    
+                    if "LATITUDE" in mapeamento.values() and "LONGITUDE" in mapeamento.values():
+                        df_final = df_raw.select(list(mapeamento.keys())).rename(mapeamento)
+                        break
 
-            # Processamento final
-            df = df.select(list(mapeamento.keys())).rename(mapeamento)
-            df = df.with_columns(pl.all().cast(pl.Utf8)) 
-            df = self._limpar_e_tipar(df)
+            if df_final is None:
+                raise ValueError(f"Não foi possível encontrar a tabela de crimes em nenhuma aba de {ano}.")
+
+            # Tratamento Prata
+            df_final = df_final.with_columns(pl.all().cast(pl.Utf8))
+            df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD
+            # LGPD (Hash)
             pepper = self.config.PEPPER
-            df = df.with_columns([
+            df_final = df_final.with_columns([
                 pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
                 pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
             ])
 
-            # H3
-            res = self.config.RESOLUCAO_H3
-            df = df.with_columns(
+            # H3 Index
+            res_h3 = self.config.RESOLUCAO_H3
+            df_final = df_final.with_columns(
                 pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], res),
+                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], res_h3),
                     return_dtype=pl.Utf8
                 ).alias("H3_INDEX")
             )
 
+            # Upload
             buf = io.BytesIO()
-            df.write_parquet(buf, compression="zstd")
+            df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} salva: {df.height} linhas.")
+            logger.info(f"✨ Prata {ano} salva: {df_final.height} linhas georreferenciadas.")
 
         except Exception as e:
             logger.error(f"💥 Falha na Prata {ano}: {e}")
