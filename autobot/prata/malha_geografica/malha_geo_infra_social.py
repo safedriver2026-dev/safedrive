@@ -10,6 +10,7 @@ import glob
 import re
 import csv
 import io
+import shutil
 from datetime import datetime
 from botocore.config import Config
 
@@ -18,11 +19,11 @@ class ArquitetoSafeDriverPrata:
         self.H3_RES = 9 
         self.bronze_dir = "./data_raw"
         self.prata_dir = "./data_prata"
-        self.temp_dir = "./temp_duckdb"
+        self.temp_extract_dir = "./data_raw/extracted_json"
         
         os.makedirs(self.bronze_dir, exist_ok=True)
         os.makedirs(self.prata_dir, exist_ok=True)
-        os.makedirs(self.temp_dir, exist_ok=True)
+        os.makedirs(self.temp_extract_dir, exist_ok=True)
         
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
@@ -37,10 +38,12 @@ class ArquitetoSafeDriverPrata:
         )
 
         self.con = duckdb.connect(database=':memory:')
-        self.con.execute(f"PRAGMA memory_limit='4GB';")
-        self.con.execute(f"PRAGMA temp_directory='{self.temp_dir}';")
-        try: self.con.execute("INSTALL spatial; LOAD spatial;")
-        except: pass 
+        # PRAGMA vital para o GitHub Actions não abortar por falta de RAM
+        self.con.execute(f"PRAGMA memory_limit='5GB';")
+        try:
+            self.con.execute("INSTALL spatial; LOAD spatial;")
+        except:
+            pass 
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now())}
 
@@ -51,17 +54,15 @@ class ArquitetoSafeDriverPrata:
         return re.sub(r'[^a-zA-Z0-9\s]', '', texto).upper().strip()
 
     def _buscar_arquivo_flexivel(self, padrao):
-        print(f"📂 Buscando por: {padrao} em {self.bronze_dir}...", flush=True)
+        print(f"📂 Buscando por: {padrao}...", flush=True)
         arqs = glob.glob(f"**/{padrao}", recursive=True)
         if not arqs:
-            conteudo = os.listdir(self.bronze_dir)
-            print(f"⚠️ Não encontrado. Conteúdo atual da pasta: {conteudo}")
-            raise FileNotFoundError(f"Arquivo ({padrao}) ausente!")
+            raise FileNotFoundError(f"Arquivo ({padrao}) não localizado no disco!")
         return arqs[0]
 
     def download_r2(self):
         print("📥 Sincronizando Bronze do R2...", flush=True)
-        targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
+        targets = ["SP_Faces_2022.zip", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
             for obj in p.get('Contents', []):
@@ -74,10 +75,10 @@ class ArquitetoSafeDriverPrata:
         print("✅ Bronze carregada localmente.")
 
     def processar(self):
-        print("🚀 Processando Malha Híbrida Hierárquica...", flush=True)
+        print("🚀 Iniciando Processamento da Malha Híbrida Hierárquica...", flush=True)
         try:
-            # 1. REFERÊNCIA SOCIAL (De-para de CD_SETOR para Nomes)
-            print("--- Lendo Censo (Agregados) ---")
+            # 1. REFERÊNCIA SOCIAL (De-para de Setores para Nomes)
+            print("--- Lendo Censo (Referência de Nomes) ---")
             csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
             df_social_raw = pl.read_csv(csv_f, separator=";", encoding="latin1", infer_schema_length=10000, ignore_errors=True)
             
@@ -90,29 +91,43 @@ class ArquitetoSafeDriverPrata:
                 pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
             ])
 
-            # 2. GEOMETRIAS (Faces de Logradouros)
-            print("--- Extraindo Geometrias IBGE ---")
+            # 2. GEOMETRIAS (IBGE Faces) - PROCESSAMENTO EM LOTE (BATCHING)
+            print("--- Extraindo e Processando Geometrias (Batch Mode) ---")
             zip_f = self._buscar_arquivo_flexivel("SP_Faces_2022.zip")
-            with zipfile.ZipFile(zip_f, 'r') as z: z.extractall(self.bronze_dir)
             
-            json_files = glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True)
-            sqls = []
-            for f in json_files:
-                # CORREÇÃO: Tratar o path fora da f-string para evitar SyntaxError no Python 3.11
-                f_path_sql = str(f).replace("\\", "/")
-                sqls.append(f"""
-                    SELECT 
-                        CAST(CD_SETOR AS VARCHAR) as CD_SETOR,
-                        trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, 
-                        ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON, 
-                        TRY_CAST(TOT_RES AS FLOAT) as TOT_RES 
-                    FROM ST_Read('{f_path_sql}')
-                """)
+            list_vias_df = []
+            with zipfile.ZipFile(zip_f, 'r') as z:
+                json_files = [f for f in z.namelist() if f.endswith('.json')]
+                batch_size = 50 
+                for i in range(0, len(json_files), batch_size):
+                    batch = json_files[i:i + batch_size]
+                    sqls = []
+                    for f_json in batch:
+                        z.extract(f_json, self.temp_extract_dir)
+                        # Resolvemos o path antes da f-string para evitar o SyntaxError do \
+                        f_path_sql = os.path.join(self.temp_extract_dir, f_json).replace("\\", "/")
+                        sqls.append(f"""
+                            SELECT 
+                                CAST(CD_SETOR AS VARCHAR) as CD_SETOR,
+                                trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, 
+                                ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON, 
+                                TRY_CAST(TOT_RES AS FLOAT) as TOT_RES 
+                            FROM ST_Read('{f_path_sql}')
+                        """)
+                    
+                    # Processa o lote no DuckDB e converte para Polars
+                    df_batch = self.con.execute(" UNION ALL ".join(sqls)).pl()
+                    list_vias_df.append(df_batch)
+                    
+                    # Limpeza imediata do disco após processar o lote
+                    for f_json in batch:
+                        try: os.remove(os.path.join(self.temp_extract_dir, f_json))
+                        except: pass
+                    print(f"   -> Progresso: {min(i + batch_size, len(json_files))}/{len(json_files)} arquivos", flush=True)
+
+            df_faces = pl.concat(list_vias_df)
             
-            df_faces = self.con.execute(" UNION ALL ".join(sqls)).pl()
-            
-            # 3. CONSTRUÇÃO DA MALHA
-            print("--- Vinculando Nomes e Gerando H3 ---")
+            print("--- Consolidando Hierarquia e H3 ---")
             df_vias_completo = df_faces.join(df_ref_nomes, on="CD_SETOR", how="left").with_columns([
                 pl.col("CIDADE").fill_null("NAO INFORMADO"),
                 pl.col("BAIRRO").fill_null("NAO INFORMADO"),
@@ -120,7 +135,7 @@ class ArquitetoSafeDriverPrata:
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             ])
 
-            # Exportação 1: Hierarquia de Vias
+            # Exportação 1: Hierarquia de Vias (Cidade > Bairros > Logradouros)
             df_hierarquico = (
                 df_vias_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST"))
                 .group_by(["CIDADE", "BAIRRO"]).agg(pl.struct([pl.col("RUA"), pl.col("H3_LIST")]).alias("LOGRADOUROS"))
@@ -128,19 +143,21 @@ class ArquitetoSafeDriverPrata:
             )
             df_hierarquico.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
 
-            # Exportação 2: Micro-População (H3 Flat)
-            df_vias_completo.group_by("H3_INDEX").agg(pl.sum("TOT_RES").alias("MICRO_POPULACAO_H3")).write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
+            # Exportação 2: Micro-População (H3 Flat para a Ouro)
+            df_vias_completo.group_by("H3_INDEX").agg(pl.sum("TOT_RES").alias("MICRO_POPULACAO_H3")) \
+                .write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
 
-            # Exportação 3: Social Macro (Censo)
-            df_social_raw.select([pl.col("CD_SETOR").cast(pl.Utf8), "NM_MUN", "NM_BAIRRO", "v0001", "v0002"]).write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet")
+            # Exportação 3: Social Macro
+            df_social_raw.select([pl.col("CD_SETOR").cast(pl.Utf8), "NM_MUN", "NM_BAIRRO", "v0001", "v0002"]) \
+                .write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet")
 
-            # 4. INFRAESTRUTURA (CNAEs)
+            # 4. INFRAESTRUTURA (CNAEs) - MOTOR DE STREAMING
+            print("--- Processando Infraestrutura (Streaming Mode) ---")
             pqs_infra = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             if pqs_infra:
-                print("--- Processando Infraestrutura ---")
                 df_infra = pl.scan_parquet(pqs_infra).filter(pl.col("lat").is_not_null()).with_columns([
                     pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")
-                ]).group_by(["lat", "lon", "CNAE_DIV"]).len().collect()
+                ]).group_by(["lat", "lon", "CNAE_DIV"]).len().collect(engine="streaming")
 
                 df_infra_h3 = df_infra.with_columns(pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s])).alias("H3_INDEX"))
                 df_pivot = df_infra_h3.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("len").alias("TOTAL")).pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV").fill_null(0)
@@ -148,14 +165,18 @@ class ArquitetoSafeDriverPrata:
                 df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
 
             self.auditoria["STATUS"] = "SUCESSO"
-            print("✨ Pipeline de Malha Prata Finalizado com Sucesso!")
+            print("✨ Pipeline Prata concluído com sucesso!")
+            
         except Exception as e:
             self.auditoria["STATUS"] = f"ERRO: {str(e)}"
             print(f"❌ Erro Crítico: {e}")
+        finally:
+            shutil.rmtree(self.temp_extract_dir, ignore_errors=True)
 
     def finalizar(self):
         r2_dest_path = "datalake/prata/malha_trusted"
-        with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: json.dump(self.auditoria, f, indent=4)
+        with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: 
+            json.dump(self.auditoria, f, indent=4)
         print(f"📤 Exportando Malha para R2...")
         for f in os.listdir(self.prata_dir):
             if f.endswith((".parquet", ".json")):
@@ -163,6 +184,6 @@ class ArquitetoSafeDriverPrata:
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverPrata()
-    app.download_r2() 
+    app.download_r2()
     app.processar()
     app.finalizar()
