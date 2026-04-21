@@ -27,7 +27,8 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Mapeamento Ultra Flexível (RegEx) para encontrar as colunas independente do nome
+    # Palavras-chave para identificar se UMA LINHA é o cabeçalho
+    # SSP muda muito, então focamos no padrão semântico
     MAPA_COLUNAS = {
         "NUM_BO": [r"NUM.*BO", r"N.MERO.*BO", r"BO_NUMERO"],
         "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN"],
@@ -63,37 +64,18 @@ class IngestorSafeDriver:
             return True
         except: return False
 
-    def _resolver_colunas_fuzzy(self, colunas_reais):
-        mapeamento_final = {}
+    def _resolver_mapeamento(self, colunas_da_linha):
+        """Verifica se uma lista de strings (uma linha do Excel) contém o cabeçalho."""
+        mapeamento = {}
         for alvo, padroes in self.config.MAPA_COLUNAS.items():
-            for col in colunas_reais:
-                col_str = str(col).upper().strip()
+            for i, col_name in enumerate(colunas_da_linha):
+                col_str = str(col_name).upper().strip()
                 for p in padroes:
-                    if re.search(p, col_str, re.IGNORECASE):
-                        mapeamento_final[col] = alvo
+                    if re.search(p, col_str):
+                        mapeamento[i] = alvo # Mapeia o índice da coluna ao nome alvo
                         break
-                if col in mapeamento_final: break
-        return mapeamento_final
-
-    def _encontrar_cabecalho_real(self, excel_data, sheet_id):
-        """Varre as primeiras 20 linhas da aba para achar onde começa o cabeçalho real."""
-        try:
-            # Lê as primeiras 20 linhas como string para analisar
-            df_teste = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_id, engine="calamine", read_options={"n_rows": 20, "has_header": False})
-            
-            for i, row in enumerate(df_teste.iter_rows()):
-                row_str = [str(cell).upper() for cell in row]
-                # Se encontrarmos pelo menos 3 colunas chaves, essa é a linha do cabeçalho
-                matches = 0
-                for cell in row_str:
-                    if any(re.search(p, cell) for padroes in self.config.MAPA_COLUNAS.values() for p in padroes):
-                        matches += 1
-                
-                if matches >= 4: # Encontrou o cabeçalho
-                    return i
-            return None
-        except:
-            return None
+                if i in mapeamento: break
+        return mapeamento
 
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
         df = df.with_columns([
@@ -125,51 +107,59 @@ class IngestorSafeDriver:
             return
 
         try:
-            logger.info(f"🥈 Caçando dados na estrutura de {ano}...")
+            logger.info(f"🥈 Escaneando cabeçalhos em {ano}...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             excel_data = obj['Body'].read()
             
             df_final = None
-            mapeamento = {}
 
-            # Varre as abas (Sheet IDs em calamine começam em 1)
-            for sheet_idx in range(1, 10):
-                skip_linha = self._encontrar_cabecalho_real(excel_data, sheet_idx)
-                
-                if skip_linha is not None:
-                    logger.info(f"   🎯 Cabeçalho encontrado na Aba {sheet_idx}, linha {skip_linha + 1}")
+            # Testamos as abas de 1 a 10
+            for sheet_idx in range(1, 11):
+                try:
+                    # Lemos a aba ignorando cabeçalhos automáticos (pegamos bruto)
+                    # n_rows=50 é suficiente para achar o cabeçalho mesmo com capas grandes
+                    df_scan = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine", read_options={"has_header": False, "n_rows": 50})
                     
-                    # Lê a aba pulando as linhas inúteis da "capa"
-                    df_raw = pl.read_excel(
-                        io.BytesIO(excel_data), 
-                        sheet_id=sheet_idx, 
-                        engine="calamine", 
-                        read_options={"skip_rows": skip_linha}
-                    )
-                    
-                    # Normaliza nomes de colunas encontrados
-                    df_raw.columns = [str(c).upper().strip() for c in df_raw.columns]
-                    mapeamento = self._resolver_colunas_fuzzy(df_raw.columns)
-                    
-                    if "LATITUDE" in mapeamento.values() and "LONGITUDE" in mapeamento.values():
-                        df_final = df_raw.select(list(mapeamento.keys())).rename(mapeamento)
-                        break
+                    for i, row in enumerate(df_scan.iter_rows()):
+                        map_indices = self._resolver_mapeamento(row)
+                        
+                        # Se encontrarmos LATITUDE e LONGITUDE nesta linha, ela É o cabeçalho
+                        if "LATITUDE" in map_indices.values() and "LONGITUDE" in map_indices.values():
+                            logger.info(f"   🎯 Cabeçalho identificado na Aba {sheet_idx}, Linha {i+1}")
+                            
+                            # Agora lemos a planilha inteira pulando as linhas acima do cabeçalho
+                            df_raw = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine", read_options={"skip_rows": i})
+                            
+                            # Normalizamos os nomes das colunas atuais para bater com o mapeamento
+                            renomear = {}
+                            cols_reais = [str(c).upper().strip() for c in df_raw.columns]
+                            
+                            # Refazemos o mapeamento agora com os nomes reais das colunas lidas
+                            map_final = self._resolver_mapeamento(df_raw.columns)
+                            # Invertemos o mapa para renomear: {NomeReal: NomeAlvo}
+                            inverso = {df_raw.columns[idx]: alvo for idx, alvo in map_final.items()}
+                            
+                            df_final = df_raw.select(list(inverso.keys())).rename(inverso)
+                            break
+                    if df_final is not None: break
+                except Exception:
+                    continue
 
             if df_final is None:
-                raise ValueError(f"Não foi possível encontrar a tabela de crimes em nenhuma aba de {ano}.")
+                raise ValueError(f"Não foi possível localizar os nomes das colunas na estrutura de {ano}.")
 
             # Tratamento Prata
             df_final = df_final.with_columns(pl.all().cast(pl.Utf8))
             df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD (Hash)
+            # LGPD
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
                 pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
                 pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
             ])
 
-            # H3 Index
+            # H3
             res_h3 = self.config.RESOLUCAO_H3
             df_final = df_final.with_columns(
                 pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
@@ -178,11 +168,10 @@ class IngestorSafeDriver:
                 ).alias("H3_INDEX")
             )
 
-            # Upload
             buf = io.BytesIO()
             df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} salva: {df_final.height} linhas georreferenciadas.")
+            logger.info(f"✨ Prata {ano} finalizada: {df_final.height} linhas.")
 
         except Exception as e:
             logger.error(f"💥 Falha na Prata {ano}: {e}")
