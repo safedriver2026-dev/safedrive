@@ -16,9 +16,6 @@ from datetime import datetime
 from botocore.config import Config
 from pathlib import Path
 
-# ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (MALHA TRUSTED V8)
-# ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
         self.H3_RES = 9 
@@ -52,11 +49,7 @@ class ArquitetoSafeDriverPrata:
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now())}
 
-    # ==========================================
-    # UTILITÁRIOS DE NORMALIZAÇÃO (SIMÉTRICO AOS CRIMES)
-    # ==========================================
     def _normalizar_texto(self, valor):
-        """Remove acentos, caracteres especiais e deixa em maiúsculo."""
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
             return "NAO INFORMADO"
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
@@ -64,7 +57,7 @@ class ArquitetoSafeDriverPrata:
 
     def _buscar_arquivo_seguro(self, padrao, nome):
         arqs = glob.glob(f"{self.bronze_dir}/**/{padrao}", recursive=True)
-        if not arqs: raise FileNotFoundError(f"⚠️ {nome} ({padrao}) ausente!")
+        if not arqs: raise FileNotFoundError(f"{nome} ({padrao}) ausente!")
         return arqs[0]
 
     def _analisar_csv_dinamicamente(self, path):
@@ -88,11 +81,8 @@ class ArquitetoSafeDriverPrata:
                 f.write("[lines]\nosm_id=yes\nattributes=name,highway\n")
         return path.replace("\\", "/")
 
-    # ==========================================
-    # WORKFLOW
-    # ==========================================
     def download_r2(self):
-        print("📥 Sincronizando Bronze...", flush=True)
+        print("Sincronizando Bronze...", flush=True)
         targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
@@ -102,11 +92,10 @@ class ArquitetoSafeDriverPrata:
                     dest = os.path.join(self.bronze_dir, key.split('/')[-1])
                     if not os.path.exists(dest):
                         self.s3.download_file(self.bucket, key, dest)
-        print("✅ Bronze carregada.", flush=True)
+        print("Bronze carregada.", flush=True)
 
     def processar(self):
-        # 1. GEO (IBGE + OSM)
-        print("🗺️ Malha Geográfica (Vias)...", flush=True)
+        print("Processando Malha Geografica e Micro-Populacao...", flush=True)
         try:
             zip_f = self._buscar_arquivo_seguro("SP_Faces_2022.zip", "IBGE Faces")
             if not glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True):
@@ -119,17 +108,16 @@ class ArquitetoSafeDriverPrata:
             sqls = []
             for f in json_files:
                 f_path = str(f).replace("\\", "/")
-                sqls.append(f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f_path}')")
+                sqls.append(f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON, TRY_CAST(TOT_RES AS FLOAT) as TOT_RES FROM ST_Read('{f_path}')")
             
             query = f"""
-                SELECT name as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
+                SELECT name as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON, 0.0 as TOT_RES
                 FROM ST_Read('{osm_pbf}', layer='lines', open_options=['CONFIG_FILE={conf}', 'INTERLEAVED_READING=YES']) 
                 WHERE highway IS NOT NULL AND name IS NOT NULL
                 UNION ALL {" UNION ALL ".join(sqls)}
             """
             df = self.con.execute(query).pl()
             
-            # Normaliza nomes de ruas
             df = df.with_columns(pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
             
             coords = df.select(["LAT", "LON"]).unique()
@@ -137,19 +125,23 @@ class ArquitetoSafeDriverPrata:
                 lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])
             ).alias("H3_INDEX"))
             
-            df = df.join(coords, on=["LAT", "LON"], how="left").select(["RUA", "H3_INDEX"]).unique()
-            df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
-            self.auditoria["GEO"] = "OK"
-        except Exception as e: self.auditoria["GEO"] = str(e)
+            df = df.join(coords, on=["LAT", "LON"], how="left")
+            
+            df_vias = df.select(["RUA", "H3_INDEX"]).unique()
+            df_vias.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
 
-        # 2. SOCIAL
-        print("👥 Malha Social (Censo)...", flush=True)
+            df_micro_pop = df.group_by("H3_INDEX").agg(pl.sum("TOT_RES").fill_null(0).alias("MICRO_POPULACAO_H3"))
+            df_micro_pop.write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet", compression="zstd")
+
+            self.auditoria["GEO_E_MICROPOP"] = "OK"
+        except Exception as e: self.auditoria["GEO_E_MICROPOP"] = str(e)
+
+        print("Processando Malha Social Macro...", flush=True)
         try:
             csv_f = self._buscar_arquivo_seguro("Agregados_por_setores_basico*.csv", "Censo")
             enc, sep = self._analisar_csv_dinamicamente(csv_f)
             df = pl.read_csv(csv_f, separator=sep, encoding=enc, null_values=["."], infer_schema_length=10000).filter(pl.col("CD_SETOR").cast(pl.Utf8).str.starts_with("35"))
             
-            # Normaliza Municipio e Bairro do Censo
             df = df.with_columns([
                 pl.col("NM_MUN").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
                 pl.col("NM_BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
@@ -157,11 +149,10 @@ class ArquitetoSafeDriverPrata:
             
             df = df.select([c for c in ["CD_SETOR", "NM_MUN", "NM_BAIRRO", "v0001", "v0002"] if c in df.columns])
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet", compression="zstd")
-            self.auditoria["SOCIAL"] = "OK"
-        except Exception as e: self.auditoria["SOCIAL"] = str(e)
+            self.auditoria["SOCIAL_MACRO"] = "OK"
+        except Exception as e: self.auditoria["SOCIAL_MACRO"] = str(e)
 
-        # 3. INFRA (Agregada por H3)
-        print("🏗️ Malha Infra (Agregando via Streaming)...", flush=True)
+        print("Processando Malha Infra...", flush=True)
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             lf = pl.scan_parquet(pqs)
@@ -188,25 +179,24 @@ class ArquitetoSafeDriverPrata:
 
             df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
             df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
-            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos"
+            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexagonos processados"
             
         except Exception as e: self.auditoria["INFRA"] = str(e)
 
     def finalizar(self):
-        # CAMINHO SIMÉTRICO AOS CRIMES: datalake/prata/ + subpasta malha_trusted
         r2_dest_path = "datalake/prata/malha_trusted"
         
         with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: 
             json.dump(self.auditoria, f, indent=4)
         
-        print(f"📤 Exportando Malha Trusted para R2: {r2_dest_path}...", flush=True)
+        print(f"Exportando Malha Trusted para R2: {r2_dest_path}...", flush=True)
         for f in os.listdir(self.prata_dir):
             if f.endswith((".parquet", ".json")):
                 local_file = os.path.join(self.prata_dir, f)
                 remote_file = f"{r2_dest_path}/{f}"
                 self.s3.upload_file(local_file, self.bucket, remote_file)
         
-        print("\n📊 PIPELINE PRATA (MALHA) FINALIZADO!", flush=True)
+        print("Pipeline Prata Finalizado!", flush=True)
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverPrata()
