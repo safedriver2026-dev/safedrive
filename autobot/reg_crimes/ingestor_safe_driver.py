@@ -27,15 +27,14 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Palavras-chave para identificar se UMA LINHA é o cabeçalho
-    # SSP muda muito, então focamos no padrão semântico
+    # Mapeamento Refinado com base nos arquivos de 2026
     MAPA_COLUNAS = {
         "NUM_BO": [r"NUM.*BO", r"N.MERO.*BO", r"BO_NUMERO"],
         "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN"],
         "BAIRRO": [r"BAIRRO", r"NM_BAIRRO"],
         "LOGRADOURO": [r"LOGRADOURO", r"RUA", r"DESCR_LOG", r"NM_LOG"],
-        "DATAOCORRENCIA": [r"DATA.*OCORR", r"DT_OCORR", r"DATA_OCORRENCIA"],
-        "HORAOCORRENCIA": [r"HORA.*OCORR", r"HR_OCORR", r"HORA_OCORRENCIA"],
+        "DATAOCORRENCIA": [r"DATA.*OCORR", r"DT_OCORR", r"DATA_OCORRENCIA_BO"],
+        "HORAOCORRENCIA": [r"HORA.*OCORR", r"HR_OCORR", r"HORA_OCORRENCIA_BO"],
         "RUBRICA": [r"RUBRICA", r"NATUREZA", r"DESCR_RUBRICA"],
         "LATITUDE": [r"LATITUDE", r"LAT.*GEO", r"^LAT$", r"COORDENADA_X"],
         "LONGITUDE": [r"LONGITUDE", r"LON.*GEO", r"^LON$", r"COORDENADA_Y"],
@@ -65,23 +64,24 @@ class IngestorSafeDriver:
         except: return False
 
     def _resolver_mapeamento(self, colunas_da_linha):
-        """Verifica se uma lista de strings (uma linha do Excel) contém o cabeçalho."""
         mapeamento = {}
         for alvo, padroes in self.config.MAPA_COLUNAS.items():
             for i, col_name in enumerate(colunas_da_linha):
                 col_str = str(col_name).upper().strip()
                 for p in padroes:
                     if re.search(p, col_str):
-                        mapeamento[i] = alvo # Mapeia o índice da coluna ao nome alvo
+                        mapeamento[i] = alvo
                         break
                 if i in mapeamento: break
         return mapeamento
 
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
+        # 1. Tratamento de coordenadas (suporte a vírgula e strings sujas)
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
         ])
+        # 2. Filtro de segurança (apenas pontos válidos em SP)
         return df.filter((pl.col("LATITUDE").is_not_null()) & (pl.col("LATITUDE") < -10))
 
     def extrair_bronze(self, ano: int):
@@ -107,59 +107,63 @@ class IngestorSafeDriver:
             return
 
         try:
-            logger.info(f"🥈 Escaneando cabeçalhos em {ano}...")
+            logger.info(f"🥈 Iniciando Garimpo de Abas no arquivo de {ano}...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             excel_data = obj['Body'].read()
             
-            df_final = None
+            # Usando fastexcel para listar abas (muito mais rápido para arquivos gigantes)
+            import fastexcel
+            excel_reader = fastexcel.read_xlsx(io.BytesIO(excel_data))
+            abas_disponiveis = excel_reader.sheet_names
+            
+            list_dfs = []
 
-            # Testamos as abas de 1 a 10
-            for sheet_idx in range(1, 11):
-                try:
-                    # Lemos a aba ignorando cabeçalhos automáticos (pegamos bruto)
-                    # n_rows=50 é suficiente para achar o cabeçalho mesmo com capas grandes
-                    df_scan = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine", read_options={"has_header": False, "n_rows": 50})
-                    
-                    for i, row in enumerate(df_scan.iter_rows()):
-                        map_indices = self._resolver_mapeamento(row)
-                        
-                        # Se encontrarmos LATITUDE e LONGITUDE nesta linha, ela É o cabeçalho
-                        if "LATITUDE" in map_indices.values() and "LONGITUDE" in map_indices.values():
-                            logger.info(f"   🎯 Cabeçalho identificado na Aba {sheet_idx}, Linha {i+1}")
-                            
-                            # Agora lemos a planilha inteira pulando as linhas acima do cabeçalho
-                            df_raw = pl.read_excel(io.BytesIO(excel_data), sheet_id=sheet_idx, engine="calamine", read_options={"skip_rows": i})
-                            
-                            # Normalizamos os nomes das colunas atuais para bater com o mapeamento
-                            renomear = {}
-                            cols_reais = [str(c).upper().strip() for c in df_raw.columns]
-                            
-                            # Refazemos o mapeamento agora com os nomes reais das colunas lidas
-                            map_final = self._resolver_mapeamento(df_raw.columns)
-                            # Invertemos o mapa para renomear: {NomeReal: NomeAlvo}
-                            inverso = {df_raw.columns[idx]: alvo for idx, alvo in map_final.items()}
-                            
-                            df_final = df_raw.select(list(inverso.keys())).rename(inverso)
-                            break
-                    if df_final is not None: break
-                except Exception:
+            for nome_aba in abas_disponiveis:
+                # Pula abas conhecidas de metadados para ganhar tempo
+                if any(x in nome_aba.upper() for x in ["CAPA", "DICIONARIO", "LEGENDA", "CAMPOS"]):
                     continue
 
-            if df_final is None:
-                raise ValueError(f"Não foi possível localizar os nomes das colunas na estrutura de {ano}.")
+                try:
+                    # Scan de cabeçalho na aba atual
+                    df_scan = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"has_header": False, "n_rows": 50})
+                    
+                    cabecalho_info = None
+                    for i, row in enumerate(df_scan.iter_rows()):
+                        map_idx = self._resolver_mapeamento(row)
+                        if "LATITUDE" in map_idx.values() and "LONGITUDE" in map_idx.values():
+                            cabecalho_info = (i, map_idx)
+                            break
+                    
+                    if cabecalho_info:
+                        skip, mapping = cabecalho_info
+                        logger.info(f"   🎯 Aba '{nome_aba}': Dados encontrados na linha {skip+1}")
+                        
+                        df_mes = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": skip})
+                        
+                        # Renomeia usando o mapeamento de índices para evitar erros de nomes duplicados
+                        inverso = {df_mes.columns[idx]: alvo for idx, alvo in mapping.items()}
+                        df_mes = df_mes.select(list(inverso.keys())).rename(inverso)
+                        df_mes = df_mes.with_columns(pl.all().cast(pl.Utf8))
+                        
+                        list_dfs.append(df_mes)
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Falha ao ler aba {nome_aba}: {e}")
 
-            # Tratamento Prata
-            df_final = df_final.with_columns(pl.all().cast(pl.Utf8))
+            if not list_dfs:
+                raise ValueError(f"Não foi possível extrair dados de nenhuma aba no arquivo de {ano}.")
+
+            # Consolidação dos meses
+            df_final = pl.concat(list_dfs, how="diagonal")
             df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD
+            # LGPD (Hash Seguro)
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
                 pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
                 pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
             ])
 
-            # H3
+            # H3 Index
             res_h3 = self.config.RESOLUCAO_H3
             df_final = df_final.with_columns(
                 pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
@@ -168,13 +172,14 @@ class IngestorSafeDriver:
                 ).alias("H3_INDEX")
             )
 
+            # Salvar como Parquet Único do Ano
             buf = io.BytesIO()
             df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} finalizada: {df_final.height} linhas.")
+            logger.info(f"✨ Prata {ano} finalizada com SUCESSO: {df_final.height} crimes consolidados (todas as abas).")
 
         except Exception as e:
-            logger.error(f"💥 Falha na Prata {ano}: {e}")
+            logger.error(f"💥 Erro fatal no processamento de {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
