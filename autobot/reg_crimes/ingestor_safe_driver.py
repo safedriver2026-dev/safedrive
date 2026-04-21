@@ -8,7 +8,6 @@ import io
 import hashlib
 import re
 import unicodedata
-import botocore.exceptions
 import polars as pl
 import h3
 import fastexcel
@@ -25,8 +24,10 @@ class ConfiguracaoIngestao:
     ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
     SECRET_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
     PEPPER = os.getenv("LGPD_PEPPER", "safedriver_secret_2026")
+    WEBHOOK_DISCORD = os.getenv("DISCORD_SUCESSO")
 
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
+    MALHA_VIAS_PATH = "datalake/prata/malha_trusted/PRATA_MALHA_GEOGRAFICA_VIAS.parquet"
     RESOLUCAO_H3 = 9
     
     MAPA_COLUNAS = {
@@ -39,9 +40,7 @@ class ConfiguracaoIngestao:
         "RUBRICA": [r"RUBRICA", r"NATUREZA", r"DESCR_RUBRICA"],
         "LATITUDE": [r"LATITUDE", r"LAT.*GEO", r"^LAT$", r"COORDENADA_X", r"LATITUD"],
         "LONGITUDE": [r"LONGITUDE", r"LON.*GEO", r"^LON$", r"COORDENADA_Y", r"LONGITUD"],
-        "DESCR_TIPOLOCAL": [r"TIPOLOCAL", r"LOCAL_OCORR", r"DESCR_TIPOLOCAL", r"LOCAL"],
-        # CALLBACK DE PERÍODO NATIVO (Resiliente a nomes de colunas diferentes)
-        "PERIODO_NATIVO": [r"DESC.*PERIODO", r"PERIODO", r"DS_PERIODO", r"DESC_PERIODO_OCORRENCIA"]
+        "PERIODO_NATIVO": [r"DESC.*PERIODO", r"PERIODO", r"DS_PERIODO"]
     }
 
 class IngestorSafeDriver:
@@ -49,25 +48,30 @@ class IngestorSafeDriver:
         self.config = ConfiguracaoIngestao()
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
+        self.df_malha = None
+
+    def _notificar_discord(self, msg):
+        if self.config.WEBHOOK_DISCORD:
+            try: requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg}, timeout=10)
+            except: pass
 
     def _inicializar_s3(self):
         endpoint = self.config.ENDPOINT_URL.strip().rstrip('/')
         if endpoint.endswith(f"/{self.config.NOME_BUCKET}"):
             endpoint = endpoint[: -len(f"/{self.config.NOME_BUCKET}")]
-            
-        return boto3.client(
-            's3',
-            endpoint_url=endpoint,
-            aws_access_key_id=self.config.ACCESS_KEY.strip(),
-            aws_secret_access_key=self.config.SECRET_KEY.strip(),
-            config=Config(signature_version='s3v4')
-        )
+        return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=self.config.ACCESS_KEY.strip(),
+                            aws_secret_access_key=self.config.SECRET_KEY.strip(), config=Config(signature_version='s3v4'))
 
-    def _arquivo_existe(self, key: str) -> bool:
+    def _carregar_malha_referencia(self):
+        """Carrega a malha de vias para resgate espacial por chave composta."""
         try:
-            self.s3.head_object(Bucket=self.config.NOME_BUCKET, Key=key)
-            return True
-        except: return False
+            obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
+            self.df_malha = pl.read_parquet(io.BytesIO(obj['Body'].read())).select([
+                pl.col("RUA"), pl.col("BAIRRO"), pl.col("MUNICIPIO"), pl.col("H3_INDEX")
+            ]).unique(subset=["RUA", "BAIRRO", "MUNICIPIO"])
+            logger.info("🗺️ Malha de Referência (Vias) carregada com Sucesso.")
+        except Exception as e:
+            logger.error(f"❌ Erro ao carregar malha: {e}. Resgate espacial desativado.")
 
     def _normalizar_texto(self, valor):
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
@@ -88,120 +92,125 @@ class IngestorSafeDriver:
                         break
         return mapeamento
 
-    def _processar_periodo_mastigado(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Aplica a hierarquia de recuperação do período do dia."""
+    def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
+        total_entrada = df.height
         
-        # 1. Tentar extrair a hora e criar o período base
+        # 1. Normalização de Texto
+        cols_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO", "HORAOCORRENCIA", "PERIODO_NATIVO"]]
+        for col in cols_texto:
+            df = df.with_columns(pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
+
+        # 2. Hierarquia de Período (Hora > Callback SSP)
         df = df.with_columns(
-            pl.col("HORAOCORRENCIA").str.to_time(format="%H:%M:%S", strict=False).dt.hour().alias("_hora_temp")
-        )
-        
-        # 2. Lógica de Fallback
-        df = df.with_columns(
-            # Tenta pela Hora
-            pl.when(pl.col("_hora_temp").is_between(0, 5)).then(pl.lit("MADRUGADA"))
-            .when(pl.col("_hora_temp").is_between(6, 11)).then(pl.lit("MANHA"))
-            .when(pl.col("_hora_temp").is_between(12, 17)).then(pl.lit("TARDE"))
-            .when(pl.col("_hora_temp").is_between(18, 23)).then(pl.lit("NOITE"))
-            # Se hora for nula, tenta pelo texto nativo da SSP
+            pl.col("HORAOCORRENCIA").str.to_time(format="%H:%M:%S", strict=False).dt.hour().alias("_hr")
+        ).with_columns(
+            pl.when(pl.col("_hr").is_between(0, 5)).then(pl.lit("MADRUGADA"))
+            .when(pl.col("_hr").is_between(6, 11)).then(pl.lit("MANHA"))
+            .when(pl.col("_hr").is_between(12, 17)).then(pl.lit("TARDE"))
+            .when(pl.col("_hr").is_between(18, 23)).then(pl.lit("NOITE"))
             .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MADRUGADA")).then(pl.lit("MADRUGADA"))
             .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MANHA|MANHÃ")).then(pl.lit("MANHA"))
             .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("TARDE")).then(pl.lit("TARDE"))
             .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("NOITE")).then(pl.lit("NOITE"))
             .otherwise(pl.lit(None))
             .alias("SAZON_PERIODO")
-        ).drop(["_hora_temp", "PERIODO_NATIVO"]) # Limpa colunas temporárias
-        
-        # 3. EXCLUSÃO: Se não recuperou por nada, deleta a linha
-        return df.filter(pl.col("SAZON_PERIODO").is_not_null())
+        ).drop(["_hr", "PERIODO_NATIVO"])
 
-    def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
-        # 1. Normalização de Texto Universal
-        colunas_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO", "HORAOCORRENCIA", "PERIODO_NATIVO"]]
-        for col in colunas_texto:
-            df = df.with_columns(pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8).alias(col))
-
-        # 2. Processar Período (Hierarquia de Recuperação)
-        df = self._processar_periodo_mastigado(df)
-
-        # 3. LAT/LON para Float e Filtro Geográfico
+        # 3. Coordenadas e H3 via GPS Original
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
         ])
-        return df.filter((pl.col("LATITUDE").is_not_null()) & (pl.col("LATITUDE") < -10))
+
+        df = df.with_columns(
+            pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
+                lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3) if x["LATITUDE"] is not None else None,
+                return_dtype=pl.Utf8
+            ).alias("H3_INDEX")
+        )
+
+        # 4. Resgate Geográfico por Chave Composta (Rua + Bairro + Cidade)
+        if self.df_malha is not None:
+            df = df.join(
+                self.df_malha,
+                left_on=["LOGRADOURO", "BAIRRO", "MUNICIPIO"],
+                right_on=["RUA", "BAIRRO", "MUNICIPIO"],
+                how="left"
+            ).with_columns(
+                pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))
+            ).drop("H3_INDEX_right")
+
+        # 5. FILTRO DE EXCLUSÃO RÍGIDA (Só passa o que tem Espaço e Tempo)
+        df_limpo = df.filter(pl.col("H3_INDEX").is_not_null() & pl.col("SAZON_PERIODO").is_not_null())
+        
+        # Estatísticas de Resgate
+        bo_com_gps = df.filter(pl.col("LATITUDE").is_not_null()).height
+        bo_salvos = df_limpo.height - bo_com_gps
+        
+        report = (
+            f"🥈 **[SafeDriver] Prata SSP: Relatório de Qualidade**\n"
+            f"```ml\n"
+            f"• Ingestão Total: {total_entrada}\n"
+            f"• GPS Original: {bo_com_gps}\n"
+            f"• Salvos via Chave Composta: {bo_salvos}\n"
+            f"• Descartados (Falta Dados): {total_entrada - df_limpo.height}\n"
+            f"• Base Trusted Final: {df_limpo.height}\n"
+            f"```"
+        )
+        self._notificar_discord(report)
+        return df_limpo
 
     def extrair_bronze(self, ano: int):
         path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
-        if ano < self.ano_atual and self._arquivo_existe(path): return
         url = self.config.URL_BASE_SSP.format(ano=ano)
         try:
             res = requests.get(url, timeout=600)
             if res.status_code == 200:
                 self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path, Body=res.content)
-                logger.info(f"✅ Bronze {ano} salva.")
+                logger.info(f"✅ Bronze {ano} baixada.")
         except Exception as e: logger.error(f"❌ Erro Download {ano}: {e}")
 
     def processar_prata(self, ano: int):
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
 
-        if self._arquivo_existe(path_p):
-            logger.info(f"⏭️ Prata {ano} já pronta.")
-            return
-
         try:
-            logger.info(f"🥈 [Ano {ano}] Iniciando Normalização Universal...")
+            if self.df_malha is None: self._carregar_malha_referencia()
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             excel_bytes = obj['Body'].read()
-            
             excel_reader = fastexcel.read_excel(excel_bytes)
             abas = [n for n in excel_reader.sheet_names if not any(x in n.upper() for x in ["CAPA", "DICIONARIO", "LEGENDA", "CAMPOS", "SPDADOS"])]
+            
             list_dfs = []
-
             for nome_aba in abas:
                 try:
                     df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine")
                     indices_map = self._resolver_mapeamento(df_raw.columns)
-                    
-                    # Lógica de salto de linha se cabeçalho não estiver na linha 0
                     if "LATITUDE" not in indices_map.values():
-                        for row_idx in range(min(30, df_raw.height)):
+                        for row_idx in range(min(20, df_raw.height)):
                             indices_map = self._resolver_mapeamento(df_raw.row(row_idx))
                             if "LATITUDE" in indices_map.values():
                                 df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": row_idx + 1})
                                 indices_map = self._resolver_mapeamento(df_raw.columns)
                                 break
-                    
                     df_mes = df_raw.select([df_raw.columns[i] for i in indices_map.keys()])
                     df_mes.columns = [indices_map[i] for i in indices_map.keys()]
-                    df_mes = df_mes.with_columns(pl.all().cast(pl.Utf8))
-                    list_dfs.append(df_mes)
+                    list_dfs.append(df_mes.with_columns(pl.all().cast(pl.Utf8)))
                 except: continue
 
-            if not list_dfs: raise ValueError(f"Dados não localizados em {ano}.")
             df_final = pl.concat(list_dfs, how="diagonal")
-            
-            # Limpeza, Tipagem e Hierarquia Temporal
             df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD e H3
+            # Anonimização e Upload
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
-                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
-                pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3),
-                    return_dtype=pl.Utf8
-                ).alias("H3_INDEX")
+                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
             ])
-
-            buf = io.BytesIO()
-            df_final.write_parquet(buf, compression="zstd")
+            buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} normalizada e 'mastigada' com SUCESSO.")
+            logger.info(f"✨ Prata {ano} (SSP Trusted) finalizada.")
 
-        except Exception as e:
-            logger.error(f"💥 Erro fatal em {ano}: {e}")
+        except Exception as e: logger.error(f"💥 Erro fatal no processamento {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
