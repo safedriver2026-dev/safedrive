@@ -39,7 +39,9 @@ class ConfiguracaoIngestao:
         "RUBRICA": [r"RUBRICA", r"NATUREZA", r"DESCR_RUBRICA"],
         "LATITUDE": [r"LATITUDE", r"LAT.*GEO", r"^LAT$", r"COORDENADA_X", r"LATITUD"],
         "LONGITUDE": [r"LONGITUDE", r"LON.*GEO", r"^LON$", r"COORDENADA_Y", r"LONGITUD"],
-        "DESCR_TIPOLOCAL": [r"TIPOLOCAL", r"LOCAL_OCORR", r"DESCR_TIPOLOCAL", r"LOCAL"]
+        "DESCR_TIPOLOCAL": [r"TIPOLOCAL", r"LOCAL_OCORR", r"DESCR_TIPOLOCAL", r"LOCAL"],
+        # CALLBACK DE PERÍODO NATIVO (Resiliente a nomes de colunas diferentes)
+        "PERIODO_NATIVO": [r"DESC.*PERIODO", r"PERIODO", r"DS_PERIODO", r"DESC_PERIODO_OCORRENCIA"]
     }
 
 class IngestorSafeDriver:
@@ -49,7 +51,6 @@ class IngestorSafeDriver:
         self.ano_atual = datetime.now().year
 
     def _inicializar_s3(self):
-        # FIX: Limpeza idêntica à malha para não duplicar o bucket no R2
         endpoint = self.config.ENDPOINT_URL.strip().rstrip('/')
         if endpoint.endswith(f"/{self.config.NOME_BUCKET}"):
             endpoint = endpoint[: -len(f"/{self.config.NOME_BUCKET}")]
@@ -69,12 +70,9 @@ class IngestorSafeDriver:
         except: return False
 
     def _normalizar_texto(self, valor):
-        """Remove acentos, caracteres especiais e deixa em maiúsculo."""
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
             return "NAO INFORMADO"
-        # Normalização NFKD para separar acentos das letras
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
-        # Remove tudo que não for letra, número ou espaço e limpa as pontas
         return re.sub(r'[^a-zA-Z0-9\s]', '', texto).upper().strip()
 
     def _resolver_mapeamento(self, lista_colunas):
@@ -90,16 +88,43 @@ class IngestorSafeDriver:
                         break
         return mapeamento
 
-    def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
-        # FIX: LOGRADOURO incluído na normalização de texto para que o Join com a Ouro funcione perfeitamente
-        colunas_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO"]]
+    def _processar_periodo_mastigado(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Aplica a hierarquia de recuperação do período do dia."""
         
-        for col in colunas_texto:
-            df = df.with_columns(
-                pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8).alias(col)
-            )
+        # 1. Tentar extrair a hora e criar o período base
+        df = df.with_columns(
+            pl.col("HORAOCORRENCIA").str.to_time(format="%H:%M:%S", strict=False).dt.hour().alias("_hora_temp")
+        )
+        
+        # 2. Lógica de Fallback
+        df = df.with_columns(
+            # Tenta pela Hora
+            pl.when(pl.col("_hora_temp").is_between(0, 5)).then(pl.lit("MADRUGADA"))
+            .when(pl.col("_hora_temp").is_between(6, 11)).then(pl.lit("MANHA"))
+            .when(pl.col("_hora_temp").is_between(12, 17)).then(pl.lit("TARDE"))
+            .when(pl.col("_hora_temp").is_between(18, 23)).then(pl.lit("NOITE"))
+            # Se hora for nula, tenta pelo texto nativo da SSP
+            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MADRUGADA")).then(pl.lit("MADRUGADA"))
+            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MANHA|MANHÃ")).then(pl.lit("MANHA"))
+            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("TARDE")).then(pl.lit("TARDE"))
+            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("NOITE")).then(pl.lit("NOITE"))
+            .otherwise(pl.lit(None))
+            .alias("SAZON_PERIODO")
+        ).drop(["_hora_temp", "PERIODO_NATIVO"]) # Limpa colunas temporárias
+        
+        # 3. EXCLUSÃO: Se não recuperou por nada, deleta a linha
+        return df.filter(pl.col("SAZON_PERIODO").is_not_null())
 
-        # 2. LAT/LON para Float
+    def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
+        # 1. Normalização de Texto Universal
+        colunas_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO", "HORAOCORRENCIA", "PERIODO_NATIVO"]]
+        for col in colunas_texto:
+            df = df.with_columns(pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8).alias(col))
+
+        # 2. Processar Período (Hierarquia de Recuperação)
+        df = self._processar_periodo_mastigado(df)
+
+        # 3. LAT/LON para Float e Filtro Geográfico
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
@@ -131,67 +156,49 @@ class IngestorSafeDriver:
             excel_bytes = obj['Body'].read()
             
             excel_reader = fastexcel.read_excel(excel_bytes)
-            abas = excel_reader.sheet_names
+            abas = [n for n in excel_reader.sheet_names if not any(x in n.upper() for x in ["CAPA", "DICIONARIO", "LEGENDA", "CAMPOS", "SPDADOS"])]
             list_dfs = []
 
             for nome_aba in abas:
-                if any(x in nome_aba.upper() for x in ["CAPA", "DICIONARIO", "LEGENDA", "CAMPOS", "SPDADOS"]):
-                    continue
-
                 try:
                     df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine")
                     indices_map = self._resolver_mapeamento(df_raw.columns)
                     
+                    # Lógica de salto de linha se cabeçalho não estiver na linha 0
                     if "LATITUDE" not in indices_map.values():
-                        found = False
                         for row_idx in range(min(30, df_raw.height)):
-                            row_data = df_raw.row(row_idx)
-                            indices_map = self._resolver_mapeamento(row_data)
-                            if "LATITUDE" in indices_map.values() and "LONGITUDE" in indices_map.values():
-                                df_real = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", 
-                                                        read_options={"skip_rows": row_idx + 1})
-                                indices_map = self._resolver_mapeamento(df_real.columns)
-                                df_mes = df_real.select([df_real.columns[i] for i in indices_map.keys()])
-                                df_mes.columns = [indices_map[i] for i in indices_map.keys()]
-                                found = True
+                            indices_map = self._resolver_mapeamento(df_raw.row(row_idx))
+                            if "LATITUDE" in indices_map.values():
+                                df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": row_idx + 1})
+                                indices_map = self._resolver_mapeamento(df_raw.columns)
                                 break
-                        if not found: continue
-                    else:
-                        df_mes = df_raw.select([df_raw.columns[i] for i in indices_map.keys()])
-                        df_mes.columns = [indices_map[i] for i in indices_map.keys()]
-
+                    
+                    df_mes = df_raw.select([df_raw.columns[i] for i in indices_map.keys()])
+                    df_mes.columns = [indices_map[i] for i in indices_map.keys()]
                     df_mes = df_mes.with_columns(pl.all().cast(pl.Utf8))
                     list_dfs.append(df_mes)
-
-                except Exception as e:
-                    logger.warning(f"   ⚠️ Falha na aba {nome_aba}: {e}")
+                except: continue
 
             if not list_dfs: raise ValueError(f"Dados não localizados em {ano}.")
-
             df_final = pl.concat(list_dfs, how="diagonal")
             
-            # APLICA NORMALIZAÇÃO (MAIÚSCULO E SEM ACENTO PARA TUDO, INCLUINDO LOGRADOURO)
+            # Limpeza, Tipagem e Hierarquia Temporal
             df_final = self._limpar_e_tipar(df_final)
             
-            # FIX: Apenas o BO recebe hash para anonimização (LGPD). A rua permanece em texto claro para geocoding!
+            # LGPD e H3
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
-                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
-            ])
-
-            # H3
-            res_h3 = self.config.RESOLUCAO_H3
-            df_final = df_final.with_columns(
+                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
                 pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], res_h3),
+                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3),
                     return_dtype=pl.Utf8
                 ).alias("H3_INDEX")
-            )
+            ])
 
             buf = io.BytesIO()
             df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} normalizada com SUCESSO.")
+            logger.info(f"✨ Prata {ano} normalizada e 'mastigada' com SUCESSO.")
 
         except Exception as e:
             logger.error(f"💥 Erro fatal em {ano}: {e}")
