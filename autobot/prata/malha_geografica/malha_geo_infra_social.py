@@ -17,7 +17,7 @@ from botocore.config import Config
 from pathlib import Path
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (STREAMING ENGINE V5 - FINAL)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (AGGREGATED INFRA ENGINE)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -30,7 +30,6 @@ class ArquitetoSafeDriverPrata:
         os.makedirs(self.prata_dir, exist_ok=True)
         os.makedirs(self.temp_dir, exist_ok=True)
         
-        # Conexão R2
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -43,103 +42,44 @@ class ArquitetoSafeDriverPrata:
             config=Config(signature_version='s3v4', retries={'max_attempts': 3})
         )
 
-        self.pepper = os.getenv("LGPD_PEPPER", "safedriver_seguranca_padrao_2026").strip()
-        
-        # DuckDB Engine
+        # Config DuckDB
         self.con = duckdb.connect(database=':memory:')
         self.con.execute(f"PRAGMA memory_limit='4GB';")
         self.con.execute(f"PRAGMA temp_directory='{self.temp_dir}';")
         
         try:
             self.con.execute("INSTALL spatial; LOAD spatial;")
-        except:
-            pass 
+        except: pass 
         
-        self.auditoria = {"DATA_EXECUCAO": str(datetime.now()), "CAMADAS": {}}
+        self.auditoria = {"DATA_EXECUCAO": str(datetime.now())}
 
     # ==========================================
     # UTILITÁRIOS
     # ==========================================
     def _buscar_arquivo_seguro(self, padrao, nome):
         arqs = glob.glob(f"{self.bronze_dir}/**/{padrao}", recursive=True)
-        if not arqs: raise FileNotFoundError(f"⚠️ {nome} não encontrado!")
+        if not arqs: raise FileNotFoundError(f"⚠️ {nome} ({padrao}) ausente!")
         return arqs[0]
 
     def _analisar_csv_dinamicamente(self, path):
-        encs = ['utf-8', 'windows-1252', 'iso-8859-1', 'latin1']
+        encs = ['utf-8', 'windows-1252', 'latin1']
         with open(path, 'rb') as f: sample = f.read(100000)
         enc_final = 'utf-8'
         for e in encs:
             try:
-                sample.decode(e)
-                enc_final = e
-                break
+                sample.decode(e); enc_final = e; break
             except: continue
         sep = ";"
         try:
-            sniffer = csv.Sniffer()
-            sep = sniffer.sniff(sample.decode(enc_final), delimiters=";,|").delimiter
+            sep = csv.Sniffer().sniff(sample.decode(enc_final), delimiters=";,|").delimiter
         except: pass
         return enc_final, sep
 
     def _garantir_osmconf(self):
         path = os.path.join(self.bronze_dir, "osmconf.ini")
         if not os.path.exists(path):
-            cfg = "[lines]\nosm_id=yes\nattributes=name,highway\n[points]\nosm_id=yes\nattributes=name\n"
-            with open(path, "w") as f: f.write(cfg)
+            with open(path, "w") as f: f.write("[lines]\nosm_id=yes\nattributes=name,highway\n")
         return path.replace("\\", "/")
-
-    def _normalizar(self, v):
-        if v is None or str(v).upper() in ["NULL", "NAN", ".", "", "NONE"]: return "NAO INFORMADO"
-        s = "".join(c for c in unicodedata.normalize('NFKD', str(v)) if unicodedata.category(c) != 'Mn')
-        return re.sub(r'[^a-zA-Z0-9\s]', '', s).upper().strip()
-
-    def normalizar_df(self, df: pl.DataFrame) -> pl.DataFrame:
-        cols = df.select(cs.string()).columns
-        for c in cols:
-            uniques = df.select(pl.col(c).unique()).drop_nulls()
-            if uniques.height > 0:
-                map_df = uniques.with_columns(pl.col(c).map_elements(self._normalizar, return_dtype=pl.Utf8).alias("_n"))
-                df = df.join(map_df, on=c, how="left").with_columns(pl.col("_n").fill_null("NAO INFORMADO").alias(c)).drop("_n")
-            df = df.with_columns(pl.col(c).cast(pl.Categorical))
-        return df
-
-    # ==========================================
-    # CORE DE PERFORMANCE
-    # ==========================================
-    def aplicar_h3_batch(self, df: pl.DataFrame, lat="lat", lon="lon") -> pl.DataFrame:
-        coords = df.select([lat, lon]).drop_nulls().unique()
-        if coords.height > 0:
-            coords = coords.with_columns(pl.struct([lat, lon]).map_batches(
-                lambda s: pl.Series([h3.latlng_to_cell(x[lat], x[lon], self.H3_RES) for x in s])
-            ).alias("H3_INDEX"))
-            return df.join(coords, on=[lat, lon], how="left")
-        return df.with_columns(pl.lit(None).alias("H3_INDEX"))
-
-    def imputar_h3_infra(self, df: pl.DataFrame, colunas: list) -> pl.DataFrame:
-        # Garante que usamos apenas colunas que existem no DF
-        cols_presentes = [c for c in colunas if c in df.columns]
-        if not cols_presentes or "H3_INDEX" not in df.columns: return df
-        
-        print(f"   🪄 IA Espacial: Recuperando localizações via H3...", flush=True)
-        for c in cols_presentes:
-            guia = df.filter((pl.col(c).is_not_null()) & (pl.col(c) != "NAO INFORMADO")) \
-                     .group_by("H3_INDEX").agg(pl.col(c).mode().first().alias("_inf"))
-            
-            df = df.join(guia, on="H3_INDEX", how="left") \
-                   .with_columns(pl.when(pl.col(c).is_null() | (pl.col(c) == "NAO INFORMADO"))
-                                   .then(pl.col("_inf")).otherwise(pl.col(c)).fill_null("NAO INFORMADO").alias(c)) \
-                   .drop("_inf")
-        return df
-
-    def aplicar_lgpd_infra(self, df: pl.DataFrame) -> pl.DataFrame:
-        def _h(v):
-            if v is None or str(v).strip() == "": return "ANONIMIZADO"
-            return hashlib.sha256((str(v).upper().strip() + self.pepper).encode()).hexdigest()
-        
-        # id_protegido já é o cnpj, razao_social e nome_fantasia precisam de hash
-        cols = [c for c in ["id_protegido", "razao_social", "nome_fantasia"] if c in df.columns]
-        return df.with_columns([pl.col(c).map_elements(_h, return_dtype=pl.Utf8) for c in cols])
 
     # ==========================================
     # WORKFLOW
@@ -148,18 +88,17 @@ class ArquitetoSafeDriverPrata:
         print("📥 Sincronizando Bronze...", flush=True)
         targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
-        count = 0
         for p in pag.paginate(Bucket=self.bucket):
             for obj in p.get('Contents', []):
                 key = obj['Key']
                 if any(t in key for t in targets):
                     dest = os.path.join(self.bronze_dir, key.split('/')[-1])
-                    self.s3.download_file(self.bucket, key, dest)
-                    count += 1
-        print(f"✅ {count} arquivos prontos.", flush=True)
+                    if not os.path.exists(dest):
+                        self.s3.download_file(self.bucket, key, dest)
+        print("✅ Bronze sincronizada.", flush=True)
 
     def processar(self):
-        # 1. GEO (OSM + IBGE)
+        # 1. GEO (IBGE + OSM) - Mantemos 1-para-1 pois é a nossa malha de ruas
         print("🗺️ Malha Geográfica...", flush=True)
         try:
             zip_f = self._buscar_arquivo_seguro("SP_Faces_2022.zip", "IBGE Faces")
@@ -168,28 +107,26 @@ class ArquitetoSafeDriverPrata:
             
             json_files = glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True)
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OSM PBF")
-            conf_path = self._garantir_osmconf()
+            conf = self._garantir_osmconf()
 
-            sqls = []
-            for f in json_files:
-                f_path = str(f).replace("\\", "/")
-                sqls.append(f"SELECT CAST(CD_FACE AS VARCHAR) as CD_FACE, trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(NULL AS VARCHAR) as NM_MUN, CAST(NULL AS VARCHAR) as NM_BAIRRO, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f_path}')")
+            sqls = [f"SELECT trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f.replace('\\','/')}')" for f in json_files]
             
-            # FIX: open_options agora inclui o CONFIG_FILE corretamente
             query = f"""
-                SELECT CAST(osm_id AS VARCHAR) as CD_FACE, name as RUA, CAST(NULL AS VARCHAR) as NM_MUN, CAST(NULL AS VARCHAR) as NM_BAIRRO, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
-                FROM ST_Read('{osm_pbf}', layer='lines', open_options=['CONFIG_FILE={conf_path}', 'INTERLEAVED_READING=YES']) 
+                SELECT name as RUA, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
+                FROM ST_Read('{osm_pbf}', layer='lines', open_options=['CONFIG_FILE={conf}', 'INTERLEAVED_READING=YES']) 
                 WHERE highway IS NOT NULL AND name IS NOT NULL
                 UNION ALL {" UNION ALL ".join(sqls)}
             """
             df = self.con.execute(query).pl()
-            df = self.normalizar_df(df)
-            df = self.aplicar_h3_batch(df, "LAT", "LON")
-            df = self.imputar_h3_infra(df, ["RUA", "NM_MUN", "NM_BAIRRO"])
             
-            df.unique(subset=["RUA", "H3_INDEX"]).write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
-            self.auditoria["GEO"] = {"STATUS": "OK", "COUNT": df.height}
-        except Exception as e: self.auditoria["GEO"] = {"STATUS": "ERRO", "MSG": str(e)}
+            # Cálculo H3 simplificado para Malha Geo
+            coords = df.select(["LAT", "LON"]).unique()
+            coords = coords.with_columns(pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX"))
+            df = df.join(coords, on=["LAT", "LON"], how="left").select(["RUA", "H3_INDEX"]).unique()
+            
+            df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
+            self.auditoria["GEO"] = "OK"
+        except Exception as e: self.auditoria["GEO"] = str(e)
 
         # 2. SOCIAL
         print("👥 Malha Social...", flush=True)
@@ -197,51 +134,63 @@ class ArquitetoSafeDriverPrata:
             csv_f = self._buscar_arquivo_seguro("Agregados_por_setores_basico*.csv", "Censo")
             enc, sep = self._analisar_csv_dinamicamente(csv_f)
             df = pl.read_csv(csv_f, separator=sep, encoding=enc, null_values=["."], infer_schema_length=10000).filter(pl.col("CD_SETOR").cast(pl.Utf8).str.starts_with("35"))
-            df = df.with_columns([
-                pl.col("AREA_KM2").cast(pl.Utf8).str.replace(",", ".").cast(pl.Float32, strict=False),
-                pl.col("v0001").cast(pl.UInt32, strict=False).fill_null(0).alias("POPULACAO"),
-                pl.col("v0002").cast(pl.UInt32, strict=False).fill_null(0).alias("DOMICILIOS")
-            ])
-            df = self.normalizar_df(df)
+            df = df.select([c for c in ["CD_SETOR", "NM_MUN", "NM_BAIRRO", "v0001", "v0002"] if c in df.columns])
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet", compression="zstd")
-            self.auditoria["SOCIAL"] = {"STATUS": "OK", "COUNT": df.height}
-        except Exception as e: self.auditoria["SOCIAL"] = {"STATUS": "ERRO", "MSG": str(e)}
+            self.auditoria["SOCIAL"] = "OK"
+        except Exception as e: self.auditoria["SOCIAL"] = str(e)
 
-        # 3. INFRA (Otimizado contra Crash e PerformanceWarning)
-        print("🏗️ Malha Infra (Processamento Streaming)...", flush=True)
+        # 3. INFRA (MÁGICA DE ENGENHARIA: AGGREGAÇÃO POR H3)
+        print("🏗️ Malha Infra (Agregando 300M de registros por H3)...", flush=True)
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
+            
+            # Scan Lazy
             lf = pl.scan_parquet(pqs)
             
-            # FIX: Usar collect_schema().names() para evitar PerformanceWarning
-            colunas_schema = lf.collect_schema().names()
-            colunas_alvo = ["id_protegido", "cnpj", "razao_social", "nome_fantasia", "lat", "lon", 
-                            "municipio", "bairro", "cnae_fiscal_principal", "situacao_cadastral"]
-            
-            cols_reais = [c for c in colunas_alvo if c in colunas_schema]
-            
-            lf = lf.select(cols_reais).filter(pl.col("lat").is_not_null())
+            # Filtro Precoce e Extração da Divisão CNAE (2 primeiros dígitos)
+            # Divisão 56 = Alimentação, 47 = Varejo, 64 = Financeiro, etc.
+            lf = lf.select(["lat", "lon", "cnae_fiscal_principal"]) \
+                   .filter(pl.col("lat").is_not_null()) \
+                   .with_columns(
+                       pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")
+                   )
 
-            # FIX: engine="streaming" conforme nova versão do Polars
-            df = lf.collect(engine="streaming")
+            # Agregação Nível 1: Reduzimos de milhões para milhares por (Lat, Lon, CNAE_DIV)
+            df_reduced = lf.group_by(["lat", "lon", "CNAE_DIV"]).count().collect(engine="streaming")
+
+            # Cálculo de H3 nas coordenadas únicas reduzidas
+            unique_coords = df_reduced.select(["lat", "lon"]).unique()
+            unique_coords = unique_coords.with_columns(
+                pl.struct(["lat", "lon"]).map_batches(
+                    lambda s: pl.Series([h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s])
+                ).alias("H3_INDEX")
+            )
             
-            df = self.aplicar_h3_batch(df, "lat", "lon")
-            df = self.imputar_h3_infra(df, ["municipio", "bairro"])
-            df = self.aplicar_lgpd_infra(df)
-            df = self.normalizar_df(df)
+            # Join e Agregação Final por H3
+            df_infra = df_reduced.join(unique_coords, on=["lat", "lon"])
             
-            df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA.parquet", compression="zstd")
-            self.auditoria["INFRA"] = {"STATUS": "OK", "COUNT": df.height}
-            print(f"   ✅ Infra Concluída: {df.height} empresas.", flush=True)
-        except Exception as e: self.auditoria["INFRA"] = {"STATUS": "ERRO", "MSG": str(e)}
+            # Pivot para criar colunas por setor econômico (Features para o modelo)
+            # Ex: hexágono tal tem X estabelecimentos do tipo Y
+            df_pivot = df_infra.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("count").alias("TOTAL")) \
+                               .pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV") \
+                               .fill_null(0)
+
+            # Prefixar colunas para o modelo saber que é infra
+            df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
+
+            df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
+            self.auditoria["INFRA"] = f"OK - {df_pivot.height} hexágonos mapeados"
+            print(f"   ✅ Infra Agregada: {df_pivot.height} hexágonos processados.", flush=True)
+            
+        except Exception as e: self.auditoria["INFRA"] = f"ERRO: {str(e)}"
 
     def finalizar(self):
         proj = os.getenv("BQ_PROJECT_ID", "safedriver").strip()
         with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f: json.dump(self.auditoria, f, indent=4)
         for f in os.listdir(self.prata_dir):
-            if f.endswith((".parquet", ".json")):
+            if f.endswith(".parquet"):
                 self.s3.upload_file(os.path.join(self.prata_dir, f), self.bucket, f"{proj}/datalake/prata/malhas/{f}")
-        print("\n📊 PIPELINE FINALIZADO:", json.dumps(self.auditoria, indent=4), flush=True)
+        print("\n📊 PIPELINE AGREGADO FINALIZADO:", json.dumps(self.auditoria, indent=4), flush=True)
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverPrata()
