@@ -17,7 +17,7 @@ on:
           - 'PRATA_COMPLETA'
           - 'FLUXO_CRIMES'
           - 'FLUXO_MAPA'
-          - 'ORGANIZAR_PROJETO_R2' # <--- OPÇÃO PARA MOVER OS BLOCÕES
+          - 'ORGANIZAR_PROJETO_R2'
           - 'tudo'
 
 jobs:
@@ -96,7 +96,9 @@ jobs:
           python-version: '3.11'
       
       - name: "⚙️ Instalar Motores de Performance"
-        run: pip install boto3 polars h3 pyarrow python-calamine fsspec
+        run: |
+          # Adicionado 'requests' aqui para garantir que a Prata consiga validar arquivos se necessário
+          pip install boto3 polars h3 pyarrow python-calamine fsspec requests
 
       - name: "🛡️ [PRATA-A] Processamento Crimes"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
@@ -106,7 +108,7 @@ jobs:
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
-  # --- JOB DE ORGANIZAÇÃO: Mover Blocões para a pasta do Projeto ---
+  # --- JOB DE ORGANIZAÇÃO ---
   organizacao-r2:
     if: github.event.inputs.job == 'ORGANIZAR_PROJETO_R2'
     runs-on: ubuntu-latest
@@ -115,7 +117,7 @@ jobs:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }} # Nome da pasta do projeto (ex: safedriver)
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -129,10 +131,9 @@ jobs:
         run: pip install boto3
 
       - name: "🚚 Mover Blocos para Pasta do Projeto"
-        # O script organizador_r2.py deve estar na pasta autobot/
         run: python autobot/organizador_r2.py
 
-  # --- NOTIFICAÇÃO: Avalia o Pipeline Inteiro ---
+  # --- NOTIFICAÇÃO ---
   notificacao:
     needs: [camada-bronze, camada-prata, organizacao-r2]
     if: always()
