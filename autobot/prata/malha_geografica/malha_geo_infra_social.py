@@ -13,17 +13,17 @@ from datetime import datetime
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
-        # Configurações Essenciais
+        # Configurações de Pastas e Resolução
         self.H3_RES = 9 
         self.bronze_dir = "./data_raw"
         self.prata_dir = "./data_prata"
         os.makedirs(self.prata_dir, exist_ok=True)
         
-        # Engine Espacial (DuckDB)
+        # Inicialização do DuckDB com suporte Espacial
         self.con = duckdb.connect(database=':memory:')
         self.con.execute("INSTALL spatial; LOAD spatial;")
         
-        # Dicionário de Auditoria Blindado
+        # Estrutura de Auditoria para Data Quality
         self.auditoria = {
             "DATA_EXECUCAO": str(datetime.now()),
             "QUALIDADE_GERAL": "PROCESSANDO",
@@ -31,28 +31,31 @@ class ArquitetoSafeDriverPrata:
         }
 
     def _normalizar_string(self, valor):
-        """Limpa textos: remove acentos, coloca em maiúsculas e trata nulos."""
+        """Padroniza textos: Remove acentos, caracteres especiais e limpa espaços."""
         if valor is None or valor == "" or str(valor).upper() in ["NULL", "NAN", ".", "N/A", "NONE"]: 
             return "NAO INFORMADO"
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
+        # Remove caracteres que não sejam letras, números ou espaços
+        import re
+        texto = re.sub(r'[^a-zA-Z0-9\s]', '', texto)
         return texto.upper().strip()
 
     # ---------------------------------------------------------
-    # 1. MALHA GEOGRÁFICA (Esqueleto Viário)
+    # 1. MALHA GEOGRÁFICA (Esqueleto Viário - Faces de Logradouro)
     # ---------------------------------------------------------
     def processar_malha_geografica(self):
-        print("🗺️ [PRATA] A construir Malha Geográfica (Vias)...")
+        print("🗺️ [PRATA] Construindo Malha Geográfica (Vias)...")
         try:
-            # Busca recursiva no diretório
+            # Busca recursiva para encontrar o ZIP em qualquer subpasta
             zip_paths = glob.glob(os.path.join(self.bronze_dir, "**", "SP_Faces_2022.zip"), recursive=True)
             
             if not zip_paths:
-                raise FileNotFoundError("Arquivo SP_Faces_2022.zip não encontrado no diretório local.")
+                raise FileNotFoundError("Arquivo SP_Faces_2022.zip não encontrado para processamento.")
 
             with zipfile.ZipFile(zip_paths[0], 'r') as z:
                 z.extractall(self.bronze_dir)
 
-            # Extração Espacial com DuckDB
+            # DuckDB extrai o centroide de cada rua e converte em coordenadas planas
             query = f"""
                 SELECT 
                     CD_FACE,
@@ -64,7 +67,7 @@ class ArquitetoSafeDriverPrata:
             """
             df_geo = self.con.execute(query).pl()
             
-            # Transformação e Tipagem Defensiva
+            # Polars calcula o H3 e aplica downcasting (Float64 -> Float32)
             df_geo = df_geo.with_columns([
                 pl.col("RUA").map_elements(self._normalizar_string, return_dtype=pl.Utf8).cast(pl.Categorical),
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
@@ -74,15 +77,14 @@ class ArquitetoSafeDriverPrata:
                 pl.col("LON").cast(pl.Float32, strict=False)
             ]).unique(subset=["CD_FACE"])
             
-            caminho_saida = os.path.join(self.prata_dir, "PRATA_MALHA_GEOGRAFICA_VIAS.parquet")
-            df_geo.write_parquet(caminho_saida, compression="zstd", compression_level=9)
+            # Persistência com compressão máxima para a Camada Ouro
+            df_geo.write_parquet(os.path.join(self.prata_dir, "PRATA_MALHA_GEOGRAFICA_VIAS.parquet"), compression="zstd", compression_level=9)
             
-            # Registo de Auditoria Seguro (.item() converte de Polars para Python nativo)
             self.auditoria["CAMADAS"]["GEOGRAFICA"] = {
                 "STATUS": "SUCESSO",
                 "REGISTROS_TOTAIS": df_geo.height,
                 "HEXAGONOS_H3_UNICOS": df_geo.select(pl.col("H3_INDEX").n_unique()).item(),
-                "VALORES_NULOS_LAT_LON": df_geo.select(pl.col("LAT").is_null().sum()).item()
+                "VALORES_NULOS_LAT_LON": int(df_geo.select(pl.col("LAT").is_null().sum()).item())
             }
             
         except Exception as e:
@@ -90,27 +92,28 @@ class ArquitetoSafeDriverPrata:
             self.auditoria["CAMADAS"]["GEOGRAFICA"] = {"STATUS": "ERRO", "MENSAGEM": str(e)}
 
     # ---------------------------------------------------------
-    # 2. MALHA SOCIAL (Demografia IBGE)
+    # 2. MALHA SOCIAL (Demografia e Vulnerabilidade - IBGE)
     # ---------------------------------------------------------
     def processar_malha_social(self):
-        print("👥 [PRATA] A construir Malha Social/Demográfica...")
+        print("👥 [PRATA] Construindo Malha Social/Demográfica...")
         try:
             csv_paths = glob.glob(os.path.join(self.bronze_dir, "**", "Agregados_por_setores_basico*.csv"), recursive=True)
             
             if not csv_paths:
-                raise FileNotFoundError("CSV de Setores Censitários não encontrado.")
+                raise FileNotFoundError("Arquivo CSV de Agregados do IBGE não encontrado.")
                 
-            # Leitura Inteligente e Proteção da Chave Primária
+            # Inferência de tipos com proteção para colunas de código (CD_)
             df_social = pl.read_csv(
                 csv_paths[0], separator=";", null_values=["."],
                 infer_schema_length=10000, 
                 schema_overrides={"CD_SETOR": pl.Utf8, "CD_MUN": pl.Utf8, "CD_BAIRRO": pl.Utf8}
-            ).filter(pl.col("CD_SETOR").str.starts_with("35")) # Filtra SP
+            ).filter(pl.col("CD_SETOR").str.starts_with("35")) # Foco em SP
             
+            # Colunas fundamentais para análise de risco social
             colunas_alvo = ["CD_SETOR", "CD_MUN", "NM_MUN", "CD_BAIRRO", "NM_BAIRRO", "AREA_KM2", "SITUACAO", "CD_SITUACAO", "CD_TIPO", "v0001", "v0002"]
             df_social = df_social.select([c for c in colunas_alvo if c in df_social.columns])
 
-            # Tratamento da área (replace da vírgula brasileira para ponto)
+            # Tratamento da vírgula decimal e tipos numéricos curtos (UInt8/UInt32)
             area_expr = pl.col("AREA_KM2").str.replace_all(",", ".").cast(pl.Float32, strict=False) if df_social.schema["AREA_KM2"] == pl.Utf8 else pl.col("AREA_KM2").cast(pl.Float32, strict=False)
 
             df_social = df_social.with_columns([
@@ -124,15 +127,13 @@ class ArquitetoSafeDriverPrata:
                 pl.col("v0002").cast(pl.UInt32, strict=False).fill_null(0).alias("TOTAL_DOMICILIOS")
             ]).drop(["v0001", "v0002"])
 
-            caminho_saida = os.path.join(self.prata_dir, "PRATA_MALHA_SOCIAL_SETORES.parquet")
-            df_social.write_parquet(caminho_saida, compression="zstd", compression_level=9)
+            df_social.write_parquet(os.path.join(self.prata_dir, "PRATA_MALHA_SOCIAL_SETORES.parquet"), compression="zstd", compression_level=9)
             
-            # Registo de Auditoria Seguro
             self.auditoria["CAMADAS"]["SOCIAL"] = {
                 "STATUS": "SUCESSO",
                 "SETORES_TOTAIS": df_social.height,
                 "POPULACAO_MAPEADA": int(df_social.select(pl.col("TOTAL_PESSOAS").sum()).item()),
-                "BAIRROS_MAPEADOS": df_social.select(pl.col("NM_BAIRRO").n_unique()).item()
+                "BAIRROS_MAPEADOS": int(df_social.select(pl.col("NM_BAIRRO").n_unique()).item())
             }
             
         except Exception as e:
@@ -140,25 +141,28 @@ class ArquitetoSafeDriverPrata:
             self.auditoria["CAMADAS"]["SOCIAL"] = {"STATUS": "ERRO", "MENSAGEM": str(e)}
 
     # ---------------------------------------------------------
-    # 3. MALHA DE INFRAESTRUTURA (Comércio / CNPJ)
+    # 3. MALHA DE INFRAESTRUTURA (Estabelecimentos Comerciais - CNPJ)
     # ---------------------------------------------------------
     def processar_malha_infraestrutura(self):
-        print("🏗️ [PRATA] A construir Malha de Infraestrutura (Comércio)...")
+        print("🏗️ [PRATA] Construindo Malha de Infraestrutura (Comércio)...")
         try:
             pattern = os.path.join(self.bronze_dir, "**", "CNPJ_SP_HISTORICO_LOTE_*.parquet")
             arquivos = glob.glob(pattern, recursive=True)
             
             if not arquivos:
-                raise FileNotFoundError("Nenhum lote de CNPJ encontrado.")
+                raise FileNotFoundError("Nenhum lote de CNPJ Parquet encontrado para processamento.")
 
+            # Leitura de múltiplos shards
             df_infra = pl.read_parquet(arquivos)
 
+            # Limpeza de coordenadas e indexação H3
             df_infra = df_infra.drop_nulls(subset=["lat", "lon"]).with_columns([
                 pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([
                     h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s
                 ])).alias("H3_INDEX")
             ])
 
+            # Categorização massiva para reduzir uso de RAM na Camada Ouro
             colunas_categoria = ["H3_INDEX", "cnae_fiscal_principal", "cep", "municipio", "bairro", "situacao_cadastral"]
             df_infra = df_infra.with_columns(
                 [pl.col(c).cast(pl.Categorical) for c in colunas_categoria if c in df_infra.columns] + 
@@ -171,17 +175,13 @@ class ArquitetoSafeDriverPrata:
             if "data_inicio_atividade" in df_infra.columns:
                 df_infra = df_infra.with_columns(pl.col("data_inicio_atividade").cast(pl.Date, strict=False))
                 
-            caminho_saida = os.path.join(self.prata_dir, "PRATA_MALHA_INFRA_COMERCIAL.parquet")
-            df_infra.write_parquet(caminho_saida, compression="zstd", compression_level=9)
-            
-            # Registo de Auditoria Seguro
-            diversidade_cnae = df_infra.select(pl.col("cnae_fiscal_principal").n_unique()).item() if "cnae_fiscal_principal" in df_infra.columns else 0
+            df_infra.write_parquet(os.path.join(self.prata_dir, "PRATA_MALHA_INFRA_COMERCIAL.parquet"), compression="zstd", compression_level=9)
             
             self.auditoria["CAMADAS"]["INFRAESTRUTURA"] = {
                 "STATUS": "SUCESSO",
                 "EMPRESAS_TOTAIS": df_infra.height,
-                "HEXAGONOS_H3_COM_COMERCIO": df_infra.select(pl.col("H3_INDEX").n_unique()).item(),
-                "DIVERSIDADE_CNAE": diversidade_cnae
+                "HEXAGONOS_H3_COM_COMERCIO": int(df_infra.select(pl.col("H3_INDEX").n_unique()).item()),
+                "DIVERSIDADE_CNAE": int(df_infra.select(pl.col("cnae_fiscal_principal").n_unique()).item()) if "cnae_fiscal_principal" in df_infra.columns else 0
             }
             
         except Exception as e:
@@ -189,10 +189,9 @@ class ArquitetoSafeDriverPrata:
             self.auditoria["CAMADAS"]["INFRAESTRUTURA"] = {"STATUS": "ERRO", "MENSAGEM": str(e)}
 
     # ---------------------------------------------------------
-    # 4. AUDITORIA E FINALIZAÇÃO
+    # 4. FINALIZAÇÃO E RELATÓRIO DE QUALIDADE
     # ---------------------------------------------------------
     def finalizar_auditoria(self):
-        # Verifica se alguma camada teve erro para definir a qualidade geral
         erros = [v for k, v in self.auditoria["CAMADAS"].items() if v.get("STATUS") == "ERRO"]
         if erros:
             self.auditoria["QUALIDADE_GERAL"] = "SUCESSO_PARCIAL" if len(erros) < 3 else "FALHA_CRITICA"
@@ -201,11 +200,10 @@ class ArquitetoSafeDriverPrata:
             
         caminho_audit = os.path.join(self.prata_dir, "AUDITORIA_PRATA_MALHAS.json")
         with open(caminho_audit, "w", encoding="utf-8") as f:
-            # O ensure_ascii=False garante que os acentos fiquem legíveis no JSON
             json.dump(self.auditoria, f, indent=4, ensure_ascii=False)
             
         print("\n" + "="*60)
-        print("📊 AUDITORIA FINALIZADA (Copie o JSON abaixo e envie no chat):")
+        print("📊 AUDITORIA FINALIZADA (Envie o JSON abaixo no chat):")
         print("="*60)
         print(json.dumps(self.auditoria, indent=4, ensure_ascii=False))
         print("="*60 + "\n")
