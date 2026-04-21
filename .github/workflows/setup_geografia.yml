@@ -9,7 +9,6 @@ on:
         default: 'tudo'
         type: choice
         options:
-          - 'BRONZE_RECEITA'
           - 'BRONZE_CRIMES'
           - 'BRONZE_COMPLETA'
           - 'PRATA_CRIMES'
@@ -41,38 +40,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: "🔑 Autenticação Google Cloud (GCS)"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA' || github.event.inputs.job == 'FLUXO_MAPA'
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: '${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}'
-
-      - name: "📦 [BRONZE-A] Malha Receita (GCS -> R2)"
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA' || github.event.inputs.job == 'FLUXO_MAPA'
-        run: |
-          pip install google-cloud-storage boto3
-          curl -s https://rclone.org/install.sh | sudo bash
-          CLEAN_ENDPOINT=$(echo "$R2_ENDPOINT_URL" | tr -d ' \n\r\t')
-          CLEAN_ACCESS=$(echo "$R2_ACCESS_KEY_ID" | tr -d ' \n\r\t')
-          CLEAN_SECRET=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d ' \n\r\t')
-          CLEAN_BUCKET=$(echo "$R2_BUCKET_NAME" | tr -d ' \n\r\t')
-          
-          cat <<EOF > rclone.conf
-          [gcs]
-          type = google cloud storage
-          [r2]
-          type = s3
-          provider = Cloudflare
-          access_key_id = $CLEAN_ACCESS
-          secret_access_key = $CLEAN_SECRET
-          endpoint = $CLEAN_ENDPOINT
-          EOF
-          rclone --config ./rclone.conf copy gcs:safedriver/datalake/bronze/malha_raw r2:$CLEAN_BUCKET/datalake/bronze/malha_raw -P
-
       - name: "📦 [BRONZE-B] Crimes SSP (Web -> R2)"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: |
-          pip install boto3 requests
+          # Adicionado pacotes necessários para o script do ingestor não falhar na importação
+          pip install boto3 requests polars h3 python-calamine fastexcel
           python autobot/reg_crimes/ingestor_safe_driver.py bronze
 
   # --- CAMADA PRATA: Transformação e Auditoria ---
@@ -101,7 +73,6 @@ jobs:
       
       - name: "⚙️ Instalar Motores de Performance"
         run: |
-          # Adicionado python-calamine e fastexcel para leitura de Crimes SSP
           pip install boto3 polars h3 pyarrow requests duckdb python-calamine fastexcel
 
       - name: "🛡️ [PRATA-A] Processamento Crimes e LGPD"
