@@ -1,10 +1,10 @@
-name: "SafeDriver: Pipeline Multicamadas Escalável"
+name: "SafeDriver: Pipeline de Produção"
 
 on:
   workflow_dispatch:
     inputs:
       job:
-        description: 'O que deseja executar?'
+        description: 'Selecione o Job para execução:'
         required: true
         default: 'tudo'
         type: choice
@@ -21,7 +21,7 @@ on:
           - 'tudo'
 
 jobs:
-  # --- CAMADA BRONZE: Ingestão Pura (GCS/SSP -> R2) ---
+  # --- CAMADA BRONZE: Ingestão Pura ---
   camada-bronze:
     if: |
       github.event.inputs.job == 'tudo' || 
@@ -34,15 +34,15 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
     steps:
-      - name: 🔍 Checkout
+      - name: 🔍 Checkout do Código
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: "🔑 [AUTH] Google Cloud"
+      - name: "🔑 Autenticação Google Cloud (GCS)"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA' || github.event.inputs.job == 'BRONZE_RECEITA' || github.event.inputs.job == 'FLUXO_MAPA'
         uses: google-github-actions/auth@v2
         with:
@@ -54,7 +54,7 @@ jobs:
           pip install google-cloud-storage boto3
           curl -s https://rclone.org/install.sh | sudo bash
           
-          # BLINDAGEM CONTRA ESPAÇOS: Higieniza os segredos antes do uso
+          # Limpeza de espaços nos secrets para evitar erros de I/O
           CLEAN_ENDPOINT=$(echo "$R2_ENDPOINT_URL" | tr -d ' \n\r\t')
           CLEAN_ACCESS=$(echo "$R2_ACCESS_KEY_ID" | tr -d ' \n\r\t')
           CLEAN_SECRET=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d ' \n\r\t')
@@ -70,7 +70,6 @@ jobs:
           secret_access_key = $CLEAN_SECRET
           endpoint = $CLEAN_ENDPOINT
           EOF
-          
           rclone --config ./rclone.conf copy gcs:safedriver/datalake/bronze/malha_raw r2:$CLEAN_BUCKET/datalake/bronze/malha_raw -P
 
       - name: "📦 [BRONZE-B] Crimes SSP (Web -> R2)"
@@ -79,7 +78,7 @@ jobs:
           pip install boto3 requests
           python autobot/reg_crimes/ingestor_safe_driver.py bronze
 
-  # --- CAMADA PRATA: Transformação e LGPD (Bronze R2 -> Prata R2) ---
+  # --- CAMADA PRATA: Transformação e Auditoria ---
   camada-prata:
     needs: [camada-bronze] 
     if: |
@@ -92,63 +91,31 @@ jobs:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
       LGPD_SALT: ${{ secrets.LGPD_SALT }}
-      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
     steps:
-      - name: 🔍 Checkout
+      - name: 🔍 Checkout do Código
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
       - name: "⚙️ Instalar Motores de Performance"
         run: |
-          pip install boto3 polars h3 pyarrow python-calamine fsspec requests duckdb
+          pip install boto3 polars h3 pyarrow requests duckdb
 
       - name: "🛡️ [PRATA-A] Processamento Crimes"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
-      - name: "🏗️ [PRATA-B] Malha Geo & Infra (Desacoplado)"
+      - name: "🏗️ [PRATA-B] Malha Geo & Infra (100% Python Resiliente)"
         if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_COMPLETA' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_MAPA'
         run: |
-          echo "⚙️ 1. Configurando Conexão R2 (com proteção de chaves)..."
-          curl -s https://rclone.org/install.sh | sudo bash
-          
-          # BLINDAGEM CONTRA ESPAÇOS: Higieniza os segredos antes do uso
-          CLEAN_ENDPOINT=$(echo "$R2_ENDPOINT_URL" | tr -d ' \n\r\t')
-          CLEAN_ACCESS=$(echo "$R2_ACCESS_KEY_ID" | tr -d ' \n\r\t')
-          CLEAN_SECRET=$(echo "$R2_SECRET_ACCESS_KEY" | tr -d ' \n\r\t')
-          CLEAN_BUCKET=$(echo "$R2_BUCKET_NAME" | tr -d ' \n\r\t')
-          CLEAN_PROJECT=$(echo "$BQ_PROJECT_ID" | tr -d ' \n\r\t')
-          
-          cat <<EOF > rclone.conf
-          [r2]
-          type = s3
-          provider = Cloudflare
-          access_key_id = $CLEAN_ACCESS
-          secret_access_key = $CLEAN_SECRET
-          endpoint = $CLEAN_ENDPOINT
-          EOF
-          
-          echo "📁 2. Criando Doca Local..."
-          mkdir -p ./data_raw ./data_prata
-          
-          echo "🔎 3. Super Diagnóstico R2..."
-          rclone --config ./rclone.conf lsd r2: || echo "⚠️ Falha ao ler r2:"
-          rclone --config ./rclone.conf ls r2:$CLEAN_BUCKET/ | head -n 15 || echo "⚠️ Falha ao ler o bucket: $CLEAN_BUCKET"
-          
-          echo "📥 4. Download Inteligente (Busca Wildcard em todo o Bucket)..."
-          rclone --config ./rclone.conf copy r2:$CLEAN_BUCKET/ ./data_raw --include "**/SP_Faces_2022.zip" --include "**/Agregados_por_setores_basico*.csv" --include "**/CNPJ_SP_HISTORICO_LOTE_*.parquet" -P
-          
-          echo "🧠 5. Executando Motor de Processamento (Python)..."
+          echo "🚀 Iniciando motor híbrido (I/O Boto3 + Compute DuckDB/Polars)..."
           python autobot/prata/malha_geografica/malha_geo_infra_social.py
-          
-          echo "📤 6. Upload da Prata (Arquivos + Auditoria)..."
-          rclone --config ./rclone.conf copy ./data_prata r2:$CLEAN_BUCKET/$CLEAN_PROJECT/datalake/prata/malhas -P
 
   # --- JOB DE ORGANIZAÇÃO ---
   organizacao-r2:
@@ -164,12 +131,12 @@ jobs:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: "⚙️ Instalar Boto3"
+      - name: "⚙️ Instalar Dependências"
         run: pip install boto3
 
       - name: "🚚 Mover Blocos para Pasta do Projeto"
@@ -181,13 +148,13 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: "📢 Discord Feedback"
+      - name: "📢 Feedback para o Discord"
         run: |
           if [[ "${{ needs.camada-bronze.result }}" != "failure" && "${{ needs.camada-prata.result }}" != "failure" && "${{ needs.organizacao-r2.result }}" != "failure" && "${{ needs.camada-bronze.result }}" != "cancelled" && "${{ needs.camada-prata.result }}" != "cancelled" && "${{ needs.organizacao-r2.result }}" != "cancelled" ]]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Pipeline finalizado com sucesso: ${{ github.event.inputs.job }}"
+            MSG="✅ **[SafeDriver]** Pipeline de Produção finalizado com sucesso: ${{ github.event.inputs.job }}"
           else
             URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Falha detectada no pipeline: ${{ github.event.inputs.job }}"
+            MSG="🚨 **[SafeDriver]** Falha detetada no pipeline: ${{ github.event.inputs.job }}"
           fi
           curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
