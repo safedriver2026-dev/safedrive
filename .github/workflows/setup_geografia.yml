@@ -14,6 +14,7 @@ on:
           - 'PRATA_CRIMES'
           - 'PRATA_MAPA'
           - 'PRATA_COMPLETA'
+          - 'OURO_COMPLETA'
           - 'FLUXO_CRIMES'
           - 'FLUXO_MAPA'
           - 'tudo'
@@ -94,18 +95,49 @@ jobs:
             fi
           fi
 
+  # --- CAMADA OURO: Tabela Base Analítica (ABT) ---
+  camada-ouro:
+    needs: [camada-prata]
+    if: |
+      always() && 
+      (needs.camada-prata.result == 'success' || needs.camada-prata.result == 'skipped') &&
+      (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'OURO_COMPLETA')
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - name: 🔍 Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: "⚙️ Instalar Bibliotecas Ouro"
+        run: pip install boto3 polars pyarrow
+
+      - name: "🏆 [OURO] Processador da Tabela Analítica (ABT)"
+        run: python autobot/ouro/processador_ouro_safedriver.py
+
   # --- NOTIFICAÇÃO ---
   notificacao:
-    needs: [camada-bronze, camada-prata]
+    needs: [camada-bronze, camada-prata, camada-ouro]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: "📢 Feedback para o Discord"
         run: |
-          PRATA_RESULT="${{ needs.camada-prata.result }}"
           BRONZE_RESULT="${{ needs.camada-bronze.result }}"
+          PRATA_RESULT="${{ needs.camada-prata.result }}"
+          OURO_RESULT="${{ needs.camada-ouro.result }}"
           
-          if [[ ("$PRATA_RESULT" == "success" || "$PRATA_RESULT" == "skipped") && ("$BRONZE_RESULT" == "success" || "$BRONZE_RESULT" == "skipped") ]]; then
+          if [[ ("$BRONZE_RESULT" == "success" || "$BRONZE_RESULT" == "skipped") && \
+                ("$PRATA_RESULT" == "success" || "$PRATA_RESULT" == "skipped") && \
+                ("$OURO_RESULT" == "success" || "$OURO_RESULT" == "skipped") ]]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
             MSG="✅ **[SafeDriver]** Pipeline finalizado com sucesso!\nJob: \`${{ github.event.inputs.job }}\`"
           else
