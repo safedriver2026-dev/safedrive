@@ -48,8 +48,6 @@ jobs:
         if: contains(github.event.inputs.job, 'RECEITA') || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA'
         run: |
           pip install google-cloud-storage boto3
-          # Sincronização direta de Nuvem para Nuvem via rclone ou aws cli
-          # Usando rclone para garantir resiliência em grandes volumes (3GB)
           curl https://rclone.org/install.sh | sudo bash
           cat <<EOF > rclone.conf
           [gcs]
@@ -67,12 +65,11 @@ jobs:
         if: contains(github.event.inputs.job, 'CRIMES') || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_COMPLETA'
         run: |
           pip install boto3 requests
-          # Chama o novo script que tem o loop de retentativa inteligente
-          python autobot/reg_crimes/ingestao_crimes_bronze.py
+          # Chamada modular passando o argumento 'bronze'
+          python autobot/reg_crimes/ingestor_safe_driver.py bronze
 
   # --- CAMADA PRATA: Transformação e LGPD (Bronze R2 -> Prata R2) ---
   camada-prata:
-    # needs: [camada-bronze] -> Removido para permitir rodar Prata de forma avulsa
     if: |
       always() && 
       (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_PROCESS')
@@ -97,11 +94,12 @@ jobs:
         run: pip install boto3 polars h3 pyarrow python-calamine fsspec
 
       - name: "🛡️ [PRATA] Processamento Crimes"
-        # O script agora lê da Bronze no R2 e grava na Prata no R2
-        run: python autobot/reg_crimes/processamento_crimes_prata.py
+        # Chamada modular passando o argumento 'prata'
+        # Ele vai ler os arquivos que o step acima (ou uma run anterior) deixou no R2
+        run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
       - name: "🏗️ [PRATA] Malha Geo & Infra"
-        # Processa os CNAEs agregando por H3 para reduzir os 3GB
+        # Processa a malha de CNAEs para a camada Prata
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
   notificacao:
@@ -113,9 +111,9 @@ jobs:
         run: |
           if [ "${{ needs.camada-prata.result }}" == "success" ]; then
             URL="${{ secrets.DISCORD_SUCESSO }}"
-            MSG="✅ **[SafeDriver]** Pipeline finalizado: ${{ github.event.inputs.job }}"
+            MSG="✅ **[SafeDriver]** Pipeline finalizado com sucesso: ${{ github.event.inputs.job }}"
           else
             URL="${{ secrets.DISCORD_ERRO }}"
-            MSG="🚨 **[SafeDriver]** Falha no job: ${{ github.event.inputs.job }}"
+            MSG="🚨 **[SafeDriver]** Falha detectada no pipeline: ${{ github.event.inputs.job }}"
           fi
           curl -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
