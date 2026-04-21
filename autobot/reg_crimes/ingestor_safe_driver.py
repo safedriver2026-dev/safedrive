@@ -27,7 +27,7 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Mapeamento Refinado com base nos arquivos de 2026
+    # Mapeamento Ultra Flexível para capturar colunas de 2022 a 2026
     MAPA_COLUNAS = {
         "NUM_BO": [r"NUM.*BO", r"N.MERO.*BO", r"BO_NUMERO"],
         "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN"],
@@ -63,25 +63,26 @@ class IngestorSafeDriver:
             return True
         except: return False
 
-    def _resolver_mapeamento(self, colunas_da_linha):
+    def _resolver_mapeamento(self, colunas):
+        """Varre os nomes das colunas e retorna o mapeamento {NomeOriginal: NomeAlvo}."""
         mapeamento = {}
         for alvo, padroes in self.config.MAPA_COLUNAS.items():
-            for i, col_name in enumerate(colunas_da_linha):
-                col_str = str(col_name).upper().strip()
+            for col in colunas:
+                col_str = str(col).upper().strip()
                 for p in padroes:
                     if re.search(p, col_str):
-                        mapeamento[i] = alvo
+                        mapeamento[col] = alvo
                         break
-                if i in mapeamento: break
+                if col in mapeamento: break
         return mapeamento
 
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
-        # 1. Tratamento de coordenadas (suporte a vírgula e strings sujas)
+        # 1. LAT/LON para Float (Trata string com vírgula e extrai apenas o número)
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
         ])
-        # 2. Filtro de segurança (apenas pontos válidos em SP)
+        # 2. Filtro: Se não tem coordenada válida em SP, não serve
         return df.filter((pl.col("LATITUDE").is_not_null()) & (pl.col("LATITUDE") < -10))
 
     def extrair_bronze(self, ano: int):
@@ -111,59 +112,67 @@ class IngestorSafeDriver:
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             excel_data = obj['Body'].read()
             
-            # Usando fastexcel para listar abas (muito mais rápido para arquivos gigantes)
+            # CORREÇÃO: fastexcel.read_excel (não read_xlsx)
             import fastexcel
-            excel_reader = fastexcel.read_xlsx(io.BytesIO(excel_data))
+            excel_reader = fastexcel.read_excel(io.BytesIO(excel_data))
             abas_disponiveis = excel_reader.sheet_names
             
             list_dfs = []
 
             for nome_aba in abas_disponiveis:
-                # Pula abas conhecidas de metadados para ganhar tempo
+                # Pula abas de metadados
                 if any(x in nome_aba.upper() for x in ["CAPA", "DICIONARIO", "LEGENDA", "CAMPOS"]):
                     continue
 
                 try:
-                    # Scan de cabeçalho na aba atual
-                    df_scan = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"has_header": False, "n_rows": 50})
+                    # Lemos as primeiras 20 linhas para achar o cabeçalho real
+                    df_scan = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"has_header": False, "n_rows": 20})
                     
-                    cabecalho_info = None
+                    row_index_header = None
+                    mapeamento_aba = {}
+
                     for i, row in enumerate(df_scan.iter_rows()):
-                        map_idx = self._resolver_mapeamento(row)
-                        if "LATITUDE" in map_idx.values() and "LONGITUDE" in map_idx.values():
-                            cabecalho_info = (i, map_idx)
-                            break
+                        row_values = [str(val).upper().strip() for val in row]
+                        # Tenta encontrar o mapeamento nessa linha específica
+                        teste_map = self._resolver_mapeamento(row_values)
+                        
+                        # Se acharmos Latitude e Longitude, essa linha é o cabeçalho
+                        if any(re.search(r"LATITUDE", str(k)) for k in teste_map.keys()) or "LATITUDE" in teste_map.values():
+                            if "LATITUDE" in teste_map.values() and "LONGITUDE" in teste_map.values():
+                                row_index_header = i
+                                break
                     
-                    if cabecalho_info:
-                        skip, mapping = cabecalho_info
-                        logger.info(f"   🎯 Aba '{nome_aba}': Dados encontrados na linha {skip+1}")
+                    if row_index_header is not None:
+                        logger.info(f"   🎯 Aba '{nome_aba}': Cabeçalho na linha {row_index_header + 1}")
                         
-                        df_mes = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": skip})
+                        # Lê a aba inteira agora sabendo onde o cabeçalho está
+                        df_mes = pl.read_excel(io.BytesIO(excel_data), sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": row_index_header})
                         
-                        # Renomeia usando o mapeamento de índices para evitar erros de nomes duplicados
-                        inverso = {df_mes.columns[idx]: alvo for idx, alvo in mapping.items()}
-                        df_mes = df_mes.select(list(inverso.keys())).rename(inverso)
-                        df_mes = df_mes.with_columns(pl.all().cast(pl.Utf8))
+                        # Resolve o mapeamento final com os nomes reais das colunas
+                        map_final = self._resolver_mapeamento(df_mes.columns)
                         
-                        list_dfs.append(df_mes)
+                        if "LATITUDE" in map_final.values():
+                            df_mes = df_mes.select(list(map_final.keys())).rename(map_final)
+                            df_mes = df_mes.with_columns(pl.all().cast(pl.Utf8))
+                            list_dfs.append(df_mes)
                 except Exception as e:
-                    logger.warning(f"   ⚠️ Falha ao ler aba {nome_aba}: {e}")
+                    logger.warning(f"   ⚠️ Erro ao processar aba {nome_aba}: {e}")
 
             if not list_dfs:
-                raise ValueError(f"Não foi possível extrair dados de nenhuma aba no arquivo de {ano}.")
+                raise ValueError(f"Não foi possível localizar dados de crimes em nenhuma aba de {ano}.")
 
-            # Consolidação dos meses
+            # Unifica todos os meses
             df_final = pl.concat(list_dfs, how="diagonal")
             df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD (Hash Seguro)
+            # LGPD
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
                 pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
                 pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
             ])
 
-            # H3 Index
+            # H3
             res_h3 = self.config.RESOLUCAO_H3
             df_final = df_final.with_columns(
                 pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
@@ -172,11 +181,11 @@ class IngestorSafeDriver:
                 ).alias("H3_INDEX")
             )
 
-            # Salvar como Parquet Único do Ano
+            # Upload Parquet
             buf = io.BytesIO()
             df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} finalizada com SUCESSO: {df_final.height} crimes consolidados (todas as abas).")
+            logger.info(f"✨ Prata {ano} salva: {df_final.height} crimes consolidados.")
 
         except Exception as e:
             logger.error(f"💥 Erro fatal no processamento de {ano}: {e}")
