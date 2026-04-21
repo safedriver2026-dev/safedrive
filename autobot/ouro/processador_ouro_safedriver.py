@@ -38,7 +38,6 @@ class ArquitetoSafeDriverOuro:
             return None
 
     def construir_tabela_analitica(self):
-        print("Carregando bases da camada prata...", flush=True)
         df_vias = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet")
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL.parquet")
@@ -55,13 +54,11 @@ class ArquitetoSafeDriverOuro:
             
         df_crimes = pl.concat([self._ler_parquet_r2(f) for f in crime_files], how="diagonal")
 
-        print("Executando auto-cura espacial e geocoding...", flush=True)
         h3_mun_map = df_crimes.filter(pl.col("H3_INDEX").is_not_null()) \
                               .group_by("H3_INDEX") \
                               .agg(pl.col("MUNICIPIO").mode().first().alias("MUN_H3"))
         
         df_vias_enriquecida = df_vias.join(h3_mun_map, on="H3_INDEX", how="inner")
-        
         ref_vias = df_vias_enriquecida.group_by(["RUA", "MUN_H3"]).agg(pl.col("H3_INDEX").first())
         
         df_crimes = df_crimes.join(
@@ -75,7 +72,6 @@ class ArquitetoSafeDriverOuro:
 
         df_crimes = df_crimes.filter(pl.col("H3_INDEX").is_not_null())
 
-        print("Aplicando tratamento temporal e categorizacao penal...", flush=True)
         df_feriados = df_feriados.select([
             pl.col("data").alias("DATA_FERIADO"),
             pl.col("feriado_nome").alias("SAZON_NOME_FERIADO"),
@@ -95,7 +91,34 @@ class ArquitetoSafeDriverOuro:
             pl.col("SAZON_PONTO_FACULTATIVO").fill_null(False)
         ])
 
+        df_ouro = df_ouro.with_columns(
+            pl.when(pl.col("SAZON_HORA").is_between(0, 5)).then(pl.lit("MADRUGADA"))
+            .when(pl.col("SAZON_HORA").is_between(6, 11)).then(pl.lit("MANHA"))
+            .when(pl.col("SAZON_HORA").is_between(12, 17)).then(pl.lit("TARDE"))
+            .when(pl.col("SAZON_HORA").is_between(18, 23)).then(pl.lit("NOITE"))
+            .otherwise(pl.lit(None))
+            .alias("SAZON_PERIODO")
+        )
+
+        df_modas_h3 = df_ouro.filter(pl.col("SAZON_PERIODO").is_not_null()) \
+                             .group_by("H3_INDEX") \
+                             .agg(pl.col("SAZON_PERIODO").mode().first().alias("SAZON_PERIODO_IMPUTADO"))
+
+        df_ouro = df_ouro.join(df_modas_h3, on="H3_INDEX", how="left")
+        df_ouro = df_ouro.with_columns(
+            pl.col("SAZON_PERIODO").fill_null(pl.col("SAZON_PERIODO_IMPUTADO"))
+        ).drop("SAZON_PERIODO_IMPUTADO")
+
+        df_ouro = df_ouro.filter(pl.col("SAZON_PERIODO").is_not_null())
+
         df_ouro = df_ouro.with_columns([
+            pl.when(pl.col("RUBRICA").str.contains("VEICULO|CARGA|AUTO|MOTO|CAMINHAO"))
+            .then(pl.lit("MOTORISTA"))
+            .when(pl.col("RUBRICA").str.contains("CELULAR|TRANSEUNTE|PEDESTRE|PESSOA"))
+            .then(pl.lit("PEDESTRE"))
+            .otherwise(pl.lit("OUTROS"))
+            .alias("META_PERFIL_VITIMA"),
+
             pl.when(pl.col("RUBRICA").str.contains("LATROCINIO|HOMICIDIO"))
             .then(pl.lit("CRIME_LETO"))
             .when(pl.col("RUBRICA").str.contains("ROUBO"))
@@ -115,7 +138,6 @@ class ArquitetoSafeDriverOuro:
             .alias("META_PESO_GRAVIDADE")
         ])
 
-        print("Integrando variaveis urbanas e demograficas...", flush=True)
         df_ouro = df_ouro.join(df_infra, on="H3_INDEX", how="left")
         cols_infra = [c for c in df_ouro.columns if c.startswith("INFRA_DIV_")]
         df_ouro = df_ouro.with_columns([pl.col(c).fill_null(0) for c in cols_infra])
@@ -153,13 +175,32 @@ class ArquitetoSafeDriverOuro:
             pl.col("META_DOMICILIOS_BAIRRO").fill_null(0)
         ])
 
-        print("Exportando tabela final...", flush=True)
+        cols_cat = [
+            "H3_INDEX", "SAZON_DIA_SEMANA", "SAZON_MES", "SAZON_HORA", 
+            "SAZON_PERIODO", "SAZON_NOME_FERIADO", "SAZON_TIPO_FERIADO", 
+            "META_CATEGORIA_CRIME", "META_PERFIL_VITIMA"
+        ]
+        df_ouro = df_ouro.with_columns([
+            pl.col(c).cast(pl.Utf8).fill_null("NAO_INFORMADO") for c in cols_cat
+        ])
+        
+        cols_num = [
+            "META_PESO_GRAVIDADE", "MICRO_POPULACAO_H3", 
+            "META_POPULACAO_BAIRRO", "META_DOMICILIOS_BAIRRO"
+        ]
+        cols_infra_final = [c for c in df_ouro.columns if c.startswith("INFRA_DIV_") or c.startswith("META_POLO_")]
+        
+        df_ouro = df_ouro.with_columns([
+            pl.col(c).fill_null(0.0) for c in (cols_num + cols_infra_final) if c not in cols_cat
+        ])
+        
+        df_ouro = df_ouro.with_columns(pl.col("SAZON_PONTO_FACULTATIVO").fill_null(False))
+
         buf = io.BytesIO()
         df_ouro.write_parquet(buf, compression="zstd")
         
         caminho_final = f"{self.ouro_dir}/safedriver_abt_eventos.parquet"
         self.s3.put_object(Bucket=self.bucket, Key=caminho_final, Body=buf.getvalue())
-        print("Processo concluido.", flush=True)
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverOuro()
