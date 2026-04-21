@@ -10,23 +10,20 @@ on:
         type: choice
         options:
           - 'BRONZE_CRIMES'
-          - 'BRONZE_COMPLETA'
           - 'PRATA_CRIMES'
           - 'PRATA_MAPA'
-          - 'PRATA_COMPLETA'
           - 'OURO_COMPLETA'
           - 'TREINAR_IA'
-          - 'FLUXO_CRIMES'
-          - 'FLUXO_MAPA'
+          - 'FLUXO_CRIMES' # Bronze -> Prata -> Ouro (Crimes)
           - 'tudo'
 
 jobs:
-  # --- CAMADA BRONZE: Ingestão Pura ---
+  # --- CAMADA BRONZE ---
   camada-bronze:
     if: |
       github.event.inputs.job == 'tudo' || 
-      startsWith(github.event.inputs.job, 'BRONZE_') ||
-      startsWith(github.event.inputs.job, 'FLUXO_')
+      github.event.inputs.job == 'BRONZE_CRIMES' || 
+      github.event.inputs.job == 'FLUXO_CRIMES'
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -34,24 +31,23 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
     steps:
-      - name: 🔍 Checkout do Código
+      - name: 🔍 Checkout
         uses: actions/checkout@v4
-      - name: 🐍 Configurar Python
+      - name: 🐍 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "📦 [BRONZE] Crimes SSP"
+      - name: "📦 [BRONZE] Ingestão SSP"
         run: |
           pip install boto3 requests polars h3 python-calamine fastexcel
           python autobot/reg_crimes/ingestor_safe_driver.py bronze
 
-  # --- CAMADA PRATA: Transformação e Auditoria ---
+  # --- CAMADA PRATA ---
   camada-prata:
     needs: [camada-bronze]
     if: |
-      always() && 
-      (needs.camada-bronze.result == 'success' || needs.camada-bronze.result == 'skipped') &&
-      (github.event.inputs.job == 'tudo' || startsWith(github.event.inputs.job, 'PRATA_') || startsWith(github.event.inputs.job, 'FLUXO_'))
+      always() &&
+      (github.event.inputs.job == 'tudo' || contains(github.event.inputs.job, 'PRATA_') || github.event.inputs.job == 'FLUXO_CRIMES')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -60,50 +56,53 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
     steps:
-      - name: 🔍 Checkout do Código
+      - name: 🔍 Checkout
         uses: actions/checkout@v4
-      - name: 🐍 Configurar Python
+      - name: 🐍 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "⚙️ Instalar Motores de Performance"
+      - name: "⚙️ Instalar Dependências"
         run: pip install boto3 polars h3 pyarrow requests duckdb python-calamine fastexcel
-      - name: "🛡️ [PRATA] Processamento e Malha"
-        run: |
-          python autobot/reg_crimes/ingestor_safe_driver.py prata
-          python autobot/prata/malha_geografica/malha_geo_infra_social.py
+      
+      - name: "🛡️ [PRATA-A] Crimes SSP"
+        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
+        run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
-  # --- CAMADA OURO: Tabela Base Analítica (ABT) ---
+      - name: "🏗️ [PRATA-B] Malha Geográfica"
+        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_MAPA'
+        run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
+
+  # --- CAMADA OURO ---
   camada-ouro:
     needs: [camada-prata]
     if: |
-      always() && 
-      (needs.camada-prata.result == 'success' || needs.camada-prata.result == 'skipped') &&
-      (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'OURO_COMPLETA')
+      always() &&
+      (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'OURO_COMPLETA' || github.event.inputs.job == 'FLUXO_CRIMES')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
     steps:
-      - name: 🔍 Checkout do Código
+      - name: 🔍 Checkout
         uses: actions/checkout@v4
-      - name: 🐍 Configurar Python
+      - name: 🐍 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: "🏆 [OURO] Gerar ABT"
         run: |
-          pip install boto3 polars pyarrow
+          pip install boto3 polars pyarrow requests
           python autobot/ouro/processador_ouro_safedriver.py
 
- # --- TREINAMENTO DE IA: CatBoost & SHAP ---
+  # --- CAMADA TREINO ---
   camada-treino:
     needs: [camada-ouro]
     if: |
-      always() && 
-      (needs.camada-ouro.result == 'success' || needs.camada-ouro.result == 'skipped') &&
+      always() &&
       (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'TREINAR_IA')
     runs-on: ubuntu-latest
     env:
@@ -113,45 +112,31 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
     steps:
-      - name: 🔍 Checkout do Código
+      - name: 🔍 Checkout
         uses: actions/checkout@v4
-
-      - name: 🐍 Configurar Python
+      - name: 🐍 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: "⚙️ Instalar Bibliotecas de IA"
+      - name: "🧠 [TREINO] IA e SHAP"
         run: |
-          # ADICIONADO PYARROW AQUI
           pip install boto3 polars pyarrow pandas catboost scikit-learn shap requests
+          python autobot/ml/treinador_safe_driver.py
 
-      - name: "🧠 [TREINO] Executar Treinador e SHAP"
-        run: python autobot/ml/treinador_safe_driver.py
-  # --- NOTIFICAÇÃO ---
+  # --- NOTIFICAÇÃO FINAL ---
   notificacao:
     needs: [camada-bronze, camada-prata, camada-ouro, camada-treino]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: "📢 Feedback para o Discord"
+      - name: "📢 Feedback Discord"
         run: |
-          B_RES="${{ needs.camada-bronze.result }}"
-          P_RES="${{ needs.camada-prata.result }}"
-          O_RES="${{ needs.camada-ouro.result }}"
-          T_RES="${{ needs.camada-treino.result }}"
-          
-          # Se os jobs que deveriam rodar terminaram bem (ou foram pulados por escolha do usuário)
-          if [[ ($B_RES == "success" || $B_RES == "skipped") && \
-                ($P_RES == "success" || $P_RES == "skipped") && \
-                ($O_RES == "success" || $O_RES == "skipped") && \
-                ($T_RES == "success" || $T_RES == "skipped") ]]; then
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-            STATUS="✅ SUCESSO"
-          else
+          # Checa se algum dos jobs que DEVERIA rodar falhou
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
             URL="${{ secrets.DISCORD_ERRO }}"
-            STATUS="🚨 FALHA"
+            MSG="🚨 **[SafeDriver]** Falha no Job: \`${{ github.event.inputs.job }}\`"
+          else
+            URL="${{ secrets.DISCORD_SUCESSO }}"
+            MSG="✅ **[SafeDriver]** Sucesso no Job: \`${{ github.event.inputs.job }}\`"
           fi
-          
-          MSG="$STATUS **[SafeDriver]** Job: \`${{ github.event.inputs.job }}\` finalizado."
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
