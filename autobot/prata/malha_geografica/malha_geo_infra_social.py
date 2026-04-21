@@ -60,14 +60,12 @@ class ArquitetoSafeDriverPrata:
         return arquivos[0]
 
     def _analisar_csv_dinamicamente(self, file_path):
-        """Descobre dinamicamente o Encoding e o Separador do arquivo, sem forçar padrões."""
         print(f"   🔎 [Auto-Detect] Inspecionando estrutura do CSV...", flush=True)
         encodings = ['utf-8', 'windows-1252', 'iso-8859-1', 'latin1']
         
-        # 1. Descobrir Encoding testando os bytes brutos
         encoding_correto = 'utf-8'
         with open(file_path, 'rb') as f:
-            amostra_bytes = f.read(50000) # Lemos uma amostra segura
+            amostra_bytes = f.read(50000) 
             
         for enc in encodings:
             try:
@@ -77,7 +75,6 @@ class ArquitetoSafeDriverPrata:
             except UnicodeDecodeError:
                 continue
                 
-        # 2. Descobrir Separador usando IA da biblioteca CSV
         separador = ";"
         try:
             amostra_texto = amostra_bytes.decode(encoding_correto)
@@ -85,7 +82,7 @@ class ArquitetoSafeDriverPrata:
             dialect = sniffer.sniff(amostra_texto)
             separador = dialect.delimiter
         except Exception:
-            pass # Mantém o fallback
+            pass
 
         print(f"   ✅ [Auto-Detect] Estrutura Mapeada -> Encoding: {encoding_correto.upper()} | Separador: '{separador}'", flush=True)
         return encoding_correto, separador
@@ -234,7 +231,24 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OpenStreetMap PBF")
             osmconf_path = self._garantir_osmconf_offline()
             
-            json_list_sql = "[" + ", ".join([f"'{f}'" for f in json_files]) + "]"
+            # --- O PULO DO GATO: GERADOR DINÂMICO DE 'UNION ALL' ---
+            # Como o ST_Read não suporta listas, o Python escreve a query passando por cada ficheiro!
+            ibge_queries = []
+            for f in json_files:
+                f_clean = f.replace("\\", "/") # Corrige barras no Windows/Linux
+                ibge_queries.append(f"""
+                    SELECT 
+                        CAST(ibge.CD_FACE AS VARCHAR) as CD_FACE,
+                        trim(ibge.NM_TIP_LOG || ' ' || ibge.NM_LOG) as RUA, 
+                        CAST(NULL AS VARCHAR) as NM_MUN,
+                        CAST(NULL AS VARCHAR) as NM_BAIRRO,
+                        CAST(ST_Y(ST_Centroid(ibge.geom)) AS FLOAT) as LAT, 
+                        CAST(ST_X(ST_Centroid(ibge.geom)) AS FLOAT) as LON
+                    FROM ST_Read('{f_clean}') AS ibge
+                    WHERE ibge.NM_LOG IS NOT NULL
+                """)
+                
+            ibge_union_sql = "\nUNION ALL\n".join(ibge_queries)
             
             query = f"""
                 SELECT 
@@ -249,16 +263,9 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
                 
                 UNION ALL
                 
-                SELECT 
-                    CAST(ibge.CD_FACE AS VARCHAR) as CD_FACE,
-                    trim(ibge.NM_TIP_LOG || ' ' || ibge.NM_LOG) as RUA, 
-                    CAST(NULL AS VARCHAR) as NM_MUN,
-                    CAST(NULL AS VARCHAR) as NM_BAIRRO,
-                    CAST(ST_Y(ST_Centroid(ibge.geom)) AS FLOAT) as LAT, 
-                    CAST(ST_X(ST_Centroid(ibge.geom)) AS FLOAT) as LON
-                FROM ST_Read({json_list_sql}) AS ibge
-                WHERE ibge.NM_LOG IS NOT NULL
+                {ibge_union_sql}
             """
+            
             df = self.con.execute(query).pl()
             
             df = self.normalizar_strings_global(df)
@@ -278,7 +285,6 @@ attributes=name,highway,waterway,aerialway,barrier,man_made,z_order
         try:
             csv_f = self._buscar_arquivo_seguro("Agregados_por_setores_basico*.csv", "Setores Censitários CSV")
             
-            # --- O PULO DO GATO: Autodetecção Dinâmica sem forçar padrão ---
             encoding_real, separador_real = self._analisar_csv_dinamicamente(csv_f)
             
             df = pl.read_csv(
