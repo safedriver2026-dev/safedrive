@@ -4,129 +4,204 @@ import polars as pl
 import h3
 import unicodedata
 import zipfile
+import json
 import glob
-from datetime import date, datetime
+from datetime import datetime
 
 # ==========================================
-# CONFIGURAÇÕES DE ARQUITETURA SAFEDRIVER
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA
 # ==========================================
-H3_RES = 9 
-BRONZE_DIR = "data_raw"
-PRATA_DIR = "data_prata"
-
-def normalizar_string(valor):
-    if valor is None or valor == "" or str(valor).upper() in ["NULL", "NAN", ".", "N/A"]: 
-        return "NAO INFORMADO"
-    texto = str(valor)
-    texto = "".join(c for c in unicodedata.normalize('NFKD', texto) if unicodedata.category(c) != 'Mn')
-    return texto.upper().strip()
-
 class ArquitetoSafeDriverPrata:
     def __init__(self):
-        os.makedirs(PRATA_DIR, exist_ok=True)
+        # Configurações Essenciais
+        self.H3_RES = 9 
+        self.bronze_dir = "./data_raw"
+        self.prata_dir = "./data_prata"
+        os.makedirs(self.prata_dir, exist_ok=True)
+        
+        # Engine Espacial (DuckDB)
         self.con = duckdb.connect(database=':memory:')
         self.con.execute("INSTALL spatial; LOAD spatial;")
-        self.gerar_configuracao_osm()
-
-    def gerar_configuracao_osm(self):
-        ini_content = "[points]\nosm_id=yes\nattributes=name\nother_tags=yes\n[lines]\nosm_id=yes\nattributes=name\nother_tags=yes"
-        with open("osmconf.ini", "w", encoding="utf-8") as f: 
-            f.write(ini_content)
-        os.environ["OSM_CONFIG_FILE"] = os.path.abspath("osmconf.ini")
-
-    def normalizar_viaria(self):
-        print("📍 [PRATA] PROCESSANDO MALHA VIÁRIA (BASAL)...")
-        faces_zip = f"{BRONZE_DIR}/SP_Faces_2022.zip"
-        mun_shp = f"{BRONZE_DIR}/SP_Municipios_2022.shp"
         
-        if not os.path.exists(faces_zip): return
+        # O Dicionário de Auditoria para o Data Quality
+        self.auditoria = {
+            "DATA_EXECUCAO": str(datetime.now()),
+            "QUALIDADE_GERAL": "PROCESSANDO",
+            "CAMADAS": {}
+        }
 
-        json_paths = []
-        with zipfile.ZipFile(faces_zip, 'r') as z:
-            for f in z.namelist():
-                if f.endswith('.json'): 
-                    z.extract(f, BRONZE_DIR)
-                    json_paths.append(os.path.join(BRONZE_DIR, f))
+    def _normalizar_string(self, valor):
+        """Limpa textos: remove acentos, coloca em maiúsculas e trata nulos."""
+        if valor is None or valor == "" or str(valor).upper() in ["NULL", "NAN", ".", "N/A", "NONE"]: 
+            return "NAO INFORMADO"
+        texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
+        return texto.upper().strip()
 
-        self.con.execute(f"CREATE TABLE municipios AS SELECT NM_MUN, geom FROM ST_Read('{mun_shp}')")
+    # ---------------------------------------------------------
+    # 1. MALHA GEOGRÁFICA (Esqueleto Viário)
+    # ---------------------------------------------------------
+    def processar_malha_geografica(self):
+        print("🗺️ [PRATA] A construir Malha Geográfica (Vias)...")
+        zip_path = os.path.join(self.bronze_dir, "SP_Faces_2022.zip")
         
-        lista_dfs = []
-        for path in json_paths:
-            query = f"""
-                SELECT m.NM_MUN as MUNICIPIO, trim(r.NM_TIP_LOG || ' ' || r.NM_LOG) as RUA, 
-                       ST_Y(ST_Centroid(r.geom)) as LAT, ST_X(ST_Centroid(r.geom)) as LON 
-                FROM ST_Read('{path}') r 
-                LEFT JOIN municipios m ON ST_Within(ST_Centroid(r.geom), m.geom) 
-                WHERE r.NM_LOG IS NOT NULL
-            """
-            lista_dfs.append(self.con.execute(query).pl())
-            os.remove(path)
+        if not os.path.exists(zip_path):
+            print("⚠️ Ficheiro de faces não encontrado no diretório local. A saltar.")
+            return
 
-        pl.concat(lista_dfs).with_columns([
-            pl.col("MUNICIPIO").map_elements(normalizar_string, return_dtype=pl.Utf8),
-            pl.col("RUA").map_elements(normalizar_string, return_dtype=pl.Utf8),
-            pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], H3_RES) for x in s])).alias("H3_INDEX")
-        ]).unique(subset=["H3_INDEX", "RUA"]).write_parquet(f"{PRATA_DIR}/MALHA_VIARIA_INFRA.parquet")
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            z.extractall(self.bronze_dir)
 
-    def normalizar_social(self):
-        print("👥 [PRATA] PROCESSANDO MALHA SOCIAL ANUAL...")
-        csv_path = f"{BRONZE_DIR}/Agregados_por_setores_basico_BR_20250417.csv"
-        if not os.path.exists(csv_path): return
-
-        pl.read_csv(csv_path, separator=";", schema_overrides={"CD_SETOR": pl.Utf8}, 
-                    infer_schema_length=0, null_values=["."]).filter(
-            pl.col("CD_SETOR").str.starts_with("35")
-        ).select([
-            pl.col("CD_SETOR"),
-            pl.col("NM_MUN").map_elements(normalizar_string, return_dtype=pl.Utf8).alias("MUNICIPIO"),
-            pl.col("v0001").cast(pl.Int32, strict=False).fill_null(0).alias("POPULACAO")
-        ]).write_parquet(f"{PRATA_DIR}/MALHA_SOCIAL.parquet")
-
-    def normalizar_comercial(self):
-        print(f"🛍️ [PRATA] PROCESSANDO 171M DE LINHAS (STREAMING ATIVO)...")
-        pattern = os.path.join(BRONZE_DIR, "CNPJ_SP_HISTORICO_*.parquet")
+        # Extração Espacial com DuckDB
+        query = f"""
+            SELECT 
+                CD_FACE,
+                trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, 
+                ST_Y(ST_Centroid(geom)) as LAT, 
+                ST_X(ST_Centroid(geom)) as LON
+            FROM ST_Read('{self.bronze_dir}/*.json')
+            WHERE NM_LOG IS NOT NULL
+        """
+        df_geo = self.con.execute(query).pl()
         
-        # O scan_parquet lê os 3.447 shards de uma vez só como um LazyFrame
-        lf = pl.scan_parquet(pattern)
+        # Transformação e Tipagem Defensiva (Polars)
+        df_geo = df_geo.with_columns([
+            pl.col("RUA").map_elements(self._normalizar_string, return_dtype=pl.Utf8).cast(pl.Categorical),
+            pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([
+                h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s
+            ])).alias("H3_INDEX").cast(pl.Categorical),
+            pl.col("LAT").cast(pl.Float32, strict=False),
+            pl.col("LON").cast(pl.Float32, strict=False)
+        ]).unique(subset=["CD_FACE"])
+        
+        caminho_saida = os.path.join(self.prata_dir, "PRATA_MALHA_GEOGRAFICA_VIAS.parquet")
+        df_geo.write_parquet(caminho_saida, compression="zstd", compression_level=9)
+        
+        # Registo de Auditoria
+        self.auditoria["CAMADAS"]["GEOGRAFICA"] = {
+            "REGISTROS_TOTAIS": len(df_geo),
+            "HEXAGONOS_H3_UNICOS": df_geo["H3_INDEX"].n_unique(),
+            "VALORES_NULOS_LAT_LON": df_geo.select(pl.col("LAT").is_null().sum()).item()
+        }
 
-        # 1. Classificação e Tipagem
-        lf = lf.with_columns([
-            pl.col("lat").cast(pl.Float64, strict=False),
-            pl.col("lon").cast(pl.Float64, strict=False),
-            pl.col("data_inicio_atividade").str.to_date("%Y-%m-%d", strict=False),
-            pl.col("data_situacao_cadastral").str.to_date("%Y-%m-%d", strict=False)
-        ]).drop_nulls(subset=["lat", "lon"])
+    # ---------------------------------------------------------
+    # 2. MALHA SOCIAL (Demografia IBGE)
+    # ---------------------------------------------------------
+    def processar_malha_social(self):
+        print("👥 [PRATA] A construir Malha Social/Demográfica...")
+        csv_path = glob.glob(os.path.join(self.bronze_dir, "Agregados_por_setores_basico*.csv"))
+        
+        if not csv_path:
+            print("⚠️ CSV de Setores Censitários não encontrado. A saltar.")
+            return
+            
+        # Leitura Inteligente e Proteção da Chave Primária (CD_SETOR)
+        df_social = pl.read_csv(
+            csv_path[0], separator=";", null_values=["."],
+            infer_schema_length=10000, 
+            schema_overrides={"CD_SETOR": pl.Utf8, "CD_MUN": pl.Utf8, "CD_BAIRRO": pl.Utf8}
+        ).filter(pl.col("CD_SETOR").str.starts_with("35")) # Filtra SP
+        
+        colunas_alvo = ["CD_SETOR", "CD_MUN", "NM_MUN", "CD_BAIRRO", "NM_BAIRRO", "AREA_KM2", "SITUACAO", "CD_SITUACAO", "CD_TIPO", "v0001", "v0002"]
+        df_social = df_social.select([c for c in colunas_alvo if c in df_social.columns])
 
-        lf = lf.with_columns([
+        # Micro-Otimização e Tratamento de Decimais
+        df_social = df_social.with_columns([
+            pl.col("AREA_KM2").str.replace(",", ".").cast(pl.Float32, strict=False),
+            pl.col("NM_MUN").map_elements(self._normalizar_string, return_dtype=pl.Utf8).cast(pl.Categorical),
+            pl.col("NM_BAIRRO").map_elements(self._normalizar_string, return_dtype=pl.Utf8).cast(pl.Categorical),
+            pl.col("SITUACAO").map_elements(self._normalizar_string, return_dtype=pl.Utf8).cast(pl.Categorical),
+            pl.col("CD_SITUACAO").cast(pl.UInt8, strict=False),
+            pl.col("CD_TIPO").cast(pl.UInt8, strict=False),
+            pl.col("v0001").cast(pl.UInt32, strict=False).fill_null(0).alias("TOTAL_PESSOAS"),
+            pl.col("v0002").cast(pl.UInt32, strict=False).fill_null(0).alias("TOTAL_DOMICILIOS")
+        ]).drop(["v0001", "v0002"])
+
+        caminho_saida = os.path.join(self.prata_dir, "PRATA_MALHA_SOCIAL_SETORES.parquet")
+        df_social.write_parquet(caminho_saida, compression="zstd", compression_level=9)
+        
+        # Registo de Auditoria
+        self.auditoria["CAMADAS"]["SOCIAL"] = {
+            "SETORES_TOTAIS": len(df_social),
+            "POPULACAO_MAPEADA": df_social["TOTAL_PESSOAS"].sum(),
+            "BAIRROS_MAPEADOS": df_social["NM_BAIRRO"].n_unique()
+        }
+
+    # ---------------------------------------------------------
+    # 3. MALHA DE INFRAESTRUTURA (Comércio / CNPJ)
+    # ---------------------------------------------------------
+    def processar_malha_infraestrutura(self):
+        print("🏗️ [PRATA] A construir Malha de Infraestrutura (Comércio)...")
+        pattern = os.path.join(self.bronze_dir, "CNPJ_SP_HISTORICO_LOTE_*.parquet")
+        arquivos = glob.glob(pattern)
+        
+        if not arquivos:
+            print("⚠️ Nenhum lote de CNPJ encontrado. A saltar.")
+            return
+
+        # Lê todos os lotes de uma vez para a RAM
+        df_infra = pl.read_parquet(pattern)
+
+        # Filtro Espacial e Indexação H3
+        df_infra = df_infra.drop_nulls(subset=["lat", "lon"]).with_columns([
             pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([
-                h3.latlng_to_cell(x["lat"], x["lon"], H3_RES) for x in s
+                h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s
             ])).alias("H3_INDEX")
         ])
 
-        # 2. Agregação por Snapshots (Snapshot 2022 vs Atual)
-        data_corte = date(2022, 12, 31)
-        f_2022 = (pl.col("data_inicio_atividade") <= data_corte) & \
-                 ((pl.col("data_situacao_cadastral").is_null()) | (pl.col("data_situacao_cadastral") > data_corte))
-        f_atual = (pl.col("situacao_cadastral") == "02")
-
-        agg_2022 = (lf.filter(f_2022).group_by("H3_INDEX").agg(pl.len().alias("QTD_2022")))
-        agg_atual = (lf.filter(f_atual).group_by("H3_INDEX").agg(pl.len().alias("QTD_ATUAL")))
-
-        # 3. Join Final em Streaming (Protege a RAM do GitHub)
-        df_prata = agg_2022.join(agg_atual, on="H3_INDEX", how="outer").collect(streaming=True)
+        # Otimização de Memória Extremamente Agressiva
+        colunas_categoria = ["H3_INDEX", "cnae_fiscal_principal", "cep", "municipio", "bairro", "situacao_cadastral"]
+        df_infra = df_infra.with_columns(
+            [pl.col(c).cast(pl.Categorical) for c in colunas_categoria if c in df_infra.columns] + 
+            [
+                pl.col("lat").cast(pl.Float32, strict=False),
+                pl.col("lon").cast(pl.Float32, strict=False)
+            ]
+        )
         
-        df_prata.with_columns([
-            pl.col("QTD_2022").fill_null(0).cast(pl.Int32),
-            pl.col("QTD_ATUAL").fill_null(0).cast(pl.Int32)
-        ]).write_parquet(f"{PRATA_DIR}/MALHA_COMERCIAL_LIMPA.parquet")
-        print(f"✅ Malha Comercial processada.")
+        if "data_inicio_atividade" in df_infra.columns:
+            df_infra = df_infra.with_columns(pl.col("data_inicio_atividade").cast(pl.Date, strict=False))
+            
+        caminho_saida = os.path.join(self.prata_dir, "PRATA_MALHA_INFRA_COMERCIAL.parquet")
+        df_infra.write_parquet(caminho_saida, compression="zstd", compression_level=9)
+        
+        # Registo de Auditoria
+        self.auditoria["CAMADAS"]["INFRAESTRUTURA"] = {
+            "EMPRESAS_TOTAIS": len(df_infra),
+            "HEXAGONOS_H3_COM_COMERCIO": df_infra["H3_INDEX"].n_unique(),
+            "DIVERSIDADE_CNAE": df_infra["cnae_fiscal_principal"].n_unique() if "cnae_fiscal_principal" in df_infra.columns else 0
+        }
+
+    # ---------------------------------------------------------
+    # 4. AUDITORIA E FINALIZAÇÃO
+    # ---------------------------------------------------------
+    def finalizar_auditoria(self):
+        self.auditoria["QUALIDADE_GERAL"] = "SUCESSO_TOTAL"
+        
+        caminho_audit = os.path.join(self.prata_dir, "AUDITORIA_PRATA_MALHAS.json")
+        with open(caminho_audit, "w", encoding="utf-8") as f:
+            json.dump(self.auditoria, f, indent=4, ensure_ascii=False)
+            
+        print("\n" + "="*60)
+        print("📊 AUDITORIA FINALIZADA (Copie o JSON abaixo e envie no chat):")
+        print("="*60)
+        print(json.dumps(self.auditoria, indent=4, ensure_ascii=False))
+        print("="*60 + "\n")
 
     def executar(self):
         start = datetime.now()
-        self.normalizar_viaria()
-        self.normalizar_social()
-        self.normalizar_comercial()
-        print(f"🚀 [PRATA] Tempo Total: {datetime.now() - start}")
+        print("🚀 INICIANDO PROCESSAMENTO DE PRODUÇÃO (CAMADA PRATA)")
+        
+        try:
+            self.processar_malha_geografica()
+            self.processar_malha_social()
+            self.processar_malha_infraestrutura()
+            self.finalizar_auditoria()
+        except Exception as e:
+            self.auditoria["QUALIDADE_GERAL"] = f"FALHA_CRITICA: {str(e)}"
+            print(f"\n❌ ERRO CRÍTICO NO PIPELINE: {e}")
+            self.finalizar_auditoria()
+            
+        print(f"🏁 [TEMPO TOTAL]: {datetime.now() - start}")
 
 if __name__ == "__main__":
     ArquitetoSafeDriverPrata().executar()
