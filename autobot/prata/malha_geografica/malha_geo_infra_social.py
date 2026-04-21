@@ -14,7 +14,7 @@ from datetime import datetime
 from botocore.config import Config
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (POLARS EXTREME)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (POLARS EXTREME + OSM)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -39,10 +39,9 @@ class ArquitetoSafeDriverPrata:
 
         self.pepper = os.getenv("LGPD_PEPPER", "safedriver_seguranca_padrao_2026").strip()
         
-        # Conexão DuckDB (Usada apenas para ler a geometria espacial do SP_Faces)
+        # Conexão DuckDB (Usada apenas para ler a geometria espacial do SP_Faces e do OSM PBF)
         self.con = duckdb.connect(database=':memory:')
         self.con.execute("INSTALL spatial; LOAD spatial;")
-        # REMOVIDO: 'INSTALL h3' para evitar o erro 404 do servidor deles. 
         
         self.auditoria = {"DATA_EXECUCAO": str(datetime.now()), "CAMADAS": {}}
 
@@ -79,18 +78,13 @@ class ArquitetoSafeDriverPrata:
         print(f"   🧹 [Limpeza] Normalizando textos para Maiúsculas e sem acento: {string_cols}", flush=True)
         
         for col in string_cols:
-            # 1. Isola os nomes únicos (ex: Em vez de processar 'São Paulo' 2 milhões de vezes, processa 1 vez)
             unique_df = df.select(pl.col(col).unique().alias(col)).drop_nulls()
-            
-            # 2. Limpa apenas os nomes únicos
             mapped_df = unique_df.with_columns(
                 pl.col(col).map_elements(self._normalizar, return_dtype=pl.Utf8).alias(f"{col}_norm")
             )
-            
-            # 3. Distribui os nomes limpos de volta para os milhões de registos num piscar de olhos
             df = df.join(mapped_df, on=col, how="left")
             df = df.with_columns(pl.col(f"{col}_norm").fill_null("NAO INFORMADO").alias(col)).drop(f"{col}_norm")
-            df = df.with_columns(pl.col(col).cast(pl.Categorical)) # Comprime a RAM
+            df = df.with_columns(pl.col(col).cast(pl.Categorical)) 
             
         return df
 
@@ -112,7 +106,8 @@ class ArquitetoSafeDriverPrata:
     def download_r2(self):
         print("📥 Buscando arquivos na Bronze via Boto3...", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
-        targets = ["SP_Faces_2022.zip", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
+        # OSM PBF adicionado à lista de downloads
+        targets = ["SP_Faces_2022.zip", "sp-latest.osm.pbf", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         
         encontrados = 0
         for page in paginator.paginate(Bucket=self.bucket):
@@ -138,27 +133,48 @@ class ArquitetoSafeDriverPrata:
         print("✅ Pipeline concluído com sucesso!", flush=True)
 
     def processar(self):
-        # 1. GEO
-        print("🗺️ Processando Malha Geográfica...", flush=True)
+        # 1. GEO (IBGE + OSM)
+        print("🗺️ Processando Malha Geográfica (IBGE + OSM)...", flush=True)
         try:
             zip_f = glob.glob(f"{self.bronze_dir}/**/SP_Faces_2022.zip", recursive=True)[0]
             with zipfile.ZipFile(zip_f, 'r') as z: z.extractall(self.bronze_dir)
             
+            osm_pbf = glob.glob(f"{self.bronze_dir}/**/sp-latest.osm.pbf", recursive=True)[0]
+            
+            # União das duas bases usando DuckDB puro para leitura espacial
             query = f"""
-                SELECT CD_FACE, trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, 
-                CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
-                FROM ST_Read('{self.bronze_dir}/**/*.json') WHERE NM_LOG IS NOT NULL
+                SELECT 
+                    CAST(osm_id AS VARCHAR) as CD_FACE,
+                    name as RUA, 
+                    CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, 
+                    CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
+                FROM ST_Read('{osm_pbf}', layer='lines')
+                WHERE highway IS NOT NULL AND name IS NOT NULL
+                
+                UNION ALL
+                
+                SELECT 
+                    CD_FACE,
+                    trim(NM_TIP_LOG || ' ' || NM_LOG) as RUA, 
+                    CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, 
+                    CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
+                FROM ST_Read('{self.bronze_dir}/**/*.json')
+                WHERE NM_LOG IS NOT NULL
             """
             df = self.con.execute(query).pl()
             
-            # Limpeza Global e H3
+            # Limpeza Global e H3 via Polars
             df = self.normalizar_strings_global(df)
-            df = self.aplicar_h3_otimizado(df, lat_col="LAT", lon_col="LON").unique(subset=["CD_FACE"])
+            df = self.aplicar_h3_otimizado(df, lat_col="LAT", lon_col="LON")
+            
+            # Remoção de Duplicatas (Garante que a mesma rua no mesmo H3 não conte em dobro)
+            df = df.unique(subset=["RUA", "H3_INDEX"])
             
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
             self.auditoria["CAMADAS"]["GEO"] = {"STATUS": "OK", "LINHAS": df.height}
             print(f"   ✅ Geo Concluído: {df.height} linhas.", flush=True)
         except Exception as e: 
+            print(f"❌ Erro Geo: {e}", flush=True)
             self.auditoria["CAMADAS"]["GEO"] = {"STATUS": "ERRO", "MSG": str(e)}
 
         # 2. SOCIAL
@@ -174,7 +190,6 @@ class ArquitetoSafeDriverPrata:
                 pl.col("v0002").cast(pl.UInt32, strict=False).fill_null(0).alias("DOMICILIOS")
             ])
             
-            # Limpeza Global (Aplica em NM_MUN, NM_BAIRRO, etc.)
             df = self.normalizar_strings_global(df)
             
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet", compression="zstd")
@@ -183,21 +198,17 @@ class ArquitetoSafeDriverPrata:
         except Exception as e: 
             self.auditoria["CAMADAS"]["SOCIAL"] = {"STATUS": "ERRO", "MSG": str(e)}
 
-        # 3. INFRA
+        # 3. INFRA (CNAE / POI)
         print("🏗️ Processando Malha Infra/Comércio...", flush=True)
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             df = pl.read_parquet(pqs)
             df = df.filter(pl.col("lat").is_not_null() & pl.col("lon").is_not_null())
             
-            # LGPD (Hashes irreversíveis)
             colunas_perigosas = ["cnpj", "cnpj_basico", "razao_social", "nome_fantasia", "cpf_responsavel", "nome_socio"]
             df = self.aplicar_lgpd(df, colunas_perigosas)
             
-            # Limpeza Global (Aplica em municipio, bairro, cnae, etc. deixando tudo limpo e sem acento)
             df = self.normalizar_strings_global(df)
-            
-            # H3 Otimizado
             df = self.aplicar_h3_otimizado(df, lat_col="lat", lon_col="lon")
             
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA.parquet", compression="zstd")
