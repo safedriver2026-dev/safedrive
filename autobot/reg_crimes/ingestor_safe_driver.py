@@ -4,6 +4,7 @@ import requests
 import logging
 import time
 import sys
+import botocore.exceptions
 from botocore.config import Config
 from datetime import datetime
 
@@ -34,6 +35,7 @@ class IngestorSafeDriver:
     def __init__(self):
         self.config = ConfiguracaoIngestao()
         self.s3 = self._inicializar_s3()
+        self.ano_atual = datetime.now().year
 
     def _inicializar_s3(self):
         return boto3.client(
@@ -43,6 +45,16 @@ class IngestorSafeDriver:
             aws_secret_access_key=self.config.SECRET_KEY.strip(),
             config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
         )
+
+    def _arquivo_existe(self, key: str) -> bool:
+        """Verifica se o arquivo já existe no R2 usando apenas os metadados (head_object)"""
+        try:
+            self.s3.head_object(Bucket=self.config.NOME_BUCKET, Key=key)
+            return True
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return False
+            return False
 
     def _gerar_hash_lgpd(self, logradouro: str, id_bo: str) -> str:
         import hashlib # Lazy import isolado
@@ -61,8 +73,14 @@ class IngestorSafeDriver:
 
     # --- ETAPA 1: BRONZE (LEVE E PURA) ---
     def extrair_bronze(self, ano: int):
-        url = self.config.URL_BASE_SSP.format(ano=ano)
         path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
+        
+        # Inteligência de Idempotência
+        if ano < self.ano_atual and self._arquivo_existe(path_bronze):
+            logger.info(f"⏭️ [BRONZE] Arquivo de {ano} já existe no R2. Pulando download.")
+            return
+
+        url = self.config.URL_BASE_SSP.format(ano=ano)
         tentativa = 1
 
         while True:
@@ -82,14 +100,25 @@ class IngestorSafeDriver:
 
     # --- ETAPA 2: PRATA (PESADA E ANALÍTICA) ---
     def processar_prata(self, ano: int):
-        import io # Lazy import isolado
-        import polars as pl # Lazy import isolado
-
         path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_prata = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
 
+        # Inteligência de Idempotência
+        if ano < self.ano_atual and self._arquivo_existe(path_prata):
+            logger.info(f"⏭️ [PRATA] Parquet de {ano} já está pronto. Pulando processamento.")
+            return
+
+        import io # Lazy import isolado
+        import polars as pl # Lazy import isolado
+
         try:
             logger.info(f"🥈 [PRATA] Lendo Bronze {ano} do R2...")
+            
+            # Se a Bronze não existir (ex: erro no download), aborta a Prata com graciosidade
+            if not self._arquivo_existe(path_bronze):
+                logger.error(f"❌ [PRATA] Arquivo base de {ano} não encontrado na Bronze. Abortando ano.")
+                return
+
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze)
             bytes_excel = obj['Body'].read()
 
@@ -138,7 +167,7 @@ if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     
     modo = sys.argv[1].lower() if len(sys.argv) > 1 else "tudo"
-    anos = [2024, 2025, 2026] # Ajuste os anos que deseja processar
+    anos = range(2022, ingestor.ano_atual + 1)
 
     for ano in anos:
         if modo in ["bronze", "tudo"]:
