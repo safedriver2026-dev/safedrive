@@ -7,6 +7,7 @@ import sys
 import io
 import hashlib
 import re
+import unicodedata
 import botocore.exceptions
 import polars as pl
 import h3
@@ -14,7 +15,7 @@ import fastexcel
 from botocore.config import Config
 from datetime import datetime
 
-# Configuração de Log Profissional
+# Configuração de Log
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,6 @@ class ConfiguracaoIngestao:
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Mapeamento Ultra Flexível (RegEx) - Suporta acentos e cedilhas (ex: Ç, Ã)
     MAPA_COLUNAS = {
         "NUM_BO": [r"NUM.*BO", r"N.MERO.*BO", r"BO_NUMERO"],
         "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN", r"NOME_MUN"],
@@ -64,15 +64,20 @@ class IngestorSafeDriver:
             return True
         except: return False
 
+    def _normalizar_texto(self, valor):
+        """Remove acentos, caracteres especiais e deixa em maiúsculo."""
+        if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
+            return "NAO INFORMADO"
+        # Normalização NFKD para separar acentos das letras
+        texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
+        # Remove tudo que não for letra, número ou espaço e limpa as pontas
+        return re.sub(r'[^a-zA-Z0-9\s]', '', texto).upper().strip()
+
     def _resolver_mapeamento(self, lista_colunas):
-        """Identifica os índices das colunas necessárias baseado em RegEx."""
         mapeamento = {}
         for i, nome_col in enumerate(lista_colunas):
             if nome_col is None: continue
-            col_limpa = str(nome_col).upper().strip()
-            # Remove acentuação básica para o Regex não falhar
-            col_limpa = "".join(c for c in col_limpa if c.isalnum() or c == '_')
-            
+            col_limpa = "".join(c for c in str(nome_col).upper() if c.isalnum() or c == '_')
             for alvo, padroes in self.config.MAPA_COLUNAS.items():
                 if alvo in mapeamento.values(): continue
                 for p in padroes:
@@ -82,6 +87,15 @@ class IngestorSafeDriver:
         return mapeamento
 
     def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
+        # 1. Normalização das Colunas de Texto (Municipio, Bairro, Rubrica, etc)
+        colunas_texto = [c for c in df.columns if c not in ["LATITUDE", "LONGITUDE", "NUM_BO", "LOGRADOURO"]]
+        
+        for col in colunas_texto:
+            df = df.with_columns(
+                pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8).alias(col)
+            )
+
+        # 2. LAT/LON para Float
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
@@ -90,16 +104,13 @@ class IngestorSafeDriver:
 
     def extrair_bronze(self, ano: int):
         path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
-        if ano < self.ano_atual and self._arquivo_existe(path):
-            logger.info(f"⏭️ Bronze {ano} já existe.")
-            return
+        if ano < self.ano_atual and self._arquivo_existe(path): return
         url = self.config.URL_BASE_SSP.format(ano=ano)
         try:
             res = requests.get(url, timeout=600)
             if res.status_code == 200:
                 self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path, Body=res.content)
                 logger.info(f"✅ Bronze {ano} salva.")
-            else: logger.error(f"❌ Falha SSP {ano}: {res.status_code}")
         except Exception as e: logger.error(f"❌ Erro Download {ano}: {e}")
 
     def processar_prata(self, ano: int):
@@ -111,14 +122,12 @@ class IngestorSafeDriver:
             return
 
         try:
-            logger.info(f"🥈 [Ano {ano}] Iniciando Scanner de Cabeçalhos...")
+            logger.info(f"🥈 [Ano {ano}] Iniciando Normalização Universal...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             excel_bytes = obj['Body'].read()
             
-            # Pega abas sem usar argumentos sensíveis de versão
             excel_reader = fastexcel.read_excel(excel_bytes)
             abas = excel_reader.sheet_names
-            
             list_dfs = []
 
             for nome_aba in abas:
@@ -126,70 +135,60 @@ class IngestorSafeDriver:
                     continue
 
                 try:
-                    # Lemos os dados brutos (Polars assume a primeira linha como header por padrão)
-                    # Não passamos 'has_header' aqui para evitar o erro de versão
                     df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine")
-                    
-                    # SCAN: Procuramos o cabeçalho primeiro nas colunas lidas
                     indices_map = self._resolver_mapeamento(df_raw.columns)
                     
-                    # Se não achou Latitude/Longitude nas colunas, o cabeçalho está enterrado nas linhas
                     if "LATITUDE" not in indices_map.values():
                         found = False
-                        # Vasculha as primeiras 30 linhas
                         for row_idx in range(min(30, df_raw.height)):
                             row_data = df_raw.row(row_idx)
                             indices_map = self._resolver_mapeamento(row_data)
-                            
                             if "LATITUDE" in indices_map.values() and "LONGITUDE" in indices_map.values():
-                                # Achamos a linha! Re-lemos a aba pulando o lixo
                                 df_real = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", 
                                                         read_options={"skip_rows": row_idx + 1})
-                                # Re-mapeia nomes reais das colunas após o skip
                                 indices_map = self._resolver_mapeamento(df_real.columns)
                                 df_mes = df_real.select([df_real.columns[i] for i in indices_map.keys()])
-                                # Renomeia colunas
                                 df_mes.columns = [indices_map[i] for i in indices_map.keys()]
                                 found = True
                                 break
                         if not found: continue
                     else:
-                        # Estava nas colunas originais
                         df_mes = df_raw.select([df_raw.columns[i] for i in indices_map.keys()])
                         df_mes.columns = [indices_map[i] for i in indices_map.keys()]
 
                     df_mes = df_mes.with_columns(pl.all().cast(pl.Utf8))
                     list_dfs.append(df_mes)
-                    logger.info(f"   🎯 Aba '{nome_aba}': {df_mes.height} linhas.")
 
                 except Exception as e:
                     logger.warning(f"   ⚠️ Falha na aba {nome_aba}: {e}")
 
-            if not list_dfs:
-                raise ValueError(f"Não foi possível localizar os dados na estrutura de {ano}.")
+            if not list_dfs: raise ValueError(f"Dados não localizados em {ano}.")
 
-            # Concatenação e Limpeza Final
             df_final = pl.concat(list_dfs, how="diagonal")
+            
+            # APLICA NORMALIZAÇÃO (MAIÚSCULO E SEM ACENTO)
             df_final = self._limpar_e_tipar(df_final)
             
-            # LGPD e H3
+            # LGPD (Hash) - Normalizamos o Logradouro ANTES do hash para bater sempre
             pepper = self.config.PEPPER
-            res_h3 = self.config.RESOLUCAO_H3
-            
             df_final = df_final.with_columns([
-                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
-                pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{v}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
+                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8),
+                pl.col("LOGRADOURO").map_elements(lambda v: hashlib.sha256(f"{self._normalizar_texto(v)}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
+            ])
+
+            # H3
+            res_h3 = self.config.RESOLUCAO_H3
+            df_final = df_final.with_columns(
                 pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
                     lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], res_h3),
                     return_dtype=pl.Utf8
                 ).alias("H3_INDEX")
-            ])
+            )
 
-            # Upload Parquet ZSTD
             buf = io.BytesIO()
             df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} salva com SUCESSO: {df_final.height} linhas.")
+            logger.info(f"✨ Prata {ano} normalizada com SUCESSO.")
 
         except Exception as e:
             logger.error(f"💥 Erro fatal em {ano}: {e}")
