@@ -12,13 +12,12 @@ import re
 import hashlib
 import csv
 import urllib.request
-import gc
 from datetime import datetime
 from botocore.config import Config
 from pathlib import Path
 
 # ==========================================
-# ARQUITETURA SAFEDRIVER: CAMADA PRATA (STREAMING ENGINE V4)
+# ARQUITETURA SAFEDRIVER: CAMADA PRATA (STREAMING ENGINE V5 - FINAL)
 # ==========================================
 class ArquitetoSafeDriverPrata:
     def __init__(self):
@@ -46,7 +45,7 @@ class ArquitetoSafeDriverPrata:
 
         self.pepper = os.getenv("LGPD_PEPPER", "safedriver_seguranca_padrao_2026").strip()
         
-        # DuckDB Engine (Ajustado para 4GB para sobrar RAM para o Polars Streaming)
+        # DuckDB Engine
         self.con = duckdb.connect(database=':memory:')
         self.con.execute(f"PRAGMA memory_limit='4GB';")
         self.con.execute(f"PRAGMA temp_directory='{self.temp_dir}';")
@@ -84,7 +83,6 @@ class ArquitetoSafeDriverPrata:
         return enc_final, sep
 
     def _garantir_osmconf(self):
-        """Gera o arquivo de configuração para o OpenStreetMap."""
         path = os.path.join(self.bronze_dir, "osmconf.ini")
         if not os.path.exists(path):
             cfg = "[lines]\nosm_id=yes\nattributes=name,highway\n[points]\nosm_id=yes\nattributes=name\n"
@@ -119,17 +117,29 @@ class ArquitetoSafeDriverPrata:
         return df.with_columns(pl.lit(None).alias("H3_INDEX"))
 
     def imputar_h3_infra(self, df: pl.DataFrame, colunas: list) -> pl.DataFrame:
+        # Garante que usamos apenas colunas que existem no DF
         cols_presentes = [c for c in colunas if c in df.columns]
         if not cols_presentes or "H3_INDEX" not in df.columns: return df
+        
         print(f"   🪄 IA Espacial: Recuperando localizações via H3...", flush=True)
         for c in cols_presentes:
             guia = df.filter((pl.col(c).is_not_null()) & (pl.col(c) != "NAO INFORMADO")) \
                      .group_by("H3_INDEX").agg(pl.col(c).mode().first().alias("_inf"))
+            
             df = df.join(guia, on="H3_INDEX", how="left") \
                    .with_columns(pl.when(pl.col(c).is_null() | (pl.col(c) == "NAO INFORMADO"))
                                    .then(pl.col("_inf")).otherwise(pl.col(c)).fill_null("NAO INFORMADO").alias(c)) \
                    .drop("_inf")
         return df
+
+    def aplicar_lgpd_infra(self, df: pl.DataFrame) -> pl.DataFrame:
+        def _h(v):
+            if v is None or str(v).strip() == "": return "ANONIMIZADO"
+            return hashlib.sha256((str(v).upper().strip() + self.pepper).encode()).hexdigest()
+        
+        # id_protegido já é o cnpj, razao_social e nome_fantasia precisam de hash
+        cols = [c for c in ["id_protegido", "razao_social", "nome_fantasia"] if c in df.columns]
+        return df.with_columns([pl.col(c).map_elements(_h, return_dtype=pl.Utf8) for c in cols])
 
     # ==========================================
     # WORKFLOW
@@ -158,14 +168,14 @@ class ArquitetoSafeDriverPrata:
             
             json_files = glob.glob(f"{self.bronze_dir}/**/*.json", recursive=True)
             osm_pbf = self._buscar_arquivo_seguro("sp-latest.osm.pbf", "OSM PBF")
-            conf_path = self._garantir_osmconf() # FIX: Gerar e pegar o caminho do conf
-            
+            conf_path = self._garantir_osmconf()
+
             sqls = []
             for f in json_files:
                 f_path = str(f).replace("\\", "/")
                 sqls.append(f"SELECT CAST(CD_FACE AS VARCHAR) as CD_FACE, trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, CAST(NULL AS VARCHAR) as NM_MUN, CAST(NULL AS VARCHAR) as NM_BAIRRO, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON FROM ST_Read('{f_path}')")
             
-            # FIX: Inclusão do CONFIG_FILE no ST_Read do OSM
+            # FIX: open_options agora inclui o CONFIG_FILE corretamente
             query = f"""
                 SELECT CAST(osm_id AS VARCHAR) as CD_FACE, name as RUA, CAST(NULL AS VARCHAR) as NM_MUN, CAST(NULL AS VARCHAR) as NM_BAIRRO, CAST(ST_Y(ST_Centroid(geom)) AS FLOAT) as LAT, CAST(ST_X(ST_Centroid(geom)) AS FLOAT) as LON
                 FROM ST_Read('{osm_pbf}', layer='lines', open_options=['CONFIG_FILE={conf_path}', 'INTERLEAVED_READING=YES']) 
@@ -197,25 +207,27 @@ class ArquitetoSafeDriverPrata:
             self.auditoria["SOCIAL"] = {"STATUS": "OK", "COUNT": df.height}
         except Exception as e: self.auditoria["SOCIAL"] = {"STATUS": "ERRO", "MSG": str(e)}
 
-        # 3. INFRA (Otimizado)
+        # 3. INFRA (Otimizado contra Crash e PerformanceWarning)
         print("🏗️ Malha Infra (Processamento Streaming)...", flush=True)
         try:
             pqs = glob.glob(f"{self.bronze_dir}/**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             lf = pl.scan_parquet(pqs)
             
-            # FIX: Ajuste de colunas conforme o seu log de erro (cnpj -> id_protegido)
+            # FIX: Usar collect_schema().names() para evitar PerformanceWarning
+            colunas_schema = lf.collect_schema().names()
             colunas_alvo = ["id_protegido", "cnpj", "razao_social", "nome_fantasia", "lat", "lon", 
                             "municipio", "bairro", "cnae_fiscal_principal", "situacao_cadastral"]
-            cols_reais = [c for c in colunas_alvo if c in lf.columns]
+            
+            cols_reais = [c for c in colunas_alvo if c in colunas_schema]
             
             lf = lf.select(cols_reais).filter(pl.col("lat").is_not_null())
 
-            # Coletamos usando o motor de streaming atualizado (evita DeprecationWarning)
+            # FIX: engine="streaming" conforme nova versão do Polars
             df = lf.collect(engine="streaming")
             
-            # Processamento
             df = self.aplicar_h3_batch(df, "lat", "lon")
             df = self.imputar_h3_infra(df, ["municipio", "bairro"])
+            df = self.aplicar_lgpd_infra(df)
             df = self.normalizar_df(df)
             
             df.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA.parquet", compression="zstd")
