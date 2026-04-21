@@ -2,15 +2,10 @@ import os
 import boto3
 import requests
 import logging
-import io
 import time
 import sys
-import polars as pl
-import h3
-import hashlib
 from botocore.config import Config
 from datetime import datetime
-from typing import Optional
 
 # Configuração de Log
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -50,19 +45,21 @@ class IngestorSafeDriver:
         )
 
     def _gerar_hash_lgpd(self, logradouro: str, id_bo: str) -> str:
+        import hashlib # Lazy import isolado
         if not logradouro or str(logradouro).upper() in ["NONE", "NULL", "NAN"]:
             return "LOCAL_ANONIMIZADO"
         payload = f"{self.config.PEPPER}{logradouro}{id_bo}{self.config.SALT}".encode('utf-8')
         return hashlib.sha256(payload).hexdigest()
 
     def _calcular_h3(self, lat, lon):
+        import h3 # Lazy import isolado
         try:
             lat, lon = float(lat), float(lon)
             if lat == 0 or lon == 0 or abs(lat) > 90 or abs(lon) > 180: return None
             return h3.latlng_to_cell(lat, lon, self.config.RESOLUCAO_H3)
         except: return None
 
-    # --- ETAPA 1: BRONZE (DOWNLOAD RESILIENTE) ---
+    # --- ETAPA 1: BRONZE (LEVE E PURA) ---
     def extrair_bronze(self, ano: int):
         url = self.config.URL_BASE_SSP.format(ano=ano)
         path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
@@ -83,8 +80,11 @@ class IngestorSafeDriver:
             tentativa += 1
             time.sleep(20)
 
-    # --- ETAPA 2: PRATA (TRANSFORMAÇÃO INDEPENDENTE) ---
+    # --- ETAPA 2: PRATA (PESADA E ANALÍTICA) ---
     def processar_prata(self, ano: int):
+        import io # Lazy import isolado
+        import polars as pl # Lazy import isolado
+
         path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_prata = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
 
@@ -137,10 +137,8 @@ class IngestorSafeDriver:
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     
-    # Gerenciamento via argumento de linha de comando
-    # Uso: python script.py bronze | prata | tudo
     modo = sys.argv[1].lower() if len(sys.argv) > 1 else "tudo"
-    anos = [2024, 2025, 2026]
+    anos = [2024, 2025, 2026] # Ajuste os anos que deseja processar
 
     for ano in anos:
         if modo in ["bronze", "tudo"]:
