@@ -12,7 +12,7 @@ import h3
 from botocore.config import Config
 from datetime import datetime
 
-# Configuração de Log
+# Configuração de Log Profissional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -21,18 +21,24 @@ class ConfiguracaoIngestao:
     ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL")
     ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
     SECRET_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-    
     PEPPER = os.getenv("LGPD_PEPPER", "safedriver_secret_2026")
 
     URL_BASE_SSP = "https://www.ssp.sp.gov.br/assets/estatistica/transparencia/spDados/SPDadosCriminais_{ano}.xlsx"
     RESOLUCAO_H3 = 9
     
-    # Colunas que o modelo SafeDriver exige
-    COLUNAS_ALVO = [
-        "NUM_BO", "MUNICIPIO", "BAIRRO", "LOGRADOURO",
-        "DATAOCORRENCIA", "HORAOCORRENCIA", "RUBRICA", 
-        "LATITUDE", "LONGITUDE", "DESCR_TIPOLOCAL"
-    ]
+    # Mapeamento Flexível (Gaps de nomes que a SSP costuma mudar)
+    MAPA_COLUNAS = {
+        "NUM_BO": ["NUM_BO", "NÚMERO_BO", "NUMERO_BO"],
+        "MUNICIPIO": ["MUNICIPIO", "CIDADE", "NOME_MUNICIPIO"],
+        "BAIRRO": ["BAIRRO", "NOME_BAIRRO"],
+        "LOGRADOURO": ["LOGRADOURO", "DESCR_LOGRADOURO", "RUA"],
+        "DATAOCORRENCIA": ["DATAOCORRENCIA", "DATA_OCORRENCIA", "DATA_OCORRENCIA_BO"],
+        "HORAOCORRENCIA": ["HORAOCORRENCIA", "HORA_OCORRENCIA", "HORA_OCORRENCIA_BO"],
+        "RUBRICA": ["RUBRICA", "DESCR_RUBRICA", "NATUREZA"],
+        "LATITUDE": ["LATITUDE", "LAT"],
+        "LONGITUDE": ["LONGITUDE", "LON", "LONG"],
+        "DESCR_TIPOLOCAL": ["DESCR_TIPOLOCAL", "TIPO_LOCAL", "LOCAL"]
+    }
 
 class IngestorSafeDriver:
     def __init__(self):
@@ -47,138 +53,130 @@ class IngestorSafeDriver:
             endpoint_url=endpoint,
             aws_access_key_id=self.config.ACCESS_KEY.strip(),
             aws_secret_access_key=self.config.SECRET_KEY.strip(),
-            config=Config(signature_version='s3v4')
+            config=Config(signature_version='s3v4', retries={'max_attempts': 5})
         )
 
     def _arquivo_existe(self, key: str) -> bool:
         try:
             self.s3.head_object(Bucket=self.config.NOME_BUCKET, Key=key)
             return True
-        except:
-            return False
+        except: return False
 
-    def _limpar_e_converter_tipos(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Aqui é onde a mágica acontece: transformamos as Strings da Bronze 
-        nos tipos reais da Prata (Float, Int, Date).
-        """
-        print("   ⚙️ Convertendo strings da Bronze para tipos Prata...", flush=True)
+    def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Trata as strings da Bronze para os tipos reais da Prata."""
+        print("   ⚙️ Refinando tipos e limpando coordenadas...", flush=True)
         
-        return df.with_columns([
-            # 1. LAT/LON: Troca vírgula por ponto e converte pra Float64
+        # 1. Garantir que Lat/Lon sejam números (SSP usa vírgula)
+        df = df.with_columns([
             pl.col("LATITUDE").str.replace(",", ".").cast(pl.Float64, strict=False),
-            pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False),
-            
-            # 2. Padronização de textos básicos
-            pl.col("MUNICIPIO").str.to_uppercase().fill_null("NAO INFORMADO"),
-            pl.col("BAIRRO").str.to_uppercase().fill_null("NAO INFORMADO"),
-            
-            # 3. Garantir que RUBRICA (tipo de crime) esteja limpo para o XGBoost
-            pl.col("RUBRICA").str.to_uppercase().str.strip_chars()
-        ]).filter(
-            # Remove lixo de coordenadas (linhas sem GPS não servem para o SafeDriver)
-            (pl.col("LATITUDE").is_not_null()) & 
-            (pl.col("LATITUDE") != 0)
-        )
-
-    def _aplicar_lgpd(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Anonimização via SHA-256"""
-        def hash_value(val):
-            if val is None: return "ANONIMIZADO"
-            return hashlib.sha256(f"{str(val).upper()}{self.config.PEPPER}".encode()).hexdigest()
-
-        return df.with_columns([
-            pl.col("NUM_BO").map_elements(hash_value, return_dtype=pl.Utf8),
-            pl.col("LOGRADOURO").map_elements(hash_value, return_dtype=pl.Utf8)
+            pl.col("LONGITUDE").str.replace(",", ".").cast(pl.Float64, strict=False)
         ])
 
-    def _indexar_h3(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Cálculo do Hexágono H3"""
-        return df.with_columns(
-            pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3),
-                return_dtype=pl.Utf8
-            ).alias("H3_INDEX")
+        # 2. Filtro de Qualidade (Crime sem coordenada não treina modelo de mapa)
+        df = df.filter(
+            (pl.col("LATITUDE").is_not_null()) & 
+            (pl.col("LATITUDE") != 0) &
+            (pl.col("LATITUDE") < -10) # Coordenada válida para SP
         )
 
-    def extrair_bronze(self, ano: int):
-        """Salva o Excel BRUTO (Raw) no R2"""
-        path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
+        # 3. Normalização de Texto
+        df = df.with_columns([
+            pl.all().exclude(["LATITUDE", "LONGITUDE"]).map_elements(
+                lambda x: str(x).upper().strip() if x is not None else "NAO INFORMADO",
+                return_dtype=pl.Utf8
+            )
+        ])
         
-        if ano < self.ano_atual and self._arquivo_existe(path_bronze):
-            logger.info(f"⏭️ [BRONZE] {ano} já existe. Pulando download.")
+        return df
+
+    def _aplicar_lgpd(self, df: pl.DataFrame) -> pl.DataFrame:
+        """Pseudonimização irreversível."""
+        def hash_v(val):
+            return hashlib.sha256(f"{val}{self.config.PEPPER}".encode()).hexdigest()
+
+        return df.with_columns([
+            pl.col("NUM_BO").map_elements(hash_v, return_dtype=pl.Utf8),
+            pl.col("LOGRADOURO").map_elements(hash_v, return_dtype=pl.Utf8)
+        ])
+
+    def _resolver_colunas(self, df_cols):
+        """Inteligência para achar as colunas certas mesmo se a SSP mudar o nome."""
+        selecao = {}
+        for alvo, variantes in self.config.MAPA_COLUNAS.items():
+            for v in variantes:
+                if v in df_cols:
+                    selecao[v] = alvo
+                    break
+        return selecao
+
+    def extrair_bronze(self, ano: int):
+        path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
+        if ano < self.ano_atual and self._arquivo_existe(path):
+            logger.info(f"⏭️ Bronze {ano} já existe.")
             return
 
         url = self.config.URL_BASE_SSP.format(ano=ano)
         try:
-            logger.info(f"🚀 [BRONZE] Baixando ano {ano}...")
-            res = requests.get(url, timeout=300)
+            res = requests.get(url, timeout=600)
             if res.status_code == 200:
-                self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze, Body=res.content)
-                logger.info(f"✅ [BRONZE] {ano} salvo no R2.")
-            else:
-                logger.error(f"❌ Erro download {ano}: Status {res.status_code}")
-        except Exception as e:
-            logger.error(f"❌ Falha crítica no download {ano}: {e}")
+                self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path, Body=res.content)
+                logger.info(f"✅ Bronze {ano} salva.")
+            else: logger.error(f"❌ Falha SSP {ano}: {res.status_code}")
+        except Exception as e: logger.error(f"❌ Erro Download {ano}: {e}")
 
     def processar_prata(self, ano: int):
-        """Lê a Bronze como String e converte para Prata Trusted"""
-        path_bronze = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
-        path_prata = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
+        path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
+        path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
 
-        if self._arquivo_existe(path_prata):
-            logger.info(f"⏭️ [PRATA] {ano} já processado. Pulando.")
+        if self._arquivo_existe(path_p):
+            logger.info(f"⏭️ Prata {ano} já processada.")
             return
 
         try:
-            logger.info(f"🥈 [PRATA] Iniciando tratamento do ano {ano}...")
-            obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_bronze)
-            content = obj['Body'].read()
+            logger.info(f"🥈 Processando Prata {ano}...")
+            obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
             
-            # 1. LER TUDO COMO STRING (A solução para o seu problema)
-            # Ao usar o motor 'calamine', o Polars lê o Excel. 
-            # Em seguida, forçamos o cast de TODAS as colunas para String imediatamente.
-            df = pl.read_excel(io.BytesIO(content), sheet_id=1, engine="calamine")
-            df = df.with_columns(pl.all().cast(pl.Utf8)) 
+            # Tenta ler com calamine (motor mais estável para Excel sujo)
+            df = pl.read_excel(io.BytesIO(obj['Body'].read()), sheet_id=1, engine="calamine")
             
-            # 2. Padronização de Nomes de Colunas
+            # Achata tudo para String imediatamente para evitar erros de esquema (Schema-on-read)
+            df = df.with_columns(pl.all().cast(pl.Utf8))
+            
+            # Resolve nomes de colunas dinamicamente
             df.columns = [c.upper().replace(" ", "_").strip() for c in df.columns]
+            mapeamento = self._resolver_colunas(df.columns)
             
-            # 3. Selecionar apenas o que importa (Evita carregar lixo na memória)
-            cols_disponiveis = [c for c in self.config.COLUNAS_ALVO if c in df.columns]
-            df = df.select(cols_disponiveis)
+            if "LATITUDE" not in mapeamento.values():
+                raise ValueError(f"Arquivo de {ano} não possui coluna de Latitude identificável!")
 
-            # 4. Converter as strings nos tipos corretos (Float, String Limpa, etc)
-            df = self._limpar_e_converter_tipos(df)
+            df = df.select(list(mapeamento.keys())).rename(mapeamento)
 
-            # 5. LGPD (Anonimizar antes de salvar na Prata)
+            # Transformações e Inteligência
+            df = self._limpar_e_tipar(df)
             df = self._aplicar_lgpd(df)
-
-            # 6. H3 Index (Espacialização)
-            df = self._indexar_h3(df)
-
-            # 7. Salvar em Parquet (Muito mais leve que Excel para o Power BI / ML)
-            buffer = io.BytesIO()
-            df.write_parquet(buffer, compression="snappy")
-            self.s3.put_object(
-                Bucket=self.config.NOME_BUCKET, 
-                Key=path_prata, 
-                Body=buffer.getvalue()
+            
+            # H3 Index
+            df = df.with_columns(
+                pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
+                    lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3),
+                    return_dtype=pl.Utf8
+                ).alias("H3_INDEX")
             )
-            logger.info(f"✨ [PRATA] {ano} finalizada: {df.height} ocorrências georreferenciadas.")
+
+            # Upload Parquet
+            buf = io.BytesIO()
+            df.write_parquet(buf, compression="zstd")
+            self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
+            logger.info(f"✨ Prata {ano} finalizada: {df.height} linhas.")
 
         except Exception as e:
-            logger.error(f"💥 Erro fatal na Prata {ano}: {e}")
+            logger.error(f"💥 Falha na Prata {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     modo = sys.argv[1].lower() if len(sys.argv) > 1 else "tudo"
-    
     anos = range(2022, ingestor.ano_atual + 1)
 
     for ano in anos:
-        if modo in ["bronze", "tudo"]:
-            ingestor.extrair_bronze(ano)
-        
-        if modo in ["prata", "tudo"]:
-            ingestor.processar_prata(ano)
+        if modo in ["bronze", "tudo"]: ingestor.extrair_bronze(ano)
+        if modo in ["prata", "tudo"]: ingestor.processar_prata(ano)
