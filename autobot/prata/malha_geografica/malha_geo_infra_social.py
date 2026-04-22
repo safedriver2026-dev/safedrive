@@ -49,7 +49,7 @@ class ArquitetoSafeDriverPrata:
             pass 
         
         self.auditoria = {
-            "projeto": "SafeDriver - Malha Geográfica (Spatial Join)",
+            "projeto": "SafeDriver - Malha Geográfica (Spatial Join + Social H3)",
             "data_execucao": str(datetime.now()),
             "status_pipeline": "PROCESSANDO",
             "telemetria": {}
@@ -99,7 +99,6 @@ class ArquitetoSafeDriverPrata:
 
     def download_r2(self):
         print("📥 Sincronizando Bronze do R2...", flush=True)
-        # CORREÇÃO AQUI: Mudamos de SP_Bairros_2022 para SP_bairros_CD2022
         targets = ["SP_Faces_2022.zip", "SP_bairros_CD2022", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
@@ -117,9 +116,9 @@ class ArquitetoSafeDriverPrata:
         print("🚀 Iniciando Processamento da Malha com Spatial Join...", flush=True)
         try:
             # =================================================================
-            # 1. CARREGAR RUAS E CALCULAR H3 (Do arquivo Zip de Faces)
+            # 1. CARREGAR RUAS E CALCULAR H3 (Incluindo a ponte CD_SETOR)
             # =================================================================
-            print("--- Extraindo Vias e Coordenadas (Faces) ---")
+            print("--- Extraindo Vias, Setores e Coordenadas (Faces) ---")
             zip_f = self._buscar_arquivo_flexivel("SP_Faces_2022.zip")
             list_vias_df = []
             
@@ -134,6 +133,7 @@ class ArquitetoSafeDriverPrata:
                         f_path_sql = os.path.join(self.temp_extract_dir, f_json).replace("\\", "/")
                         sqls.append(f"""
                             SELECT 
+                                TRIM(CAST(CD_SETOR AS VARCHAR)) as CD_SETOR,
                                 trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, 
                                 ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON, 
                                 TRY_CAST(TOT_RES AS FLOAT) as TOT_RES 
@@ -167,7 +167,6 @@ class ArquitetoSafeDriverPrata:
             self.con.register("tabela_h3", df_h3_centers.to_arrow())
             
             print("--- Localizando Shapefile de Bairros ---")
-            # CORREÇÃO AQUI: Mudamos a busca para o nome exato do seu bucket
             arq_poligonos = self._buscar_arquivo_flexivel("SP_bairros_CD2022*.shp").replace("\\", "/")
             
             query_espacial = f"""
@@ -191,7 +190,7 @@ class ArquitetoSafeDriverPrata:
             )
 
             # =================================================================
-            # 3. EXPORTAÇÕES DA MALHA
+            # 3. EXPORTAÇÕES DA MALHA (Hierarquia e Micro-população)
             # =================================================================
             print("--- Consolidando e Exportando a Hierarquia Geográfica ---")
             df_hierarquico = (
@@ -205,16 +204,35 @@ class ArquitetoSafeDriverPrata:
             df_micro.write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
 
             # =================================================================
-            # 4. REFERÊNCIA SOCIAL MACRO 
+            # 4. REFERÊNCIA SOCIAL MACRO (Criando o H3 Social para a Camada Ouro)
             # =================================================================
-            print("--- Extraindo Variáveis Sociais (Censo) ---")
+            print("--- Extraindo Variáveis Sociais (Censo) e Agrupando por H3 ---")
+            linhas_social_exportadas = 0
             try:
                 csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
                 df_social_raw = self._ler_csv_agnostico(csv_f)
-                df_social_raw.select([pl.col("CD_SETOR").cast(pl.Utf8), "NM_MUN", "NM_BAIRRO", "v0001", "v0002"]) \
-                    .write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet")
+                
+                # Tratamento numérico para População (v0001) e Renda (v0002)
+                df_social_limpo = df_social_raw.select([
+                    pl.col("CD_SETOR").str.strip_chars(),
+                    pl.col("v0001").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_POPULACAO"),
+                    pl.col("v0002").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_RENDA")
+                ])
+                
+                # O Join com df_vias_completo cria a ponte entre Setor Censitário e H3
+                df_social_h3 = df_vias_completo.select(["CD_SETOR", "H3_INDEX", "TOT_RES"]).join(
+                    df_social_limpo, on="CD_SETOR", how="left"
+                ).group_by("H3_INDEX").agg([
+                    pl.sum("TOT_RES").fill_null(0).alias("MICRO_POPULACAO_FACES"),
+                    pl.mean("CENSO_POPULACAO").fill_null(0).alias("CENSO_MEDIA_V0001"),
+                    pl.mean("CENSO_RENDA").fill_null(0).alias("CENSO_MEDIA_V0002")
+                ])
+
+                df_social_h3.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet", compression="zstd")
+                linhas_social_exportadas = df_social_h3.height
+                print(f"✅ Arquivo PRATA_MALHA_SOCIAL_H3.parquet gerado com {linhas_social_exportadas} registros.")
             except Exception as e:
-                logger.warning(f"Aviso: Não foi possível processar o CSV Social: {e}")
+                print(f"❌ Erro Crítico no processamento Social: {e}")
 
             # =================================================================
             # 5. INFRAESTRUTURA URBANA (CNAEs)
@@ -266,16 +284,17 @@ class ArquitetoSafeDriverPrata:
                     "h3_com_atividade_comercial": df_pivot_height
                 },
                 "tabelas_exportadas_linhas": {
-                    "PRATA_MALHA_GEOGRAFICA_VIAS": df_hierarquico.height
+                    "PRATA_MALHA_GEOGRAFICA_VIAS": df_hierarquico.height,
+                    "PRATA_MALHA_SOCIAL_H3": linhas_social_exportadas
                 }
             }
 
             print("✨ Pipeline Prata da Malha concluído com sucesso!")
             
-            msg = "🗺️ **[SafeDriver] Malha Prata (Spatial Join Concluído)**\n```ml\n"
+            msg = "🗺️ **[SafeDriver] Malha Prata Atualizada (Ponte Social OK)**\n```ml\n"
             msg += f"• H3 Únicos Mapeados : {df_h3_mapeado.height}\n"
             msg += f"• Precisão do IBGE   : {taxa_sucesso}%\n"
-            msg += f"• CNPJs Processados  : {total_cnpjs}\n"
+            msg += f"• Hexágonos Sociais  : {linhas_social_exportadas}\n"
             msg += f"• Tempo Execução     : {tempo_exec}s\n```"
             self._notificar_discord(msg)
             
