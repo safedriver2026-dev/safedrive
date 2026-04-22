@@ -11,9 +11,11 @@ import unicodedata
 import polars as pl
 import h3
 import fastexcel
+import json
 from botocore.config import Config
 from datetime import datetime
 
+# Configuração de Log
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -48,8 +50,7 @@ class IngestorSafeDriver:
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
         self.df_lookup_vias = None
-        # Acumulador para o relatório final
-        self.stats_consolidado = []
+        self.diagnostico_anos = []
 
     def _inicializar_s3(self):
         endpoint = self.config.ENDPOINT_URL.strip().rstrip('/')
@@ -60,16 +61,16 @@ class IngestorSafeDriver:
 
     def _carregar_malha_referencia(self):
         try:
-            logger.info("🗺️ Baixando Malha Geográfica para resgate...")
+            logger.info("🗺️ Baixando Malha Hierárquica para resgate...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
-            df_hierarquico = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+            df_h = pl.read_parquet(io.BytesIO(obj['Body'].read()))
             self.df_lookup_vias = (
-                df_hierarquico.explode("BAIRROS").unnest("BAIRROS")
+                df_h.explode("BAIRROS").unnest("BAIRROS")
                 .explode("LOGRADOUROS").unnest("LOGRADOUROS")
                 .with_columns(pl.col("H3_LIST").list.first().alias("H3_INDEX"))
                 .select(["CIDADE", "BAIRRO", "RUA", "H3_INDEX"]).unique()
             )
-            logger.info(f"✅ Malha carregada: {self.df_lookup_vias.height} logradouros.")
+            logger.info(f"✅ Malha preparada: {self.df_lookup_vias.height} logradouros mapeados.")
         except Exception as e:
             logger.error(f"❌ Erro ao carregar malha: {e}")
 
@@ -79,37 +80,27 @@ class IngestorSafeDriver:
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
         return re.sub(r'[^a-zA-Z0-9\s]', '', texto).upper().strip()
 
-    def _resolver_mapeamento(self, lista_colunas):
-        mapeamento = {}
-        for i, nome_col in enumerate(lista_colunas):
-            if nome_col is None: continue
-            col_limpa = "".join(c for c in str(nome_col).upper() if c.isalnum() or c == '_')
-            for alvo, padroes in self.config.MAPA_COLUNAS.items():
-                if alvo in mapeamento.values(): continue
-                for p in padroes:
-                    if re.search(p, col_limpa, re.IGNORECASE):
-                        mapeamento[i] = alvo
-                        break
-        return mapeamento
-
     def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
         if self.df_lookup_vias is None: return df
-        df = df.join(self.df_lookup_vias, left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO"], right_on=["CIDADE", "BAIRRO", "RUA"], how="left") \
+        # Join Nível 1: Tríade Completa
+        df = df.join(self.df_lookup_vias, left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO"], 
+                     right_on=["CIDADE", "BAIRRO", "RUA"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
+        # Join Nível 2: Fallback Cidade + Rua
         df_fb = self.df_lookup_vias.unique(subset=["CIDADE", "RUA"]).select(["CIDADE", "RUA", "H3_INDEX"])
         df = df.join(df_fb, left_on=["MUNICIPIO", "LOGRADOURO"], right_on=["CIDADE", "RUA"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         return df
 
     def _limpar_e_tipar(self, df: pl.DataFrame, ano: int) -> pl.DataFrame:
-        # MÉTRICAS INICIAIS
-        total_entrada = df.height
+        total_inicial = df.height
         
-        # 1. Normalização e Período
+        # 1. Normalização de Texto
         cols_ignorar = ["LATITUDE", "LONGITUDE", "NUM_BO", "HORAOCORRENCIA", "PERIODO_NATIVO"]
         for col in [c for c in df.columns if c not in cols_ignorar]:
             df = df.with_columns(pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
 
+        # 2. Hierarquia de Período
         df = df.with_columns(pl.col("HORAOCORRENCIA").str.to_time(format="%H:%M:%S", strict=False).dt.hour().alias("_hr")) \
                .with_columns(
                    pl.when(pl.col("_hr").is_between(0, 5)).then(pl.lit("MADRUGADA"))
@@ -123,7 +114,7 @@ class IngestorSafeDriver:
                    .otherwise(pl.lit(None)).alias("SAZON_PERIODO")
                ).drop(["_hr", "PERIODO_NATIVO"])
 
-        # 2. Coordenadas e GPS Original
+        # 3. GPS Original (H3)
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
@@ -134,67 +125,58 @@ class IngestorSafeDriver:
             ).alias("H3_INDEX")
         )
 
-        # Métrica: Registros que já tinham H3 via GPS
-        bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
+        bo_gps_valido = df.filter(pl.col("H3_INDEX").is_not_null()).height
         
-        # 3. Resgate Espacial
+        # 4. Resgate Geográfico
         df = self._resgatar_espacial(df)
         
-        # Métrica: Registros pós resgate
-        bo_pos_resgate = df.filter(pl.col("H3_INDEX").is_not_null()).height
-        bo_resgatados = bo_pos_resgate - bo_com_gps
-        
-        # 4. Filtro Final e Descarte
-        df_limpo = df.filter(pl.col("H3_INDEX").is_not_null() & pl.col("SAZON_PERIODO").is_not_null())
-        descartados = total_entrada - df_limpo.height
+        df_final = df.filter(pl.col("H3_INDEX").is_not_null() & pl.col("SAZON_PERIODO").is_not_null())
+        bo_resgatados = df_final.height - bo_gps_valido
 
-        # Armazenar estatísticas para o relatório final
-        self.stats_consolidado.append({
-            "ANO": ano,
-            "TOTAL": total_entrada,
-            "GPS_ORIGINAL": bo_com_gps,
-            "RESGATADOS": bo_resgatados,
-            "DESCARTADOS": descartados,
-            "FINAL": df_limpo.height
+        # Salva diagnóstico do ano
+        self.diagnostico_anos.append({
+            "ano": ano,
+            "total_raw": total_inicial,
+            "gps_original": bo_gps_valido,
+            "resgatados_via_malha": bo_resgatados,
+            "descartados": total_inicial - df_final.height,
+            "total_trusted": df_final.height
         })
         
-        return df_limpo
+        return df_final
 
-    def enviar_relatorio_discord(self):
-        if not self.config.WEBHOOK_DISCORD or not self.stats_consolidado:
-            return
+    def finalizar_e_reportar(self):
+        if not self.diagnostico_anos: return
 
-        # Cabeçalho da Tabela
-        msg = "📊 **[SafeDriver] Relatório Consolidado de Ingestão de Crimes**\n```ml\n"
-        msg += f"{'ANO':<6} | {'TOTAL':<8} | {'GPS':<7} | {'RESGATE':<8} | {'FINAL':<8}\n"
-        msg += "-" * 50 + "\n"
-
-        total_proc = 0
-        total_resg = 0
-        total_final = 0
-
-        for s in sorted(self.stats_consolidado, key=lambda x: x['ANO']):
-            msg += f"{s['ANO']:<6} | {s['TOTAL']:<8} | {s['GPS_ORIGINAL']:<7} | {s['RESGATADOS']:<8} | {s['FINAL']:<8}\n"
-            total_proc += s['TOTAL']
-            total_resg += s['RESGATADOS']
-            total_final += s['FINAL']
-
-        msg += "-" * 50 + "\n"
-        msg += f"{'TOTAL':<6} | {total_proc:<8} | {'-':<7} | {total_resg:<8} | {total_final:<8}\n"
-        msg += "```"
+        # 1. Enviar Relatório para o Discord
+        msg = "📊 **[SafeDriver] Relatório de Ingestão de Crimes**\n```ml\n"
+        msg += f"{'ANO':<5} | {'TOTAL':<7} | {'GPS':<6} | {'RESGATE':<7} | {'FINAL':<7}\n"
+        msg += "-" * 45 + "\n"
         
-        # Resumo de Eficiência
-        taxa_resgate = (total_resg / total_proc) * 100 if total_proc > 0 else 0
-        taxa_aproveitamento = (total_final / total_proc) * 100 if total_proc > 0 else 0
-        
-        msg += f"\n💡 **Eficiência da Malha:** {taxa_resgate:.2f}% de B.O.s sem GPS foram salvos."
-        msg += f"\n🎯 **Aproveitamento Final:** {taxa_aproveitamento:.2f}% da base SSP convertida em ABT."
+        t_raw, t_res, t_fin = 0, 0, 0
+        for d in sorted(self.diagnostico_anos, key=lambda x: x['ano']):
+            msg += f"{d['ano']:<5} | {d['total_raw']:<7} | {d['gps_original']:<6} | {d['resgatados_via_malha']:<7} | {d['total_trusted']:<7}\n"
+            t_raw += d['total_raw']; t_res += d['resgatados_via_malha']; t_fin += d['total_trusted']
 
-        try:
-            requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg}, timeout=15)
-            logger.info("✅ Relatório consolidado enviado ao Discord.")
-        except Exception as e:
-            logger.error(f"❌ Falha ao enviar para o Discord: {e}")
+        msg += "-" * 45 + "\n"
+        msg += f"{'SOMA':<5} | {t_raw:<7} | {'-':<6} | {t_res:<7} | {t_fin:<7}\n```"
+        msg += f"\n💡 **Eficiência:** {((t_res/t_raw)*100):.2f}% da base SSP recuperada por código."
+        
+        if self.config.WEBHOOK_DISCORD:
+            requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg})
+
+        # 2. Salvar Diagnóstico completo como Arquivo no R2
+        diag_final = {
+            "projeto": "SafeDriver",
+            "data_processamento": str(datetime.now()),
+            "metricas_detalhadas": self.diagnostico_anos,
+            "totais": {"bruto": t_raw, "recuperado": t_res, "final": t_fin}
+        }
+        buf = io.BytesIO(json.dumps(diag_final, indent=4).encode())
+        self.s3.put_object(Bucket=self.config.NOME_BUCKET, 
+                           Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES.json", 
+                           Body=buf.getvalue())
+        logger.info("📁 Arquivo de diagnóstico salvo no R2.")
 
     def extrair_bronze(self, ano: int):
         path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
@@ -221,16 +203,16 @@ class IngestorSafeDriver:
                 try:
                     df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine")
                     indices_map = self._resolver_mapeamento(df_raw.columns)
+                    # Lógica de correção de cabeçalho
                     if "LATITUDE" not in indices_map.values():
                         for row_idx in range(min(20, df_raw.height)):
-                            indices_map = self._resolver_mapeamento(df_raw.row(row_idx))
-                            if "LATITUDE" in indices_map.values():
+                            if "LATITUDE" in self._resolver_mapeamento(df_raw.row(row_idx)).values():
                                 df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": row_idx + 1})
                                 indices_map = self._resolver_mapeamento(df_raw.columns)
                                 break
-                    df_mes = df_raw.select([df_raw.columns[i] for i in indices_map.keys()])
-                    df_mes.columns = [indices_map[i] for i in indices_map.keys()]
-                    list_dfs.append(df_mes.with_columns(pl.all().cast(pl.Utf8)))
+                    df_m = df_raw.select([df_raw.columns[i] for i in indices_map.keys()])
+                    df_m.columns = [indices_map[i] for i in indices_map.keys()]
+                    list_dfs.append(df_m.with_columns(pl.all().cast(pl.Utf8)))
                 except: continue
 
             df_final = pl.concat(list_dfs, how="diagonal")
@@ -243,18 +225,14 @@ class IngestorSafeDriver:
             buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
             logger.info(f"✨ Prata {ano} finalizada.")
-        except Exception as e: logger.error(f"💥 Erro fatal {ano}: {e}")
+        except Exception as e: logger.error(f"💥 Erro em {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     modo = sys.argv[1].lower() if len(sys.argv) > 1 else "tudo"
-    
-    anos_para_processar = range(2022, ingestor.ano_atual + 1)
-    
-    for ano in anos_para_processar:
+    for ano in range(2022, ingestor.ano_atual + 1):
         if modo in ["bronze", "tudo"]: ingestor.extrair_bronze(ano)
         if modo in ["prata", "tudo"]: ingestor.processar_prata(ano)
     
-    # Ao final de todos os anos, envia o relatório único
     if modo in ["prata", "tudo"]:
-        ingestor.enviar_relatorio_discord()
+        ingestor.finalizar_e_reportar()
