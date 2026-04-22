@@ -317,5 +317,5 @@ class ArquitetoSafeDriverPrata:
 
 if __name__ == "__main__":
     arquiteto = ArquitetoSafeDriverPrata()
-    # arquiteto.download_r2()
+    arquiteto.download_r2()
     arquiteto.processar()
