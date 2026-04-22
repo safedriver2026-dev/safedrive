@@ -39,10 +39,16 @@ class ArquitetoSafeDriverOuro:
             except: pass
 
     def _ler_parquet_r2(self, key):
+        """Versão com log de erro para não esconder falhas."""
         try:
+            print(f"   -> Procurando: {key}", flush=True)
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-            return pl.read_parquet(io.BytesIO(obj['Body'].read()))
-        except: return None
+            df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+            print(f"      [OK] {df.height} linhas carregadas.")
+            return df
+        except Exception as e:
+            print(f"      [ERRO FATAL] Falha ao carregar {key}. Detalhe: {e}")
+            return None
 
     def construir_abt_final(self):
         inicio_timer = time.time()
@@ -53,10 +59,20 @@ class ArquitetoSafeDriverOuro:
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
 
+        # Guard Clauses: Se faltar a base, não tenta fazer o Join
+        if df_infra is None:
+            raise FileNotFoundError(f"O ficheiro de Infraestrutura não foi encontrado no R2 ({self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet). Verifique se a Prata da Malha rodou com sucesso.")
+        
+        if df_social is None:
+            # Caso não tenha o social, criamos um vazio apenas com a chave para o Join não quebrar.
+            # Isto salva a execução caso o CSV do IBGE não tenha sido processado por falta de ficheiro.
+            print("⚠️ Ficheiro Social ausente. Prosseguindo sem variáveis demográficas (Apenas Infra e Crimes).")
+            df_social = pl.DataFrame({"H3_INDEX": df_infra["H3_INDEX"].unique()})
+
         # Unimos as bases de apoio num único dicionário de inteligência por hexágono
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
 
-        # 2. CARREGAMENTO DOS CRIMES (Com os 40k resgatados inclusos!)
+        # 2. CARREGAMENTO DOS CRIMES (Com os resgatados inclusos!)
         print("📥 Agregando crimes processados...", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
@@ -64,7 +80,10 @@ class ArquitetoSafeDriverOuro:
             for obj in p.get('Contents', []) if obj['Key'].endswith('.parquet')
         ]
         
-        df_crimes = pl.concat([self._ler_parquet_r2(f) for f in crime_files], how="diagonal")
+        if not crime_files:
+            raise FileNotFoundError("Nenhum ficheiro de crimes foi encontrado na Prata. A base analítica precisa de crimes para treinar o modelo.")
+
+        df_crimes = pl.concat([self._ler_parquet_r2(f) for f in crime_files if self._ler_parquet_r2(f) is not None], how="diagonal")
 
         # 3. FEATURE ENGINEERING (Cérebro da IA)
         print("📅 Gerando Variáveis Temporais e de Risco...", flush=True)
@@ -85,28 +104,4 @@ class ArquitetoSafeDriverOuro:
         # 5. UPLOAD E AUDITORIA
         print("📦 Exportando ABT para o R2...", flush=True)
         buf = io.BytesIO()
-        df_final.write_parquet(buf, compression="zstd")
-        self.s3.put_object(Bucket=self.bucket, Key=f"{self.ouro_dir}/safedriver_abt_treino.parquet", Body=buf.getvalue())
-
-        duracao = time.time() - inicio_timer
-        self.auditoria["metricas"] = {
-            "total_eventos": df_final.height,
-            "colunas_geradas": len(df_final.columns),
-            "tempo_execucao": duracao
-        }
-
-        # Notificação
-        msg = (
-            f"🏆 **[SafeDriver] Camada Ouro Concluída**\n"
-            f"```ml\n"
-            f"• ABT Gerada: {df_final.height} linhas\n"
-            f"• Integridade: Crimes + Infra + Censo OK\n"
-            f"• Status: PRONTO PARA MODELAGEM (CatBoost)\n"
-            f"```"
-        )
-        self._notificar_discord(msg)
-        print("✨ Tudo pronto. Podes abrir o Power BI ou começar o notebook de IA!")
-
-if __name__ == "__main__":
-    app = ArquitetoSafeDriverOuro()
-    app.construir_abt_final()
+        df_final
