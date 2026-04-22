@@ -63,17 +63,12 @@ class IngestorSafeDriver:
                             aws_secret_access_key=self.config.SECRET_KEY.strip(), config=Config(signature_version='s3v4'))
 
     def _limpeza_extrema(self, valor):
-        """A função definitiva de normalização: MAIÚSCULO, SEM ACENTO, SEM LIXO."""
         if valor is None or str(valor).upper() in ["NULL", "NAN", "0", ".", "NAO INFORMADO"]:
             return "DESCONHECIDO"
-        # Remove acentos
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
-        # Uppercase e remove caracteres especiais (mantém apenas letras, números e espaços)
         texto = re.sub(r'[^A-Z0-9\s]', ' ', texto.upper())
-        # Normaliza espaços
         texto = " ".join(texto.split())
         
-        # Correções específicas de cidades comuns na SSP
         subs_cidades = {
             r'\bS PAULO\b': 'SAO PAULO', r'\bS BERNARDO\b': 'SAO BERNARDO DO CAMPO',
             r'\bS CAETANO\b': 'SAO CAETANO DO SUL', r'\bS ANDRE\b': 'SANTO ANDRE'
@@ -84,12 +79,10 @@ class IngestorSafeDriver:
         return texto.strip() if texto.strip() != "" else "DESCONHECIDO"
 
     def _normalizar_logradouro(self, texto):
-        """Limpa especificamente tipos de via (RUA, AV) para match de nome base."""
         t = self._limpeza_extrema(texto)
         if t == "DESCONHECIDO" or "VEDACAO" in t or "VIA PUBLICA" in t:
             return "DESCONHECIDO"
         
-        # Expansão de siglas comuns de endereço
         subs = {
             r'\bJD\b': 'JARDIM', r'\bVL\b': 'VILA', r'\bSTA\b': 'SANTA', r'\bSTO\b': 'SANTO',
             r'\bPC\b': 'PRACA', r'\bTV\b': 'TRAVESSA', r'\bAV\b': 'AVENIDA', r'\bR\b': 'RUA'
@@ -97,7 +90,6 @@ class IngestorSafeDriver:
         for sigla, expansao in subs.items():
             t = re.sub(sigla, expansao, t)
             
-        # Remove o tipo da via no início para match flexível
         prefixos = r'^(RUA|AVENIDA|TRAVESSA|PRACA|ALAMEDA|ESTRADA|RODOVIA|LADEIRA|VIADUTO|MARGINAL)\s+'
         return re.sub(prefixos, '', t).strip()
 
@@ -107,7 +99,6 @@ class IngestorSafeDriver:
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
             df_flat = pl.read_parquet(io.BytesIO(obj['Body'].read())).explode("BAIRROS").unnest("BAIRROS").explode("LOGRADOUROS").unnest("LOGRADOUROS")
             
-            # Normalização da Malha (IBGE)
             df_base = df_flat.with_columns([
                 pl.col("H3_LIST").list.first().alias("H3_INDEX"),
                 pl.col("CIDADE").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("CID_NORM"),
@@ -115,24 +106,22 @@ class IngestorSafeDriver:
                 pl.col("RUA").map_elements(self._normalizar_logradouro, return_dtype=pl.Utf8).alias("RUA_BASE")
             ]).select(["CID_NORM", "BAI_NORM", "RUA_BASE", "H3_INDEX"])
 
-            # 1. Lookup Exato
             self.df_lookup_vias = df_base.unique(subset=["CID_NORM", "BAI_NORM", "RUA_BASE"])
 
-            # 2. Lookup Prefixo (Fuzzy Leve)
             df_prefix = df_base.with_columns(pl.col("RUA_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("RUA_PREFIX"))
             valid_p = df_prefix.group_by(["CID_NORM", "RUA_PREFIX"]).agg(pl.col("H3_INDEX").n_unique().alias("n")).filter(pl.col("n") == 1)
             self.df_lookup_prefix = df_prefix.join(valid_p.select(["CID_NORM", "RUA_PREFIX"]), on=["CID_NORM", "RUA_PREFIX"], how="inner").unique(subset=["CID_NORM", "RUA_PREFIX"])
 
-            # 3. Lookup Bairro (Centroide)
             self.df_lookup_bairro = df_base.group_by(["CID_NORM", "BAI_NORM"]).agg(pl.col("H3_INDEX").mode().first().alias("H3_BAIRRO"))
             
             logger.info(f"✅ Malha pronta. Vias: {self.df_lookup_vias.height} | Bairros: {self.df_lookup_bairro.height}")
         except Exception as e: logger.error(f"❌ Erro malha: {e}")
 
-    def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
-        if self.df_lookup_vias is None: return df
+    def _resgatar_espacial(self, df: pl.DataFrame):
+        """Retorna o DataFrame e a Telemetria exata do funil 1-2-3."""
+        if self.df_lookup_vias is None: 
+            return df, {"p1_exato": 0, "p2_prefixo": 0, "p3_bairro": 0}
         
-        # Normalização do Crime (SSP)
         df = df.with_columns([
             pl.col("MUNICIPIO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("MUN_NORM"),
             pl.col("BAIRRO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("BAI_NORM"),
@@ -140,21 +129,36 @@ class IngestorSafeDriver:
         ])
         df = df.with_columns(pl.col("LOG_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("LOG_PREFIX"))
 
+        # BaseLine - Quantos já tinham GPS
+        count_init = df.filter(pl.col("H3_INDEX").is_not_null()).height
+
         # CASCATA 1: Exato
         df = df.join(self.df_lookup_vias, left_on=["MUN_NORM", "BAI_NORM", "LOG_BASE"], right_on=["CID_NORM", "BAI_NORM", "RUA_BASE"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
+        count_p1 = df.filter(pl.col("H3_INDEX").is_not_null()).height
+        resgatados_p1 = count_p1 - count_init
 
         # CASCATA 2: Prefixo
         df = df.join(self.df_lookup_prefix.select(["CID_NORM", "RUA_PREFIX", "H3_INDEX"]), left_on=["MUN_NORM", "LOG_PREFIX"], right_on=["CID_NORM", "RUA_PREFIX"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
+        count_p2 = df.filter(pl.col("H3_INDEX").is_not_null()).height
+        resgatados_p2 = count_p2 - count_p1
 
         # CASCATA 3: Bairro
         df = df.join(self.df_lookup_bairro, left_on=["MUN_NORM", "BAI_NORM"], right_on=["CID_NORM", "BAI_NORM"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop("H3_BAIRRO")
+        count_p3 = df.filter(pl.col("H3_INDEX").is_not_null()).height
+        resgatados_p3 = count_p3 - count_p2
         
-        return df.drop(["MUN_NORM", "BAI_NORM", "LOG_BASE", "LOG_PREFIX"])
+        estatisticas = {
+            "p1_exato": resgatados_p1,
+            "p2_prefixo": resgatados_p2,
+            "p3_bairro": resgatados_p3
+        }
 
-    def _limpar_e_tipar(self, df: pl.DataFrame, ano: int) -> pl.DataFrame:
+        return df.drop(["MUN_NORM", "BAI_NORM", "LOG_BASE", "LOG_PREFIX"]), estatisticas
+
+    def _limpar_e_tipar(self, df: pl.DataFrame, ano: int, tempo_inicio_ano: float) -> pl.DataFrame:
         total_entrada = df.height
         df = df.with_columns(pl.all().cast(pl.Utf8).fill_null("NAO INFORMADO"))
 
@@ -171,8 +175,8 @@ class IngestorSafeDriver:
         )
         bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
 
-        # Resgate 1->2->3
-        df = self._resgatar_espacial(df)
+        # Resgate Espacial com Telemetria (A Magia Acontece Aqui)
+        df, stats_resgate = self._resgatar_espacial(df)
 
         # Tempo INCERTO
         df = df.with_columns(
@@ -191,9 +195,22 @@ class IngestorSafeDriver:
             pl.col("_lon_f").cast(pl.Float64, strict=False).alias("LONGITUDE")
         ]).drop(["_lat_f", "_lon_f", "_hr_t"])
 
+        tempo_execucao = round(time.time() - tempo_inicio_ano, 2)
+        total_resgatado = stats_resgate["p1_exato"] + stats_resgate["p2_prefixo"] + stats_resgate["p3_bairro"]
+
         self.audit_stats.append({
-            "ano": int(ano), "total_raw": total_entrada, "gps_original": bo_com_gps,
-            "resgatados_total": df_trusted.height - bo_com_gps, "total_trusted": df_trusted.height
+            "ano_referencia": int(ano),
+            "telemetria_funil": {
+                "1_total_bruto_ssp": total_entrada,
+                "2_com_coordenadas_validas": bo_com_gps,
+                "3_resgatados_passo1_rua_exata": stats_resgate["p1_exato"],
+                "4_resgatados_passo2_rua_prefixo": stats_resgate["p2_prefixo"],
+                "5_resgatados_passo3_centroide_bairro": stats_resgate["p3_bairro"],
+                "6_total_salvo_pela_malha": total_resgatado,
+                "7_descartados_sem_geografia": total_entrada - df_trusted.height,
+                "8_total_final_trusted": df_trusted.height
+            },
+            "performance_segundos": tempo_execucao
         })
         return df_trusted
 
@@ -221,6 +238,7 @@ class IngestorSafeDriver:
         except Exception as e: logger.error(f"❌ Erro Download {ano}: {e}")
 
     def processar_prata(self, ano: int):
+        tempo_inicio_ano = time.time()
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
         try:
@@ -249,7 +267,7 @@ class IngestorSafeDriver:
 
             if list_dfs:
                 df_final = pl.concat(list_dfs, how="diagonal")
-                df_final = self._limpar_e_tipar(df_final, ano)
+                df_final = self._limpar_e_tipar(df_final, ano, tempo_inicio_ano)
                 pepper = self.config.PEPPER
                 df_final = df_final.with_columns([pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)])
                 buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
@@ -259,19 +277,35 @@ class IngestorSafeDriver:
 
     def finalizar_ciclo_auditoria(self):
         if not self.audit_stats: return
-        msg = "📊 **[SafeDriver] Relatório de Ingestão de Crimes (Cascata 1-2-3)**\n```ml\n"
-        msg += f"{'ANO':<5} | {'TOTAL':<8} | {'GPS':<7} | {'RESGATE':<8} | {'FINAL':<8}\n"
-        msg += "-" * 50 + "\n"
-        t_raw, t_res, t_fin = 0, 0, 0
-        for s in sorted(self.audit_stats, key=lambda x: x['ano']):
-            msg += f"{s['ano']:<5} | {s['total_raw']:<8} | {s['gps_original']:<7} | {s['resgatados_total']:<8} | {s['total_trusted']:<8}\n"
-            t_raw += s['total_raw']; t_res += s['resgatados_total']; t_fin += s['total_trusted']
-        msg += "-" * 50 + "\n"
-        msg += f"{'SOMA':<5} | {t_raw:<8} | {'-':<7} | {t_res:<8} | {t_fin:<8}\n```"
-        if self.config.WEBHOOK_DISCORD: requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg})
         
-        audit_json = {"projeto": "SafeDriver", "stats": self.audit_stats}
-        self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES.json", Body=json.dumps(audit_json, indent=4).encode())
+        t_raw, t_gps, t_p1, t_p2, t_p3, t_fin = 0, 0, 0, 0, 0, 0
+        for s in self.audit_stats:
+            f = s["telemetria_funil"]
+            t_raw += f["1_total_bruto_ssp"]
+            t_gps += f["2_com_coordenadas_validas"]
+            t_p1 += f["3_resgatados_passo1_rua_exata"]
+            t_p2 += f["4_resgatados_passo2_rua_prefixo"]
+            t_p3 += f["5_resgatados_passo3_centroide_bairro"]
+            t_fin += f["8_total_final_trusted"]
+
+        msg = "📊 **[SafeDriver] Deep Audit de Resgate de Crimes**\n```ml\n"
+        msg += f"• Total SSP Bruto: {t_raw}\n"
+        msg += f"• GPS Original   : {t_gps}\n"
+        msg += f"• Salvos (Passo1): {t_p1} (Exato)\n"
+        msg += f"• Salvos (Passo2): {t_p2} (Prefixo)\n"
+        msg += f"• Salvos (Passo3): {t_p3} (Bairro)\n"
+        msg += f"-------------------------\n"
+        msg += f"• Total TRUSTED  : {t_fin} ({(t_fin/t_raw*100) if t_raw > 0 else 0:.1f}%)\n```"
+        
+        if self.config.WEBHOOK_DISCORD: 
+            requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg})
+        
+        audit_json = {
+            "projeto": "SafeDriver - Telemetria Avançada", 
+            "data_processamento": str(datetime.now()), 
+            "anos_processados": self.audit_stats
+        }
+        self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES_DEEP.json", Body=json.dumps(audit_json, indent=4).encode())
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
