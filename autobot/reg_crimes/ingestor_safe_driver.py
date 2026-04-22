@@ -51,7 +51,6 @@ class IngestorSafeDriver:
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
         self.df_lookup_vias = None
-        # Acumulador para o relatório final
         self.audit_stats = []
 
     def _notificar_discord(self, msg):
@@ -66,17 +65,26 @@ class IngestorSafeDriver:
         return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=self.config.ACCESS_KEY.strip(),
                             aws_secret_access_key=self.config.SECRET_KEY.strip(), config=Config(signature_version='s3v4'))
 
+    def _extrair_nome_base(self, texto):
+        """Remove termos comuns (RUA, AV, etc) para permitir resgate por proximidade."""
+        if texto == "NAO INFORMADO": return texto
+        # Lista de prefixos para remover
+        prefixos = r'^(RUA|R|AVENIDA|AV|TRAVESSA|TV|PRACA|PC|ALAMEDA|AL|ESTRADA|EST|RODOVIA|ROD|LADEIRA|LD|VIADUTO|VD|BOULEVARD|BLV)\s+'
+        res = re.sub(prefixos, '', str(texto).upper().strip())
+        return res
+
     def _carregar_malha_referencia(self):
         try:
             logger.info("🗺️ Baixando Malha Geográfica para resgate...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
-            df_hierarquico = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+            df_h = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+            
             self.df_lookup_vias = (
-                df_hierarquico
-                .explode("BAIRROS").unnest("BAIRROS")
+                df_h.explode("BAIRROS").unnest("BAIRROS")
                 .explode("LOGRADOUROS").unnest("LOGRADOUROS")
                 .with_columns(pl.col("H3_LIST").list.first().alias("H3_INDEX"))
                 .select(["CIDADE", "BAIRRO", "RUA", "H3_INDEX"])
+                .with_columns(pl.col("RUA").map_elements(self._extrair_nome_base, return_dtype=pl.Utf8).alias("RUA_BASE"))
                 .unique()
             )
             logger.info(f"✅ Malha preparada: {self.df_lookup_vias.height} logradouros mapeados.")
@@ -104,15 +112,27 @@ class IngestorSafeDriver:
 
     def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
         if self.df_lookup_vias is None: return df
-        # Resgate Nível 1: Precisão Total
+        
+        # Cria a coluna de NOME_BASE no dataframe de crimes para o join não-literal
+        df = df.with_columns(pl.col("LOGRADOURO").map_elements(self._extrair_nome_base, return_dtype=pl.Utf8).alias("LOGRADOURO_BASE"))
+
+        # Nível 1: Precisão Literal (Cidade + Bairro + Rua Completa)
         df = df.join(self.df_lookup_vias, left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO"], 
                      right_on=["CIDADE", "BAIRRO", "RUA"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
-        # Resgate Nível 2: Fallback (Cidade + Rua)
-        df_fb = self.df_lookup_vias.unique(subset=["CIDADE", "RUA"]).select(["CIDADE", "RUA", "H3_INDEX"])
-        df = df.join(df_fb, left_on=["MUNICIPIO", "LOGRADOURO"], right_on=["CIDADE", "RUA"], how="left") \
+
+        # Nível 2: Resgate por Nome Base (Cidade + Bairro + Nome Sem 'Rua/Av')
+        df = df.join(self.df_lookup_vias.select(["CIDADE", "BAIRRO", "RUA_BASE", "H3_INDEX"]).unique(),
+                     left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO_BASE"],
+                     right_on=["CIDADE", "BAIRRO", "RUA_BASE"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
-        return df
+
+        # Nível 3: Fallback Amplo (Cidade + Nome Base) - Para casos de bairro divergente
+        df_fb = self.df_lookup_vias.unique(subset=["CIDADE", "RUA_BASE"]).select(["CIDADE", "RUA_BASE", "H3_INDEX"])
+        df = df.join(df_fb, left_on=["MUNICIPIO", "LOGRADOURO_BASE"], right_on=["CIDADE", "RUA_BASE"], how="left") \
+               .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
+        
+        return df.drop("LOGRADOURO_BASE")
 
     def _limpar_e_tipar(self, df: pl.DataFrame, ano: int) -> pl.DataFrame:
         total_entrada = df.height
@@ -149,14 +169,14 @@ class IngestorSafeDriver:
 
         bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
         
-        # 4. Resgate via Malha
+        # 4. Resgate Inteligente (Literal + Nome Base)
         df = self._resgatar_espacial(df)
         
         # 5. Exclusão Rígida (Aproveitamento Final)
         df_limpo = df.filter(pl.col("H3_INDEX").is_not_null() & pl.col("SAZON_PERIODO").is_not_null())
         bo_resgatados = df_limpo.height - bo_com_gps
 
-        # Acumula estatísticas para o relatório consolidado
+        # Acumula estatísticas
         self.audit_stats.append({
             "ano": ano,
             "total_raw": total_entrada,
@@ -171,7 +191,6 @@ class IngestorSafeDriver:
     def finalizar_ciclo_auditoria(self):
         if not self.audit_stats: return
 
-        # 1. Montagem do Relatório Discord
         msg = "📊 **[SafeDriver] Relatório Consolidado de Ingestão**\n```ml\n"
         msg += f"{'ANO':<5} | {'TOTAL':<7} | {'GPS':<6} | {'RESGATE':<7} | {'FINAL':<7}\n"
         msg += "-" * 45 + "\n"
@@ -184,27 +203,18 @@ class IngestorSafeDriver:
         msg += "-" * 45 + "\n"
         msg += f"{'SOMA':<5} | {t_raw:<7} | {t_gps:<6} | {t_res:<7} | {t_fin:<7}\n```"
         
-        # Indicadores de Eficiência
         taxa_resgate = (t_res / (t_raw - t_gps)) * 100 if (t_raw - t_gps) > 0 else 0
-        taxa_aproveitamento = (t_fin / t_raw) * 100 if t_raw > 0 else 0
-        
-        msg += f"\n💡 **Eficiência da Malha:** {taxa_resgate:.2f}% dos BOs sem GPS foram recuperados."
-        msg += f"\n🎯 **Aproveitamento Global:** {taxa_aproveitamento:.2f}% da base bruta virou Trusted."
+        msg += f"\n💡 **Inteligência:** {taxa_resgate:.2f}% dos BOs sem GPS foram salvos pela Malha Base."
         
         self._notificar_discord(msg)
 
-        # 2. Geração e Upload do JSON de Auditoria
         audit_file = {
-            "projeto": "SafeDriver",
-            "data_execucao": str(datetime.now()),
-            "stats_por_ano": self.audit_stats,
+            "projeto": "SafeDriver", "data": str(datetime.now()),
+            "stats": self.audit_stats,
             "consolidado": {"total_bruto": t_raw, "total_gps": t_gps, "total_resgate": t_res, "total_trusted": t_fin}
         }
         buf = io.BytesIO(json.dumps(audit_file, indent=4).encode())
-        self.s3.put_object(Bucket=self.config.NOME_BUCKET, 
-                           Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES.json", 
-                           Body=buf.getvalue())
-        logger.info("📁 Arquivo de auditoria salvo no R2.")
+        self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES.json", Body=buf.getvalue())
 
     def extrair_bronze(self, ano: int):
         path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
@@ -219,7 +229,6 @@ class IngestorSafeDriver:
     def processar_prata(self, ano: int):
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
-
         try:
             if self.df_lookup_vias is None: self._carregar_malha_referencia()
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
@@ -234,27 +243,24 @@ class IngestorSafeDriver:
                     indices_map = self._resolver_mapeamento(df_raw.columns)
                     if "LATITUDE" not in indices_map.values():
                         for row_idx in range(min(20, df_raw.height)):
-                            indices_map = self._resolver_mapeamento(df_raw.row(row_idx))
-                            if "LATITUDE" in indices_map.values():
+                            if "LATITUDE" in self._resolver_mapeamento(df_raw.row(row_idx)).values():
                                 df_raw = pl.read_excel(excel_bytes, sheet_name=nome_aba, engine="calamine", read_options={"skip_rows": row_idx + 1})
                                 indices_map = self._resolver_mapeamento(df_raw.columns)
                                 break
+                    if not indices_map: continue
                     df_mes = df_raw.select([df_raw.columns[i] for i in indices_map.keys()])
                     df_mes.columns = [indices_map[i] for i in indices_map.keys()]
                     list_dfs.append(df_mes.with_columns(pl.all().cast(pl.Utf8)))
                 except: continue
 
-            df_final = pl.concat(list_dfs, how="diagonal")
-            df_final = self._limpar_e_tipar(df_final, ano)
-            
-            pepper = self.config.PEPPER
-            df_final = df_final.with_columns([
-                pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)
-            ])
-            buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
-            self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
-            logger.info(f"✨ Prata {ano} finalizada.")
-
+            if list_dfs:
+                df_final = pl.concat(list_dfs, how="diagonal")
+                df_final = self._limpar_e_tipar(df_final, ano)
+                pepper = self.config.PEPPER
+                df_final = df_final.with_columns([pl.col("NUM_BO").map_elements(lambda v: hashlib.sha256(f"{str(v).upper()}{pepper}".encode()).hexdigest(), return_dtype=pl.Utf8)])
+                buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
+                self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
+                logger.info(f"✨ Prata {ano} finalizada.")
         except Exception as e: logger.error(f"💥 Erro fatal {ano}: {e}")
 
 if __name__ == "__main__":
@@ -263,7 +269,5 @@ if __name__ == "__main__":
     for ano in range(2022, ingestor.ano_atual + 1):
         if modo in ["bronze", "tudo"]: ingestor.extrair_bronze(ano)
         if modo in ["prata", "tudo"]: ingestor.processar_prata(ano)
-    
-    # Ao final de todos os anos, executa a auditoria consolidada
     if modo in ["prata", "tudo"]:
         ingestor.finalizar_ciclo_auditoria()
