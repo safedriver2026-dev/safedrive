@@ -137,18 +137,24 @@ class IngestorSafeDriver:
     def _limpar_e_tipar(self, df: pl.DataFrame, ano: int, tempo_inicio_ano: float) -> pl.DataFrame:
         total_entrada = df.height
         df = df.with_columns(pl.all().cast(pl.Utf8).fill_null("NAO INFORMADO"))
-        
-        # Fallback Data
-        df = df.with_columns([
-            pl.col("DATAOCORRENCIA").str.to_date(strict=False).alias("_dt_oc"),
-            pl.col("DATAREGISTRO").str.to_date(strict=False).alias("_dt_re")
-        ]).with_columns(pl.coalesce(["_dt_oc", "_dt_re"]).alias("DATAOCORRENCIA")).drop(["_dt_oc", "_dt_re"])
+
+        # GAP DATA: Lógica de Fallback Dinâmica
+        if "DATAREGISTRO" in df.columns:
+            df = df.with_columns([
+                pl.col("DATAOCORRENCIA").str.to_date(strict=False).alias("_dt_oc"),
+                pl.col("DATAREGISTRO").str.to_date(strict=False).alias("_dt_re")
+            ]).with_columns(
+                pl.coalesce(["_dt_oc", "_dt_re"]).alias("DATAOCORRENCIA")
+            ).drop(["_dt_oc", "_dt_re"])
+        else:
+            df = df.with_columns(pl.col("DATAOCORRENCIA").str.to_date(strict=False))
 
         # GPS Original
         df = df.with_columns([
             pl.col("LATITUDE").str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").alias("_lat_f"),
             pl.col("LONGITUDE").str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").alias("_lon_f")
         ])
+        
         df = df.with_columns(
             pl.struct(["_lat_f", "_lon_f"]).map_elements(
                 lambda x: h3.latlng_to_cell(float(x["_lat_f"]), float(x["_lon_f"]), self.config.RESOLUCAO_H3) 
@@ -157,14 +163,15 @@ class IngestorSafeDriver:
         )
         bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
 
-        # Resgate 1-2-3
+        # Resgate Espacial 1-2-3
         df, stats_resgate = self._resgatar_espacial(df)
 
-        # Lógica Híbrida de Período (O que você pediu)
+        # GAP PERÍODO: Lógica Híbrida (Hora + Texto)
         df = df.with_columns([
             pl.col("HORAOCORRENCIA").str.extract(r"(\d{1,2})", 1).cast(pl.Int32, strict=False).alias("_hr_t"),
             pl.col("PERIODO_NATIVO").str.to_uppercase().alias("_per_txt")
         ])
+
         df = df.with_columns(
             pl.when(pl.col("_hr_t").is_between(0, 5) | pl.col("_per_txt").str.contains("MADRUGADA"))
             .then(pl.lit("MADRUGADA"))
@@ -177,14 +184,18 @@ class IngestorSafeDriver:
             .otherwise(pl.lit("INCERTO")).alias("SAZON_PERIODO")
         )
 
+        # Safe Drop: Remove apenas o que existe
+        cols_remover = ["_lat_f", "_lon_f", "_hr_t", "_per_txt", "DATAREGISTRO", "PERIODO_NATIVO"]
+        existing_cols_to_drop = [c for c in cols_remover if c in df.columns]
+
         df_trusted = df.filter(pl.col("H3_INDEX").is_not_null()).with_columns([
             pl.col("_lat_f").cast(pl.Float64, strict=False).alias("LATITUDE"),
             pl.col("_lon_f").cast(pl.Float64, strict=False).alias("LONGITUDE")
-        ]).drop(["_lat_f", "_lon_f", "_hr_t", "_per_txt"])
+        ]).drop(existing_cols_to_drop)
 
-        # Contagem por Período para a Auditoria
-        contagem_periodo = df_trusted.group_by("SAZON_PERIODO").len().to_dicts()
-        dict_periodos = {d["SAZON_PERIODO"]: d["len"] for d in contagem_periodo}
+        # Auditoria por Período
+        cp = df_trusted.group_by("SAZON_PERIODO").len().to_dicts()
+        dict_periodos = {d["SAZON_PERIODO"]: d["len"] for d in cp}
 
         tempo_exec = round(time.time() - tempo_inicio_ano, 2)
         self.audit_stats.append({
@@ -266,12 +277,10 @@ class IngestorSafeDriver:
         if not self.audit_stats: return
         t_raw, t_gps, t_salvos, t_fin = 0, 0, 0, 0
         p_mad, p_man, p_tar, p_noi, p_inc = 0, 0, 0, 0, 0
-        
         for s in self.audit_stats:
             f = s["telemetria_funil"]
             t_raw += f["1_total_bruto_ssp"]; t_gps += f["2_com_coordenadas_validas"]
             t_salvos += f["6_total_salvo_pela_malha"]; t_fin += f["8_total_final_trusted"]
-            
             cp = s["contagem_por_periodo"]
             p_mad += cp.get("MADRUGADA", 0); p_man += cp.get("MANHA", 0)
             p_tar += cp.get("TARDE", 0); p_noi += cp.get("NOITE", 0); p_inc += cp.get("INCERTO", 0)
@@ -282,11 +291,9 @@ class IngestorSafeDriver:
         msg += "-----------------------------------\n"
         msg += "BREAKDOWN POR PERÍODO (Trusted):\n"
         msg += f"• MADRUGADA : {p_mad}\n• MANHA     : {p_man}\n• TARDE     : {p_tar}\n• NOITE     : {p_noi}\n• INCERTO   : {p_inc}\n```"
-        
         if self.config.WEBHOOK_DISCORD: 
             try: requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg})
             except: pass
-        
         audit_json = {"projeto": "SafeDriver", "data_processamento": str(datetime.now()), "stats_anuais": self.audit_stats}
         self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES_PERIODOS.json", Body=json.dumps(audit_json, indent=4).encode())
 
