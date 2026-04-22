@@ -53,12 +53,14 @@ class ArquitetoSafeDriverOuro:
         inicio_timer = time.time()
         print("🚀 [OURO] Iniciando Consolidação da ABT Final...", flush=True)
         
+        # =================================================================
         # 1. CARREGAMENTO DOS COMPONENTES DA MALHA
+        # =================================================================
         print("📥 Carregando Infraestrutura e Dados Sociais...", flush=True)
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         
-        # CORREÇÃO: Nome do arquivo ajustado conforme o log do seu bucket R2
-        df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL.parquet")
+        # CORREÇÃO: Nome exato do arquivo gerado pela Malha Prata
+        df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
 
         if df_infra is None:
             raise FileNotFoundError("Base de Infraestrutura não encontrada. Abortando pipeline Gold.")
@@ -70,7 +72,9 @@ class ArquitetoSafeDriverOuro:
         # Unimos Infra + Social num mapa de inteligência por hexágono
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
 
+        # =================================================================
         # 2. CARREGAMENTO DOS CRIMES (2022 a 2026)
+        # =================================================================
         print("📥 Consolidando crimes da Prata...", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
@@ -88,31 +92,42 @@ class ArquitetoSafeDriverOuro:
                 lista_crimes.append(df_ano)
         
         df_crimes = pl.concat(lista_crimes, how="diagonal")
+        
+        # Filtro de segurança: Remove B.Os que não conseguiram mapeamento espacial na Prata
+        df_crimes = df_crimes.filter(pl.col("H3_INDEX").is_not_null())
 
+        # =================================================================
         # 3. FEATURE ENGINEERING
+        # =================================================================
         print("📅 Criando Features de Tempo, Período e Severidade...", flush=True)
+        
+        # Garante que DATAOCORRENCIA seja data para não quebrar a extração (.dt)
+        df_crimes = df_crimes.with_columns(pl.col("DATAOCORRENCIA").cast(pl.Date, strict=False))
+        
         df_gold = df_crimes.with_columns([
-            pl.col("DATAOCORRENCIA").dt.weekday().alias("FEAT_DIA_SEMANA"),
-            pl.col("DATAOCORRENCIA").dt.month().alias("FEAT_MES"),
+            pl.col("DATAOCORRENCIA").dt.weekday().fill_null(0).alias("FEAT_DIA_SEMANA"),
+            pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES"),
             # Categorização de Risco para o CatBoost
-            pl.when(pl.col("RUBRICA").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit(10))
-            .when(pl.col("RUBRICA").str.contains("ROUBO")).then(pl.lit(5))
+            pl.when(pl.col("RUBRICA").fill_null("").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit(10))
+            .when(pl.col("RUBRICA").fill_null("").str.contains("ROUBO")).then(pl.lit(5))
             .otherwise(pl.lit(1)).alias("LABEL_PESO_RISCO")
         ])
 
+        # =================================================================
         # 4. O GRANDE JOIN FINAL: EVENTO + CONTEXTO URBANO
+        # =================================================================
         print("🏙️ Realizando enriquecimento espacial (H3)...", flush=True)
         df_final = df_gold.join(df_universo_h3, on="H3_INDEX", how="left")
         
         # Limpeza de Nulos em todas as colunas de contexto (Infraestrutura, Censo e Micropopulação)
-        # Importante: Mantemos a coluna SAZON_PERIODO (que veio da Prata) como está para o treino
         cols_contexto = [c for c in df_final.columns if any(x in c for x in ["INFRA_", "CENSO_", "MICRO_"])]
         df_final = df_final.with_columns([pl.col(c).fill_null(0) for c in cols_contexto])
 
+        # =================================================================
         # 5. SALVAMENTO NO R2
+        # =================================================================
         print("📦 Gravando ABT Final no Data Lake...", flush=True)
         
-        # Grava o Parquet da ABT (Analytical Base Table)
         buf_parquet = io.BytesIO()
         df_final.write_parquet(buf_parquet, compression="zstd")
         self.s3.put_object(
@@ -121,7 +136,9 @@ class ArquitetoSafeDriverOuro:
             Body=buf_parquet.getvalue()
         )
 
+        # =================================================================
         # 6. FINALIZAÇÃO E AUDITORIA
+        # =================================================================
         duracao = round(time.time() - inicio_timer, 2)
         mem_mb = round(df_final.estimated_size() / (1024 * 1024), 2)
         
@@ -132,7 +149,6 @@ class ArquitetoSafeDriverOuro:
             "memoria_estimada_mb": mem_mb
         }
 
-        # Salva o log de auditoria
         buf_json = io.BytesIO(json.dumps(self.auditoria, indent=4).encode())
         self.s3.put_object(
             Bucket=self.bucket, 
@@ -140,14 +156,13 @@ class ArquitetoSafeDriverOuro:
             Body=buf_json.getvalue()
         )
 
-        # Notificação Final para o Discord
         msg = (
             f"🏆 **[SafeDriver] Camada Ouro Concluída**\n"
             f"```ml\n"
             f"• Registros Processados: {df_final.height}\n"
             f"• Features Totais      : {len(df_final.columns)}\n"
             f"• Contexto Social      : {'OK' if df_social.height > 1 else 'FALHA/ESQUELETO'}\n"
-            f"• Tempo de Spark       : {duracao}s\n"
+            f"• Tempo de Process.    : {duracao}s\n"
             f"-----------------------------------\n"
             f"Status: PRONTO PARA MODELAGEM (CatBoost)\n"
             f"```"
