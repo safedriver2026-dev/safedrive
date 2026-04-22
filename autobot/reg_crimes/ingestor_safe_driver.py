@@ -11,6 +11,7 @@ import unicodedata
 import polars as pl
 import h3
 import fastexcel
+import json
 from botocore.config import Config
 from datetime import datetime
 
@@ -50,8 +51,13 @@ class IngestorSafeDriver:
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
         self.df_lookup_vias = None
-        # Lista para consolidar estatísticas
-        self.metricas_consolidado = []
+        # Acumulador para o relatório final
+        self.audit_stats = []
+
+    def _notificar_discord(self, msg):
+        if self.config.WEBHOOK_DISCORD:
+            try: requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg}, timeout=10)
+            except: pass
 
     def _inicializar_s3(self):
         endpoint = self.config.ENDPOINT_URL.strip().rstrip('/')
@@ -75,7 +81,7 @@ class IngestorSafeDriver:
             )
             logger.info(f"✅ Malha preparada: {self.df_lookup_vias.height} logradouros mapeados.")
         except Exception as e:
-            logger.error(f"❌ Erro ao carregar malha: {e}")
+            logger.error(f"❌ Erro ao carregar malha: {e}. Resgate espacial desativado.")
 
     def _normalizar_texto(self, valor):
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
@@ -98,13 +104,13 @@ class IngestorSafeDriver:
 
     def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
         if self.df_lookup_vias is None: return df
-        # Nível 1: Precisão Total
+        # Resgate Nível 1: Precisão Total
         df = df.join(self.df_lookup_vias, left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO"], 
                      right_on=["CIDADE", "BAIRRO", "RUA"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
-        # Nível 2: Fallback
-        df_fallback = self.df_lookup_vias.unique(subset=["CIDADE", "RUA"]).select(["CIDADE", "RUA", "H3_INDEX"])
-        df = df.join(df_fallback, left_on=["MUNICIPIO", "LOGRADOURO"], right_on=["CIDADE", "RUA"], how="left") \
+        # Resgate Nível 2: Fallback (Cidade + Rua)
+        df_fb = self.df_lookup_vias.unique(subset=["CIDADE", "RUA"]).select(["CIDADE", "RUA", "H3_INDEX"])
+        df = df.join(df_fb, left_on=["MUNICIPIO", "LOGRADOURO"], right_on=["CIDADE", "RUA"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         return df
 
@@ -146,56 +152,74 @@ class IngestorSafeDriver:
         # 4. Resgate via Malha
         df = self._resgatar_espacial(df)
         
-        # 5. Exclusão Rígida
+        # 5. Exclusão Rígida (Aproveitamento Final)
         df_limpo = df.filter(pl.col("H3_INDEX").is_not_null() & pl.col("SAZON_PERIODO").is_not_null())
-        
-        # Consolida Métricas do Ano
-        self.metricas_consolidado.append({
+        bo_resgatados = df_limpo.height - bo_com_gps
+
+        # Acumula estatísticas para o relatório consolidado
+        self.audit_stats.append({
             "ano": ano,
-            "total_entrada": total_entrada,
-            "gps_original": bo_com_gps,
-            "resgatados": df_limpo.height - bo_com_gps,
+            "total_raw": total_entrada,
+            "com_gps": bo_com_gps,
+            "resgatados": bo_resgatados,
             "descartados": total_entrada - df_limpo.height,
-            "final": df_limpo.height
+            "final_trusted": df_limpo.height
         })
         
         return df_limpo
 
-    def enviar_relatorio_final(self):
-        if not self.config.WEBHOOK_DISCORD or not self.metricas_consolidado:
-            return
+    def finalizar_ciclo_auditoria(self):
+        if not self.audit_stats: return
 
-        msg = "📊 **[SafeDriver] Relatório Consolidado de Crimes**\n```ml\n"
-        msg += f"{'ANO':<5} | {'TOTAL':<8} | {'GPS':<6} | {'RESGATE':<7} | {'FINAL':<7}\n"
-        msg += "-" * 48 + "\n"
+        # 1. Montagem do Relatório Discord
+        msg = "📊 **[SafeDriver] Relatório Consolidado de Ingestão**\n```ml\n"
+        msg += f"{'ANO':<5} | {'TOTAL':<7} | {'GPS':<6} | {'RESGATE':<7} | {'FINAL':<7}\n"
+        msg += "-" * 45 + "\n"
         
-        t_entrada, t_gps, t_resgate, t_final = 0, 0, 0, 0
-        
-        for m in sorted(self.metricas_consolidado, key=lambda x: x['ano']):
-            msg += f"{m['ano']:<5} | {m['total_entrada']:<8} | {m['gps_original']:<6} | {m['resgatados']:<7} | {m['final']:<7}\n"
-            t_entrada += m['total_entrada']
-            t_gps += m['gps_original']
-            t_resgate += m['resgatados']
-            t_final += m['final']
+        t_raw, t_gps, t_res, t_fin = 0, 0, 0, 0
+        for s in sorted(self.audit_stats, key=lambda x: x['ano']):
+            msg += f"{s['ano']:<5} | {s['total_raw']:<7} | {s['com_gps']:<6} | {s['resgatados']:<7} | {s['final_trusted']:<7}\n"
+            t_raw += s['total_raw']; t_gps += s['com_gps']; t_res += s['resgatados']; t_fin += s['final_trusted']
 
-        msg += "-" * 48 + "\n"
-        msg += f"{'TOTAL':<5} | {t_entrada:<8} | {t_gps:<6} | {t_resgate:<7} | {t_final:<7}\n```"
+        msg += "-" * 45 + "\n"
+        msg += f"{'SOMA':<5} | {t_raw:<7} | {t_gps:<6} | {t_res:<7} | {t_fin:<7}\n```"
         
-        eficiencia = (t_resgate / (t_entrada - t_gps) * 100) if (t_entrada - t_gps) > 0 else 0
-        aproveitamento = (t_final / t_entrada * 100) if t_entrada > 0 else 0
+        # Indicadores de Eficiência
+        taxa_resgate = (t_res / (t_raw - t_gps)) * 100 if (t_raw - t_gps) > 0 else 0
+        taxa_aproveitamento = (t_fin / t_raw) * 100 if t_raw > 0 else 0
         
-        msg += f"\n💡 **Eficiência do Resgate:** {eficiencia:.2f}% dos B.O.s sem GPS foram recuperados."
-        msg += f"\n🎯 **Taxa de Aproveitamento:** {aproveitamento:.2f}% da base total foi qualificada."
+        msg += f"\n💡 **Eficiência da Malha:** {taxa_resgate:.2f}% dos BOs sem GPS foram recuperados."
+        msg += f"\n🎯 **Aproveitamento Global:** {taxa_aproveitamento:.2f}% da base bruta virou Trusted."
+        
+        self._notificar_discord(msg)
 
+        # 2. Geração e Upload do JSON de Auditoria
+        audit_file = {
+            "projeto": "SafeDriver",
+            "data_execucao": str(datetime.now()),
+            "stats_por_ano": self.audit_stats,
+            "consolidado": {"total_bruto": t_raw, "total_gps": t_gps, "total_resgate": t_res, "total_trusted": t_fin}
+        }
+        buf = io.BytesIO(json.dumps(audit_file, indent=4).encode())
+        self.s3.put_object(Bucket=self.config.NOME_BUCKET, 
+                           Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES.json", 
+                           Body=buf.getvalue())
+        logger.info("📁 Arquivo de auditoria salvo no R2.")
+
+    def extrair_bronze(self, ano: int):
+        path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
+        url = self.config.URL_BASE_SSP.format(ano=ano)
         try:
-            requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg})
-            logger.info("✅ Relatório consolidado enviado ao Discord.")
-        except:
-            logger.error("❌ Falha ao enviar relatório ao Discord.")
+            res = requests.get(url, timeout=600)
+            if res.status_code == 200:
+                self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path, Body=res.content)
+                logger.info(f"✅ Bronze {ano} baixada.")
+        except Exception as e: logger.error(f"❌ Erro Download {ano}: {e}")
 
     def processar_prata(self, ano: int):
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
+
         try:
             if self.df_lookup_vias is None: self._carregar_malha_referencia()
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
@@ -230,6 +254,7 @@ class IngestorSafeDriver:
             buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
             logger.info(f"✨ Prata {ano} finalizada.")
+
         except Exception as e: logger.error(f"💥 Erro fatal {ano}: {e}")
 
 if __name__ == "__main__":
@@ -239,6 +264,6 @@ if __name__ == "__main__":
         if modo in ["bronze", "tudo"]: ingestor.extrair_bronze(ano)
         if modo in ["prata", "tudo"]: ingestor.processar_prata(ano)
     
-    # Chama o relatório final somente após o loop
+    # Ao final de todos os anos, executa a auditoria consolidada
     if modo in ["prata", "tudo"]:
-        ingestor.enviar_relatorio_final()
+        ingestor.finalizar_ciclo_auditoria()
