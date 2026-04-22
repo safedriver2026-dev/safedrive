@@ -59,7 +59,6 @@ class ArquitetoSafeDriverOuro:
         print("📥 Carregando Infraestrutura e Dados Sociais...", flush=True)
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         
-        # CORREÇÃO: Nome exato do arquivo gerado pela Malha Prata
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
 
         if df_infra is None:
@@ -99,7 +98,7 @@ class ArquitetoSafeDriverOuro:
         # =================================================================
         # 3. FEATURE ENGINEERING
         # =================================================================
-        print("📅 Criando Features de Tempo, Período e Severidade...", flush=True)
+        print("📅 Criando Features de Tempo, Perfil de Vítima e Severidade...", flush=True)
         
         # Garante que DATAOCORRENCIA seja data para não quebrar a extração (.dt)
         df_crimes = df_crimes.with_columns(pl.col("DATAOCORRENCIA").cast(pl.Date, strict=False))
@@ -107,6 +106,13 @@ class ArquitetoSafeDriverOuro:
         df_gold = df_crimes.with_columns([
             pl.col("DATAOCORRENCIA").dt.weekday().fill_null(0).alias("FEAT_DIA_SEMANA"),
             pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES"),
+            
+            # ✨ Classificação do Perfil da Vítima
+            pl.when(pl.col("RUBRICA").fill_null("").str.contains("VEICULO|CARGA")).then(pl.lit("MOTORISTA"))
+            .when(pl.col("RUBRICA").fill_null("").str.contains("TRANSEUNTE|CELULAR|PESSOA")).then(pl.lit("PEDESTRE"))
+            .when(pl.col("RUBRICA").fill_null("").str.contains("RESIDENCIA|ESTABELECIMENTO|BANCO")).then(pl.lit("PATRIMONIO_FIXO"))
+            .otherwise(pl.lit("GERAL")).alias("FEAT_PERFIL_VITIMA"),
+
             # Categorização de Risco para o CatBoost
             pl.when(pl.col("RUBRICA").fill_null("").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit(10))
             .when(pl.col("RUBRICA").fill_null("").str.contains("ROUBO")).then(pl.lit(5))
@@ -162,6 +168,7 @@ class ArquitetoSafeDriverOuro:
             f"• Registros Processados: {df_final.height}\n"
             f"• Features Totais      : {len(df_final.columns)}\n"
             f"• Contexto Social      : {'OK' if df_social.height > 1 else 'FALHA/ESQUELETO'}\n"
+            f"• Perfis Mapeados      : Sim (Motorista, Pedestre, etc.)\n"
             f"• Tempo de Process.    : {duracao}s\n"
             f"-----------------------------------\n"
             f"Status: PRONTO PARA MODELAGEM (CatBoost)\n"
