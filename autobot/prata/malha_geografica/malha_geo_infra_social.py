@@ -40,7 +40,6 @@ class ArquitetoSafeDriverPrata:
         
         self.webhook_url = os.getenv("DISCORD_SUCESSO")
 
-        # Configuração do Motor Matemático
         self.con = duckdb.connect(database=':memory:')
         self.con.execute(f"PRAGMA memory_limit='5GB';")
         try:
@@ -49,7 +48,7 @@ class ArquitetoSafeDriverPrata:
             pass 
         
         self.auditoria = {
-            "projeto": "SafeDriver - Malha Geográfica (Spatial Join + Social H3)",
+            "projeto": "SafeDriver - Malha Híbrida (Spatial + CSV Censo)",
             "data_execucao": str(datetime.now()),
             "status_pipeline": "PROCESSANDO",
             "telemetria": {}
@@ -74,7 +73,6 @@ class ArquitetoSafeDriverPrata:
         return arqs[0]
 
     def _ler_csv_agnostico(self, filepath):
-        """Leitor cego para os dados Sociais do Censo"""
         print(f"🔍 Auto-detetando formato do CSV: {filepath}", flush=True)
         encodings_to_try = ['utf-8', 'iso-8859-1', 'cp1252', 'latin1']
         used_enc = 'utf-8'
@@ -113,12 +111,27 @@ class ArquitetoSafeDriverPrata:
 
     def processar(self):
         tempo_inicio = time.time()
-        print("🚀 Iniciando Processamento da Malha com Spatial Join...", flush=True)
+        print("🚀 Iniciando Processamento da Malha (CSV Censo + Spatial Join)...", flush=True)
         try:
             # =================================================================
-            # 1. CARREGAR RUAS E CALCULAR H3 (Incluindo a ponte CD_SETOR)
+            # 1. LER O CSV DO CENSO ANTECIPADAMENTE (A "Ponta" de Fallback)
             # =================================================================
-            print("--- Extraindo Vias, Setores e Coordenadas (Faces) ---")
+            print("--- Preparando Dicionário Relacional do Censo (Ponte CD_SETOR) ---")
+            csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
+            df_censo_raw = self._ler_csv_agnostico(csv_f)
+            
+            df_censo = df_censo_raw.select([
+                pl.col("CD_SETOR").cast(pl.Utf8).str.strip_chars(),
+                pl.col("NM_MUN").alias("CID_CENSO"),
+                pl.col("NM_BAIRRO").alias("BAI_CENSO"),
+                pl.col("v0001").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_POPULACAO"),
+                pl.col("v0002").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_RENDA")
+            ])
+
+            # =================================================================
+            # 2. CARREGAR RUAS E FAZER O JOIN COM O CENSO IMEDIATAMENTE
+            # =================================================================
+            print("--- Extraindo Vias (Faces JSON) ---")
             zip_f = self._buscar_arquivo_flexivel("SP_Faces_2022.zip")
             list_vias_df = []
             
@@ -150,49 +163,62 @@ class ArquitetoSafeDriverPrata:
             df_ruas_raw = pl.concat(list_vias_df)
             total_faces = df_ruas_raw.height
             
+            # Cruzamento Equalizado: Ruas + Censo (Pelo CD_SETOR)
+            print("--- Equalizando Pontas: Unindo Ruas e Censo ---")
+            df_ruas_censo = df_ruas_raw.with_columns(
+                pl.col("CD_SETOR").cast(pl.Utf8).str.strip_chars()
+            ).join(df_censo, on="CD_SETOR", how="left")
+
             print("--- Mapeando Ruas para Hexágonos H3 ---")
-            df_ruas = df_ruas_raw.with_columns(
+            df_ruas_h3 = df_ruas_censo.with_columns(
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             )
 
             # =================================================================
-            # 2. O SPATIAL JOIN (Motor Matemático de Bairros)
+            # 3. O SPATIAL JOIN (A Camada de Precisão Geométrica)
             # =================================================================
-            print("--- Executando Spatial Join (H3 vs Polígonos de Bairros) ---")
+            print("--- Executando Spatial Join (Shapefile vs H3) ---")
             
-            df_h3_centers = df_ruas.group_by("H3_INDEX").agg([
+            df_h3_centers = df_ruas_h3.group_by("H3_INDEX").agg([
                 pl.col("LAT").first().alias("LAT"),
-                pl.col("LON").first().alias("LON")
+                pl.col("LON").first().alias("LON"),
+                pl.col("CID_CENSO").first().alias("CID_CENSO"),
+                pl.col("BAI_CENSO").first().alias("BAI_CENSO")
             ])
             self.con.register("tabela_h3", df_h3_centers.to_arrow())
             
-            print("--- Localizando Shapefile de Bairros ---")
             arq_poligonos = self._buscar_arquivo_flexivel("SP_bairros_CD2022*.shp").replace("\\", "/")
             
+            # A GRANDE MAGIA AQUI: COALESCE(Shapefile, CSV_Censo, Desconhecido)
             query_espacial = f"""
                 SELECT 
                     h3.H3_INDEX,
-                    COALESCE(ibge.NM_MUN, 'DESCONHECIDO') AS CIDADE,
-                    COALESCE(ibge.NM_BAIRRO, 'DESCONHECIDO') AS BAIRRO
+                    COALESCE(ibge.NM_MUN, h3.CID_CENSO, 'DESCONHECIDO') AS CIDADE,
+                    COALESCE(ibge.NM_BAIRRO, h3.BAI_CENSO, 'DESCONHECIDO') AS BAIRRO,
+                    CASE WHEN ibge.NM_BAIRRO IS NOT NULL THEN 1 ELSE 0 END as MATCH_POLIGONAL
                 FROM tabela_h3 h3
                 LEFT JOIN ST_Read('{arq_poligonos}') ibge
                 ON ST_Contains(ibge.geom, ST_Point(h3.LON, h3.LAT))
             """
             df_h3_mapeado = self.con.execute(query_espacial).pl()
+            sucesso_poligono = df_h3_mapeado.select(pl.sum("MATCH_POLIGONAL")).item()
 
             df_h3_mapeado = df_h3_mapeado.with_columns([
                 pl.col("CIDADE").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
                 pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
             ])
 
-            df_vias_completo = df_ruas.join(df_h3_mapeado, on="H3_INDEX", how="left").with_columns(
+            # Junta o resultado final de volta com os dados completos das vias
+            df_vias_completo = df_ruas_h3.drop(["CID_CENSO", "BAI_CENSO"]).join(
+                df_h3_mapeado.drop("MATCH_POLIGONAL"), on="H3_INDEX", how="left"
+            ).with_columns(
                 pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
             )
 
             # =================================================================
-            # 3. EXPORTAÇÕES DA MALHA (Hierarquia e Micro-população)
+            # 4. EXPORTAÇÕES DA MALHA (Hierarquia e Micro-população)
             # =================================================================
-            print("--- Consolidando e Exportando a Hierarquia Geográfica ---")
+            print("--- Consolidando e Exportando Tabelas da Prata ---")
             df_hierarquico = (
                 df_vias_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST"))
                 .group_by(["CIDADE", "BAIRRO"]).agg(pl.struct([pl.col("RUA"), pl.col("H3_LIST")]).alias("LOGRADOUROS"))
@@ -204,38 +230,18 @@ class ArquitetoSafeDriverPrata:
             df_micro.write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
 
             # =================================================================
-            # 4. REFERÊNCIA SOCIAL MACRO (Criando o H3 Social para a Camada Ouro)
+            # 5. REFERÊNCIA SOCIAL MACRO (Muito mais limpo, dados já estão atrelados!)
             # =================================================================
-            print("--- Extraindo Variáveis Sociais (Censo) e Agrupando por H3 ---")
-            linhas_social_exportadas = 0
-            try:
-                csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
-                df_social_raw = self._ler_csv_agnostico(csv_f)
-                
-                # Tratamento numérico para População (v0001) e Renda (v0002)
-                df_social_limpo = df_social_raw.select([
-                    pl.col("CD_SETOR").str.strip_chars(),
-                    pl.col("v0001").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_POPULACAO"),
-                    pl.col("v0002").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_RENDA")
-                ])
-                
-                # O Join com df_vias_completo cria a ponte entre Setor Censitário e H3
-                df_social_h3 = df_vias_completo.select(["CD_SETOR", "H3_INDEX", "TOT_RES"]).join(
-                    df_social_limpo, on="CD_SETOR", how="left"
-                ).group_by("H3_INDEX").agg([
-                    pl.sum("TOT_RES").fill_null(0).alias("MICRO_POPULACAO_FACES"),
-                    pl.mean("CENSO_POPULACAO").fill_null(0).alias("CENSO_MEDIA_V0001"),
-                    pl.mean("CENSO_RENDA").fill_null(0).alias("CENSO_MEDIA_V0002")
-                ])
-
-                df_social_h3.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet", compression="zstd")
-                linhas_social_exportadas = df_social_h3.height
-                print(f"✅ Arquivo PRATA_MALHA_SOCIAL_H3.parquet gerado com {linhas_social_exportadas} registros.")
-            except Exception as e:
-                print(f"❌ Erro Crítico no processamento Social: {e}")
+            print("--- Gerando Agregação Social por H3 ---")
+            df_social_h3 = df_vias_completo.group_by("H3_INDEX").agg([
+                pl.mean("CENSO_POPULACAO").fill_null(0).alias("CENSO_MEDIA_V0001"),
+                pl.mean("CENSO_RENDA").fill_null(0).alias("CENSO_MEDIA_V0002")
+            ])
+            df_social_h3.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet", compression="zstd")
+            linhas_social_exportadas = df_social_h3.height
 
             # =================================================================
-            # 5. INFRAESTRUTURA URBANA (CNAEs)
+            # 6. INFRAESTRUTURA URBANA (CNAEs)
             # =================================================================
             print("--- Processando Infraestrutura Urbana (CNAEs) ---")
             pqs_infra = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
@@ -264,20 +270,23 @@ class ArquitetoSafeDriverPrata:
                 df_pivot_height = df_infra_hierarquica.height
 
             # =================================================================
-            # 6. TELEMETRIA E AUDITORIA DE PRECISÃO
+            # 7. TELEMETRIA E AUDITORIA DE PRECISÃO
             # =================================================================
             tempo_exec = round(time.time() - tempo_inicio, 2)
-            sucesso_bairros = df_h3_mapeado.filter(pl.col("BAIRRO") != "DESCONHECIDO").height
-            taxa_sucesso = round((sucesso_bairros / df_h3_mapeado.height) * 100, 2) if df_h3_mapeado.height > 0 else 0
+            sucesso_total = df_h3_mapeado.filter(pl.col("BAIRRO") != "DESCONHECIDO").height
+            taxa_sucesso_geral = round((sucesso_total / df_h3_mapeado.height) * 100, 2) if df_h3_mapeado.height > 0 else 0
+            taxa_precisao_poligonal = round((sucesso_poligono / df_h3_mapeado.height) * 100, 2) if df_h3_mapeado.height > 0 else 0
 
             self.auditoria["status_pipeline"] = "SUCESSO"
             self.auditoria["telemetria"] = {
                 "processamento": {"tempo_total_segundos": tempo_exec},
                 "geometrias_faces": {"poligonos_ruas_extraidos": total_faces},
-                "saude_espacial_spatial_join": {
+                "saude_espacial_hibrida": {
                     "h3_unicos_processados": df_h3_mapeado.height,
-                    "h3_com_bairro_matematicamente_confirmado": sucesso_bairros,
-                    "taxa_precisao_poligonal_pct": taxa_sucesso
+                    "h3_salvos_pelo_poligono_ibge_shape": sucesso_poligono,
+                    "h3_salvos_pela_ponte_csv_censo": sucesso_total - sucesso_poligono,
+                    "taxa_precisao_poligonal_pura_pct": taxa_precisao_poligonal,
+                    "taxa_cobertura_hibrida_final_pct": taxa_sucesso_geral
                 },
                 "infraestrutura_urbana": {
                     "cnpjs_agregados": total_cnpjs,
@@ -289,12 +298,12 @@ class ArquitetoSafeDriverPrata:
                 }
             }
 
-            print("✨ Pipeline Prata da Malha concluído com sucesso!")
+            print("✨ Pipeline Prata da Malha Híbrida concluído com sucesso!")
             
-            msg = "🗺️ **[SafeDriver] Malha Prata Atualizada (Ponte Social OK)**\n```ml\n"
+            msg = "🗺️ **[SafeDriver] Malha Prata Equalizada (Spatial + Relacional)**\n```ml\n"
             msg += f"• H3 Únicos Mapeados : {df_h3_mapeado.height}\n"
-            msg += f"• Precisão do IBGE   : {taxa_sucesso}%\n"
-            msg += f"• Hexágonos Sociais  : {linhas_social_exportadas}\n"
+            msg += f"• Cobertura Final    : {taxa_sucesso_geral}% (Com Fallback)\n"
+            msg += f"• Precisão Poligonal : {taxa_precisao_poligonal}%\n"
             msg += f"• Tempo Execução     : {tempo_exec}s\n```"
             self._notificar_discord(msg)
             
