@@ -28,7 +28,7 @@ class ArquitetoSafeDriverOuro:
         self.ouro_dir = "datalake/ouro"
         
         self.auditoria = {
-            "camada": "OURO",
+            "projeto": "SafeDriver - Camada Ouro",
             "data_processamento": str(datetime.now()),
             "metricas": {}
         }
@@ -39,7 +39,6 @@ class ArquitetoSafeDriverOuro:
             except: pass
 
     def _ler_parquet_r2(self, key):
-        """Versão com log de erro para não esconder falhas."""
         try:
             print(f"   -> Procurando: {key}", flush=True)
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -47,33 +46,30 @@ class ArquitetoSafeDriverOuro:
             print(f"      [OK] {df.height} linhas carregadas.")
             return df
         except Exception as e:
-            print(f"      [ERRO FATAL] Falha ao carregar {key}. Detalhe: {e}")
+            print(f"      [AVISO] Falha ao carregar {key}. Detalhe: {e}")
             return None
 
     def construir_abt_final(self):
         inicio_timer = time.time()
-        print("🚀 [OURO] Consolidando ABT Final para IA e Dashboard...", flush=True)
+        print("🚀 [OURO] Iniciando Consolidação da ABT Final...", flush=True)
         
-        # 1. CARREGAMENTO DOS COMPONENTES DA MALHA (Infra + Social)
-        print("📥 Carregando Infraestrutura e Dados Sociais do Censo...", flush=True)
+        # 1. CARREGAMENTO DOS COMPONENTES DA MALHA
+        print("📥 Carregando Infraestrutura e Dados Sociais...", flush=True)
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
 
-        # Guard Clauses: Se faltar a base, não tenta fazer o Join
         if df_infra is None:
-            raise FileNotFoundError(f"O ficheiro de Infraestrutura não foi encontrado no R2 ({self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet). Verifique se a Prata da Malha rodou com sucesso.")
+            raise FileNotFoundError("Base de Infraestrutura não encontrada. Abortando.")
         
         if df_social is None:
-            # Caso não tenha o social, criamos um vazio apenas com a chave para o Join não quebrar.
-            # Isto salva a execução caso o CSV do IBGE não tenha sido processado por falta de ficheiro.
-            print("⚠️ Ficheiro Social ausente. Prosseguindo sem variáveis demográficas (Apenas Infra e Crimes).")
+            print("⚠️ Ficheiro Social ausente. Gerando esqueleto H3 para manter o Join.")
             df_social = pl.DataFrame({"H3_INDEX": df_infra["H3_INDEX"].unique()})
 
-        # Unimos as bases de apoio num único dicionário de inteligência por hexágono
+        # Unimos as bases de apoio num único mapa de inteligência por hexágono
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
 
-        # 2. CARREGAMENTO DOS CRIMES (Com os resgatados inclusos!)
-        print("📥 Agregando crimes processados...", flush=True)
+        # 2. CARREGAMENTO DOS CRIMES
+        print("📥 Consolidando crimes da Prata...", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
             obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
@@ -81,27 +77,79 @@ class ArquitetoSafeDriverOuro:
         ]
         
         if not crime_files:
-            raise FileNotFoundError("Nenhum ficheiro de crimes foi encontrado na Prata. A base analítica precisa de crimes para treinar o modelo.")
+            raise FileNotFoundError("Nenhum crime encontrado na Prata.")
 
-        df_crimes = pl.concat([self._ler_parquet_r2(f) for f in crime_files if self._ler_parquet_r2(f) is not None], how="diagonal")
+        # Carrega e empilha todos os anos
+        lista_crimes = []
+        for f in crime_files:
+            df_ano = self._ler_parquet_r2(f)
+            if df_ano is not None:
+                lista_crimes.append(df_ano)
+        
+        df_crimes = pl.concat(lista_crimes, how="diagonal")
 
-        # 3. FEATURE ENGINEERING (Cérebro da IA)
-        print("📅 Gerando Variáveis Temporais e de Risco...", flush=True)
+        # 3. FEATURE ENGINEERING
+        print("📅 Criando Features de Tempo e Risco...", flush=True)
         df_gold = df_crimes.with_columns([
-            pl.col("DATAOCORRENCIA").dt.weekday().alias("SAZON_DIA_SEMANA"),
-            pl.col("DATAOCORRENCIA").dt.month().alias("SAZON_MES"),
-            # Target de Risco SafeDriver
+            pl.col("DATAOCORRENCIA").dt.weekday().alias("FEAT_DIA_SEMANA"),
+            pl.col("DATAOCORRENCIA").dt.month().alias("FEAT_MES"),
             pl.when(pl.col("RUBRICA").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit(10))
             .when(pl.col("RUBRICA").str.contains("ROUBO")).then(pl.lit(5))
-            .otherwise(pl.lit(1)).alias("SCORE_GRAVIDADE")
+            .otherwise(pl.lit(1)).alias("LABEL_PESO_RISCO")
         ])
 
-        # 4. O GRANDE JOIN FINAL (Crimes + Malha)
-        print("🏙️ Fazendo o enriquecimento espacial completo...", flush=True)
-        # Cada crime agora sabe exatamente quantas pessoas moram ali e quantos bares existem por perto
+        # 4. JOIN FINAL: EVENTO + CONTEXTO URBANO
+        print("🏙️ Realizando enriquecimento espacial (H3)...", flush=True)
         df_final = df_gold.join(df_universo_h3, on="H3_INDEX", how="left")
+        
+        # Garante que colunas de infraestrutura não tenham nulos (essencial para CatBoost/XGBoost)
+        cols_infra = [c for c in df_final.columns if "INFRA_" in c or "CENSO_" in c or "MICRO_" in c]
+        df_final = df_final.with_columns([pl.col(c).fill_null(0) for c in cols_infra])
 
-        # 5. UPLOAD E AUDITORIA
-        print("📦 Exportando ABT para o R2...", flush=True)
-        buf = io.BytesIO()
-        df_final
+        # 5. SALVAMENTO NO R2 (O QUE ESTAVA FALTANDO)
+        print("📦 Gravando ABT Final no Data Lake...", flush=True)
+        
+        # Salvando o Parquet de Treino
+        buf_parquet = io.BytesIO()
+        df_final.write_parquet(buf_parquet, compression="zstd")
+        self.s3.put_object(
+            Bucket=self.bucket, 
+            Key=f"{self.ouro_dir}/safedriver_abt_treino.parquet", 
+            Body=buf_parquet.getvalue()
+        )
+
+        # 6. FINALIZAÇÃO E AUDITORIA
+        duracao = round(time.time() - inicio_timer, 2)
+        self.auditoria["metricas"] = {
+            "linhas_processadas": df_final.height,
+            "colunas_totais": len(df_final.columns),
+            "tempo_execucao_segundos": duracao,
+            "memoria_estimada_mb": round(df_final.estimated_size() / (1024 * 1024), 2)
+        }
+
+        # Salva o JSON de auditoria da Ouro
+        buf_json = io.BytesIO(json.dumps(self.auditoria, indent=4).encode())
+        self.s3.put_object(
+            Bucket=self.bucket, 
+            Key=f"{self.ouro_dir}/auditoria/AUDITORIA_OURO_FINAL.json", 
+            Body=buf_json.getvalue()
+        )
+
+        # Notificação Final
+        msg = (
+            f"🏆 **[SafeDriver] ABT Gold Gerada com Sucesso!**\n"
+            f"```ml\n"
+            f"• Registros para IA: {df_final.height}\n"
+            f"• Features Criadas : {len(df_final.columns)}\n"
+            f"• Tamanho em RAM   : {self.auditoria['metricas']['memoria_estimada_mb']} MB\n"
+            f"• Tempo de Spark   : {duracao}s\n"
+            f"-----------------------------------\n"
+            f"Status: PRONTO PARA MODELAGEM\n"
+            f"```"
+        )
+        self._notificar_discord(msg)
+        print(f"✨ Processamento concluído! ABT salva em: {self.ouro_dir}/safedriver_abt_treino.parquet")
+
+if __name__ == "__main__":
+    app = ArquitetoSafeDriverOuro()
+    app.construir_abt_final()
