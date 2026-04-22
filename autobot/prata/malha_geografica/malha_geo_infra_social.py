@@ -12,12 +12,13 @@ import csv
 import io
 import shutil
 import time
-import requests  # CORREÇÃO: Faltava este import para o webhook
+import requests
 from datetime import datetime
 from botocore.config import Config
 
 class ArquitetoSafeDriverPrata:
     def __init__(self):
+        # Configurações de Resolução H3 e Diretórios
         self.H3_RES = 9 
         self.bronze_dir = "./data_raw"
         self.prata_dir = "./data_prata"
@@ -27,6 +28,7 @@ class ArquitetoSafeDriverPrata:
         os.makedirs(self.prata_dir, exist_ok=True)
         os.makedirs(self.temp_extract_dir, exist_ok=True)
         
+        # Configuração Cloudflare R2 / S3
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -40,13 +42,14 @@ class ArquitetoSafeDriverPrata:
         )
         
         self.webhook_url = os.getenv("DISCORD_SUCESSO")
+
+        # Inicialização do DuckDB
         self.con = duckdb.connect(database=':memory:')
         self.con.execute("PRAGMA memory_limit='5GB';")
-        
         try:
             self.con.execute("INSTALL spatial; LOAD spatial;")
         except Exception as e:
-            print(f"⚠️ Erro ao carregar extensão spatial: {e}")
+            print(f"⚠️ Aviso: Não foi possível carregar extensão spatial: {e}")
         
         self.auditoria = {
             "projeto": "SafeDriver - Malha Híbrida Equalizada (V2)",
@@ -57,8 +60,10 @@ class ArquitetoSafeDriverPrata:
 
     def _notificar_discord(self, msg):
         if self.webhook_url:
-            try: requests.post(self.webhook_url, json={"content": msg}, timeout=10)
-            except: pass
+            try:
+                requests.post(self.webhook_url, json={"content": msg}, timeout=10)
+            except:
+                pass
 
     def _normalizar_texto(self, valor):
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE", "NAO INFORMADO"]: 
@@ -76,15 +81,28 @@ class ArquitetoSafeDriverPrata:
         encodings_to_try = ['utf-8', 'iso-8859-1', 'cp1252']
         for enc in encodings_to_try:
             try:
-                # Detectar separador
                 with open(filepath, 'r', encoding=enc) as f:
                     sample = f.read(5000)
                 sep = ';' if sample.count(';') > sample.count(',') else ','
-                # Ler com Polars
                 return pl.read_csv(filepath, separator=sep, encoding='utf8' if enc=='utf-8' else 'iso-8859-1', 
                                  infer_schema_length=0, ignore_errors=True)
-            except: continue
-        raise ValueError(f"Não foi possível ler o CSV: {filepath}")
+            except:
+                continue
+        raise ValueError(f"Não foi possível ler o CSV {filepath}")
+
+    def download_r2(self):
+        print("📥 Sincronizando Bronze do R2...", flush=True)
+        targets = ["SP_Faces_2022.zip", "SP_bairros_CD2022", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
+        pag = self.s3.get_paginator('list_objects_v2')
+        for p in pag.paginate(Bucket=self.bucket):
+            for obj in p.get('Contents', []):
+                key = obj['Key']
+                if any(t in key for t in targets):
+                    dest = os.path.join(self.bronze_dir, key.split('/')[-1])
+                    if not os.path.exists(dest):
+                        print(f"  -> Baixando {key}...")
+                        self.s3.download_file(self.bucket, key, dest)
+        print("✅ Bronze sincronizada.")
 
     def processar(self):
         tempo_inicio = time.time()
@@ -117,6 +135,7 @@ class ArquitetoSafeDriverPrata:
                     for f in batch:
                         z.extract(f, self.temp_extract_dir)
                         f_path = os.path.join(self.temp_extract_dir, f).replace("\\","/")
+                        # Forçamos CD_SETOR para VARCHAR no DuckDB para garantir match no Polars
                         sqls.append(f"SELECT CAST(CD_SETOR AS VARCHAR) as CD_SETOR, trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON, TRY_CAST(TOT_RES AS FLOAT) as TOT_RES FROM ST_Read('{f_path}')")
                     
                     df_batch = self.con.execute(" UNION ALL ".join(sqls)).pl()
@@ -135,10 +154,9 @@ class ArquitetoSafeDriverPrata:
             df_ruas_censo = df_ruas_raw.join(df_censo, on="CD_SETOR", how="left")
             
             print("--- Mapeando para H3 ---")
+            # H3 v4 usa latlng_to_cell
             df_ruas_h3 = df_ruas_censo.with_columns(
-                pl.struct(["LAT", "LON"]).map_batches(
-                    lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])
-                ).alias("H3_INDEX")
+                pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             )
 
             # 3. SPATIAL JOIN E FALLBACK
@@ -174,13 +192,11 @@ class ArquitetoSafeDriverPrata:
 
             # 4. EXPORTAÇÕES
             print("--- Exportando Tabelas Prata ---")
-            # Tabela de Vias (Hierárquica)
             df_vias_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST")) \
                 .group_by(["CIDADE", "BAIRRO"]).agg(pl.struct([pl.col("RUA"), pl.col("H3_LIST")]).alias("LOGRADOUROS")) \
                 .group_by("CIDADE").agg(pl.struct([pl.col("BAIRRO"), pl.col("LOGRADOUROS")]).alias("BAIRROS")) \
                 .write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
 
-            # Tabela Social H3
             df_social_h3 = df_vias_completo.group_by("H3_INDEX").agg([
                 pl.sum("TOT_RES").alias("MICRO_POPULACAO_FACES"),
                 pl.mean("CENSO_POPULACAO").fill_null(0).alias("CENSO_MEDIA_V0001"),
@@ -205,17 +221,31 @@ class ArquitetoSafeDriverPrata:
             # 6. TELEMETRIA FINAL
             tempo_exec = round(time.time() - tempo_inicio, 2)
             sucesso_total = df_h3_mapeado.filter(pl.col("BAIRRO") != "DESCONHECIDO").height
-            taxa_sucesso_geral = round((sucesso_total / df_h3_mapeado.height) * **100**, 2)
+            taxa_sucesso_geral = round((sucesso_total / max(df_h3_mapeado.height, 1)) * 100, 2)
             
-            msg = f"🗺️ **[SafeDriver] Malha Prata Híbrida OK**\n- H3 Unicos: {df_h3_mapeado.height}\n- Cobertura: {taxa_sucesso_geral}%\n- Tempo: {tempo_exec}s"
+            self.auditoria["status_pipeline"] = "SUCESSO"
+            self.auditoria["telemetria"] = {
+                "h3_unicos": df_h3_mapeado.height,
+                "salvos_pelo_censo_csv": sucesso_total - sucesso_poligono,
+                "taxa_cobertura_final_pct": taxa_sucesso_geral
+            }
+            
+            msg = (f"🗺️ **[SafeDriver] Malha Prata Híbrida OK**\n"
+                   f"- H3 Unicos: {df_h3_mapeado.height}\n"
+                   f"- Salvos pelo Censo: {sucesso_total - sucesso_poligono}\n"
+                   f"- Cobertura: {taxa_sucesso_geral}%\n"
+                   f"- Tempo: {tempo_exec}s")
+            
             self._notificar_discord(msg)
-            print(f"✅ Processamento concluído em {tempo_exec}s")
+            print(f"✅ Processamento Finalizado: {taxa_sucesso_geral}% de cobertura.")
 
         except Exception as e:
-            err_msg = f"❌ **[SafeDriver] Erro no Pipeline:** {str(e)}"
+            err_msg = f"❌ **[SafeDriver] Erro Fatal:** {str(e)}"
+            print(err_msg)
             self._notificar_discord(err_msg)
             raise e
 
 if __name__ == "__main__":
     arquiteto = ArquitetoSafeDriverPrata()
+    # arquiteto.download_r2() # Descomente se precisar baixar os arquivos no runner
     arquiteto.processar()
