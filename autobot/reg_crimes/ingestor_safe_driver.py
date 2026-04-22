@@ -14,7 +14,6 @@ import fastexcel
 from botocore.config import Config
 from datetime import datetime
 
-# Configuração de Log
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,6 @@ class ConfiguracaoIngestao:
         "RUBRICA": [r"RUBRICA", r"NATUREZA", r"DESCR_RUBRICA"],
         "LATITUDE": [r"LATITUDE", r"LAT.*GEO", r"^LAT$", r"COORDENADA_X", r"LATITUD"],
         "LONGITUDE": [r"LONGITUDE", r"LON.*GEO", r"^LON$", r"COORDENADA_Y", r"LONGITUD"],
-        "DESCR_TIPOLOCAL": [r"TIPOLOCAL", r"LOCAL_OCORR", r"DESCR_TIPOLOCAL", r"LOCAL"],
         "PERIODO_NATIVO": [r"DESC.*PERIODO", r"PERIODO", r"DS_PERIODO", r"DESC_PERIODO_OCORRENCIA"]
     }
 
@@ -50,11 +48,8 @@ class IngestorSafeDriver:
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
         self.df_lookup_vias = None
-
-    def _notificar_discord(self, msg):
-        if self.config.WEBHOOK_DISCORD:
-            try: requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg}, timeout=10)
-            except: pass
+        # Acumulador para o relatório final
+        self.stats_consolidado = []
 
     def _inicializar_s3(self):
         endpoint = self.config.ENDPOINT_URL.strip().rstrip('/')
@@ -64,25 +59,19 @@ class IngestorSafeDriver:
                             aws_secret_access_key=self.config.SECRET_KEY.strip(), config=Config(signature_version='s3v4'))
 
     def _carregar_malha_referencia(self):
-        """Carrega a malha hierárquica e a 'achata' para busca otimizada."""
         try:
             logger.info("🗺️ Baixando Malha Geográfica para resgate...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
             df_hierarquico = pl.read_parquet(io.BytesIO(obj['Body'].read()))
-            
-            # Transforma a estrutura aninhada (Cidade > Bairro > Logradouro) em tabela plana de busca
             self.df_lookup_vias = (
-                df_hierarquico
-                .explode("BAIRROS").unnest("BAIRROS")
+                df_hierarquico.explode("BAIRROS").unnest("BAIRROS")
                 .explode("LOGRADOUROS").unnest("LOGRADOUROS")
-                # Pegamos o primeiro H3 da lista como referência principal da rua
                 .with_columns(pl.col("H3_LIST").list.first().alias("H3_INDEX"))
-                .select(["CIDADE", "BAIRRO", "RUA", "H3_INDEX"])
-                .unique()
+                .select(["CIDADE", "BAIRRO", "RUA", "H3_INDEX"]).unique()
             )
-            logger.info(f"✅ Malha achatada com sucesso: {self.df_lookup_vias.height} logradouros mapeados.")
+            logger.info(f"✅ Malha carregada: {self.df_lookup_vias.height} logradouros.")
         except Exception as e:
-            logger.error(f"❌ Erro ao carregar malha: {e}. Resgate espacial desativado.")
+            logger.error(f"❌ Erro ao carregar malha: {e}")
 
     def _normalizar_texto(self, valor):
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
@@ -104,90 +93,108 @@ class IngestorSafeDriver:
         return mapeamento
 
     def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Aplica resgate em cascata usando a Malha de Referência."""
         if self.df_lookup_vias is None: return df
-        
-        # Nível 1: Precisão Total (Cidade + Bairro + Rua)
-        df = df.join(
-            self.df_lookup_vias,
-            left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO"],
-            right_on=["CIDADE", "BAIRRO", "RUA"],
-            how="left"
-        ).with_columns(
-            pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))
-        ).drop("H3_INDEX_right")
-
-        # Nível 2: Recuperação por Cidade + Rua (Caso o nome do bairro divirja entre SSP e IBGE)
-        df_fallback = self.df_lookup_vias.unique(subset=["CIDADE", "RUA"]).select(["CIDADE", "RUA", "H3_INDEX"])
-        df = df.join(
-            df_fallback,
-            left_on=["MUNICIPIO", "LOGRADOURO"],
-            right_on=["CIDADE", "RUA"],
-            how="left"
-        ).with_columns(
-            pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))
-        ).drop("H3_INDEX_right")
-        
+        df = df.join(self.df_lookup_vias, left_on=["MUNICIPIO", "BAIRRO", "LOGRADOURO"], right_on=["CIDADE", "BAIRRO", "RUA"], how="left") \
+               .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
+        df_fb = self.df_lookup_vias.unique(subset=["CIDADE", "RUA"]).select(["CIDADE", "RUA", "H3_INDEX"])
+        df = df.join(df_fb, left_on=["MUNICIPIO", "LOGRADOURO"], right_on=["CIDADE", "RUA"], how="left") \
+               .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         return df
 
-    def _limpar_e_tipar(self, df: pl.DataFrame) -> pl.DataFrame:
+    def _limpar_e_tipar(self, df: pl.DataFrame, ano: int) -> pl.DataFrame:
+        # MÉTRICAS INICIAIS
         total_entrada = df.height
         
-        # 1. Normalização de Texto
+        # 1. Normalização e Período
         cols_ignorar = ["LATITUDE", "LONGITUDE", "NUM_BO", "HORAOCORRENCIA", "PERIODO_NATIVO"]
-        cols_texto = [c for c in df.columns if c not in cols_ignorar]
-        for col in cols_texto:
+        for col in [c for c in df.columns if c not in cols_ignorar]:
             df = df.with_columns(pl.col(col).map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
 
-        # 2. Hierarquia de Período (Hora > Callback SSP)
-        df = df.with_columns(
-            pl.col("HORAOCORRENCIA").str.to_time(format="%H:%M:%S", strict=False).dt.hour().alias("_hr")
-        ).with_columns(
-            pl.when(pl.col("_hr").is_between(0, 5)).then(pl.lit("MADRUGADA"))
-            .when(pl.col("_hr").is_between(6, 11)).then(pl.lit("MANHA"))
-            .when(pl.col("_hr").is_between(12, 17)).then(pl.lit("TARDE"))
-            .when(pl.col("_hr").is_between(18, 23)).then(pl.lit("NOITE"))
-            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MADRUGADA")).then(pl.lit("MADRUGADA"))
-            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MANHA|MANHÃ")).then(pl.lit("MANHA"))
-            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("TARDE")).then(pl.lit("TARDE"))
-            .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("NOITE")).then(pl.lit("NOITE"))
-            .otherwise(pl.lit(None))
-            .alias("SAZON_PERIODO")
-        ).drop(["_hr", "PERIODO_NATIVO"])
+        df = df.with_columns(pl.col("HORAOCORRENCIA").str.to_time(format="%H:%M:%S", strict=False).dt.hour().alias("_hr")) \
+               .with_columns(
+                   pl.when(pl.col("_hr").is_between(0, 5)).then(pl.lit("MADRUGADA"))
+                   .when(pl.col("_hr").is_between(6, 11)).then(pl.lit("MANHA"))
+                   .when(pl.col("_hr").is_between(12, 17)).then(pl.lit("TARDE"))
+                   .when(pl.col("_hr").is_between(18, 23)).then(pl.lit("NOITE"))
+                   .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MADRUGADA")).then(pl.lit("MADRUGADA"))
+                   .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("MANHA|MANHÃ")).then(pl.lit("MANHA"))
+                   .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("TARDE")).then(pl.lit("TARDE"))
+                   .when(pl.col("PERIODO_NATIVO").str.to_uppercase().str.contains("NOITE")).then(pl.lit("NOITE"))
+                   .otherwise(pl.lit(None)).alias("SAZON_PERIODO")
+               ).drop(["_hr", "PERIODO_NATIVO"])
 
-        # 3. Coordenadas e H3 via GPS (Considerando 0 como nulo)
+        # 2. Coordenadas e GPS Original
         df = df.with_columns([
             pl.col("LATITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False),
             pl.col("LONGITUDE").cast(pl.Utf8).str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").cast(pl.Float64, strict=False)
         ]).with_columns(
             pl.struct(["LATITUDE", "LONGITUDE"]).map_elements(
-                lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], self.config.RESOLUCAO_H3) if x["LATITUDE"] and x["LATITUDE"] != 0 else None,
+                lambda x: h3.latlng_to_cell(x["LATITUDE"], x["LONGITUDE"], 9) if x["LATITUDE"] and x["LATITUDE"] != 0 else None,
                 return_dtype=pl.Utf8
             ).alias("H3_INDEX")
         )
 
-        # 4. Resgate Hierárquico via Malha
+        # Métrica: Registros que já tinham H3 via GPS
+        bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
+        
+        # 3. Resgate Espacial
         df = self._resgatar_espacial(df)
-
-        # 5. EXCLUSÃO RÍGIDA (Só passa dado com Local e Tempo)
+        
+        # Métrica: Registros pós resgate
+        bo_pos_resgate = df.filter(pl.col("H3_INDEX").is_not_null()).height
+        bo_resgatados = bo_pos_resgate - bo_com_gps
+        
+        # 4. Filtro Final e Descarte
         df_limpo = df.filter(pl.col("H3_INDEX").is_not_null() & pl.col("SAZON_PERIODO").is_not_null())
+        descartados = total_entrada - df_limpo.height
+
+        # Armazenar estatísticas para o relatório final
+        self.stats_consolidado.append({
+            "ANO": ano,
+            "TOTAL": total_entrada,
+            "GPS_ORIGINAL": bo_com_gps,
+            "RESGATADOS": bo_resgatados,
+            "DESCARTADOS": descartados,
+            "FINAL": df_limpo.height
+        })
         
-        # Estatísticas de Resgate
-        bo_com_gps = df.filter(pl.col("LATITUDE").is_not_null() & (pl.col("LATITUDE") != 0)).height
-        bo_salvos = df_limpo.height - bo_com_gps
-        
-        report = (
-            f"🥈 **[SafeDriver] Prata SSP: Qualidade dos Dados**\n"
-            f"```ml\n"
-            f"• Registros Processados: {total_entrada}\n"
-            f"• GPS Original Válido: {bo_com_gps}\n"
-            f"• Salvos via Malha (Resgate): {bo_salvos}\n"
-            f"• Descartados (Irrecuperáveis): {total_entrada - df_limpo.height}\n"
-            f"• Base Trusted Final: {df_limpo.height}\n"
-            f"```"
-        )
-        self._notificar_discord(report)
         return df_limpo
+
+    def enviar_relatorio_discord(self):
+        if not self.config.WEBHOOK_DISCORD or not self.stats_consolidado:
+            return
+
+        # Cabeçalho da Tabela
+        msg = "📊 **[SafeDriver] Relatório Consolidado de Ingestão de Crimes**\n```ml\n"
+        msg += f"{'ANO':<6} | {'TOTAL':<8} | {'GPS':<7} | {'RESGATE':<8} | {'FINAL':<8}\n"
+        msg += "-" * 50 + "\n"
+
+        total_proc = 0
+        total_resg = 0
+        total_final = 0
+
+        for s in sorted(self.stats_consolidado, key=lambda x: x['ANO']):
+            msg += f"{s['ANO']:<6} | {s['TOTAL']:<8} | {s['GPS_ORIGINAL']:<7} | {s['RESGATADOS']:<8} | {s['FINAL']:<8}\n"
+            total_proc += s['TOTAL']
+            total_resg += s['RESGATADOS']
+            total_final += s['FINAL']
+
+        msg += "-" * 50 + "\n"
+        msg += f"{'TOTAL':<6} | {total_proc:<8} | {'-':<7} | {total_resg:<8} | {total_final:<8}\n"
+        msg += "```"
+        
+        # Resumo de Eficiência
+        taxa_resgate = (total_resg / total_proc) * 100 if total_proc > 0 else 0
+        taxa_aproveitamento = (total_final / total_proc) * 100 if total_proc > 0 else 0
+        
+        msg += f"\n💡 **Eficiência da Malha:** {taxa_resgate:.2f}% de B.O.s sem GPS foram salvos."
+        msg += f"\n🎯 **Aproveitamento Final:** {taxa_aproveitamento:.2f}% da base SSP convertida em ABT."
+
+        try:
+            requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg}, timeout=15)
+            logger.info("✅ Relatório consolidado enviado ao Discord.")
+        except Exception as e:
+            logger.error(f"❌ Falha ao enviar para o Discord: {e}")
 
     def extrair_bronze(self, ano: int):
         path = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
@@ -202,7 +209,6 @@ class IngestorSafeDriver:
     def processar_prata(self, ano: int):
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
-
         try:
             if self.df_lookup_vias is None: self._carregar_malha_referencia()
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=path_b)
@@ -228,7 +234,7 @@ class IngestorSafeDriver:
                 except: continue
 
             df_final = pl.concat(list_dfs, how="diagonal")
-            df_final = self._limpar_e_tipar(df_final)
+            df_final = self._limpar_e_tipar(df_final, ano)
             
             pepper = self.config.PEPPER
             df_final = df_final.with_columns([
@@ -237,12 +243,18 @@ class IngestorSafeDriver:
             buf = io.BytesIO(); df_final.write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path_p, Body=buf.getvalue())
             logger.info(f"✨ Prata {ano} finalizada.")
-
         except Exception as e: logger.error(f"💥 Erro fatal {ano}: {e}")
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
     modo = sys.argv[1].lower() if len(sys.argv) > 1 else "tudo"
-    for ano in range(2022, ingestor.ano_atual + 1):
+    
+    anos_para_processar = range(2022, ingestor.ano_atual + 1)
+    
+    for ano in anos_para_processar:
         if modo in ["bronze", "tudo"]: ingestor.extrair_bronze(ano)
         if modo in ["prata", "tudo"]: ingestor.processar_prata(ano)
+    
+    # Ao final de todos os anos, envia o relatório único
+    if modo in ["prata", "tudo"]:
+        ingestor.enviar_relatorio_discord()
