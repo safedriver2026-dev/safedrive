@@ -120,23 +120,33 @@ class IngestorSafeDriver:
         ])
         df = df.with_columns(pl.col("LOG_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("LOG_PREFIX"))
         count_init = df.filter(pl.col("H3_INDEX").is_not_null()).height
+        
         df = df.join(self.df_lookup_vias, left_on=["MUN_NORM", "BAI_NORM", "LOG_BASE"], right_on=["CID_NORM", "BAI_NORM", "RUA_BASE"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         count_p1 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p1 = count_p1 - count_init
+        
         df = df.join(self.df_lookup_prefix.select(["CID_NORM", "RUA_PREFIX", "H3_INDEX"]), left_on=["MUN_NORM", "LOG_PREFIX"], right_on=["CID_NORM", "RUA_PREFIX"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         count_p2 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p2 = count_p2 - count_p1
+        
         df = df.join(self.df_lookup_bairro, left_on=["MUN_NORM", "BAI_NORM"], right_on=["CID_NORM", "BAI_NORM"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop("H3_BAIRRO")
         count_p3 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p3 = count_p3 - count_p2
+        
         return df.drop(["MUN_NORM", "BAI_NORM", "LOG_BASE", "LOG_PREFIX"]), {"p1_exato": resgatados_p1, "p2_prefixo": resgatados_p2, "p3_bairro": resgatados_p3}
 
     def _limpar_e_tipar(self, df: pl.DataFrame, ano: int, tempo_inicio_ano: float) -> pl.DataFrame:
         total_entrada = df.height
         df = df.with_columns(pl.all().cast(pl.Utf8).fill_null("NAO INFORMADO"))
+
+        # ✨ NORMALIZAÇÃO TEXTUAL FORTE (Preparando o terreno para a Ouro)
+        if "RUBRICA" in df.columns:
+            df = df.with_columns(
+                pl.col("RUBRICA").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8)
+            )
 
         # GAP DATA: Lógica de Fallback Dinâmica
         if "DATAREGISTRO" in df.columns:
