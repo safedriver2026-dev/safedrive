@@ -99,14 +99,13 @@ class ArquitetoSafeDriverPrata:
 
     def download_r2(self):
         print("📥 Sincronizando Bronze do R2...", flush=True)
-        # SP_Bairros_2022 agora é lido como prefixo, trazendo todos os arquivos soltos (.shp, .dbf, etc)
-        targets = ["SP_Faces_2022.zip", "SP_Bairros_2022", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
+        # CORREÇÃO AQUI: Mudamos de SP_Bairros_2022 para SP_bairros_CD2022
+        targets = ["SP_Faces_2022.zip", "SP_bairros_CD2022", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
             for obj in p.get('Contents', []):
                 key = obj['Key']
                 if any(t in key for t in targets):
-                    # Salva direto no data_raw tirando as pastas, mantendo todos lado a lado
                     dest = os.path.join(self.bronze_dir, key.split('/')[-1])
                     if not os.path.exists(dest):
                         print(f"   -> Baixando: {key}")
@@ -167,9 +166,9 @@ class ArquitetoSafeDriverPrata:
             ])
             self.con.register("tabela_h3", df_h3_centers.to_arrow())
             
-            # COMO VOCÊ SUBIU OS ARQUIVOS SOLTOS, AGORA SÓ PROCURAMOS O .SHP DIRETO
             print("--- Localizando Shapefile de Bairros ---")
-            arq_poligonos = self._buscar_arquivo_flexivel("SP_Bairros_2022*.shp").replace("\\", "/")
+            # CORREÇÃO AQUI: Mudamos a busca para o nome exato do seu bucket
+            arq_poligonos = self._buscar_arquivo_flexivel("SP_bairros_CD2022*.shp").replace("\\", "/")
             
             query_espacial = f"""
                 SELECT 
