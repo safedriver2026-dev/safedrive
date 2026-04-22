@@ -50,8 +50,8 @@ class IngestorSafeDriver:
         self.config = ConfiguracaoIngestao()
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
-        self.df_lookup_vias = None # Dicionário Cidade + Bairro + Rua
-        self.df_lookup_unico = None # Dicionário Cidade + Rua (Apenas Unicas)
+        self.df_lookup_vias = None   # Lookup Preciso (Cidade + Bairro + Rua)
+        self.df_lookup_unico = None  # Lookup Amplo (Cidade + Rua Única)
         self.audit_stats = []
 
     def _notificar_discord(self, msg):
@@ -74,11 +74,11 @@ class IngestorSafeDriver:
 
     def _carregar_malha_referencia(self):
         try:
-            logger.info("🗺️ Preparando Malha Geográfica Inteligente...")
+            logger.info("🗺️ Carregando Malha Geográfica e Analisando Ambiguidades...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
             df_h = pl.read_parquet(io.BytesIO(obj['Body'].read()))
             
-            # Achatamento da Malha
+            # Achatamento da Malha e Criação da Rua Base
             df_flat = (
                 df_h.explode("BAIRROS").unnest("BAIRROS")
                 .explode("LOGRADOUROS").unnest("LOGRADOUROS")
@@ -87,45 +87,35 @@ class IngestorSafeDriver:
                 .with_columns(pl.col("RUA").map_elements(self._extrair_nome_base, return_dtype=pl.Utf8).alias("RUA_BASE"))
             )
 
-            # 1. Lookup Completo (Cidade + Bairro + Rua Base)
+            # 1. Dicionário Preciso (Cidade + Bairro + Rua Base)
             self.df_lookup_vias = df_flat.unique(subset=["CIDADE", "BAIRRO", "RUA_BASE"])
 
-            # 2. Lookup de Segurança (Cidade + Rua Base) - Filtra ruas que existem em múltiplos bairros
-            ambiguidade = df_flat.group_by(["CIDADE", "RUA_BASE"]).agg(pl.col("H3_INDEX").n_unique().alias("contagem_h3"))
-            ruas_unicas = ambiguidade.filter(pl.col("contagem_h3") == 1).select(["CIDADE", "RUA_BASE"])
+            # 2. Dicionário Amplo (Apenas Ruas ÚNICAS por cidade)
+            # Contamos quantas células H3 diferentes uma rua tem em uma cidade
+            contagem_ambiguidade = df_flat.group_by(["CIDADE", "RUA_BASE"]).agg(pl.col("H3_INDEX").n_unique().alias("qtd_h3"))
+            ruas_sem_ambiguidade = contagem_ambiguidade.filter(pl.col("qtd_h3") == 1).select(["CIDADE", "RUA_BASE"])
             
-            self.df_lookup_unico = df_flat.join(ruas_unicas, on=["CIDADE", "RUA_BASE"], how="inner").select(["CIDADE", "RUA_BASE", "H3_INDEX"])
+            # Criamos o lookup amplo apenas com o que é seguro resgatar
+            self.df_lookup_unico = df_flat.join(ruas_sem_ambiguidade, on=["CIDADE", "RUA_BASE"], how="inner").select(["CIDADE", "RUA_BASE", "H3_INDEX"]).unique()
 
-            logger.info(f"✅ Malha carregada. Endereços Úteis: {self.df_lookup_vias.height} | Ruas sem ambiguidade: {self.df_lookup_unico.height}")
+            logger.info(f"✅ Malha preparada. Lookup Preciso: {self.df_lookup_vias.height} | Lookup Seguro (Sem Ambiguidade): {self.df_lookup_unico.height}")
         except Exception as e:
-            logger.error(f"❌ Erro ao preparar malha: {e}")
-
-    def _resolver_mapeamento(self, lista_colunas):
-        mapeamento = {}
-        for i, nome_col in enumerate(lista_colunas):
-            if nome_col is None: continue
-            col_limpa = "".join(c for c in str(nome_col).upper() if c.isalnum() or c == '_')
-            for alvo, padroes in self.config.MAPA_COLUNAS.items():
-                if alvo in mapeamento.values(): continue
-                for p in padroes:
-                    if re.search(p, col_limpa, re.IGNORECASE):
-                        mapeamento[i] = alvo
-                        break
-        return mapeamento
+            logger.error(f"❌ Erro ao carregar malha: {e}. Resgate espacial desativado.")
 
     def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
         if self.df_lookup_vias is None: return df
         
+        # Cria a chave de busca simplificada nos crimes
         df = df.with_columns(pl.col("LOGRADOURO").map_elements(self._extrair_nome_base, return_dtype=pl.Utf8).alias("LOG_BASE"))
 
-        # Passo 1: Resgate por Cidade + Bairro + Rua
+        # RESGATE 1: Cidade + Bairro + Rua (Precisão Máxima)
         df = df.join(self.df_lookup_vias.select(["CIDADE", "BAIRRO", "RUA_BASE", "H3_INDEX"]),
                      left_on=["MUNICIPIO", "BAIRRO", "LOG_BASE"],
                      right_on=["CIDADE", "BAIRRO", "RUA_BASE"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))) \
                .drop("H3_INDEX_right")
 
-        # Passo 2: Resgate por Cidade + Rua (Apenas se for ÚNICA na cidade)
+        # RESGATE 2: Cidade + Rua (Apenas se não houver ambiguidade na cidade)
         df = df.join(self.df_lookup_unico, 
                      left_on=["MUNICIPIO", "LOG_BASE"],
                      right_on=["CIDADE", "RUA_BASE"], how="left") \
@@ -137,7 +127,7 @@ class IngestorSafeDriver:
     def _limpar_e_tipar(self, df: pl.DataFrame, ano: int) -> pl.DataFrame:
         total_entrada = df.height
         
-        # ETAPA 1: STRING FIRST (Garante que nenhum dado suma por erro de tipo)
+        # ETAPA 1: STRING FIRST (Proteção contra perda de dados)
         df = df.with_columns(pl.all().cast(pl.Utf8).fill_null("NAO INFORMADO"))
 
         # ETAPA 2: COORDENADAS
@@ -146,7 +136,7 @@ class IngestorSafeDriver:
             pl.col("LONGITUDE").str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").alias("_lon_f")
         ])
 
-        # Geração de H3 via GPS Original
+        # Geração de H3 via GPS Original (Apenas válidos)
         df = df.with_columns(
             pl.struct(["_lat_f", "_lon_f"]).map_elements(
                 lambda x: h3.latlng_to_cell(float(x["_lat_f"]), float(x["_lon_f"]), self.config.RESOLUCAO_H3) 
@@ -157,10 +147,10 @@ class IngestorSafeDriver:
 
         bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
 
-        # Resgate Inteligente (Com proteção de ambiguidade)
+        # Resgate Inteligente em Cascata (Preciso -> Amplo Único)
         df = self._resgatar_espacial(df)
 
-        # ETAPA 3: TEMPO (Hierarquia de Recuperação)
+        # ETAPA 3: TEMPO (Hierarquia INCERTO)
         df = df.with_columns(
             pl.col("HORAOCORRENCIA").str.extract(r"(\d{1,2})", 1).cast(pl.Int32, strict=False).alias("_hr_temp")
         ).with_columns(
@@ -175,16 +165,18 @@ class IngestorSafeDriver:
             .otherwise(pl.lit("INCERTO")).alias("SAZON_PERIODO")
         )
 
-        # ETAPA 4: CONVERSÃO FINAL
+        # ETAPA 4: TIPAGEM FINAL E FILTRO
+        # O "INCERTO" é válido para a IA, mas sem H3 não há como treinar.
         df_trusted = df.filter(pl.col("H3_INDEX").is_not_null()).with_columns([
             pl.col("DATAOCORRENCIA").str.to_date(strict=False).alias("DATAOCORRENCIA"),
             pl.col("_lat_f").cast(pl.Float64, strict=False).alias("LATITUDE"),
             pl.col("_lon_f").cast(pl.Float64, strict=False).alias("LONGITUDE")
         ]).drop(["_lat_f", "_lon_f", "_hr_temp"])
 
+        # Estatísticas corrigidas
         self.audit_stats.append({
             "ano": ano,
-            "total_bruto": total_entrada,
+            "total_raw": total_entrada,
             "com_gps_original": bo_com_gps,
             "resgatados_via_malha": df_trusted.height - bo_com_gps,
             "total_trusted": df_trusted.height,
@@ -195,18 +187,24 @@ class IngestorSafeDriver:
 
     def finalizar_ciclo_auditoria(self):
         if not self.audit_stats: return
-        msg = "📊 **[SafeDriver] Relatório de Ingestão de Crimes**\n```ml\n"
-        msg += f"{'ANO':<5} | {'TOTAL':<7} | {'GPS':<6} | {'RESGATE':<7} | {'FINAL':<7}\n"
-        msg += "-" * 45 + "\n"
-        t_raw, t_res, t_fin = 0, 0, 0
+
+        # 1. Relatório Discord
+        msg = "📊 **[SafeDriver] Relatório Consolidado de Ingestão de Crimes**\n```ml\n"
+        msg += f"{'ANO':<5} | {'TOTAL':<8} | {'GPS':<7} | {'RESGATE':<8} | {'FINAL':<8}\n"
+        msg += "-" * 50 + "\n"
+        t_raw, t_gps, t_res, t_fin = 0, 0, 0, 0
         for s in sorted(self.audit_stats, key=lambda x: x['ano']):
-            msg += f"{s['ano']:<5} | {s['total_bruto']:<7} | {s['com_gps_original']:<6} | {s['resgatados_via_malha']:<7} | {s['total_trusted']:<7}\n"
-            t_raw += s['total_bruto']; t_res += s['resgatados_via_malha']; t_fin += s['total_trusted']
-        msg += "-" * 45 + "\n"
-        msg += f"{'SOMA':<5} | {t_raw:<7} | {'-':<6} | {t_res:<7} | {t_fin:<7}\n```"
-        self._notificar_discord(msg)
+            msg += f"{s['ano']:<5} | {s['total_raw']:<8} | {s['com_gps']:<7} | {s['resgatados']:<8} | {s['total_trusted']:<8}\n"
+            t_raw += s['total_raw']; t_gps += s['com_gps']; t_res += s['resgatados']; t_fin += s['total_trusted']
+        msg += "-" * 50 + "\n"
+        msg += f"{'SOMA':<5} | {t_raw:<8} | {'-':<7} | {t_res:<8} | {t_fin:<8}\n```"
         
-        audit_json = {"projeto": "SafeDriver", "stats": self.audit_stats}
+        taxa_recup = (t_res / (t_raw - t_gps) * 100) if (t_raw - t_gps) > 0 else 0
+        msg += f"\n💡 **Inteligência de Resgate:** {taxa_recup:.2f}% dos BOs sem GPS foram salvos pela Malha Ampla (Filtro de Ambiguidade)."
+        self._notificar_discord(msg)
+
+        # 2. Upload JSON Auditoria
+        audit_json = {"projeto": "SafeDriver", "data": str(datetime.now()), "stats": self.audit_stats}
         self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES.json", Body=json.dumps(audit_json, indent=4).encode())
 
     def extrair_bronze(self, ano: int):
@@ -216,7 +214,8 @@ class IngestorSafeDriver:
             res = requests.get(url, timeout=600)
             if res.status_code == 200:
                 self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key=path, Body=res.content)
-        except: pass
+                logger.info(f"✅ Bronze {ano} baixada.")
+        except Exception as e: logger.error(f"❌ Erro Download {ano}: {e}")
 
     def processar_prata(self, ano: int):
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
