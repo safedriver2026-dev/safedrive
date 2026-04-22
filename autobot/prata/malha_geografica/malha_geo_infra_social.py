@@ -1,3 +1,11 @@
+Você tem toda a razão. Pedir desculpas por isso. Manter o delimitador (`;`) e o *encoding* (`latin1`) "chumbados" no código é um erro grave de arquitetura quando se lida com ficheiros governamentais ou de fontes externas, pois eles mudam o padrão sem aviso prévio. Se o ficheiro vier com vírgula (`,`) ou UTF-8, o Polars corrompe a leitura, o `CD_SETOR` fica em branco e o *join* cai para 0%.
+
+Para resolver isto definitivamente, criei a função **`_ler_csv_agnostico`**. 
+Ela funciona como um radar: lê os primeiros 10.000 bytes do ficheiro, testa os *encodings* possíveis, invoca o `csv.Sniffer` nativo do Python para adivinhar matematicamente qual é o separador, e depois injeta essa informação no Polars forçando **todas as colunas como String** (`infer_schema_length=0`) para blindar o `CD_SETOR`.
+
+Aqui está o código com o leitor 100% agnóstico incorporado:
+
+```python
 import os
 import boto3
 import duckdb
@@ -47,7 +55,6 @@ class ArquitetoSafeDriverPrata:
         except:
             pass 
         
-        # Estrutura base da auditoria expandida
         self.auditoria = {
             "projeto": "SafeDriver - Malha Geográfica",
             "data_execucao": str(datetime.now()),
@@ -73,6 +80,38 @@ class ArquitetoSafeDriverPrata:
             raise FileNotFoundError(f"Arquivo ({padrao}) não localizado no disco!")
         return arqs[0]
 
+    def _ler_csv_agnostico(self, filepath):
+        """Leitor cego: Descobre encoding e delimitador sozinho antes de ler."""
+        print(f"🔍 Auto-detetando formato do CSV: {filepath}", flush=True)
+        
+        # 1. Descobrir Encoding
+        encodings_to_try = ['utf-8', 'iso-8859-1', 'cp1252', 'latin1']
+        used_enc = 'utf-8'
+        sample_text = ""
+        for enc in encodings_to_try:
+            try:
+                with open(filepath, 'r', encoding=enc) as f:
+                    sample_text = f.read(10000)
+                used_enc = enc
+                break
+            except Exception:
+                continue
+                
+        # 2. Descobrir Delimitador via Sniffer Estatístico
+        try:
+            sep = csv.Sniffer().sniff(sample_text).delimiter
+        except Exception:
+            # Fallback seguro caso o sniffer falhe
+            sep = ';' if sample_text.count(';') > sample_text.count(',') else ','
+            
+        print(f"✅ Identificado -> Encoding: {used_enc} | Separador: '{sep}'", flush=True)
+        
+        # O Polars usa internamente 'utf8' ou 'iso-8859-1'
+        pl_encoding = 'utf8' if used_enc == 'utf-8' else 'iso-8859-1'
+        
+        # infer_schema_length=0 FORÇA que tudo seja lido como String (blindando o CD_SETOR)
+        return pl.read_csv(filepath, separator=sep, encoding=pl_encoding, infer_schema_length=0, ignore_errors=True)
+
     def download_r2(self):
         print("📥 Sincronizando Bronze do R2...", flush=True)
         targets = ["SP_Faces_2022.zip", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
@@ -91,13 +130,11 @@ class ArquitetoSafeDriverPrata:
         tempo_inicio = time.time()
         print("🚀 Iniciando Processamento da Malha Híbrida Hierárquica...", flush=True)
         try:
-            # 1. REFERÊNCIA SOCIAL
+            # 1. REFERÊNCIA SOCIAL (Agora 100% Agnóstico)
             print("--- Lendo Censo (Referência de Nomes) ---")
             csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
             
-            # Forçar CD_SETOR para String (Evita corrupção de Join)
-            dtypes = {"CD_SETOR": pl.Utf8}
-            df_social_raw = pl.read_csv(csv_f, separator=";", encoding="latin1", infer_schema_length=10000, ignore_errors=True, dtypes=dtypes)
+            df_social_raw = self._ler_csv_agnostico(csv_f)
             
             df_ref_nomes = df_social_raw.select([
                 pl.col("CD_SETOR").str.strip_chars(),
@@ -151,7 +188,7 @@ class ArquitetoSafeDriverPrata:
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             ])
 
-            # Métricas de Qualidade do JOIN IBGE (Verifica se Cidades/Bairros ficaram nulos)
+            # Métricas de Qualidade
             faces_sem_cidade = df_vias_completo.filter(pl.col("CIDADE") == "NAO INFORMADO").height
             faces_sem_bairro = df_vias_completo.filter(pl.col("BAIRRO") == "NAO INFORMADO").height
             h3_unicos = df_vias_completo.select("H3_INDEX").n_unique()
@@ -172,7 +209,7 @@ class ArquitetoSafeDriverPrata:
             df_social_raw.select([pl.col("CD_SETOR").cast(pl.Utf8), "NM_MUN", "NM_BAIRRO", "v0001", "v0002"]) \
                 .write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet")
 
-            # 4. INFRAESTRUTURA (CNAEs)
+            # 4. INFRAESTRUTURA
             print("--- Processando Infraestrutura (Streaming Mode) ---")
             pqs_infra = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             total_cnpjs = 0
@@ -252,3 +289,4 @@ if __name__ == "__main__":
     app.download_r2()
     app.processar()
     app.finalizar()
+```
