@@ -96,28 +96,41 @@ class ArquitetoSafeDriverOuro:
         df_crimes = df_crimes.filter(pl.col("H3_INDEX").is_not_null())
 
         # =================================================================
-        # 3. FEATURE ENGINEERING
+        # 3. FEATURE ENGINEERING (Híbrido: Código Penal + Textual)
         # =================================================================
-        print("📅 Criando Features de Tempo, Perfil de Vítima e Severidade...", flush=True)
+        print("📅 Criando Features: Perfil de Vítima e Tipificação Penal...", flush=True)
         
-        # Garante que DATAOCORRENCIA seja data para não quebrar a extração (.dt)
         df_crimes = df_crimes.with_columns(pl.col("DATAOCORRENCIA").cast(pl.Date, strict=False))
+        
+        # Coluna temporária limpa para busca de regex (Normalização Final)
+        df_crimes = df_crimes.with_columns(
+            pl.col("RUBRICA").fill_null("").str.to_uppercase().alias("RUBRICA_UPPER")
+        )
         
         df_gold = df_crimes.with_columns([
             pl.col("DATAOCORRENCIA").dt.weekday().fill_null(0).alias("FEAT_DIA_SEMANA"),
             pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES"),
             
             # ✨ Classificação do Perfil da Vítima
-            pl.when(pl.col("RUBRICA").fill_null("").str.contains("VEICULO|CARGA")).then(pl.lit("MOTORISTA"))
-            .when(pl.col("RUBRICA").fill_null("").str.contains("TRANSEUNTE|CELULAR|PESSOA")).then(pl.lit("PEDESTRE"))
-            .when(pl.col("RUBRICA").fill_null("").str.contains("RESIDENCIA|ESTABELECIMENTO|BANCO")).then(pl.lit("PATRIMONIO_FIXO"))
+            pl.when(pl.col("RUBRICA_UPPER").str.contains(r"VEICULO|VEÍCULO|CARGA")).then(pl.lit("MOTORISTA"))
+            .when(pl.col("RUBRICA_UPPER").str.contains(r"TRANSEUNTE|CELULAR|PESSOA")).then(pl.lit("PEDESTRE"))
+            .when(pl.col("RUBRICA_UPPER").str.contains(r"RESIDENCIA|RESIDÊNCIA|ESTABELECIMENTO|BANCO|COMERCIO|COMÉRCIO")).then(pl.lit("PATRIMONIO_FIXO"))
             .otherwise(pl.lit("GERAL")).alias("FEAT_PERFIL_VITIMA"),
 
-            # Categorização de Risco para o CatBoost
-            pl.when(pl.col("RUBRICA").fill_null("").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit(10))
-            .when(pl.col("RUBRICA").fill_null("").str.contains("ROUBO")).then(pl.lit(5))
+            # ⚖️ Categorização de Risco ancorada no Código Penal (Artigos)
+            pl.when(
+                pl.col("RUBRICA_UPPER").str.contains(r"ART(?:IGO)?\s*121") |  # Homicídio
+                pl.col("RUBRICA_UPPER").str.contains(r"LATROCINIO|LATROCÍNIO") # Latrocínio
+            ).then(pl.lit(10))
+            .when(
+                pl.col("RUBRICA_UPPER").str.contains(r"ART(?:IGO)?\s*157") |  # Roubo
+                pl.col("RUBRICA_UPPER").str.contains(r"\bROUBO\b")            # Fallback textual
+            ).then(pl.lit(5))
             .otherwise(pl.lit(1)).alias("LABEL_PESO_RISCO")
         ])
+        
+        # Removemos a coluna temporária
+        df_gold = df_gold.drop("RUBRICA_UPPER")
 
         # =================================================================
         # 4. O GRANDE JOIN FINAL: EVENTO + CONTEXTO URBANO
@@ -168,7 +181,7 @@ class ArquitetoSafeDriverOuro:
             f"• Registros Processados: {df_final.height}\n"
             f"• Features Totais      : {len(df_final.columns)}\n"
             f"• Contexto Social      : {'OK' if df_social.height > 1 else 'FALHA/ESQUELETO'}\n"
-            f"• Perfis Mapeados      : Sim (Motorista, Pedestre, etc.)\n"
+            f"• Tipificação          : Híbrida (Código Penal + Regex)\n"
             f"• Tempo de Process.    : {duracao}s\n"
             f"-----------------------------------\n"
             f"Status: PRONTO PARA MODELAGEM (CatBoost)\n"
