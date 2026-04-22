@@ -56,19 +56,21 @@ class ArquitetoSafeDriverOuro:
         # 1. CARREGAMENTO DOS COMPONENTES DA MALHA
         print("📥 Carregando Infraestrutura e Dados Sociais...", flush=True)
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
-        df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
+        
+        # CORREÇÃO: Nome do arquivo ajustado conforme o log do seu bucket R2
+        df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL.parquet")
 
         if df_infra is None:
-            raise FileNotFoundError("Base de Infraestrutura não encontrada. Abortando.")
+            raise FileNotFoundError("Base de Infraestrutura não encontrada. Abortando pipeline Gold.")
         
         if df_social is None:
-            print("⚠️ Ficheiro Social ausente. Gerando esqueleto H3 para manter o Join.")
+            print("⚠️ Ficheiro Social ausente. Gerando esqueleto H3 para não quebrar o Join.")
             df_social = pl.DataFrame({"H3_INDEX": df_infra["H3_INDEX"].unique()})
 
-        # Unimos as bases de apoio num único mapa de inteligência por hexágono
+        # Unimos Infra + Social num mapa de inteligência por hexágono
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
 
-        # 2. CARREGAMENTO DOS CRIMES
+        # 2. CARREGAMENTO DOS CRIMES (2022 a 2026)
         print("📥 Consolidando crimes da Prata...", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
@@ -77,9 +79,8 @@ class ArquitetoSafeDriverOuro:
         ]
         
         if not crime_files:
-            raise FileNotFoundError("Nenhum crime encontrado na Prata.")
+            raise FileNotFoundError("Nenhum arquivo de crime encontrado em datalake/prata/crimes_trusted/")
 
-        # Carrega e empilha todos os anos
         lista_crimes = []
         for f in crime_files:
             df_ano = self._ler_parquet_r2(f)
@@ -89,27 +90,29 @@ class ArquitetoSafeDriverOuro:
         df_crimes = pl.concat(lista_crimes, how="diagonal")
 
         # 3. FEATURE ENGINEERING
-        print("📅 Criando Features de Tempo e Risco...", flush=True)
+        print("📅 Criando Features de Tempo, Período e Severidade...", flush=True)
         df_gold = df_crimes.with_columns([
             pl.col("DATAOCORRENCIA").dt.weekday().alias("FEAT_DIA_SEMANA"),
             pl.col("DATAOCORRENCIA").dt.month().alias("FEAT_MES"),
+            # Categorização de Risco para o CatBoost
             pl.when(pl.col("RUBRICA").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit(10))
             .when(pl.col("RUBRICA").str.contains("ROUBO")).then(pl.lit(5))
             .otherwise(pl.lit(1)).alias("LABEL_PESO_RISCO")
         ])
 
-        # 4. JOIN FINAL: EVENTO + CONTEXTO URBANO
+        # 4. O GRANDE JOIN FINAL: EVENTO + CONTEXTO URBANO
         print("🏙️ Realizando enriquecimento espacial (H3)...", flush=True)
         df_final = df_gold.join(df_universo_h3, on="H3_INDEX", how="left")
         
-        # Garante que colunas de infraestrutura não tenham nulos (essencial para CatBoost/XGBoost)
-        cols_infra = [c for c in df_final.columns if "INFRA_" in c or "CENSO_" in c or "MICRO_" in c]
-        df_final = df_final.with_columns([pl.col(c).fill_null(0) for c in cols_infra])
+        # Limpeza de Nulos em todas as colunas de contexto (Infraestrutura, Censo e Micropopulação)
+        # Importante: Mantemos a coluna SAZON_PERIODO (que veio da Prata) como está para o treino
+        cols_contexto = [c for c in df_final.columns if any(x in c for x in ["INFRA_", "CENSO_", "MICRO_"])]
+        df_final = df_final.with_columns([pl.col(c).fill_null(0) for c in cols_contexto])
 
-        # 5. SALVAMENTO NO R2 (O QUE ESTAVA FALTANDO)
+        # 5. SALVAMENTO NO R2
         print("📦 Gravando ABT Final no Data Lake...", flush=True)
         
-        # Salvando o Parquet de Treino
+        # Grava o Parquet da ABT (Analytical Base Table)
         buf_parquet = io.BytesIO()
         df_final.write_parquet(buf_parquet, compression="zstd")
         self.s3.put_object(
@@ -120,14 +123,16 @@ class ArquitetoSafeDriverOuro:
 
         # 6. FINALIZAÇÃO E AUDITORIA
         duracao = round(time.time() - inicio_timer, 2)
+        mem_mb = round(df_final.estimated_size() / (1024 * 1024), 2)
+        
         self.auditoria["metricas"] = {
             "linhas_processadas": df_final.height,
             "colunas_totais": len(df_final.columns),
             "tempo_execucao_segundos": duracao,
-            "memoria_estimada_mb": round(df_final.estimated_size() / (1024 * 1024), 2)
+            "memoria_estimada_mb": mem_mb
         }
 
-        # Salva o JSON de auditoria da Ouro
+        # Salva o log de auditoria
         buf_json = io.BytesIO(json.dumps(self.auditoria, indent=4).encode())
         self.s3.put_object(
             Bucket=self.bucket, 
@@ -135,20 +140,20 @@ class ArquitetoSafeDriverOuro:
             Body=buf_json.getvalue()
         )
 
-        # Notificação Final
+        # Notificação Final para o Discord
         msg = (
-            f"🏆 **[SafeDriver] ABT Gold Gerada com Sucesso!**\n"
+            f"🏆 **[SafeDriver] Camada Ouro Concluída**\n"
             f"```ml\n"
-            f"• Registros para IA: {df_final.height}\n"
-            f"• Features Criadas : {len(df_final.columns)}\n"
-            f"• Tamanho em RAM   : {self.auditoria['metricas']['memoria_estimada_mb']} MB\n"
-            f"• Tempo de Spark   : {duracao}s\n"
+            f"• Registros Processados: {df_final.height}\n"
+            f"• Features Totais      : {len(df_final.columns)}\n"
+            f"• Contexto Social      : {'OK' if df_social.height > 1 else 'FALHA/ESQUELETO'}\n"
+            f"• Tempo de Spark       : {duracao}s\n"
             f"-----------------------------------\n"
-            f"Status: PRONTO PARA MODELAGEM\n"
+            f"Status: PRONTO PARA MODELAGEM (CatBoost)\n"
             f"```"
         )
         self._notificar_discord(msg)
-        print(f"✨ Processamento concluído! ABT salva em: {self.ouro_dir}/safedriver_abt_treino.parquet")
+        print(f"✨ ABT completa salva em: {self.ouro_dir}/safedriver_abt_treino.parquet")
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverOuro()
