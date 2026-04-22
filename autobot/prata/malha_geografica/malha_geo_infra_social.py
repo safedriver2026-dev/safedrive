@@ -11,6 +11,7 @@ import re
 import csv
 import io
 import shutil
+import time
 from datetime import datetime
 from botocore.config import Config
 
@@ -36,16 +37,28 @@ class ArquitetoSafeDriverPrata:
             aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
             config=Config(signature_version='s3v4', retries={'max_attempts': 3})
         )
+        
+        self.webhook_url = os.getenv("DISCORD_SUCESSO")
 
         self.con = duckdb.connect(database=':memory:')
-        # PRAGMA vital para o GitHub Actions não abortar por falta de RAM
         self.con.execute(f"PRAGMA memory_limit='5GB';")
         try:
             self.con.execute("INSTALL spatial; LOAD spatial;")
         except:
             pass 
         
-        self.auditoria = {"DATA_EXECUCAO": str(datetime.now())}
+        # Estrutura base da auditoria expandida
+        self.auditoria = {
+            "projeto": "SafeDriver - Malha Geográfica",
+            "data_execucao": str(datetime.now()),
+            "status_pipeline": "PROCESSANDO",
+            "telemetria": {}
+        }
+
+    def _notificar_discord(self, msg):
+        if self.webhook_url:
+            try: requests.post(self.webhook_url, json={"content": msg}, timeout=10)
+            except: pass
 
     def _normalizar_texto(self, valor):
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
@@ -75,23 +88,28 @@ class ArquitetoSafeDriverPrata:
         print("✅ Bronze carregada localmente.")
 
     def processar(self):
+        tempo_inicio = time.time()
         print("🚀 Iniciando Processamento da Malha Híbrida Hierárquica...", flush=True)
         try:
-            # 1. REFERÊNCIA SOCIAL (De-para de Setores para Nomes)
+            # 1. REFERÊNCIA SOCIAL
             print("--- Lendo Censo (Referência de Nomes) ---")
             csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
-            df_social_raw = pl.read_csv(csv_f, separator=";", encoding="latin1", infer_schema_length=10000, ignore_errors=True)
+            
+            # Forçar CD_SETOR para String (Evita corrupção de Join)
+            dtypes = {"CD_SETOR": pl.Utf8}
+            df_social_raw = pl.read_csv(csv_f, separator=";", encoding="latin1", infer_schema_length=10000, ignore_errors=True, dtypes=dtypes)
             
             df_ref_nomes = df_social_raw.select([
-                pl.col("CD_SETOR").cast(pl.Utf8),
+                pl.col("CD_SETOR").str.strip_chars(),
                 pl.col("NM_MUN").alias("CIDADE"),
                 pl.col("NM_BAIRRO").alias("BAIRRO")
             ]).with_columns([
                 pl.col("CIDADE").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
                 pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
             ])
+            total_censo = df_social_raw.height
 
-            # 2. GEOMETRIAS (IBGE Faces) - PROCESSAMENTO EM LOTE (BATCHING)
+            # 2. GEOMETRIAS (IBGE Faces)
             print("--- Extraindo e Processando Geometrias (Batch Mode) ---")
             zip_f = self._buscar_arquivo_flexivel("SP_Faces_2022.zip")
             
@@ -104,28 +122,26 @@ class ArquitetoSafeDriverPrata:
                     sqls = []
                     for f_json in batch:
                         z.extract(f_json, self.temp_extract_dir)
-                        # Resolvemos o path antes da f-string para evitar o SyntaxError do \
                         f_path_sql = os.path.join(self.temp_extract_dir, f_json).replace("\\", "/")
                         sqls.append(f"""
                             SELECT 
-                                CAST(CD_SETOR AS VARCHAR) as CD_SETOR,
+                                TRIM(CAST(CD_SETOR AS VARCHAR)) as CD_SETOR,
                                 trim(COALESCE(NM_TIP_LOG, '') || ' ' || COALESCE(NM_LOG, '')) as RUA, 
                                 ST_Y(ST_Centroid(geom)) as LAT, ST_X(ST_Centroid(geom)) as LON, 
                                 TRY_CAST(TOT_RES AS FLOAT) as TOT_RES 
                             FROM ST_Read('{f_path_sql}')
                         """)
                     
-                    # Processa o lote no DuckDB e converte para Polars
                     df_batch = self.con.execute(" UNION ALL ".join(sqls)).pl()
                     list_vias_df.append(df_batch)
                     
-                    # Limpeza imediata do disco após processar o lote
                     for f_json in batch:
                         try: os.remove(os.path.join(self.temp_extract_dir, f_json))
                         except: pass
                     print(f"   -> Progresso: {min(i + batch_size, len(json_files))}/{len(json_files)} arquivos", flush=True)
 
             df_faces = pl.concat(list_vias_df)
+            total_faces = df_faces.height
             
             print("--- Consolidando Hierarquia e H3 ---")
             df_vias_completo = df_faces.join(df_ref_nomes, on="CD_SETOR", how="left").with_columns([
@@ -135,7 +151,12 @@ class ArquitetoSafeDriverPrata:
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             ])
 
-            # Exportação 1: Hierarquia de Vias (Cidade > Bairros > Logradouros)
+            # Métricas de Qualidade do JOIN IBGE (Verifica se Cidades/Bairros ficaram nulos)
+            faces_sem_cidade = df_vias_completo.filter(pl.col("CIDADE") == "NAO INFORMADO").height
+            faces_sem_bairro = df_vias_completo.filter(pl.col("BAIRRO") == "NAO INFORMADO").height
+            h3_unicos = df_vias_completo.select("H3_INDEX").n_unique()
+
+            # Exportação 1: Hierarquia
             df_hierarquico = (
                 df_vias_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST"))
                 .group_by(["CIDADE", "BAIRRO"]).agg(pl.struct([pl.col("RUA"), pl.col("H3_LIST")]).alias("LOGRADOUROS"))
@@ -143,32 +164,76 @@ class ArquitetoSafeDriverPrata:
             )
             df_hierarquico.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
 
-            # Exportação 2: Micro-População (H3 Flat para a Ouro)
-            df_vias_completo.group_by("H3_INDEX").agg(pl.sum("TOT_RES").alias("MICRO_POPULACAO_H3")) \
-                .write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
+            # Exportação 2: Micro-População
+            df_micro = df_vias_completo.group_by("H3_INDEX").agg(pl.sum("TOT_RES").alias("MICRO_POPULACAO_H3"))
+            df_micro.write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
 
-            # Exportação 3: Social Macro
+            # Exportação 3: Social
             df_social_raw.select([pl.col("CD_SETOR").cast(pl.Utf8), "NM_MUN", "NM_BAIRRO", "v0001", "v0002"]) \
                 .write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet")
 
-            # 4. INFRAESTRUTURA (CNAEs) - MOTOR DE STREAMING
+            # 4. INFRAESTRUTURA (CNAEs)
             print("--- Processando Infraestrutura (Streaming Mode) ---")
             pqs_infra = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
+            total_cnpjs = 0
+            df_pivot_height = 0
+            
             if pqs_infra:
                 df_infra = pl.scan_parquet(pqs_infra).filter(pl.col("lat").is_not_null()).with_columns([
                     pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")
                 ]).group_by(["lat", "lon", "CNAE_DIV"]).len().collect(engine="streaming")
+                
+                total_cnpjs = df_infra.select(pl.sum("len")).item()
 
                 df_infra_h3 = df_infra.with_columns(pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s])).alias("H3_INDEX"))
                 df_pivot = df_infra_h3.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("len").alias("TOTAL")).pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV").fill_null(0)
                 df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
                 df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
+                df_pivot_height = df_pivot.height
 
-            self.auditoria["STATUS"] = "SUCESSO"
+            # --- POPULANDO A AUDITORIA ---
+            tempo_exec = round(time.time() - tempo_inicio, 2)
+            self.auditoria["status_pipeline"] = "SUCESSO"
+            self.auditoria["telemetria"] = {
+                "processamento": {
+                    "tempo_total_segundos": tempo_exec,
+                    "resolucao_h3_utilizada": self.H3_RES
+                },
+                "censo_ibge": {
+                    "setores_lidos_csv": total_censo
+                },
+                "geometrias_faces": {
+                    "poligonos_extraidos": total_faces,
+                    "h3_unicos_gerados": h3_unicos
+                },
+                "saude_do_join_espacial": {
+                    "faces_com_cidade_invalida": faces_sem_cidade,
+                    "faces_com_bairro_invalido": faces_sem_bairro,
+                    "taxa_sucesso_relacionamento_pct": round(((total_faces - faces_sem_bairro) / total_faces) * 100, 2) if total_faces > 0 else 0
+                },
+                "infraestrutura_urbana": {
+                    "cnpjs_agregados": total_cnpjs,
+                    "h3_com_atividade_comercial": df_pivot_height
+                },
+                "tabelas_exportadas_linhas": {
+                    "PRATA_MALHA_GEOGRAFICA_VIAS": df_hierarquico.height,
+                    "PRATA_MALHA_MICRO_POPULACAO": df_micro.height,
+                    "PRATA_MALHA_INFRA_AGREGADA": df_pivot_height
+                }
+            }
+
             print("✨ Pipeline Prata concluído com sucesso!")
             
+            # Notificação no Discord
+            msg = "🗺️ **[SafeDriver] Malha Geográfica Prata Atualizada**\n```ml\n"
+            msg += f"• H3 Únicos Gerados: {h3_unicos}\n"
+            msg += f"• Taxa Sucesso IBGE : {self.auditoria['telemetria']['saude_do_join_espacial']['taxa_sucesso_relacionamento_pct']}%\n"
+            msg += f"• CNPJs Mapeados   : {total_cnpjs}\n"
+            msg += f"• Tempo Execução   : {tempo_exec}s\n```"
+            self._notificar_discord(msg)
+            
         except Exception as e:
-            self.auditoria["STATUS"] = f"ERRO: {str(e)}"
+            self.auditoria["status_pipeline"] = f"ERRO: {str(e)}"
             print(f"❌ Erro Crítico: {e}")
         finally:
             shutil.rmtree(self.temp_extract_dir, ignore_errors=True)
