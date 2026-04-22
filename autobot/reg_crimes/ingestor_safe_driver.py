@@ -32,17 +32,18 @@ class ConfiguracaoIngestao:
     RESOLUCAO_H3 = 9
     
     MAPA_COLUNAS = {
-        "NUM_BO": [r"NUM.*BO", r"N.MERO.*BO", r"BO_NUMERO"],
-        "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN", r"NOME_MUN"],
+        "NUM_BO": [r"NUM.*BO", r"BO_NUMERO"],
+        "MUNICIPIO": [r"MUNIC.PIO", r"CIDADE", r"NM_MUN", r"NOME_MUNICIPIO$"],
         "BAIRRO": [r"BAIRRO", r"NM_BAIRRO"],
-        "LOGRADOURO": [r"LOGRADOURO", r"RUA", r"DESCR_LOG", r"NM_LOG", r"ENDERECO"],
-        "DATAOCORRENCIA": [r"DATA.*OCORR", r"DT_OCORR", r"DATA_OCORRENCIA"],
-        "HORAOCORRENCIA": [r"HORA.*OCORR", r"HR_OCORR", r"HORA_OCORRENCIA"],
+        "LOGRADOURO": [r"LOGRADOURO", r"RUA", r"DESCR_LOG", r"ENDERECO"],
+        "DATAOCORRENCIA": [r"DATA_OCORRENCIA_BO", r"DT_OCORR", r"DATA_OCORRENCIA"],
+        "DATAREGISTRO": [r"DATA_REGISTRO", r"DT_REGISTRO"],
+        "HORAOCORRENCIA": [r"HORA_OCORRENCIA_BO", r"HR_OCORR", r"HORA_OCORRENCIA"],
         "RUBRICA": [r"RUBRICA", r"NATUREZA", r"DESCR_RUBRICA"],
-        "LATITUDE": [r"LATITUDE", r"LAT.*GEO", r"^LAT$", r"COORDENADA_X", r"LATITUD"],
-        "LONGITUDE": [r"LONGITUDE", r"LON.*GEO", r"^LON$", r"COORDENADA_Y", r"LONGITUD"],
-        "DESCR_TIPOLOCAL": [r"TIPOLOCAL", r"LOCAL_OCORR", r"DESCR_TIPOLOCAL", r"LOCAL"],
-        "PERIODO_NATIVO": [r"DESC.*PERIODO", r"PERIODO", r"DS_PERIODO", r"DESC_PERIODO_OCORRENCIA"]
+        "LATITUDE": [r"LATITUDE", r"COORDENADA_X", r"LATITUD"],
+        "LONGITUDE": [r"LONGITUDE", r"COORDENADA_Y", r"LONGITUD"],
+        "DESCR_TIPOLOCAL": [r"TIPOLOCAL", r"LOCAL_OCORR", r"DESCR_TIPOLOCAL"],
+        "PERIODO_NATIVO": [r"DESC_PERIODO", r"PERIODO", r"DS_PERIODO", r"DESC_PERIODO_OCORRENCIA"]
     }
 
 class IngestorSafeDriver:
@@ -68,28 +69,25 @@ class IngestorSafeDriver:
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
         texto = re.sub(r'[^A-Z0-9\s]', ' ', texto.upper())
         texto = " ".join(texto.split())
-        
         subs_cidades = {
-            r'\bS PAULO\b': 'SAO PAULO', r'\bS BERNARDO\b': 'SAO BERNARDO DO CAMPO',
+            r'\bS PAULO\b': 'SAO PAULO', r'\bS\.PAULO\b': 'SAO PAULO',
+            r'\bS BERNARDO\b': 'SAO BERNARDO DO CAMPO',
             r'\bS CAETANO\b': 'SAO CAETANO DO SUL', r'\bS ANDRE\b': 'SANTO ANDRE'
         }
         for erro, correto in subs_cidades.items():
             texto = re.sub(erro, correto, texto)
-            
         return texto.strip() if texto.strip() != "" else "DESCONHECIDO"
 
     def _normalizar_logradouro(self, texto):
         t = self._limpeza_extrema(texto)
-        if t == "DESCONHECIDO" or "VEDACAO" in t or "VIA PUBLICA" in t:
+        if t == "DESCONHECIDO" or any(x in t for x in ["VEDACAO", "VIA PUBLICA", "NAO INFORMADO"]):
             return "DESCONHECIDO"
-        
         subs = {
             r'\bJD\b': 'JARDIM', r'\bVL\b': 'VILA', r'\bSTA\b': 'SANTA', r'\bSTO\b': 'SANTO',
             r'\bPC\b': 'PRACA', r'\bTV\b': 'TRAVESSA', r'\bAV\b': 'AVENIDA', r'\bR\b': 'RUA'
         }
         for sigla, expansao in subs.items():
             t = re.sub(sigla, expansao, t)
-            
         prefixos = r'^(RUA|AVENIDA|TRAVESSA|PRACA|ALAMEDA|ESTRADA|RODOVIA|LADEIRA|VIADUTO|MARGINAL)\s+'
         return re.sub(prefixos, '', t).strip()
 
@@ -98,69 +96,53 @@ class IngestorSafeDriver:
             logger.info("🗺️ Carregando Malha com Normalização Universal...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
             df_flat = pl.read_parquet(io.BytesIO(obj['Body'].read())).explode("BAIRROS").unnest("BAIRROS").explode("LOGRADOUROS").unnest("LOGRADOUROS")
-            
             df_base = df_flat.with_columns([
                 pl.col("H3_LIST").list.first().alias("H3_INDEX"),
                 pl.col("CIDADE").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("CID_NORM"),
                 pl.col("BAIRRO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("BAI_NORM"),
                 pl.col("RUA").map_elements(self._normalizar_logradouro, return_dtype=pl.Utf8).alias("RUA_BASE")
             ]).select(["CID_NORM", "BAI_NORM", "RUA_BASE", "H3_INDEX"])
-
             self.df_lookup_vias = df_base.unique(subset=["CID_NORM", "BAI_NORM", "RUA_BASE"])
-
             df_prefix = df_base.with_columns(pl.col("RUA_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("RUA_PREFIX"))
             valid_p = df_prefix.group_by(["CID_NORM", "RUA_PREFIX"]).agg(pl.col("H3_INDEX").n_unique().alias("n")).filter(pl.col("n") == 1)
             self.df_lookup_prefix = df_prefix.join(valid_p.select(["CID_NORM", "RUA_PREFIX"]), on=["CID_NORM", "RUA_PREFIX"], how="inner").unique(subset=["CID_NORM", "RUA_PREFIX"])
-
             self.df_lookup_bairro = df_base.group_by(["CID_NORM", "BAI_NORM"]).agg(pl.col("H3_INDEX").mode().first().alias("H3_BAIRRO"))
-            
             logger.info(f"✅ Malha pronta. Vias: {self.df_lookup_vias.height} | Bairros: {self.df_lookup_bairro.height}")
         except Exception as e: logger.error(f"❌ Erro malha: {e}")
 
     def _resgatar_espacial(self, df: pl.DataFrame):
-        """Retorna o DataFrame e a Telemetria exata do funil 1-2-3."""
         if self.df_lookup_vias is None: 
             return df, {"p1_exato": 0, "p2_prefixo": 0, "p3_bairro": 0}
-        
         df = df.with_columns([
             pl.col("MUNICIPIO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("MUN_NORM"),
             pl.col("BAIRRO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("BAI_NORM"),
             pl.col("LOGRADOURO").map_elements(self._normalizar_logradouro, return_dtype=pl.Utf8).alias("LOG_BASE")
         ])
         df = df.with_columns(pl.col("LOG_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("LOG_PREFIX"))
-
-        # BaseLine - Quantos já tinham GPS
         count_init = df.filter(pl.col("H3_INDEX").is_not_null()).height
-
-        # CASCATA 1: Exato
         df = df.join(self.df_lookup_vias, left_on=["MUN_NORM", "BAI_NORM", "LOG_BASE"], right_on=["CID_NORM", "BAI_NORM", "RUA_BASE"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         count_p1 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p1 = count_p1 - count_init
-
-        # CASCATA 2: Prefixo
         df = df.join(self.df_lookup_prefix.select(["CID_NORM", "RUA_PREFIX", "H3_INDEX"]), left_on=["MUN_NORM", "LOG_PREFIX"], right_on=["CID_NORM", "RUA_PREFIX"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         count_p2 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p2 = count_p2 - count_p1
-
-        # CASCATA 3: Bairro
         df = df.join(self.df_lookup_bairro, left_on=["MUN_NORM", "BAI_NORM"], right_on=["CID_NORM", "BAI_NORM"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop("H3_BAIRRO")
         count_p3 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p3 = count_p3 - count_p2
-        
-        estatisticas = {
-            "p1_exato": resgatados_p1,
-            "p2_prefixo": resgatados_p2,
-            "p3_bairro": resgatados_p3
-        }
-
-        return df.drop(["MUN_NORM", "BAI_NORM", "LOG_BASE", "LOG_PREFIX"]), estatisticas
+        return df.drop(["MUN_NORM", "BAI_NORM", "LOG_BASE", "LOG_PREFIX"]), {"p1_exato": resgatados_p1, "p2_prefixo": resgatados_p2, "p3_bairro": resgatados_p3}
 
     def _limpar_e_tipar(self, df: pl.DataFrame, ano: int, tempo_inicio_ano: float) -> pl.DataFrame:
         total_entrada = df.height
         df = df.with_columns(pl.all().cast(pl.Utf8).fill_null("NAO INFORMADO"))
+        
+        # Fallback Data
+        df = df.with_columns([
+            pl.col("DATAOCORRENCIA").str.to_date(strict=False).alias("_dt_oc"),
+            pl.col("DATAREGISTRO").str.to_date(strict=False).alias("_dt_re")
+        ]).with_columns(pl.coalesce(["_dt_oc", "_dt_re"]).alias("DATAOCORRENCIA")).drop(["_dt_oc", "_dt_re"])
 
         # GPS Original
         df = df.with_columns([
@@ -175,29 +157,36 @@ class IngestorSafeDriver:
         )
         bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
 
-        # Resgate Espacial com Telemetria (A Magia Acontece Aqui)
+        # Resgate 1-2-3
         df, stats_resgate = self._resgatar_espacial(df)
 
-        # Tempo INCERTO
+        # Lógica Híbrida de Período (O que você pediu)
+        df = df.with_columns([
+            pl.col("HORAOCORRENCIA").str.extract(r"(\d{1,2})", 1).cast(pl.Int32, strict=False).alias("_hr_t"),
+            pl.col("PERIODO_NATIVO").str.to_uppercase().alias("_per_txt")
+        ])
         df = df.with_columns(
-            pl.col("HORAOCORRENCIA").str.extract(r"(\d{1,2})", 1).cast(pl.Int32, strict=False).alias("_hr_t")
-        ).with_columns(
-            pl.when(pl.col("_hr_t").is_between(0, 5)).then(pl.lit("MADRUGADA"))
-            .when(pl.col("_hr_t").is_between(6, 11)).then(pl.lit("MANHA"))
-            .when(pl.col("_hr_t").is_between(12, 17)).then(pl.lit("TARDE"))
-            .when(pl.col("_hr_t").is_between(18, 23)).then(pl.lit("NOITE"))
+            pl.when(pl.col("_hr_t").is_between(0, 5) | pl.col("_per_txt").str.contains("MADRUGADA"))
+            .then(pl.lit("MADRUGADA"))
+            .when(pl.col("_hr_t").is_between(6, 11) | pl.col("_per_txt").str.contains("MANH"))
+            .then(pl.lit("MANHA"))
+            .when(pl.col("_hr_t").is_between(12, 17) | pl.col("_per_txt").str.contains("TARDE"))
+            .then(pl.lit("TARDE"))
+            .when(pl.col("_hr_t").is_between(18, 23) | pl.col("_per_txt").str.contains("NOITE"))
+            .then(pl.lit("NOITE"))
             .otherwise(pl.lit("INCERTO")).alias("SAZON_PERIODO")
         )
 
         df_trusted = df.filter(pl.col("H3_INDEX").is_not_null()).with_columns([
-            pl.col("DATAOCORRENCIA").str.to_date(strict=False).alias("DATAOCORRENCIA"),
             pl.col("_lat_f").cast(pl.Float64, strict=False).alias("LATITUDE"),
             pl.col("_lon_f").cast(pl.Float64, strict=False).alias("LONGITUDE")
-        ]).drop(["_lat_f", "_lon_f", "_hr_t"])
+        ]).drop(["_lat_f", "_lon_f", "_hr_t", "_per_txt"])
 
-        tempo_execucao = round(time.time() - tempo_inicio_ano, 2)
-        total_resgatado = stats_resgate["p1_exato"] + stats_resgate["p2_prefixo"] + stats_resgate["p3_bairro"]
+        # Contagem por Período para a Auditoria
+        contagem_periodo = df_trusted.group_by("SAZON_PERIODO").len().to_dicts()
+        dict_periodos = {d["SAZON_PERIODO"]: d["len"] for d in contagem_periodo}
 
+        tempo_exec = round(time.time() - tempo_inicio_ano, 2)
         self.audit_stats.append({
             "ano_referencia": int(ano),
             "telemetria_funil": {
@@ -206,11 +195,11 @@ class IngestorSafeDriver:
                 "3_resgatados_passo1_rua_exata": stats_resgate["p1_exato"],
                 "4_resgatados_passo2_rua_prefixo": stats_resgate["p2_prefixo"],
                 "5_resgatados_passo3_centroide_bairro": stats_resgate["p3_bairro"],
-                "6_total_salvo_pela_malha": total_resgatado,
-                "7_descartados_sem_geografia": total_entrada - df_trusted.height,
+                "6_total_salvo_pela_malha": sum(stats_resgate.values()),
                 "8_total_final_trusted": df_trusted.height
             },
-            "performance_segundos": tempo_execucao
+            "contagem_por_periodo": dict_periodos,
+            "performance_segundos": tempo_exec
         })
         return df_trusted
 
@@ -247,7 +236,6 @@ class IngestorSafeDriver:
             excel_bytes = obj['Body'].read()
             excel_reader = fastexcel.read_excel(excel_bytes)
             abas = [n for n in excel_reader.sheet_names if not any(x in n.upper() for x in ["CAPA", "DICIONARIO", "LEGENDA", "CAMPOS", "SPDADOS"])]
-            
             list_dfs = []
             for nome_aba in abas:
                 try:
@@ -264,7 +252,6 @@ class IngestorSafeDriver:
                     df_m.columns = [indices_map[i] for i in indices_map.keys()]
                     list_dfs.append(df_m)
                 except: continue
-
             if list_dfs:
                 df_final = pl.concat(list_dfs, how="diagonal")
                 df_final = self._limpar_e_tipar(df_final, ano, tempo_inicio_ano)
@@ -277,35 +264,31 @@ class IngestorSafeDriver:
 
     def finalizar_ciclo_auditoria(self):
         if not self.audit_stats: return
+        t_raw, t_gps, t_salvos, t_fin = 0, 0, 0, 0
+        p_mad, p_man, p_tar, p_noi, p_inc = 0, 0, 0, 0, 0
         
-        t_raw, t_gps, t_p1, t_p2, t_p3, t_fin = 0, 0, 0, 0, 0, 0
         for s in self.audit_stats:
             f = s["telemetria_funil"]
-            t_raw += f["1_total_bruto_ssp"]
-            t_gps += f["2_com_coordenadas_validas"]
-            t_p1 += f["3_resgatados_passo1_rua_exata"]
-            t_p2 += f["4_resgatados_passo2_rua_prefixo"]
-            t_p3 += f["5_resgatados_passo3_centroide_bairro"]
-            t_fin += f["8_total_final_trusted"]
+            t_raw += f["1_total_bruto_ssp"]; t_gps += f["2_com_coordenadas_validas"]
+            t_salvos += f["6_total_salvo_pela_malha"]; t_fin += f["8_total_final_trusted"]
+            
+            cp = s["contagem_por_periodo"]
+            p_mad += cp.get("MADRUGADA", 0); p_man += cp.get("MANHA", 0)
+            p_tar += cp.get("TARDE", 0); p_noi += cp.get("NOITE", 0); p_inc += cp.get("INCERTO", 0)
 
-        msg = "📊 **[SafeDriver] Deep Audit de Resgate de Crimes**\n```ml\n"
-        msg += f"• Total SSP Bruto: {t_raw}\n"
-        msg += f"• GPS Original   : {t_gps}\n"
-        msg += f"• Salvos (Passo1): {t_p1} (Exato)\n"
-        msg += f"• Salvos (Passo2): {t_p2} (Prefixo)\n"
-        msg += f"• Salvos (Passo3): {t_p3} (Bairro)\n"
-        msg += f"-------------------------\n"
-        msg += f"• Total TRUSTED  : {t_fin} ({(t_fin/t_raw*100) if t_raw > 0 else 0:.1f}%)\n```"
+        msg = "📊 **[SafeDriver] Relatório Consolidado de Crimes**\n```ml\n"
+        msg += f"• Total SSP Bruto: {t_raw}\n• GPS Original   : {t_gps}\n• Salvos Malha   : {t_salvos}\n"
+        msg += f"• Total TRUSTED  : {t_fin} ({(t_fin/t_raw*100) if t_raw > 0 else 0:.1f}%)\n"
+        msg += "-----------------------------------\n"
+        msg += "BREAKDOWN POR PERÍODO (Trusted):\n"
+        msg += f"• MADRUGADA : {p_mad}\n• MANHA     : {p_man}\n• TARDE     : {p_tar}\n• NOITE     : {p_noi}\n• INCERTO   : {p_inc}\n```"
         
         if self.config.WEBHOOK_DISCORD: 
-            requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg})
+            try: requests.post(self.config.WEBHOOK_DISCORD, json={"content": msg})
+            except: pass
         
-        audit_json = {
-            "projeto": "SafeDriver - Telemetria Avançada", 
-            "data_processamento": str(datetime.now()), 
-            "anos_processados": self.audit_stats
-        }
-        self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES_DEEP.json", Body=json.dumps(audit_json, indent=4).encode())
+        audit_json = {"projeto": "SafeDriver", "data_processamento": str(datetime.now()), "stats_anuais": self.audit_stats}
+        self.s3.put_object(Bucket=self.config.NOME_BUCKET, Key="datalake/prata/auditoria/AUDITORIA_QUALIDADE_CRIMES_PERIODOS.json", Body=json.dumps(audit_json, indent=4).encode())
 
 if __name__ == "__main__":
     ingestor = IngestorSafeDriver()
@@ -313,5 +296,4 @@ if __name__ == "__main__":
     for ano in range(2022, ingestor.ano_atual + 1):
         if modo in ["bronze", "tudo"]: ingestor.extrair_bronze(ano)
         if modo in ["prata", "tudo"]: ingestor.processar_prata(ano)
-    if modo in ["prata", "tudo"]:
-        ingestor.finalizar_ciclo_auditoria()
+    if modo in ["prata", "tudo"]: ingestor.finalizar_ciclo_auditoria()
