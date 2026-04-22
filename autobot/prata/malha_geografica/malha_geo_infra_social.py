@@ -60,8 +60,8 @@ class ArquitetoSafeDriverPrata:
             except: pass
 
     def _normalizar_texto(self, valor):
-        if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE"]: 
-            return "NAO INFORMADO"
+        if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE", "NAO INFORMADO"]: 
+            return "DESCONHECIDO"
         texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
         return re.sub(r'[^a-zA-Z0-9\s]', '', texto).upper().strip()
 
@@ -73,10 +73,8 @@ class ArquitetoSafeDriverPrata:
         return arqs[0]
 
     def _ler_csv_agnostico(self, filepath):
-        """Leitor cego: Descobre encoding e delimitador sozinho antes de ler."""
+        """Leitor cego: Descobre encoding e delimitador sozinho."""
         print(f"🔍 Auto-detetando formato do CSV: {filepath}", flush=True)
-        
-        # 1. Descobrir Encoding
         encodings_to_try = ['utf-8', 'iso-8859-1', 'cp1252', 'latin1']
         used_enc = 'utf-8'
         sample_text = ""
@@ -89,24 +87,19 @@ class ArquitetoSafeDriverPrata:
             except Exception:
                 continue
                 
-        # 2. Descobrir Delimitador via Sniffer Estatístico
         try:
             sep = csv.Sniffer().sniff(sample_text).delimiter
         except Exception:
-            # Fallback seguro caso o sniffer falhe
             sep = ';' if sample_text.count(';') > sample_text.count(',') else ','
             
         print(f"✅ Identificado -> Encoding: {used_enc} | Separador: '{sep}'", flush=True)
-        
-        # O Polars usa internamente 'utf8' ou 'iso-8859-1'
         pl_encoding = 'utf8' if used_enc == 'utf-8' else 'iso-8859-1'
-        
-        # infer_schema_length=0 FORÇA que tudo seja lido como String (blindando o CD_SETOR)
         return pl.read_csv(filepath, separator=sep, encoding=pl_encoding, infer_schema_length=0, ignore_errors=True)
 
     def download_r2(self):
         print("📥 Sincronizando Bronze do R2...", flush=True)
-        targets = ["SP_Faces_2022.zip", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
+        # ATENÇÃO: SP_Bairros_2022.zip deve estar no R2
+        targets = ["SP_Faces_2022.zip", "SP_Bairros_2022", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
             for obj in p.get('Contents', []):
@@ -120,29 +113,29 @@ class ArquitetoSafeDriverPrata:
 
     def processar(self):
         tempo_inicio = time.time()
-        print("🚀 Iniciando Processamento da Malha Híbrida Hierárquica...", flush=True)
+        print("🚀 Iniciando Processamento da Malha Híbrida (Spatial + Relacional)...", flush=True)
         try:
-            # 1. REFERÊNCIA SOCIAL (Agora 100% Agnóstico)
-            print("--- Lendo Censo (Referência de Nomes) ---")
+            # ==========================================================
+            # 1. REFERÊNCIA SOCIAL (Lemos o CSV e convertemos v0001 e v0002 para Float)
+            # ==========================================================
+            print("--- Lendo Censo (Referência Social) ---")
             csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
-            
             df_social_raw = self._ler_csv_agnostico(csv_f)
             
-            df_ref_nomes = df_social_raw.select([
+            df_social = df_social_raw.select([
                 pl.col("CD_SETOR").str.strip_chars(),
-                pl.col("NM_MUN").alias("CIDADE"),
-                pl.col("NM_BAIRRO").alias("BAIRRO")
-            ]).with_columns([
-                pl.col("CIDADE").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
-                pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
+                pl.col("v0001").str.replace(",", ".").cast(pl.Float64, strict=False).alias("VAR_SOC_01"),
+                pl.col("v0002").str.replace(",", ".").cast(pl.Float64, strict=False).alias("VAR_SOC_02")
             ])
-            total_censo = df_social_raw.height
+            total_censo = df_social.height
 
-            # 2. GEOMETRIAS (IBGE Faces)
-            print("--- Extraindo e Processando Geometrias (Batch Mode) ---")
+            # ==========================================================
+            # 2. GEOMETRIAS (IBGE Faces) - Extraindo Ruas E a ponte CD_SETOR
+            # ==========================================================
+            print("--- Extraindo Geometrias e Setores (Faces) ---")
             zip_f = self._buscar_arquivo_flexivel("SP_Faces_2022.zip")
-            
             list_vias_df = []
+            
             with zipfile.ZipFile(zip_f, 'r') as z:
                 json_files = [f for f in z.namelist() if f.endswith('.json')]
                 batch_size = 50 
@@ -163,46 +156,85 @@ class ArquitetoSafeDriverPrata:
                     
                     df_batch = self.con.execute(" UNION ALL ".join(sqls)).pl()
                     list_vias_df.append(df_batch)
-                    
                     for f_json in batch:
                         try: os.remove(os.path.join(self.temp_extract_dir, f_json))
                         except: pass
-                    print(f"   -> Progresso: {min(i + batch_size, len(json_files))}/{len(json_files)} arquivos", flush=True)
+                    print(f"   -> Progresso: {min(i + batch_size, len(json_files))}/{len(json_files)}", flush=True)
 
-            df_faces = pl.concat(list_vias_df)
-            total_faces = df_faces.height
+            df_ruas = pl.concat(list_vias_df)
+            total_faces = df_ruas.height
             
-            print("--- Consolidando Hierarquia e H3 ---")
-            df_vias_completo = df_faces.join(df_ref_nomes, on="CD_SETOR", how="left").with_columns([
-                pl.col("CIDADE").fill_null("NAO INFORMADO"),
-                pl.col("BAIRRO").fill_null("NAO INFORMADO"),
-                pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
+            # Indexação H3 para cada Rua
+            df_ruas = df_ruas.with_columns(
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
+            )
+
+            # ==========================================================
+            # 3. SPATIAL JOIN (A Matemática dos Bairros)
+            # ==========================================================
+            print("--- Executando Spatial Join (H3 vs Polígonos de Bairros) ---")
+            df_h3_centers = df_ruas.group_by("H3_INDEX").agg([pl.col("LAT").first(), pl.col("LON").first()])
+            self.con.register("tabela_h3", df_h3_centers.to_arrow())
+            
+            # Extrair Shapefile de Bairros
+            zip_bairros = self._buscar_arquivo_flexivel("SP_Bairros_2022*.zip")
+            bairros_dir = os.path.join(self.temp_extract_dir, "bairros_shp")
+            os.makedirs(bairros_dir, exist_ok=True)
+            with zipfile.ZipFile(zip_bairros, 'r') as z: z.extractall(bairros_dir)
+            arq_poligonos = glob.glob(f"{bairros_dir}/**/*.shp", recursive=True)[0].replace("\\", "/")
+            
+            query_espacial = f"""
+                SELECT 
+                    h3.H3_INDEX,
+                    COALESCE(ibge.NM_MUN, 'DESCONHECIDO') AS CIDADE,
+                    COALESCE(ibge.NM_BAIRRO, 'DESCONHECIDO') AS BAIRRO
+                FROM tabela_h3 h3
+                LEFT JOIN ST_Read('{arq_poligonos}') ibge
+                ON ST_Contains(ibge.geom, ST_Point(h3.LON, h3.LAT))
+            """
+            df_h3_mapeado = self.con.execute(query_espacial).pl()
+
+            # Limpeza fina dos Nomes Oficiais
+            df_h3_mapeado = df_h3_mapeado.with_columns([
+                pl.col("CIDADE").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
+                pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
             ])
 
-            # Métricas de Qualidade
-            faces_sem_cidade = df_vias_completo.filter(pl.col("CIDADE") == "NAO INFORMADO").height
-            faces_sem_bairro = df_vias_completo.filter(pl.col("BAIRRO") == "NAO INFORMADO").height
-            h3_unicos = df_vias_completo.select("H3_INDEX").n_unique()
+            # Junta Bairro Matemático na Base de Ruas
+            df_ruas_completo = df_ruas.join(df_h3_mapeado, on="H3_INDEX", how="left").with_columns(
+                pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
+            )
 
-            # Exportação 1: Hierarquia
+            # ==========================================================
+            # 4. A PONTE SOCIAL (Ligando o CSV ao H3 via CD_SETOR)
+            # ==========================================================
+            print("--- Agregando Dados Sociais por H3 ---")
+            # Juntamos as variáveis do Censo (v0001, v0002) usando o CD_SETOR que veio das Faces!
+            df_ruas_social = df_ruas_completo.join(df_social, on="CD_SETOR", how="left")
+            
+            # Exportação: A tabela que vai alimentar a Inteligência Artificial
+            df_social_h3 = df_ruas_social.group_by("H3_INDEX").agg([
+                pl.sum("TOT_RES").fill_null(0).alias("MICRO_POPULACAO_FACES"),
+                pl.mean("VAR_SOC_01").fill_null(0).alias("CENSO_MEDIA_V0001"),
+                pl.mean("VAR_SOC_02").fill_null(0).alias("CENSO_MEDIA_V0002")
+            ])
+            df_social_h3.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet", compression="zstd")
+
+            # ==========================================================
+            # 5. CONSOLIDAÇÃO PARA O DASHBOARD (Ruas, Cidades e Bairros)
+            # ==========================================================
+            print("--- Consolidando Hierarquia Geográfica ---")
             df_hierarquico = (
-                df_vias_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST"))
+                df_ruas_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST"))
                 .group_by(["CIDADE", "BAIRRO"]).agg(pl.struct([pl.col("RUA"), pl.col("H3_LIST")]).alias("LOGRADOUROS"))
                 .group_by("CIDADE").agg(pl.struct([pl.col("BAIRRO"), pl.col("LOGRADOUROS")]).alias("BAIRROS"))
             )
             df_hierarquico.write_parquet(f"{self.prata_dir}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet", compression="zstd")
 
-            # Exportação 2: Micro-População
-            df_micro = df_vias_completo.group_by("H3_INDEX").agg(pl.sum("TOT_RES").alias("MICRO_POPULACAO_H3"))
-            df_micro.write_parquet(f"{self.prata_dir}/PRATA_MALHA_MICRO_POPULACAO.parquet")
-
-            # Exportação 3: Social
-            df_social_raw.select([pl.col("CD_SETOR").cast(pl.Utf8), "NM_MUN", "NM_BAIRRO", "v0001", "v0002"]) \
-                .write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL.parquet")
-
-            # 4. INFRAESTRUTURA
-            print("--- Processando Infraestrutura (Streaming Mode) ---")
+            # ==========================================================
+            # 6. INFRAESTRUTURA URBANA (CNAEs com Bairros Reais)
+            # ==========================================================
+            print("--- Processando Infraestrutura Urbana (CNAEs) ---")
             pqs_infra = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             total_cnpjs = 0
             df_pivot_height = 0
@@ -217,28 +249,33 @@ class ArquitetoSafeDriverPrata:
                 df_infra_h3 = df_infra.with_columns(pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s])).alias("H3_INDEX"))
                 df_pivot = df_infra_h3.group_by(["H3_INDEX", "CNAE_DIV"]).agg(pl.sum("len").alias("TOTAL")).pivot(values="TOTAL", index="H3_INDEX", on="CNAE_DIV").fill_null(0)
                 df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
-                df_pivot.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
-                df_pivot_height = df_pivot.height
+                
+                # Anexar a Cidade e o Bairro oficial à Infraestrutura para o Dashboard
+                mapa_oficial = df_h3_mapeado.select(["H3_INDEX", "CIDADE", "BAIRRO"]).unique(subset=["H3_INDEX"])
+                df_infra_hierarquica = df_pivot.join(mapa_oficial, on="H3_INDEX", how="left").with_columns([
+                    pl.col("CIDADE").fill_null("DESCONHECIDO"), pl.col("BAIRRO").fill_null("DESCONHECIDO")
+                ])
+                
+                cols_ordem = ["CIDADE", "BAIRRO", "H3_INDEX"] + [c for c in df_infra_hierarquica.columns if c.startswith("INFRA_")]
+                df_infra_hierarquica = df_infra_hierarquica.select(cols_ordem)
+                df_infra_hierarquica.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
+                df_pivot_height = df_infra_hierarquica.height
 
-            # --- POPULANDO A AUDITORIA ---
+            # ==========================================================
+            # 7. TELEMETRIA E AUDITORIA
+            # ==========================================================
             tempo_exec = round(time.time() - tempo_inicio, 2)
+            sucesso_bairros = df_h3_mapeado.filter(pl.col("BAIRRO") != "DESCONHECIDO").height
+            taxa_sucesso = round((sucesso_bairros / df_h3_mapeado.height) * 100, 2) if df_h3_mapeado.height > 0 else 0
+
             self.auditoria["status_pipeline"] = "SUCESSO"
             self.auditoria["telemetria"] = {
-                "processamento": {
-                    "tempo_total_segundos": tempo_exec,
-                    "resolucao_h3_utilizada": self.H3_RES
-                },
-                "censo_ibge": {
-                    "setores_lidos_csv": total_censo
-                },
-                "geometrias_faces": {
-                    "poligonos_extraidos": total_faces,
-                    "h3_unicos_gerados": h3_unicos
-                },
-                "saude_do_join_espacial": {
-                    "faces_com_cidade_invalida": faces_sem_cidade,
-                    "faces_com_bairro_invalido": faces_sem_bairro,
-                    "taxa_sucesso_relacionamento_pct": round(((total_faces - faces_sem_bairro) / total_faces) * 100, 2) if total_faces > 0 else 0
+                "processamento": {"tempo_total_segundos": tempo_exec},
+                "censo_ibge": {"setores_lidos_csv": total_censo},
+                "saude_espacial_spatial_join": {
+                    "h3_unicos_mapeados": df_h3_mapeado.height,
+                    "h3_com_bairro_matematicamente_confirmado": sucesso_bairros,
+                    "taxa_precisao_bairros_pct": taxa_sucesso
                 },
                 "infraestrutura_urbana": {
                     "cnpjs_agregados": total_cnpjs,
@@ -246,19 +283,18 @@ class ArquitetoSafeDriverPrata:
                 },
                 "tabelas_exportadas_linhas": {
                     "PRATA_MALHA_GEOGRAFICA_VIAS": df_hierarquico.height,
-                    "PRATA_MALHA_MICRO_POPULACAO": df_micro.height,
+                    "PRATA_MALHA_SOCIAL_H3": df_social_h3.height,
                     "PRATA_MALHA_INFRA_AGREGADA": df_pivot_height
                 }
             }
 
-            print("✨ Pipeline Prata concluído com sucesso!")
+            print("✨ Pipeline Prata da Malha concluído com sucesso!")
             
-            # Notificação no Discord
-            msg = "🗺️ **[SafeDriver] Malha Geográfica Prata Atualizada**\n```ml\n"
-            msg += f"• H3 Únicos Gerados: {h3_unicos}\n"
-            msg += f"• Taxa Sucesso IBGE : {self.auditoria['telemetria']['saude_do_join_espacial']['taxa_sucesso_relacionamento_pct']}%\n"
-            msg += f"• CNPJs Mapeados   : {total_cnpjs}\n"
-            msg += f"• Tempo Execução   : {tempo_exec}s\n```"
+            msg = "🗺️ **[SafeDriver] Malha Prata (Spatial + Relacional)**\n```ml\n"
+            msg += f"• H3 Únicos Mapeados : {df_h3_mapeado.height}\n"
+            msg += f"• Precisão do IBGE   : {taxa_sucesso}%\n"
+            msg += f"• CNPJs Processados  : {total_cnpjs}\n"
+            msg += f"• Tempo Execução     : {tempo_exec}s\n```"
             self._notificar_discord(msg)
             
         except Exception as e:
