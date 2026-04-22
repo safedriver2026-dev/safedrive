@@ -78,22 +78,23 @@ class TreinadorSafeDriver:
             pdf_test[col] = pdf_test[col].astype(str)
 
         # 5. CONFIGURAÇÃO DO MODELO COM FUNÇÃO TWEEDIE
-        # variance_power=1.5 é o equilíbrio entre Poisson (frequência) e Gamma (severidade)
         print("🧠 Treinando CatBoost com Tweedie Loss (variance_power=1.5)...")
         train_pool = Pool(pdf_train[cols_features], pdf_train[target], cat_features=cat_features)
         test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
 
         modelo = CatBoostRegressor(
-            iterations=2500,           # Tweedie costuma precisar de mais iterações para convergir
-            learning_rate=0.02,        # LR levemente reduzida para estabilidade
+            iterations=2500,           
+            learning_rate=0.02,        
             depth=6,
             l2_leaf_reg=7,
             
+            # Loss function matemática otimizada para risco/severidade
             loss_function='Tweedie:variance_power=1.5', 
-            eval_metric='Tweedie',
+            # Mudança crucial: Avaliação visual humana e early stopping via MAE
+            eval_metric='MAE',
             
             od_type='Iter',
-            od_wait=150,               # Mais paciência para o Tweedie estabilizar
+            od_wait=150,               
             use_best_model=True,
             
             random_strength=1,
@@ -121,7 +122,6 @@ class TreinadorSafeDriver:
 
         # 7. MÉTRICAS E PERFORMANCE
         y_pred = modelo.predict(pdf_test[cols_features])
-        # Nota: MAE ainda é útil para interpretação humana do desvio de severidade
         mae = mean_absolute_error(pdf_test[target], y_pred)
         r2 = r2_score(pdf_test[target], y_pred)
         duracao = time.time() - inicio_processo
