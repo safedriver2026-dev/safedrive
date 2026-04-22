@@ -6,9 +6,11 @@ import pandas as pd
 import requests
 import time
 import shap
+import json
+import numpy as np
 from catboost import CatBoostRegressor, Pool
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, d2_tweedie_score
+from sklearn.metrics import mean_absolute_error, r2_score
 from botocore.config import Config
 
 class TreinadorSafeDriver:
@@ -26,93 +28,120 @@ class TreinadorSafeDriver:
         )
 
         self.webhook_url = os.getenv("DISCORD_SUCESSO")
-        self.caminho_abt = "datalake/ouro/safedriver_abt_eventos.parquet"
+        self.caminho_abt = "datalake/ouro/safedriver_abt_treino.parquet"
         self.modelo_local = "modelo_safedriver_catboost.cbm"
 
     def _notificar_discord(self, msg):
         if self.webhook_url:
-            requests.post(self.webhook_url, json={"content": msg})
+            try: requests.post(self.webhook_url, json={"content": msg})
+            except: pass
 
     def executar_treino(self):
         inicio_processo = time.time()
+        print(f"🚀 Iniciando Treino com a ABT Ouro: {self.caminho_abt}", flush=True)
         
+        # 1. CARREGAMENTO DOS DADOS
         obj = self.s3.get_object(Bucket=self.bucket, Key=self.caminho_abt)
         df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
-
-        colunas_agrupamento = ["H3_INDEX", "SAZON_DIA_SEMANA", "SAZON_HORA", "SAZON_MES", "SAZON_PONTO_FACULTATIVO"]
-        cols_meta = [c for c in df.columns if c.startswith("META_") or c.startswith("INFRA_DIV_") or c == "MICRO_POPULACAO_H3"]
         
-        df_treino = df.group_by(colunas_agrupamento).agg([
-            pl.len().alias("TARGET_CONTAGEM"),
-            pl.col("META_PESO_GRAVIDADE").mean().alias("PESO_AMOSTRA"),
-            *[pl.col(c).mean() for c in cols_meta]
-        ])
+        # 2. SELEÇÃO DE FEATURES (Automática baseada nos prefixos da Ouro)
+        # Selecionamos tudo o que é variável preditiva
+        cols_features = [c for c in df.columns if any(c.startswith(pre) for pre in ["FEAT_", "INFRA_", "CENSO_", "MICRO_", "SAZON_"])]
+        # Adicionamos o H3 como categoria principal
+        cols_features.append("H3_INDEX")
+        
+        target = "LABEL_PESO_RISCO"
+        
+        print(f"📊 Features identificadas: {len(cols_features)} | Registros: {df.height}")
 
-        pdf = df_treino.to_pandas()
-        cat_features = ["H3_INDEX", "SAZON_DIA_SEMANA", "SAZON_HORA", "SAZON_MES", "SAZON_PONTO_FACULTATIVO"]
+        # 3. PREPARAÇÃO PARA PANDAS (CatBoost prefere para o Pool de categorias)
+        pdf = df.select(cols_features + [target]).to_pandas()
+        
+        # Definimos quais colunas são categóricas
+        cat_features = ["H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES"]
+        cat_features = [c for c in cat_features if c in pdf.columns]
+        
         for col in cat_features:
             pdf[col] = pdf[col].astype(str)
 
-        X = pdf.drop(["TARGET_CONTAGEM", "PESO_AMOSTRA"], axis=1)
-        y = pdf["TARGET_CONTAGEM"]
-        w = pdf["PESO_AMOSTRA"]
+        # 4. SPLIT TREINO/TESTE
+        X = pdf[cols_features]
+        y = pdf[target]
 
-        X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(X, y, w, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, random_state=42)
 
-        train_pool = Pool(X_train, y_train, weight=w_train, cat_features=cat_features)
-        test_pool = Pool(X_test, y_test, weight=w_test, cat_features=cat_features)
+        # 5. TREINAMENTO (Otimizado para Regressão de Severidade)
+        train_pool = Pool(X_train, y_train, cat_features=cat_features)
+        test_pool = Pool(X_test, y_test, cat_features=cat_features)
 
         modelo = CatBoostRegressor(
-            iterations=1000,
-            learning_rate=0.05,
-            loss_function='Tweedie:variance_power=1.5',
-            eval_metric='Tweedie',
-            early_stopping_rounds=50,
+            iterations=1500,
+            learning_rate=0.03,
+            depth=8,
+            loss_function='RMSE', # Root Mean Squared Error para penalizar grandes erros de gravidade
+            od_type='Iter',
+            od_wait=50,
             random_seed=42,
-            verbose=False
+            verbose=100
         )
 
+        print("🧠 Treinando motor CatBoost...")
         modelo.fit(train_pool, eval_set=test_pool, use_best_model=True)
+        
         duracao = time.time() - inicio_processo
 
-        # --- MOTOR DE EXPLICABILIDADE (SHAP) ---
-        print("Calculando valores SHAP para interpretabilidade...", flush=True)
+        # 6. EXPLICABILIDADE (SHAP) - O que está a causar o crime?
+        print("🔍 Calculando interpretação SHAP (Amostra de 5k)...", flush=True)
+        # Usamos uma amostra para o SHAP não demorar horas no GitHub Actions
         explainer = shap.TreeExplainer(modelo)
-        shap_values = explainer.shap_values(X_test)
+        sample_test = X_test.sample(min(5000, len(X_test)))
+        shap_values = explainer.shap_values(sample_test)
         
-        # Calculamos o impacto médio de cada feature (Global SHAP)
+        # Impacto Médio Global
         shap_importance = pd.DataFrame({
             'feature': X.columns,
-            'impacto_medio': shap.np.abs(shap_values).mean(0)
+            'impacto_medio': np.abs(shap_values).mean(0)
         }).sort_values(by='impacto_medio', ascending=False)
 
-        top_shap = "\n".join([f"• {row['feature']}: {row['impacto_medio']:.4f}" for _, row in shap_importance.head(5).iterrows()])
+        top_5_features = shap_importance.head(5)
+        resumo_shap = "\n".join([f"• {row['feature']}: {row['impacto_medio']:.4f}" for _, row in top_5_features.iterrows()])
 
-        # Métricas
+        # 7. MÉTRICAS DE PERFORMANCE
         y_pred = modelo.predict(X_test)
         mae = mean_absolute_error(y_test, y_pred)
-        tweedie_d2 = d2_tweedie_score(y_test, y_pred, power=1.5)
+        r2 = r2_score(y_test, y_pred)
 
+        # 8. RELATÓRIO E NOTIFICAÇÃO
         report_msg = (
-            f"🧠 **[SafeDriver] IA Explicável (XAI) Ativada**\n"
+            f"🤖 **[SafeDriver] Modelo de Risco Treinado**\n"
             f"```ml\n"
-            f"MÉTRICAS:\n"
-            f"• Tweedie D² Score: {tweedie_d2:.4f}\n"
-            f"• MAE: {mae:.4f}\n"
+            f"DESEMPENHO:\n"
+            f"• R² Score: {r2:.4f}\n"
+            f"• Erro Médio (MAE): {mae:.4f}\n"
             f"-------------------------------------\n"
-            f"CONTRIBUIÇÃO SHAP (O que define o risco):\n"
-            f"{top_shap}\n"
+            f"DRIVERS DE RISCO (SHAP):\n"
+            f"{resumo_shap}\n"
             f"-------------------------------------\n"
-            f"Tempo: {duracao:.2f}s | Registros: {len(pdf)}\n"
+            f"Tempo: {duracao:.2f}s | Linhas: {len(pdf)}\n"
+            f"Status: MODELO ATUALIZADO NO R2\n"
             f"```"
         )
 
         print(report_msg)
         self._notificar_discord(report_msg)
 
+        # 9. SALVAMENTO E UPLOAD
         modelo.save_model(self.modelo_local)
         with open(self.modelo_local, "rb") as f:
             self.s3.put_object(Bucket=self.bucket, Key=f"modelos/{self.modelo_local}", Body=f.read())
+        
+        # Salva também a importância SHAP como JSON para o dashboard
+        shap_dict = shap_importance.to_dict(orient='records')
+        self.s3.put_object(
+            Bucket=self.bucket, 
+            Key="modelos/explicabilidade_shap.json", 
+            Body=json.dumps(shap_dict, indent=4).encode()
+        )
 
 if __name__ == "__main__":
     trainer = TreinadorSafeDriver()
