@@ -115,8 +115,8 @@ class ArquitetoSafeDriverPrata:
         print("✅ Bronze carregada localmente.")
 
     def upload_r2(self):
-        """Faz o upload de todos os arquivos da pasta Prata para o bucket R2"""
-        print("📤 Enviando arquivos Prata para o R2...", flush=True)
+        """Faz o upload de todos os arquivos da pasta Prata para o bucket R2 na nova hierarquia"""
+        print("📤 Enviando arquivos da Malha Prata para o R2...", flush=True)
         arquivos_prata = glob.glob(f"{self.prata_dir}/*")
         
         if not arquivos_prata:
@@ -125,8 +125,9 @@ class ArquitetoSafeDriverPrata:
 
         for filepath in arquivos_prata:
             filename = os.path.basename(filepath)
-            s3_key = f"prata/{filename}" # Salva dentro da pasta 'prata' no seu bucket
-            print(f"   -> Subindo: {filename} ...", flush=True)
+            # PADRONIZAÇÃO DO DATA LAKE APLICADA AQUI:
+            s3_key = f"datalake/prata/malha_trusted/{filename}"
+            print(f"   -> Subindo: {filename} para {s3_key}...", flush=True)
             try:
                 self.s3.upload_file(filepath, self.bucket, s3_key)
             except Exception as e:
@@ -148,10 +149,15 @@ class ArquitetoSafeDriverPrata:
             df_censo_raw = df_censo_raw.rename({c: c.strip().upper() for c in df_censo_raw.columns})
             cols = df_censo_raw.columns
 
-            if "NM_BAIRRO" in cols: bairro_expr = pl.col("NM_BAIRRO")
-            elif "NM_SUBDIST" in cols: bairro_expr = pl.col("NM_SUBDIST")
-            elif "NM_DISTR" in cols: bairro_expr = pl.col("NM_DISTR")
-            else: bairro_expr = pl.lit("DESCONHECIDO")
+            colunas_localidade = [c for c in ["NM_BAIRRO", "NM_SUBDIST", "NM_DISTR"] if c in cols]
+            
+            if colunas_localidade:
+                bairro_expr = pl.coalesce([
+                    pl.when(pl.col(c).cast(pl.Utf8).str.strip_chars() == "").then(None).otherwise(pl.col(c)) 
+                    for c in colunas_localidade
+                ]).fill_null("DESCONHECIDO")
+            else:
+                bairro_expr = pl.lit("DESCONHECIDO")
 
             df_censo = df_censo_raw.select([
                 self._limpar_cd_setor("CD_SETOR").alias("CD_SETOR"),
@@ -282,10 +288,10 @@ class ArquitetoSafeDriverPrata:
             }
             
             # Salva auditoria localmente
-            with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f:
+            with open(f"{self.prata_dir}/AUDITORIA_PRATA_MALHA.json", "w") as f:
                 json.dump(self.auditoria, f, indent=4)
 
-            # ✨ NOVO: Faz o Upload de tudo para o R2 antes de finalizar
+            # ✨ Upload de tudo para o R2 com a nova hierarquia
             self.upload_r2()
 
             msg = (
@@ -294,7 +300,7 @@ class ArquitetoSafeDriverPrata:
                 f"- Cobertura Bairros: {taxa_sucesso_geral}%\n"
                 f"- Join Dados Censo (População/Renda): {taxa_join_censo}%\n"
                 f"- H3 Gerados: {total_h3}\n"
-                f"☁️ Arquivos sincronizados com sucesso no R2!"
+                f"☁️ Arquivos sincronizados em `datalake/prata/malha_trusted/` no R2!"
             )
             print(f"\n✨ {msg}")
             self._notificar_discord(msg)
@@ -311,5 +317,5 @@ class ArquitetoSafeDriverPrata:
 
 if __name__ == "__main__":
     arquiteto = ArquitetoSafeDriverPrata()
-    arquiteto.download_r2()
+    # arquiteto.download_r2()
     arquiteto.processar()
