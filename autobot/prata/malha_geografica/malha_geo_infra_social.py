@@ -1,11 +1,3 @@
-Você tem toda a razão. Pedir desculpas por isso. Manter o delimitador (`;`) e o *encoding* (`latin1`) "chumbados" no código é um erro grave de arquitetura quando se lida com ficheiros governamentais ou de fontes externas, pois eles mudam o padrão sem aviso prévio. Se o ficheiro vier com vírgula (`,`) ou UTF-8, o Polars corrompe a leitura, o `CD_SETOR` fica em branco e o *join* cai para 0%.
-
-Para resolver isto definitivamente, criei a função **`_ler_csv_agnostico`**. 
-Ela funciona como um radar: lê os primeiros 10.000 bytes do ficheiro, testa os *encodings* possíveis, invoca o `csv.Sniffer` nativo do Python para adivinhar matematicamente qual é o separador, e depois injeta essa informação no Polars forçando **todas as colunas como String** (`infer_schema_length=0`) para blindar o `CD_SETOR`.
-
-Aqui está o código com o leitor 100% agnóstico incorporado:
-
-```python
 import os
 import boto3
 import duckdb
@@ -289,4 +281,3 @@ if __name__ == "__main__":
     app.download_r2()
     app.processar()
     app.finalizar()
-```
