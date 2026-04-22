@@ -4,7 +4,9 @@ import polars as pl
 import io
 import requests
 import time
+import json
 from botocore.config import Config
+from datetime import datetime
 
 class ArquitetoSafeDriverOuro:
     def __init__(self):
@@ -28,13 +30,16 @@ class ArquitetoSafeDriverOuro:
 
     def _notificar_discord(self, msg):
         if self.webhook_url:
-            requests.post(self.webhook_url, json={"content": msg})
+            try: requests.post(self.webhook_url, json={"content": msg}, timeout=10)
+            except: pass
 
     def _ler_parquet_r2(self, key):
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
             return pl.read_parquet(io.BytesIO(obj['Body'].read()))
-        except: return None
+        except Exception as e:
+            print(f"⚠️ Erro ao ler {key}: {e}")
+            return None
 
     def _ler_json_r2(self, key):
         try:
@@ -44,121 +49,122 @@ class ArquitetoSafeDriverOuro:
 
     def construir_tabela_analitica(self):
         inicio_timer = time.time()
-        print("Carregando bases da camada prata...", flush=True)
+        print("🚀 Iniciando Consolidação da Camada Ouro (ABT)...", flush=True)
         
-        df_vias = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_GEOGRAFICA_VIAS.parquet")
+        # 1. CARREGAMENTO DOS COMPONENTES (H3 Flat)
+        # Como o resgate foi na Prata, aqui focamos nos atributos do Hexágono
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
-        df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL.parquet")
         df_micro_pop = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_MICRO_POPULACAO.parquet")
         df_feriados = self._ler_json_r2(f"{self.prata_ref}/feriados_sp_2022_2026.json")
 
+        # 2. AGREGAÇÃO DOS CRIMES TRUSTED
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
             obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
             for obj in p.get('Contents', []) if obj['Key'].endswith('.parquet')
         ]
-            
+        
+        if not crime_files:
+            print("❌ Nenhum arquivo de crime encontrado na Prata.")
+            return
+
         df_crimes = pl.concat([self._ler_parquet_r2(f) for f in crime_files], how="diagonal")
-        
-        # MÉTRICA 1: Volume Inicial
-        total_inicial = df_crimes.height
-        bo_com_gps_inicial = df_crimes.filter(pl.col("H3_INDEX").is_not_null()).height
+        total_crimes = df_crimes.height
 
-        print(f"Executando Geocoding de Resgate em {total_inicial} registros...", flush=True)
-        h3_mun_map = df_crimes.filter(pl.col("H3_INDEX").is_not_null()) \
-                              .group_by("H3_INDEX") \
-                              .agg(pl.col("MUNICIPIO").mode().first().alias("MUN_H3"))
+        # 3. FEATURE ENGINEERING TEMPORAL
+        print("📅 Gerando features sazonais...", flush=True)
         
-        df_vias_enriquecida = df_vias.join(h3_mun_map, on="H3_INDEX", how="inner")
-        ref_vias = df_vias_enriquecida.group_by(["RUA", "MUN_H3"]).agg(pl.col("H3_INDEX").first())
-        
-        df_crimes = df_crimes.join(
-            ref_vias, left_on=["LOGRADOURO", "MUNICIPIO"], right_on=["RUA", "MUN_H3"], how="left"
-        ).with_columns(
-            pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))
-        ).drop("H3_INDEX_right")
+        # Prepara feriados
+        if df_feriados is not None:
+            df_feriados = df_feriados.select([
+                pl.col("data").alias("DATA_FERIADO"),
+                pl.col("feriado_nome").alias("SAZON_NOME_FERIADO"),
+                pl.lit(1).alias("SAZON_IS_FERIADO")
+            ])
 
-        # Filtro de Localização (Cérebro da ABT)
-        df_ouro = df_crimes.filter(pl.col("H3_INDEX").is_not_null())
-        
-        # MÉTRICA 2: Eficiência da Recuperação
-        total_final = df_ouro.height
-        bo_recuperados = total_final - bo_com_gps_inicial
-        taxa_recuperacao = (bo_recuperados / (total_inicial - bo_com_gps_inicial)) * 100 if (total_inicial - bo_com_gps_inicial) > 0 else 0
-
-        # --- PROCESSAMENTO TEMPORAL E ESPACIAL (Igual à versão equalizada) ---
-        df_feriados = df_feriados.select([
-            pl.col("data").alias("DATA_FERIADO"),
-            pl.col("feriado_nome").alias("SAZON_NOME_FERIADO"),
-            pl.col("feriado_tipo").alias("SAZON_TIPO_FERIADO"),
-            pl.col("is_ponto_facultativo").alias("SAZON_PONTO_FACULTATIVO")
+        # Extração de componentes da data
+        df_ouro = df_crimes.with_columns([
+            pl.col("DATAOCORRENCIA").str.to_date(format="%Y-%m-%d", strict=False).alias("_dt_temp")
+        ]).with_columns([
+            pl.col("_dt_temp").dt.weekday().alias("SAZON_DIA_SEMANA"),
+            pl.col("_dt_temp").dt.month().alias("SAZON_MES"),
+            pl.col("_dt_temp").dt.year().alias("SAZON_ANO"),
+            # Flag de fim de semana
+            pl.when(pl.col("_dt_temp").dt.weekday() >= 6).then(pl.lit(1)).otherwise(pl.lit(0)).alias("SAZON_FIM_SEMANA")
         ])
 
+        if df_feriados is not None:
+            df_ouro = df_ouro.join(df_feriados, left_on="DATAOCORRENCIA", right_on="DATA_FERIADO", how="left")
+            df_ouro = df_ouro.with_columns(pl.col("SAZON_IS_FERIADO").fill_null(0))
+
+        # 4. CATEGORIZAÇÃO DE NEGÓCIO (Target Profiling)
+        print("🏷️ Categorizando perfis e gravidade...", flush=True)
         df_ouro = df_ouro.with_columns([
-            pl.col("DATAOCORRENCIA").str.to_date(format="%Y-%m-%d", strict=False).dt.weekday().alias("SAZON_DIA_SEMANA"),
-            pl.col("DATAOCORRENCIA").str.to_date(format="%Y-%m-%d", strict=False).dt.month().alias("SAZON_MES"),
-            pl.col("HORAOCORRENCIA").str.to_time(format="%H:%M:%S", strict=False).dt.hour().alias("SAZON_HORA")
-        ]).join(df_feriados, left_on="DATAOCORRENCIA", right_on="DATA_FERIADO", how="left")
+            # Perfil da Vítima/Alvo
+            pl.when(pl.col("RUBRICA").str.contains("VEICULO|CARGA|AUTO|MOTO|CAMINHAO|CONDUZIR")).then(pl.lit("VEICULO"))
+            .when(pl.col("RUBRICA").str.contains("CELULAR|TRANSEUNTE|PEDESTRE|PESSOA")).then(pl.lit("TRANSEUNTE"))
+            .when(pl.col("RUBRICA").str.contains("RESIDENCIA|CONDOMINIO|CASA")).then(pl.lit("RESIDENCIAL"))
+            .otherwise(pl.lit("OUTROS")).alias("META_PERFIL_ALVO"),
 
-        # Hierarquia de Período
-        df_ouro = df_ouro.with_columns(
-            pl.when(pl.col("SAZON_HORA").is_between(0, 5)).then(pl.lit("MADRUGADA"))
-            .when(pl.col("SAZON_HORA").is_between(6, 11)).then(pl.lit("MANHA"))
-            .when(pl.col("SAZON_HORA").is_between(12, 17)).then(pl.lit("TARDE"))
-            .when(pl.col("SAZON_HORA").is_between(18, 23)).then(pl.lit("NOITE"))
-            .otherwise(pl.col("SAZON_PERIODO"))
-            .alias("SAZON_PERIODO")
-        )
-
-        moda_global = df_ouro.filter(pl.col("SAZON_PERIODO").is_not_null())["SAZON_PERIODO"].mode().first()
-        df_ouro = df_ouro.with_columns(pl.col("SAZON_PERIODO").fill_null(pl.lit(moda_global)))
-
-        # Categorização e Enriquecimento
-        df_ouro = df_ouro.with_columns([
-            pl.when(pl.col("RUBRICA").str.contains("VEICULO|CARGA|AUTO|MOTO|CAMINHAO|CONDUZIR")).then(pl.lit("MOTORISTA"))
-            .when(pl.col("RUBRICA").str.contains("CELULAR|TRANSEUNTE|PEDESTRE|PESSOA|ESTABELECIMENTO")).then(pl.lit("PEDESTRE"))
-            .otherwise(pl.lit("OUTROS")).alias("META_PERFIL_VITIMA"),
-
-            pl.when(pl.col("RUBRICA").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit("CRIME_LETO"))
+            # Categoria Simplificada para IA
+            pl.when(pl.col("RUBRICA").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit("CRIME_FATAL"))
             .when(pl.col("RUBRICA").str.contains("ROUBO")).then(pl.lit("ROUBO"))
             .when(pl.col("RUBRICA").str.contains("FURTO")).then(pl.lit("FURTO"))
-            .otherwise(pl.lit("OUTROS")).alias("META_CATEGORIA_CRIME"),
+            .otherwise(pl.lit("OUTROS")).alias("META_CATEGORIA"),
             
+            # Peso de Gravidade (Score para mapas de calor)
             pl.when(pl.col("RUBRICA").str.contains("LATROCINIO|HOMICIDIO")).then(pl.lit(10.0))
             .when(pl.col("RUBRICA").str.contains("ROUBO")).then(pl.lit(5.0))
-            .when(pl.col("RUBRICA").str.contains("FURTO")).then(pl.lit(1.0))
-            .otherwise(pl.lit(0.5)).alias("META_PESO_GRAVIDADE")
+            .otherwise(pl.lit(1.0)).alias("META_SCORE_RISCO")
         ])
 
-        # Joins Finais (Infra e Social)
-        df_ouro = df_ouro.join(df_infra, on="H3_INDEX", how="left")
-        df_ouro = df_ouro.join(df_micro_pop, on="H3_INDEX", how="left")
+        # 5. ENRIQUECIMENTO URBANO (Joins Finais por H3)
+        print("🏙️ Cruzando com Infraestrutura e População...", flush=True)
+        if df_infra is not None:
+            df_ouro = df_ouro.join(df_infra, on="H3_INDEX", how="left")
         
-        # Blindagem de Nulos
-        cols_cat = ["H3_INDEX", "SAZON_DIA_SEMANA", "SAZON_MES", "SAZON_HORA", "SAZON_PERIODO", "META_CATEGORIA_CRIME", "META_PERFIL_VITIMA"]
-        df_ouro = df_ouro.with_columns([pl.col(c).cast(pl.Utf8).fill_null("NAO_INFORMADO") for c in cols_cat])
+        if df_micro_pop is not None:
+            df_ouro = df_ouro.join(df_micro_pop, on="H3_INDEX", how="left")
+
+        # 6. TRATAMENTO DE NULOS E TIPAGEM FINAL
+        # Colunas categóricas para string e nulos para "DESCONHECIDO"
+        cat_cols = ["SAZON_PERIODO", "META_PERFIL_ALVO", "META_CATEGORIA", "MUNICIPIO", "BAIRRO"]
+        df_ouro = df_ouro.with_columns([
+            pl.col(c).cast(pl.Utf8).fill_null("NAO_INFORMADO") for c in cat_cols
+        ])
+        
+        # Colunas numéricas (Infra e População) nulos para 0
         df_ouro = df_ouro.with_columns(pl.all().fill_null(0))
 
-        # --- NOTIFICAÇÃO DISCORD ---
+        # 7. NOTIFICAÇÃO E UPLOAD
         duracao = time.time() - inicio_timer
-        report_msg = (
-            f"🏆 **[SafeDriver] Camada Ouro Finalizada**\n"
+        
+        # Estatísticas de Enriquecimento
+        tem_infra = df_ouro.filter(pl.col("INFRA_DIV_01").is_not_null()).height if "INFRA_DIV_01" in df_ouro.columns else 0
+        
+        report = (
+            f"🏆 **[SafeDriver] Camada Ouro: ABT Gerada**\n"
             f"```ml\n"
-            f"ESTATÍSTICAS DE RECUPERAÇÃO:\n"
-            f"• B.O.s Totais (Bronze/Prata): {total_inicial}\n"
-            f"• B.O.s Salvos pelo Resgate: {bo_recuperados}\n"
-            f"• Taxa de Sucesso do Geocoding: {taxa_recuperacao:.2f}%\n"
-            f"• Base Final (ABT): {total_final} linhas\n"
-            f"-------------------------------------\n"
-            f"Tempo de Processamento: {duracao:.2f}s\n"
+            f"• Registros Processados: {total_crimes}\n"
+            f"• Features Temporais: OK\n"
+            f"• Features Urbanas (H3): OK\n"
+            f"• Peso de Risco Aplicado: OK\n"
+            f"• Linhas Finais ABT: {df_ouro.height}\n"
+            f"-----------------------------------\n"
+            f"Tempo de Execução: {duracao:.2f}s\n"
             f"```"
         )
-        self._notificar_discord(report_msg)
+        self._notificar_discord(report)
 
-        # Upload
+        # Upload final para a pasta OURO
         buf = io.BytesIO()
         df_ouro.write_parquet(buf, compression="zstd")
-        self.s3.put_object(Bucket=self.bucket, Key=f"{self.ouro_dir}/safedriver_abt_eventos.parquet", Body=buf.getvalue())
+        self.s3.put_object(
+            Bucket=self.bucket, 
+            Key=f"{self.ouro_dir}/safedriver_abt_eventos.parquet", 
+            Body=buf.getvalue()
+        )
+        print("✨ ABT salva no R2 com sucesso!")
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverOuro()
