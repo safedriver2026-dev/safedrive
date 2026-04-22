@@ -27,7 +27,6 @@ class ArquitetoSafeDriverPrata:
         os.makedirs(self.prata_dir, exist_ok=True)
         os.makedirs(self.temp_extract_dir, exist_ok=True)
         
-        # Configurações R2
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -42,13 +41,12 @@ class ArquitetoSafeDriverPrata:
         
         self.webhook_url = os.getenv("DISCORD_SUCESSO")
 
-        # Configuração DuckDB
         self.con = duckdb.connect(database=':memory:')
         self.con.execute(f"PRAGMA memory_limit='5GB';")
         try:
             self.con.execute("INSTALL spatial; LOAD spatial;")
         except:
-            print("⚠️ Aviso: Extensão spatial já carregada ou indisponível.")
+            pass
         
         self.auditoria = {
             "projeto": "SafeDriver - Malha Híbrida Equalizada",
@@ -59,10 +57,8 @@ class ArquitetoSafeDriverPrata:
 
     def _notificar_discord(self, msg):
         if self.webhook_url:
-            try: 
-                requests.post(self.webhook_url, json={"content": msg}, timeout=10)
-            except: 
-                pass
+            try: requests.post(self.webhook_url, json={"content": msg}, timeout=10)
+            except: pass
 
     def _normalizar_texto(self, valor):
         if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE", "NAO INFORMADO"]: 
@@ -97,6 +93,13 @@ class ArquitetoSafeDriverPrata:
         pl_encoding = 'utf8' if used_enc == 'utf-8' else 'iso-8859-1'
         return pl.read_csv(filepath, separator=sep, encoding=pl_encoding, infer_schema_length=0, ignore_errors=True)
 
+    def _limpar_cd_setor(self, coluna):
+        """Força o CD_SETOR a ser uma string limpa de 15 dígitos, matando floats e sufixos"""
+        return pl.col(coluna).cast(pl.Utf8) \
+                 .str.replace(r"\.0$", "") \
+                 .str.replace_all(r"\D", "") \
+                 .str.slice(0, 15)
+
     def download_r2(self):
         print("📥 Sincronizando Bronze do R2...", flush=True)
         targets = ["SP_Faces_2022.zip", "SP_bairros_CD2022", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
@@ -111,24 +114,56 @@ class ArquitetoSafeDriverPrata:
                         self.s3.download_file(self.bucket, key, dest)
         print("✅ Bronze carregada localmente.")
 
+    def upload_r2(self):
+        """Faz o upload de todos os arquivos da pasta Prata para o bucket R2"""
+        print("📤 Enviando arquivos Prata para o R2...", flush=True)
+        arquivos_prata = glob.glob(f"{self.prata_dir}/*")
+        
+        if not arquivos_prata:
+            print("⚠️ Nenhum arquivo encontrado na pasta Prata para upload.")
+            return
+
+        for filepath in arquivos_prata:
+            filename = os.path.basename(filepath)
+            s3_key = f"prata/{filename}" # Salva dentro da pasta 'prata' no seu bucket
+            print(f"   -> Subindo: {filename} ...", flush=True)
+            try:
+                self.s3.upload_file(filepath, self.bucket, s3_key)
+            except Exception as e:
+                print(f"❌ Erro ao subir {filename}: {str(e)}")
+                raise e
+        print("✅ Upload da camada Prata concluído com sucesso!")
+
     def processar(self):
         tempo_inicio = time.time()
         print("🚀 Iniciando Processamento Equalizado (JSON + CSV + SHP)...", flush=True)
         try:
+            # =================================================================
             # 1. PREPARAR PONTE RELACIONAL (CENSO CSV)
+            # =================================================================
             print("--- Equalizando Ponta 1: CSV do Censo ---")
             csv_f = self._buscar_arquivo_flexivel("Agregados_por_setores_basico*.csv")
             df_censo_raw = self._ler_csv_agnostico(csv_f)
             
-            df_censo = df_censo_raw.select([
-                pl.col("CD_SETOR").cast(pl.Utf8).str.extract(r"(\d{15})").alias("CD_SETOR"),
-                pl.col("NM_MUN").alias("CID_CENSO"),
-                pl.col("NM_BAIRRO").alias("BAI_CENSO"),
-                pl.col("v0001").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_POPULACAO"),
-                pl.col("v0002").str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_RENDA")
-            ]).filter(pl.col("CD_SETOR").is_not_null())
+            df_censo_raw = df_censo_raw.rename({c: c.strip().upper() for c in df_censo_raw.columns})
+            cols = df_censo_raw.columns
 
+            if "NM_BAIRRO" in cols: bairro_expr = pl.col("NM_BAIRRO")
+            elif "NM_SUBDIST" in cols: bairro_expr = pl.col("NM_SUBDIST")
+            elif "NM_DISTR" in cols: bairro_expr = pl.col("NM_DISTR")
+            else: bairro_expr = pl.lit("DESCONHECIDO")
+
+            df_censo = df_censo_raw.select([
+                self._limpar_cd_setor("CD_SETOR").alias("CD_SETOR"),
+                pl.col("NM_MUN").alias("CID_CENSO") if "NM_MUN" in cols else pl.lit("DESCONHECIDO").alias("CID_CENSO"),
+                bairro_expr.alias("BAI_CENSO"),
+                pl.col("V0001").cast(pl.Utf8).str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_POPULACAO") if "V0001" in cols else pl.lit(0.0).alias("CENSO_POPULACAO"),
+                pl.col("V0002").cast(pl.Utf8).str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_RENDA") if "V0002" in cols else pl.lit(0.0).alias("CENSO_RENDA")
+            ]).filter(pl.col("CD_SETOR").str.len_chars() == 15)
+
+            # =================================================================
             # 2. CARREGAR RUAS (JSON) E EQUALIZAR CD_SETOR
+            # =================================================================
             print("--- Equalizando Ponta 2: Faces JSON ---")
             zip_f = self._buscar_arquivo_flexivel("SP_Faces_2022.zip")
             list_vias_df = []
@@ -146,31 +181,29 @@ class ArquitetoSafeDriverPrata:
                     
                     df_batch = self.con.execute(" UNION ALL ".join(sqls)).pl()
                     list_vias_df.append(df_batch)
-                    for f in batch: 
-                        shutil.rmtree(os.path.join(self.temp_extract_dir, f.split('/')[0]), ignore_errors=True)
+                    for f in batch: shutil.rmtree(os.path.join(self.temp_extract_dir, f.split('/')[0]), ignore_errors=True)
                     print(f"   -> Extração de Vias: {min(i + batch_size, len(json_files))}/{len(json_files)}", flush=True)
 
             df_ruas_raw = pl.concat(list_vias_df)
-            df_ruas_raw = df_ruas_raw.with_columns(
-                pl.col("CD_SETOR").cast(pl.Utf8).str.extract(r"(\d{15})").alias("CD_SETOR")
-            )
+            df_ruas_raw = df_ruas_raw.with_columns(self._limpar_cd_setor("CD_SETOR").alias("CD_SETOR"))
 
             print("--- Cruzando Ruas e Censo (Join Relacional) ---")
             df_ruas_censo = df_ruas_raw.join(df_censo, on="CD_SETOR", how="left")
             total_faces = df_ruas_censo.height
+            faces_com_censo = df_ruas_censo.filter(pl.col("CENSO_POPULACAO").is_not_null()).height
 
             print("--- Mapeando Ruas para Hexágonos H3 ---")
             df_ruas_h3 = df_ruas_censo.with_columns(
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             )
 
+            # =================================================================
             # 3. SPATIAL JOIN E COALESCE FINAL
+            # =================================================================
             print("--- Executando Spatial Join e Fallback ---")
             df_h3_centers = df_ruas_h3.group_by("H3_INDEX").agg([
-                pl.col("LAT").first().alias("LAT"), 
-                pl.col("LON").first().alias("LON"),
-                pl.col("CID_CENSO").first().alias("CID_CENSO"), 
-                pl.col("BAI_CENSO").first().alias("BAI_CENSO")
+                pl.col("LAT").first().alias("LAT"), pl.col("LON").first().alias("LON"),
+                pl.col("CID_CENSO").first().alias("CID_CENSO"), pl.col("BAI_CENSO").first().alias("BAI_CENSO")
             ])
             
             self.con.register("tabela_h3", df_h3_centers.to_arrow())
@@ -195,7 +228,9 @@ class ArquitetoSafeDriverPrata:
                 df_h3_mapeado.drop("MATCH_POLIGONAL"), on="H3_INDEX", how="left"
             ).with_columns(pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
 
-            # 4. EXPORTAÇÕES
+            # =================================================================
+            # 4. EXPORTAÇÕES (Ouro/Prata)
+            # =================================================================
             print("--- Exportando Tabelas para a Camada Prata ---")
             df_hierarquico = df_vias_completo.group_by(["CIDADE", "BAIRRO", "RUA"]).agg(pl.col("H3_INDEX").unique().alias("H3_LIST")) \
                 .group_by(["CIDADE", "BAIRRO"]).agg(pl.struct([pl.col("RUA"), pl.col("H3_LIST")]).alias("LOGRADOUROS")) \
@@ -209,7 +244,9 @@ class ArquitetoSafeDriverPrata:
             ])
             df_social_h3.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet", compression="zstd")
 
+            # =================================================================
             # 5. INFRAESTRUTURA URBANA (CNAEs)
+            # =================================================================
             pqs_infra = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             if pqs_infra:
                 print("--- Processando Infraestrutura Urbana ---")
@@ -224,23 +261,41 @@ class ArquitetoSafeDriverPrata:
                 df_infra_hierarquica = df_pivot.join(df_h3_mapeado.select(["H3_INDEX", "CIDADE", "BAIRRO"]), on="H3_INDEX", how="left")
                 df_infra_hierarquica.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
 
-            # 6. TELEMETRIA E FINALIZAÇÃO
+            # =================================================================
+            # 6. TELEMETRIA, UPLOAD R2 E FINALIZAÇÃO
+            # =================================================================
             tempo_exec = round(time.time() - tempo_inicio, 2)
             sucesso_total = df_h3_mapeado.filter(pl.col("BAIRRO") != "DESCONHECIDO").height
-            taxa_sucesso_geral = round((sucesso_total / df_h3_mapeado.height) * 100, 2) if df_h3_mapeado.height > 0 else 0
+            total_h3 = df_h3_mapeado.height
+            
+            taxa_sucesso_geral = round((sucesso_total / total_h3) * 100, 2) if total_h3 > 0 else 0
+            taxa_join_censo = round((faces_com_censo / total_faces) * 100, 2) if total_faces > 0 else 0
             
             self.auditoria["status_pipeline"] = "SUCESSO"
             self.auditoria["telemetria"] = {
                 "tempo_seg": tempo_exec,
-                "h3_unicos": df_h3_mapeado.height,
-                "salvos_pelo_censo_csv": sucesso_total - sucesso_poligono,
-                "taxa_cobertura_final_pct": taxa_sucesso_geral
+                "h3_unicos": total_h3,
+                "faces_processadas": total_faces,
+                "faces_com_dados_censo": faces_com_censo,
+                "taxa_enriquecimento_censo_pct": taxa_join_censo,
+                "taxa_cobertura_nome_localidade_pct": taxa_sucesso_geral
             }
             
+            # Salva auditoria localmente
             with open(f"{self.prata_dir}/AUDITORIA_PRATA.json", "w") as f:
                 json.dump(self.auditoria, f, indent=4)
 
-            msg = f"🗺️ **[SafeDriver] Malha Prata Híbrida OK**\n- Tempo: {tempo_exec}s\n- Cobertura: {taxa_sucesso_geral}%\n- H3 Gerados: {df_h3_mapeado.height}"
+            # ✨ NOVO: Faz o Upload de tudo para o R2 antes de finalizar
+            self.upload_r2()
+
+            msg = (
+                f"🗺️ **[SafeDriver] Malha Prata Híbrida OK**\n"
+                f"- Tempo: {tempo_exec}s\n"
+                f"- Cobertura Bairros: {taxa_sucesso_geral}%\n"
+                f"- Join Dados Censo (População/Renda): {taxa_join_censo}%\n"
+                f"- H3 Gerados: {total_h3}\n"
+                f"☁️ Arquivos sincronizados com sucesso no R2!"
+            )
             print(f"\n✨ {msg}")
             self._notificar_discord(msg)
 
