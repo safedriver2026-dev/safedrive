@@ -34,7 +34,7 @@ class TreinadorSafeDriver:
         self.modelo_local = "modelo_safedriver_catboost.cbm"
         
         self.auditoria = {
-            "fase": "Treinamento Atuarial (Tweedie)",
+            "fase": "Treinamento Preditivo com Sample Weights",
             "data": str(datetime.now()),
             "metricas": {}
         }
@@ -46,7 +46,7 @@ class TreinadorSafeDriver:
 
     def executar_treino(self):
         inicio_processo = time.time()
-        print(f"🚀 [TREINO] Iniciando carregamento para Regressão Tweedie...", flush=True)
+        print(f"🚀 [TREINO] Iniciando carregamento da ABT Ouro...", flush=True)
         
         # 1. CARREGAMENTO DOS DADOS
         obj = self.s3.get_object(Bucket=self.bucket, Key=self.caminho_abt)
@@ -77,28 +77,33 @@ class TreinadorSafeDriver:
             pdf_train[col] = pdf_train[col].astype(str)
             pdf_test[col] = pdf_test[col].astype(str)
 
-        # 5. CONFIGURAÇÃO DO MODELO COM FUNÇÃO TWEEDIE
-        print("🧠 Treinando CatBoost com Tweedie Loss (variance_power=1.5)...")
-        train_pool = Pool(pdf_train[cols_features], pdf_train[target], cat_features=cat_features)
-        test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
+        # ✨ O PULO DO GATO: Sample Weights (Pesos de Amostra)
+        # Forçamos o modelo a dar extrema importância aos crimes de peso 5 e 10
+        print("⚖️ Calculando Pesos de Amostra (Foco em Severidade)...")
+        pesos_treino = np.where(pdf_train[target] == 10, 50,
+                       np.where(pdf_train[target] == 5, 10, 1))
+
+        pesos_teste = np.where(pdf_test[target] == 10, 50,
+                      np.where(pdf_test[target] == 5, 10, 1))
+
+        # 5. CONFIGURAÇÃO DO MODELO COM PESOS
+        print("🧠 Treinando CatBoost com Sample Weights...")
+        train_pool = Pool(pdf_train[cols_features], pdf_train[target], cat_features=cat_features, weight=pesos_treino)
+        test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features, weight=pesos_teste)
 
         modelo = CatBoostRegressor(
-            iterations=2500,           
-            learning_rate=0.02,        
-            depth=6,
-            l2_leaf_reg=7,
+            iterations=1500,
+            learning_rate=0.05,       # Mais rápido para ele ganhar tração inicial
+            depth=7,                  # Profundidade ideal para achar padrões espaciais
+            l2_leaf_reg=3,            # Regularização moderada
             
-            # Loss function matemática otimizada para risco/severidade
-            loss_function='Tweedie:variance_power=1.5', 
-            # Mudança crucial: Avaliação visual humana e early stopping via MAE
+            loss_function='RMSE',     # Voltamos ao RMSE guiado pelos pesos
             eval_metric='MAE',
             
             od_type='Iter',
-            od_wait=150,               
+            od_wait=100,              # Early stopping para evitar overfitting
             use_best_model=True,
             
-            random_strength=1,
-            rsm=0.8,
             max_ctr_complexity=2,
             random_seed=42,
             verbose=100
@@ -127,7 +132,7 @@ class TreinadorSafeDriver:
         duracao = time.time() - inicio_processo
 
         # 8. SALVAMENTO E UPLOAD
-        print("💾 Deploy do modelo atuarial no R2...")
+        print("💾 Deploy do modelo preditivo no R2...")
         modelo.save_model(self.modelo_local)
         with open(self.modelo_local, "rb") as f:
             self.s3.put_object(Bucket=self.bucket, Key=f"modelos/{self.modelo_local}", Body=f.read())
@@ -137,18 +142,17 @@ class TreinadorSafeDriver:
 
         # 9. RELATÓRIO DISCORD
         report = (
-            f"🛡️ **[SafeDriver] IA Atuarial (Tweedie Engine)**\n"
+            f"🛡️ **[SafeDriver] IA Preditiva Otimizada (Sample Weights)**\n"
             f"```ml\n"
             f"MÉTRICAS DE RISCO:\n"
             f"• R² Score: {r2:.4f}\n"
             f"• MAE (Erro Médio): {mae:.4f}\n"
-            f"• Variance Power: 1.5\n"
             f"-------------------------------------\n"
             f"DRIVERS DE RISCO (SHAP):\n"
             f"{resumo_shap}\n"
             f"-------------------------------------\n"
             f"Tempo: {duracao/60:.2f} min | ABT: {len(pdf_train)} linhas\n"
-            f"Status: MODELO DE ALTA PRECISÃO NO R2\n"
+            f"Status: MODELO BALANCEADO E ATIVO NO R2\n"
             f"```"
         )
         print(report)
