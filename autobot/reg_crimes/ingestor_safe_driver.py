@@ -51,7 +51,7 @@ class IngestorSafeDriver:
         self.s3 = self._inicializar_s3()
         self.ano_atual = datetime.now().year
         self.df_lookup_vias = None    # Passo 1: Match Exato (Normalizado)
-        self.df_lookup_prefix = None  # Passo 2: Match Aproximado (Leve)
+        self.df_lookup_prefix = None  # Passo 2: Match Aproximado (Prefixo Único)
         self.df_lookup_bairro = None  # Passo 3: Centroide (Fallback)
         self.audit_stats = []
 
@@ -67,12 +67,27 @@ class IngestorSafeDriver:
         return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=self.config.ACCESS_KEY.strip(),
                             aws_secret_access_key=self.config.SECRET_KEY.strip(), config=Config(signature_version='s3v4'))
 
+    def _normalizar_cidade(self, texto):
+        """Tradutor Crítico de Cidades: SSP -> IBGE"""
+        if not texto or str(texto).upper() in ["NAO INFORMADO", "NULL", "NAN", "0"]: return "DESCONHECIDO"
+        t = "".join(c for c in unicodedata.normalize('NFKD', str(texto)) if unicodedata.category(c) != 'Mn').upper().strip()
+        subs = {
+            r'\bS\.PAULO\b': 'SAO PAULO',
+            r'\bS\.BERNARDO\b': 'SAO BERNARDO DO CAMPO',
+            r'\bS\.CAETANO\b': 'SAO CAETANO DO SUL',
+            r'\bS\.ANDRE\b': 'SANTO ANDRE',
+            r'\bS\.JOSE\b': 'SAO JOSE',
+            r'\bTABOAO\s+SERRA\b': 'TABOAO DA SERRA'
+        }
+        for erro, correto in subs.items():
+            t = re.sub(erro, correto, t)
+        return t
+
     def _normalizar_termos(self, texto):
-        """OPÇÃO 1: Normalização de Abreviações e Filtro de Lixo."""
+        """OPÇÃO 1: Normalização de Abreviações e Filtro de Lixo de Ruas."""
         if not texto or str(texto).upper() in ["NAO INFORMADO", "NULL", "NAN", "0"]: return "DESCONHECIDO"
         t = "".join(c for c in unicodedata.normalize('NFKD', str(texto)) if unicodedata.category(c) != 'Mn').upper().strip()
         
-        # Bloqueia lixo comum da base da SSP
         if "VEDACAO" in t or "VIA PUBLICA" in t or t == "":
             return "DESCONHECIDO"
 
@@ -93,59 +108,60 @@ class IngestorSafeDriver:
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
             df_flat = pl.read_parquet(io.BytesIO(obj['Body'].read())).explode("BAIRROS").unnest("BAIRROS").explode("LOGRADOUROS").unnest("LOGRADOUROS")
             
-            # Base da Malha com nome normalizado e prefixo fonético/aproximado
+            # Base da Malha normalizada (Cidades e Ruas) e com Prefixo Leve
             df_base = df_flat.with_columns([
                 pl.col("H3_LIST").list.first().alias("H3_INDEX"),
+                pl.col("CIDADE").map_elements(self._normalizar_cidade, return_dtype=pl.Utf8).alias("CID_NORM"),
                 pl.col("RUA").map_elements(self._normalizar_termos, return_dtype=pl.Utf8).alias("RUA_BASE")
             ]).with_columns(
                 pl.col("RUA_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("RUA_PREFIX")
-            ).select(["CIDADE", "BAIRRO", "RUA_BASE", "RUA_PREFIX", "H3_INDEX"])
+            ).select(["CID_NORM", "BAIRRO", "RUA_BASE", "RUA_PREFIX", "H3_INDEX"])
 
             # 1. Lookup de Vias (Passo 1: Preciso)
-            self.df_lookup_vias = df_base.unique(subset=["CIDADE", "BAIRRO", "RUA_BASE"])
+            self.df_lookup_vias = df_base.unique(subset=["CID_NORM", "BAIRRO", "RUA_BASE"])
 
             # 2. Lookup Aproximado (Passo 2: Fuzzy Leve)
-            # Mantemos apenas prefixos que são ÚNICOS dentro da cidade para evitar falsos positivos
-            prefix_counts = df_base.group_by(["CIDADE", "RUA_PREFIX"]).agg(pl.col("H3_INDEX").n_unique().alias("n"))
-            valid_prefixes = prefix_counts.filter(pl.col("n") == 1).select(["CIDADE", "RUA_PREFIX"])
-            self.df_lookup_prefix = df_base.join(valid_prefixes, on=["CIDADE", "RUA_PREFIX"], how="inner").unique(subset=["CIDADE", "RUA_PREFIX"])
+            prefix_counts = df_base.group_by(["CID_NORM", "RUA_PREFIX"]).agg(pl.col("H3_INDEX").n_unique().alias("n"))
+            valid_prefixes = prefix_counts.filter(pl.col("n") == 1).select(["CID_NORM", "RUA_PREFIX"])
+            self.df_lookup_prefix = df_base.join(valid_prefixes, on=["CID_NORM", "RUA_PREFIX"], how="inner").unique(subset=["CID_NORM", "RUA_PREFIX"])
 
             # 3. Lookup de Bairro (Passo 3: Centroide)
-            self.df_lookup_bairro = df_base.group_by(["CIDADE", "BAIRRO"]).agg(pl.col("H3_INDEX").mode().first().alias("H3_BAIRRO"))
+            self.df_lookup_bairro = df_base.group_by(["CID_NORM", "BAIRRO"]).agg(pl.col("H3_INDEX").mode().first().alias("H3_BAIRRO"))
             
-            logger.info("✅ Malha preparada e estruturada para resgate.")
+            logger.info("✅ Malha pronta para o motor de resgate.")
         except Exception as e: logger.error(f"❌ Erro ao carregar malha: {e}")
 
     def _resgatar_espacial(self, df: pl.DataFrame) -> pl.DataFrame:
         if self.df_lookup_vias is None: return df
         
         # Preparar chaves no dataframe de crimes
-        df = df.with_columns(pl.col("LOGRADOURO").map_elements(self._normalizar_termos, return_dtype=pl.Utf8).alias("LOG_BASE"))
+        df = df.with_columns([
+            pl.col("MUNICIPIO").map_elements(self._normalizar_cidade, return_dtype=pl.Utf8).alias("MUN_NORM"),
+            pl.col("LOGRADOURO").map_elements(self._normalizar_termos, return_dtype=pl.Utf8).alias("LOG_BASE")
+        ])
         df = df.with_columns(pl.col("LOG_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("LOG_PREFIX"))
 
         # --- PASSO 1: NORMALIZAÇÃO (Join Literal Completo) ---
-        df = df.join(self.df_lookup_vias.select(["CIDADE", "BAIRRO", "RUA_BASE", "H3_INDEX"]), 
-                     left_on=["MUNICIPIO", "BAIRRO", "LOG_BASE"], right_on=["CIDADE", "BAIRRO", "RUA_BASE"], how="left") \
+        df = df.join(self.df_lookup_vias.select(["CID_NORM", "BAIRRO", "RUA_BASE", "H3_INDEX"]), 
+                     left_on=["MUN_NORM", "BAIRRO", "LOG_BASE"], right_on=["CID_NORM", "BAIRRO", "RUA_BASE"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
 
-        # --- PASSO 2: FUZZY MATCH LEVE (Sub-string Única) ---
-        # Se a primeira tentativa falhou, tenta cruzar pelo prefixo de 10 caracteres (ignora o bairro)
-        df = df.join(self.df_lookup_prefix.select(["CIDADE", "RUA_PREFIX", "H3_INDEX"]), 
-                     left_on=["MUNICIPIO", "LOG_PREFIX"], right_on=["CIDADE", "RUA_PREFIX"], how="left") \
+        # --- PASSO 2: FUZZY MATCH LEVE (Prefixo de Substring Única) ---
+        df = df.join(self.df_lookup_prefix.select(["CID_NORM", "RUA_PREFIX", "H3_INDEX"]), 
+                     left_on=["MUN_NORM", "LOG_PREFIX"], right_on=["CID_NORM", "RUA_PREFIX"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
 
-        # --- PASSO 3: CENTROIDE DE BAIRRO (Fallback Final) ---
-        # A âncora final para salvar volume analítico
-        df = df.join(self.df_lookup_bairro, left_on=["MUNICIPIO", "BAIRRO"], right_on=["CIDADE", "BAIRRO"], how="left") \
+        # --- PASSO 3: CENTROIDE DE BAIRRO (Fallback Final para Volume Analítico) ---
+        df = df.join(self.df_lookup_bairro, left_on=["MUN_NORM", "BAIRRO"], right_on=["CID_NORM", "BAIRRO"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop("H3_BAIRRO")
         
-        return df.drop(["LOG_BASE", "LOG_PREFIX"])
+        return df.drop(["MUN_NORM", "LOG_BASE", "LOG_PREFIX"])
 
     def _limpar_e_tipar(self, df: pl.DataFrame, ano: int) -> pl.DataFrame:
         total_entrada = df.height
         df = df.with_columns(pl.all().cast(pl.Utf8).fill_null("NAO INFORMADO"))
 
-        # GPS Original (Evita latitudes zeradas como visto no CSV)
+        # GPS Original (Evita latitudes zeradas ou strings corrompidas)
         df = df.with_columns([
             pl.col("LATITUDE").str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").alias("_lat_f"),
             pl.col("LONGITUDE").str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").alias("_lon_f")
@@ -158,7 +174,7 @@ class IngestorSafeDriver:
         )
         bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
 
-        # A Mágica Acontece Aqui: Cascata 1 -> 2 -> 3
+        # Cascata 1 -> 2 -> 3
         df = self._resgatar_espacial(df)
 
         # Tempo INCERTO preservado
@@ -188,8 +204,6 @@ class IngestorSafeDriver:
         })
         return df_trusted
 
-    # (O restante dos métodos permanece idêntico - extrair_bronze, processar_prata, _resolver_mapeamento, finalizar_ciclo_auditoria)
-    
     def processar_prata(self, ano: int):
         path_b = f"datalake/bronze/crimes_raw/ssp_raw_{ano}.xlsx"
         path_p = f"datalake/prata/crimes_trusted/ssp_trusted_{ano}.parquet"
