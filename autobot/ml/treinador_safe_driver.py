@@ -32,9 +32,17 @@ class TreinadorSafeDriver:
         self.caminho_abt = "datalake/ouro/safedriver_abt_treino.parquet"
         self.modelo_local = "modelo_safedriver_catboost.cbm"
         
+        # Dicionário de Auditoria Inicializado
         self.auditoria = {
+            "projeto": "SafeDriver - Treinamento de IA",
             "fase": "Treinamento Preditivo (Undersampling + Perfil)",
-            "data": str(datetime.now()),
+            "data_processamento": str(datetime.now()),
+            "parametros_modelo": {
+                "iterations": 1500,
+                "learning_rate": 0.03,
+                "depth": 7,
+                "l2_leaf_reg": 5
+            },
             "metricas": {}
         }
 
@@ -57,26 +65,24 @@ class TreinadorSafeDriver:
         cols_features.append("H3_INDEX")
         target = "LABEL_PESO_RISCO"
 
-        # ✨ O PULO DO GATO DEFINITIVO: UNDERSAMPLING FÍSICO
+        # ✨ UNDERSAMPLING FÍSICO
         print("⚖️ Balanceando a base (Undersampling Físico da classe majoritária)...")
         
         # Separamos os crimes de alto risco (pesos 5 e 10)
         df_graves = df.filter(pl.col(target) > 1)
         qtd_graves = df_graves.height
         
-        # Pegamos os crimes leves e sorteamos um volume equivalente (ex: 2x ou 3x o número de graves)
-        # Ajustamos para 3x para dar um bom volume de contexto seguro ao modelo
+        # Pegamos os crimes leves e sorteamos um volume equivalente (3x o número de graves)
         df_leves = df.filter(pl.col(target) == 1)
         n_amostra = min(qtd_graves * 3, df_leves.height)
         df_leves_amostra = df_leves.sample(n=n_amostra, seed=42)
         
-        # Unimos a base e reordenamos (importante embaralhar após o concat para evitar viés inicial)
+        # Unimos a base e reordenamos (importante embaralhar após o concat)
         df = pl.concat([df_graves, df_leves_amostra]).sample(fraction=1.0, seed=42)
         print(f"📉 Base reduzida de {linhas_originais} para {df.height} linhas equilibradas.")
 
         # 3. SPLIT TEMPORAL (Blindagem contra Overfitting)
         print("📅 Ordenando dados e executando Split Temporal...")
-        # Reordenamos por data antes do split para garantir a validação "out-of-time"
         df = df.sort("DATAOCORRENCIA")
         total_rows = df.height
         split_idx = int(total_rows * 0.85)
@@ -109,7 +115,7 @@ class TreinadorSafeDriver:
             l2_leaf_reg=5,            
             
             loss_function='RMSE',     
-            eval_metric='R2',         # Usando R2 para monitorar a variância capturada 
+            eval_metric='R2',         
             
             od_type='Iter',
             od_wait=100,              
@@ -142,18 +148,38 @@ class TreinadorSafeDriver:
         r2 = r2_score(pdf_test[target], y_pred)
         duracao = time.time() - inicio_processo
 
-        # 8. SALVAMENTO E UPLOAD
-        print("💾 Deploy do modelo preditivo no R2...")
+        # 8. SALVAMENTO, UPLOAD E AUDITORIA EM JSON
+        print("💾 Salvando artefatos e log de auditoria no R2...")
+        
+        # A. Salvar Modelo Binário
         modelo.save_model(self.modelo_local)
         with open(self.modelo_local, "rb") as f:
             self.s3.put_object(Bucket=self.bucket, Key=f"modelos/{self.modelo_local}", Body=f.read())
         
+        # B. Salvar Importância SHAP
         shap_json = json.dumps(shap_importance.to_dict(orient='records'), indent=4)
         self.s3.put_object(Bucket=self.bucket, Key="modelos/SHAP_IMPORTANCE.json", Body=shap_json.encode())
 
+        # C. Salvar JSON de Auditoria de Treinamento
+        self.auditoria["metricas"] = {
+            "linhas_originais_abt": linhas_originais,
+            "linhas_pos_undersampling": int(pdf_train.shape[0] + pdf_test.shape[0]),
+            "r2_score_validacao": round(r2, 4),
+            "mae_validacao": round(mae, 4),
+            "tempo_execucao_segundos": round(duracao, 2),
+            "top_features": shap_importance['feature'].head(10).tolist()
+        }
+        
+        buf_json_auditoria = io.BytesIO(json.dumps(self.auditoria, indent=4).encode())
+        self.s3.put_object(
+            Bucket=self.bucket, 
+            Key="modelos/AUDITORIA_TREINO_CATBOOST.json", 
+            Body=buf_json_auditoria.getvalue()
+        )
+
         # 9. RELATÓRIO DISCORD
         report = (
-            f"🛡️ **[SafeDriver] IA Preditiva (Undersampling Ativo)**\n"
+            f"🛡️ **[SafeDriver] IA Preditiva (Undersampling + Auditoria)**\n"
             f"```ml\n"
             f"MÉTRICAS DE RISCO:\n"
             f"• R² Score: {r2:.4f}\n"
