@@ -1,6 +1,12 @@
 name: "SafeDriver: Pipeline de Produção"
 
 on:
+  # 🕒 GATILHO AUTOMÁTICO MENSAL
+  # Roda às 04:00 (UTC) no dia 28 de cada mês (Garante que a SSP já atualizou a base)
+  schedule:
+    - cron: '0 4 28 * *'
+    
+  # 🚀 GATILHO MANUAL (Mantido para testes)
   workflow_dispatch:
     inputs:
       job:
@@ -14,13 +20,14 @@ on:
           - 'PRATA_MAPA'
           - 'OURO_COMPLETA'
           - 'TREINAR_IA'
+          - 'GERAR_LOOKER'
           - 'FLUXO_CRIMES'
           - 'tudo'
 
 jobs:
   # --- CAMADA BRONZE ---
   camada-bronze:
-    if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
+    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -44,7 +51,7 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_bronze.outcome }}" == "success" ]; then
-            MSG="📦 **[Bronze]** Ingestão SSP finalizada. Dados brutos disponíveis no R2."
+            MSG="📦 **[Bronze]** Ingestão SSP finalizada. Dados novos baixados."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
             MSG="🚨 **[Bronze]** Falha crítica na extração dos dados da SSP."
@@ -55,7 +62,7 @@ jobs:
   # --- CAMADA PRATA ---
   camada-prata:
     needs: [camada-bronze]
-    if: always() && (github.event.inputs.job == 'tudo' || contains(github.event.inputs.job, 'PRATA_') || github.event.inputs.job == 'FLUXO_CRIMES')
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || contains(github.event.inputs.job, 'PRATA_') || github.event.inputs.job == 'FLUXO_CRIMES')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -75,22 +82,22 @@ jobs:
       
       - name: "🛡️ [PRATA-A] Crimes SSP"
         id: prata_crimes
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
+        if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/reg_crimes/ingestor_safe_driver.py prata
 
       - name: "🏗️ [PRATA-B] Malha Geográfica"
         id: prata_mapa
-        if: github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_MAPA'
+        if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
 
       - name: 📢 Notificar Prata
         if: always()
         run: |
           if [[ "${{ steps.prata_crimes.outcome }}" == "failure" || "${{ steps.prata_mapa.outcome }}" == "failure" ]]; then
-            MSG="🚨 **[Prata]** Erro no processamento de limpeza ou construção da malha."
+            MSG="🚨 **[Prata]** Erro no processamento de limpeza."
             URL="${{ secrets.DISCORD_ERRO }}"
           else
-            MSG="🥈 **[Prata]** Transformação concluída. Camada Trusted (H3 Hierárquico) atualizada."
+            MSG="🥈 **[Prata]** Transformação concluída. Dados normalizados."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
@@ -98,7 +105,7 @@ jobs:
   # --- CAMADA OURO ---
   camada-ouro:
     needs: [camada-prata]
-    if: always() && (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'OURO_COMPLETA' || github.event.inputs.job == 'FLUXO_CRIMES')
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'OURO_COMPLETA' || github.event.inputs.job == 'FLUXO_CRIMES')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -112,7 +119,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🏆 [OURO] Gerar ABT"
+      - name: "🏆 [OURO] Gerar ABT e Feature Store"
         id: run_ouro
         run: |
           pip install boto3 polars pyarrow requests
@@ -122,18 +129,18 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_ouro.outcome }}" == "success" ]; then
-            MSG="🏆 **[Ouro]** ABT Gerada. Dados prontos para treinamento (Features Geo/Sazonais ok)."
+            MSG="🏆 **[Ouro]** ABT e Feature Store Geradas. Prontas para IA."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[Ouro]** Falha ao consolidar a Tabela Base Analítica."
+            MSG="🚨 **[Ouro]** Falha ao consolidar a Tabela Ouro."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
 
-  # --- CAMADA TREINO ---
+  # --- CAMADA TREINO (MACHINE LEARNING) ---
   camada-treino:
     needs: [camada-ouro]
-    if: always() && (github.event.inputs.job == 'tudo' || github.event.inputs.job == 'TREINAR_IA')
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'TREINAR_IA' || github.event.inputs.job == 'FLUXO_CRIMES')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -158,10 +165,47 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_treino.outcome }}" == "success" ]; then
-            MSG="🧠 **[Machine Learning]** Modelo CatBoost treinado e SHAP Values exportados."
+            MSG="🧠 **[ML]** Modelo CatBoost treinado com novos dados da SSP!"
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[Machine Learning]** Erro durante o treinamento ou geração de explicabilidade."
+            MSG="🚨 **[ML]** Erro durante o treinamento."
+            URL="${{ secrets.DISCORD_ERRO }}"
+          fi
+          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
+
+  # --- CAMADA FINAL: GERADOR DO LOOKER ---
+  camada-looker:
+    needs: [camada-treino]
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'GERAR_LOOKER' || github.event.inputs.job == 'FLUXO_CRIMES')
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+    steps:
+      - name: 🔍 Checkout
+        uses: actions/checkout@v4
+      - name: 🐍 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: "📈 [PRODUÇÃO] Gerar Base do Dashboard"
+        id: run_looker
+        run: |
+          pip install boto3 polars pyarrow pandas catboost requests
+          # Assumindo que o nome do script do gerador do looker seja este:
+          python autobot/ml/gerador_predicao_looker.py
+      
+      - name: 📢 Notificar Looker
+        if: always()
+        run: |
+          if [ "${{ steps.run_looker.outcome }}" == "success" ]; then
+            MSG="🚀 **[Produção]** Predições do mês atualizadas! O Dashboard Looker já reflete o risco atual."
+            URL="${{ secrets.DISCORD_SUCESSO }}"
+          else
+            MSG="🚨 **[Produção]** Falha ao gerar tabela do Looker."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
