@@ -20,7 +20,8 @@ on:
           - 'PRATA_MAPA'
           - 'OURO_COMPLETA'
           - 'TREINAR_IA'
-          - 'GERAR_LOOKER'
+          - 'INTELIGENCIA_FINAL'
+          - 'DEPLOY_BQ'
           - 'FLUXO_CRIMES'
           - 'tudo'
 
@@ -173,10 +174,10 @@ jobs:
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
 
-  # --- CAMADA FINAL: GERADOR DO LOOKER ---
-  camada-looker:
+  # --- CAMADA INTELIGÊNCIA GEOGRÁFICA ---
+  camada-inteligencia:
     needs: [camada-treino]
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'GERAR_LOOKER' || github.event.inputs.job == 'FLUXO_CRIMES')
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'INTELIGENCIA_FINAL' || github.event.inputs.job == 'FLUXO_CRIMES')
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -191,21 +192,59 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "📈 [PRODUÇÃO] Gerar Base do Dashboard"
-        id: run_looker
+      - name: "🧬 [MÓDULO 1] Gerar DNA SHAP e Cenários"
+        id: run_intel
         run: |
-          pip install boto3 polars pyarrow pandas catboost requests
-          # Assumindo que o nome do script do gerador do looker seja este:
-          python autobot/ml/gerador_predicao_looker.py
-      
-      - name: 📢 Notificar Looker
+          pip install boto3 polars pyarrow pandas catboost shap requests
+          python autobot/ml/gerador_inteligencia_final.py
+
+      - name: 📢 Notificar Inteligência
         if: always()
         run: |
-          if [ "${{ steps.run_looker.outcome }}" == "success" ]; then
-            MSG="🚀 **[Produção]** Predições do mês atualizadas! O Dashboard Looker já reflete o risco atual."
+          if [ "${{ steps.run_intel.outcome }}" == "success" ]; then
+            MSG="🧬 **[Inteligência]** Cenários de risco e DNA SHAP gerados e salvos no R2!"
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[Produção]** Falha ao gerar tabela do Looker."
+            MSG="🚨 **[Inteligência]** Falha ao gerar matriz de inteligência."
+            URL="${{ secrets.DISCORD_ERRO }}"
+          fi
+          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
+
+  # --- CAMADA DEPLOY BIGQUERY ---
+  camada-bigquery:
+    needs: [camada-inteligencia]
+    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'DEPLOY_BQ' || github.event.inputs.job == 'FLUXO_CRIMES')
+    runs-on: ubuntu-latest
+    env:
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+      BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+      BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
+      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+    steps:
+      - name: 🔍 Checkout
+        uses: actions/checkout@v4
+      - name: 🐍 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: "🌐 [MÓDULO 2] Sincronizar Data Warehouse (Star Schema)"
+        id: run_bq
+        run: |
+          pip install boto3 polars pyarrow pandas google-cloud-bigquery db-dtypes requests
+          python autobot/bq/deploy_safedriver_bq.py
+
+      - name: 📢 Notificar BigQuery
+        if: always()
+        run: |
+          if [ "${{ steps.run_bq.outcome }}" == "success" ]; then
+            MSG="🚀 **[Deploy BQ]** Arquitetura Star Schema atualizada! Master View 'vw_safedriver_master_star' pronta para o Looker Studio."
+            URL="${{ secrets.DISCORD_SUCESSO }}"
+          else
+            MSG="🚨 **[Deploy BQ]** Erro ao fazer deploy no BigQuery."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
