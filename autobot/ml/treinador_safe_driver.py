@@ -15,7 +15,7 @@ from datetime import datetime
 
 class TreinadorSafeDriver:
     def __init__(self):
-        # Configurações de conexão R2 (Cloudflare)
+        # Configurações de conexão R2
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -32,15 +32,15 @@ class TreinadorSafeDriver:
         self.caminho_abt = "datalake/ouro/safedriver_abt_treino.parquet"
         self.modelo_local = "modelo_safedriver_catboost.cbm"
         
-        # Dicionário de Auditoria Inicializado
+        # Inicialização do log de auditoria
         self.auditoria = {
-            "projeto": "SafeDriver - Treinamento de IA",
-            "fase": "Treinamento Preditivo PRO (Expectile/Precaução + Feature Store)",
+            "projeto": "SafeDriver",
+            "fase": "Treinamento de Modelo Preditivo",
             "data_processamento": str(datetime.now()),
             "parametros_modelo": {
-                "iterations": 1500,
-                "learning_rate": 0.05,
-                "depth": 8,
+                "iterations": 800,
+                "learning_rate": 0.1,
+                "depth": 6,
                 "loss_function": "Expectile:alpha=0.85"
             },
             "metricas": {}
@@ -53,30 +53,28 @@ class TreinadorSafeDriver:
 
     def executar_treino(self):
         inicio_processo = time.time()
-        print(f"🚀 [TREINO] Iniciando carregamento da ABT Master Ouro...", flush=True)
+        print("[INFO] Iniciando carregamento da ABT Ouro...", flush=True)
         
         # =================================================================
-        # 1. CARREGAMENTO DOS DADOS
+        # 1. CARREGAMENTO DOS DADOS E ENGENHARIA DE FEATURES
         # =================================================================
         obj = self.s3.get_object(Bucket=self.bucket, Key=self.caminho_abt)
         df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         linhas_originais = df.height
         
-        # ✨ FEATURE CROSS: O "Atalho" de Contexto para a Árvore
-        print("🧬 Criando Feature Cross: Contexto Crítico...", flush=True)
+        print("[INFO] Processando Feature Cross (Sazonalidade x Perfil)...", flush=True)
         df = df.with_columns(
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         )
 
-        # Seleção Dinâmica de Features (Incluindo a Feature Store: FS_)
         cols_features = [c for c in df.columns if any(c.startswith(pre) for pre in ["FEAT_", "INFRA_", "CENSO_", "MICRO_", "SAZON_", "FS_"])]
         cols_features.append("H3_INDEX")
         target = "LABEL_PESO_RISCO"
 
         # =================================================================
-        # 2. BALANCEAMENTO DA BASE (Undersampling Físico)
+        # 2. BALANCEAMENTO DA BASE (UNDERSAMPLING FÍSICO)
         # =================================================================
-        print("⚖️ Avaliando balanceamento da base na Escala Penal...")
+        print("[INFO] Aplicando undersampling baseado na distribuição do target...", flush=True)
         
         df_graves = df.filter(pl.col(target) >= 4.0)
         qtd_graves = df_graves.height
@@ -86,15 +84,14 @@ class TreinadorSafeDriver:
         df_leves_amostra = df_leves.sample(n=n_amostra, seed=42)
         
         df = pl.concat([df_graves, df_leves_amostra]).sample(fraction=1.0, seed=42)
-        
-        # 🛑 FIX CRÍTICO: Salva a volumetria antes de limpar a RAM
         linhas_balanceadas = df.height 
-        print(f"📉 Base ajustada para {linhas_balanceadas} linhas equilibradas.")
+        
+        print(f"[INFO] Volumetria ajustada: {linhas_balanceadas} registros mantidos.")
 
         # =================================================================
-        # 3. SPLIT TEMPORAL (Blindagem contra Data Leakage)
+        # 3. SPLIT TEMPORAL
         # =================================================================
-        print("📅 Ordenando dados e executando Split Temporal (85/15)...")
+        print("[INFO] Executando split temporal (85/15)...")
         df = df.sort("DATAOCORRENCIA")
         total_rows = df.height
         split_idx = int(total_rows * 0.85)
@@ -102,11 +99,11 @@ class TreinadorSafeDriver:
         train_df = df.slice(0, split_idx)
         test_df = df.slice(split_idx, total_rows - split_idx)
 
-        # Limpeza de RAM Segura
+        # Liberação explícita de memória
         del df  
 
         # =================================================================
-        # 4. PREPARAÇÃO DO DATASET (Polars -> Pandas para o CatBoost)
+        # 4. PREPARAÇÃO DO DATASET (Conversão para Pandas)
         # =================================================================
         pdf_train = train_df.select(cols_features + [target]).to_pandas()
         pdf_test = test_df.select(cols_features + [target]).to_pandas()
@@ -119,26 +116,23 @@ class TreinadorSafeDriver:
             pdf_test[col] = pdf_test[col].fillna("DESCONHECIDO").astype(str)
 
         # =================================================================
-        # 5. MOTOR DE MACHINE LEARNING (CatBoost PRO)
+        # 5. TREINAMENTO DO MODELO (CATBOOST)
         # =================================================================
-        print("🧠 Treinando CatBoost PRO (Expectile Regression / Viés de Segurança)...")
+        print("[INFO] Iniciando treinamento do modelo CatBoost (Expectile Regression)...")
         train_pool = Pool(pdf_train[cols_features], pdf_train[target], cat_features=cat_features)
         test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
 
         modelo = CatBoostRegressor(
-            iterations=1500,          
-            learning_rate=0.05,       
-            depth=8,                  # Profundidade para cruzar FS + Infra
-            l2_leaf_reg=5,            
-            
-            # ✨ Punição Assimétrica: Errar para menos (colocar usuário em perigo) é punido severamente.
-            loss_function='Expectile:alpha=0.85', 
+            iterations=800,
+            learning_rate=0.1,
+            depth=6,
+            l2_leaf_reg=3,
+            loss_function='Expectile:alpha=0.85', # Penalização assimétrica para minimizar falsos negativos
             eval_metric='R2',         
-            
             od_type='Iter',
-            od_wait=100,              
+            od_wait=50,
             use_best_model=True,
-            max_ctr_complexity=2,
+            thread_count=-1,
             random_seed=42,
             verbose=100
         )
@@ -146,9 +140,9 @@ class TreinadorSafeDriver:
         modelo.fit(train_pool, eval_set=test_pool)
         
         # =================================================================
-        # 6. EXPLICABILIDADE (SHAP VALUES)
+        # 6. EXPLICABILIDADE DO MODELO (SHAP)
         # =================================================================
-        print("🔍 Calculando Explicabilidade SHAP...")
+        print("[INFO] Calculando valores SHAP...")
         explainer = shap.TreeExplainer(modelo)
         sample_test = pdf_test[cols_features].sample(min(5000, len(pdf_test)))
         shap_values = explainer.shap_values(sample_test)
@@ -159,14 +153,14 @@ class TreinadorSafeDriver:
         }).sort_values(by='impacto_medio', ascending=False)
 
         # =================================================================
-        # 7. MÉTRICAS, SALVAMENTO E AUDITORIA
+        # 7. AVALIAÇÃO DE PERFORMANCE E SALVAMENTO
         # =================================================================
         y_pred = modelo.predict(pdf_test[cols_features])
         mae = mean_absolute_error(pdf_test[target], y_pred)
         r2 = r2_score(pdf_test[target], y_pred)
         duracao = time.time() - inicio_processo
 
-        print("💾 Salvando artefatos e log de auditoria no R2...")
+        print("[INFO] Exportando artefatos para o Data Lake...")
         modelo.save_model(self.modelo_local)
         with open(self.modelo_local, "rb") as f:
             self.s3.put_object(Bucket=self.bucket, Key=f"modelos/{self.modelo_local}", Body=f.read())
@@ -187,7 +181,7 @@ class TreinadorSafeDriver:
         self.s3.put_object(Bucket=self.bucket, Key="modelos/AUDITORIA_TREINO_CATBOOST.json", Body=buf_json_auditoria.getvalue())
 
         # =================================================================
-        # 8. DOSSIÊ DETALHADO PARA AUDITORIA DE QUALIDADE
+        # 8. GERAÇÃO DE LOG DE AUDITORIA
         # =================================================================
         top_15 = shap_importance.head(15)
         resumo_shap_detalhado = "\n".join([f"   [{str(i+1).zfill(2)}] {r['feature'].ljust(30)} : {r['impacto_medio']:.4f}" for i, r in top_15.iterrows()])
@@ -198,32 +192,33 @@ class TreinadorSafeDriver:
 
         report = (
             f"==============================================================\n"
-            f" 🛡️ DOSSIÊ DE AUDITORIA DO MODELO SAFEDRIVER PRO 🛡️\n"
+            f" RELATÓRIO DE TREINAMENTO - SAFEDRIVER \n"
             f"==============================================================\n"
-            f"📊 1. VOLUMETRIA E BALANCEAMENTO\n"
-            f"   • Base Original (Ouro)    : {linhas_originais} linhas\n"
-            f"   • Base Balanceada (Treino): {linhas_balanceadas} linhas\n"
-            f"   • Fator de Compressão     : {(linhas_balanceadas / linhas_originais * 100):.2f}%\n\n"
-            f"⚙️ 2. CONFIGURAÇÃO DO MOTOR (CATBOOST)\n"
-            f"   • Loss Function           : Expectile (alpha=0.85 | Viés Seguro)\n"
-            f"   • Árvores (Iterations)    : 1500 (Early Stopping em {modelo.tree_count_})\n"
-            f"   • Profundidade (Depth)    : 8\n\n"
-            f"🎯 3. MÉTRICAS DE PERFORMANCE (DADOS NÃO VISTOS)\n"
-            f"   • R² Score (Variância)    : {r2:.4f}\n"
-            f"   • MAE (Erro Médio Absoluto): {mae:.4f} pontos de severidade\n\n"
-            f"🧠 4. EXPLICABILIDADE SHAP (COMO A IA PENSA)\n"
-            f"   --- Top 15 Variáveis Mais Importantes ---\n"
+            f"1. VOLUMETRIA E BALANCEAMENTO\n"
+            f"   • Base Original           : {linhas_originais} registros\n"
+            f"   • Base Treinamento        : {linhas_balanceadas} registros\n"
+            f"   • Retenção de Dados       : {(linhas_balanceadas / linhas_originais * 100):.2f}%\n\n"
+            f"2. HIPERPARÂMETROS DO MODELO\n"
+            f"   • Algoritmo               : CatBoostRegressor\n"
+            f"   • Função de Perda         : Expectile (alpha=0.85)\n"
+            f"   • Iterações Utilizadas    : {modelo.tree_count_}\n"
+            f"   • Profundidade da Árvore  : 6\n\n"
+            f"3. PERFORMANCE EM VALIDAÇÃO\n"
+            f"   • R² Score                : {r2:.4f}\n"
+            f"   • Erro Médio Absoluto     : {mae:.4f}\n\n"
+            f"4. ANÁLISE DE IMPORTÂNCIA DE FEATURES (SHAP)\n"
+            f"   --- Top 15 Variáveis Mais Relevantes ---\n"
             f"{resumo_shap_detalhado}\n\n"
-            f"   --- Peso por Grupo de Inteligência ---\n"
-            f"   • Feature Store (Passado) : {fs_impact:.4f} de impacto somado\n"
-            f"   • Contexto (Hora/Perfil)  : {contexto_impact:.4f} de impacto somado\n"
-            f"   • Infraestrutura (Local)  : {infra_impact:.4f} de impacto somado\n"
+            f"   --- Agregação por Grupo de Variáveis ---\n"
+            f"   • Feature Store Histórica : {fs_impact:.4f}\n"
+            f"   • Contexto (Temporal/Alvo): {contexto_impact:.4f}\n"
+            f"   • Infraestrutura Física   : {infra_impact:.4f}\n"
             f"==============================================================\n"
-            f"Tempo Total: {duracao/60:.2f} min | Status: MODELO SALVO NO R2\n"
+            f"Duração Total: {duracao/60:.2f} min | Status: Processamento Concluído\n"
             f"==============================================================\n"
         )
         print(report)
-        self._notificar_discord(f"```ml\n{report}\n```")
+        self._notificar_discord(f"```text\n{report}\n```")
         
         if os.path.exists(self.modelo_local):
             os.remove(self.modelo_local)
