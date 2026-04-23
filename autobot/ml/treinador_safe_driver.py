@@ -108,8 +108,12 @@ class TreinadorSafeDriver:
         pdf_train = train_df.select(cols_features + [target]).to_pandas()
         pdf_test = test_df.select(cols_features + [target]).to_pandas()
         
-        # Adicionado FEAT_TIPO_FERIADO para o modelo entender a nova feature
-        cat_features_declaradas = ["H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_FERIADO"]
+        # Adicionada FEAT_IS_FIM_DE_SEMANA como variável categórica explícita
+        cat_features_declaradas = [
+            "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
+            "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_FERIADO", 
+            "FEAT_IS_FIM_DE_SEMANA"
+        ]
         cat_features = [c for c in cat_features_declaradas if c in pdf_train.columns]
         
         for col in cat_features:
@@ -128,7 +132,7 @@ class TreinadorSafeDriver:
             learning_rate=0.01,
             depth=8,
             l2_leaf_reg=5,
-            loss_function='Expectile:alpha=0.85', # Penalização assimétrica
+            loss_function='Expectile:alpha=0.85', # Penalização assimétrica para minimizar falsos negativos
             eval_metric='R2',         
             od_type='Iter',
             od_wait=200,
@@ -187,9 +191,14 @@ class TreinadorSafeDriver:
         top_15 = shap_importance.head(15)
         resumo_shap_detalhado = "\n".join([f"   [{str(i+1).zfill(2)}] {r['feature'].ljust(30)} : {r['impacto_medio']:.4f}" for i, r in top_15.iterrows()])
         
+        # Agregadores de SHAP atualizados para incluir as novas features
         fs_impact = shap_importance[shap_importance['feature'].str.startswith('FS_')]['impacto_medio'].sum()
         infra_impact = shap_importance[shap_importance['feature'].str.startswith('INFRA_')]['impacto_medio'].sum()
-        contexto_impact = shap_importance[shap_importance['feature'].isin(['SAZON_PERIODO', 'FEAT_PERFIL_VITIMA', 'FEAT_CONTEXTO_CRITICO', 'FEAT_IS_FERIADO', 'FEAT_TIPO_FERIADO', 'FEAT_IS_PONTO_FACULTATIVO'])]['impacto_medio'].sum()
+        contexto_impact = shap_importance[shap_importance['feature'].isin([
+            'SAZON_PERIODO', 'FEAT_PERFIL_VITIMA', 'FEAT_CONTEXTO_CRITICO', 
+            'FEAT_IS_FERIADO', 'FEAT_TIPO_FERIADO', 'FEAT_IS_PONTO_FACULTATIVO',
+            'FEAT_IS_FIM_DE_SEMANA', 'FEAT_DIA_SEMANA', 'FEAT_MES'
+        ])]['impacto_medio'].sum()
 
         report = (
             f"==============================================================\n"
