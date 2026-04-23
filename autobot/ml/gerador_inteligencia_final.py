@@ -11,7 +11,7 @@ class GeradorDossieSafeDriver:
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        # --- CORREÇÃO: Limpeza do Endpoint R2 idêntica à do Treinador ---
+        # --- Limpeza do Endpoint R2 idêntica à do Treinador ---
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
             endpoint = endpoint[: -len(f"/{self.bucket}")]
@@ -37,6 +37,12 @@ class GeradorDossieSafeDriver:
         print("📥 Lendo a ABT Ouro...")
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+        
+        # ---> A CORREÇÃO: Recriando a feature combinada que o modelo exige <---
+        print("⚙️ Recriando Feature Cross (Sazonalidade x Perfil)...")
+        df_ouro = df_ouro.with_columns(
+            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
+        )
         
         # =================================================================
         # 1. PREDICAÇÃO MASSIVA (Linha a Linha)
