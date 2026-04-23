@@ -38,9 +38,9 @@ class TreinadorSafeDriver:
             "fase": "Treinamento de Modelo Preditivo",
             "data_processamento": str(datetime.now()),
             "parametros_modelo": {
-                "iterations": 800,
-                "learning_rate": 0.1,
-                "depth": 6,
+                "iterations": 1500,
+                "learning_rate": 0.01,
+                "depth": 8,
                 "loss_function": "Expectile:alpha=0.85"
             },
             "metricas": {}
@@ -108,7 +108,8 @@ class TreinadorSafeDriver:
         pdf_train = train_df.select(cols_features + [target]).to_pandas()
         pdf_test = test_df.select(cols_features + [target]).to_pandas()
         
-        cat_features_declaradas = ["H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO"]
+        # Adicionado FEAT_TIPO_FERIADO para o modelo entender a nova feature
+        cat_features_declaradas = ["H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_FERIADO"]
         cat_features = [c for c in cat_features_declaradas if c in pdf_train.columns]
         
         for col in cat_features:
@@ -123,14 +124,14 @@ class TreinadorSafeDriver:
         test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
 
         modelo = CatBoostRegressor(
-            iterations=800,
-            learning_rate=0.1,
-            depth=6,
-            l2_leaf_reg=3,
-            loss_function='Expectile:alpha=0.85', # Penalização assimétrica para minimizar falsos negativos
+            iterations=1500,
+            learning_rate=0.01,
+            depth=8,
+            l2_leaf_reg=5,
+            loss_function='Expectile:alpha=0.85', # Penalização assimétrica
             eval_metric='R2',         
             od_type='Iter',
-            od_wait=50,
+            od_wait=200,
             use_best_model=True,
             thread_count=-1,
             random_seed=42,
@@ -188,7 +189,7 @@ class TreinadorSafeDriver:
         
         fs_impact = shap_importance[shap_importance['feature'].str.startswith('FS_')]['impacto_medio'].sum()
         infra_impact = shap_importance[shap_importance['feature'].str.startswith('INFRA_')]['impacto_medio'].sum()
-        contexto_impact = shap_importance[shap_importance['feature'].isin(['SAZON_PERIODO', 'FEAT_PERFIL_VITIMA', 'FEAT_CONTEXTO_CRITICO'])]['impacto_medio'].sum()
+        contexto_impact = shap_importance[shap_importance['feature'].isin(['SAZON_PERIODO', 'FEAT_PERFIL_VITIMA', 'FEAT_CONTEXTO_CRITICO', 'FEAT_IS_FERIADO', 'FEAT_TIPO_FERIADO', 'FEAT_IS_PONTO_FACULTATIVO'])]['impacto_medio'].sum()
 
         report = (
             f"==============================================================\n"
@@ -202,7 +203,7 @@ class TreinadorSafeDriver:
             f"   • Algoritmo               : CatBoostRegressor\n"
             f"   • Função de Perda         : Expectile (alpha=0.85)\n"
             f"   • Iterações Utilizadas    : {modelo.tree_count_}\n"
-            f"   • Profundidade da Árvore  : 6\n\n"
+            f"   • Profundidade da Árvore  : 8\n\n"
             f"3. PERFORMANCE EM VALIDAÇÃO\n"
             f"   • R² Score                : {r2:.4f}\n"
             f"   • Erro Médio Absoluto     : {mae:.4f}\n\n"
