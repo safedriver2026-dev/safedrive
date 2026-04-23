@@ -180,7 +180,31 @@ class ArquitetoSafeDriverOuro:
         
         # Limpeza de Nulos: O que não foi achado no passado/espaço, vira Zero.
         cols_fill = [c for c in df_final.columns if any(x in c for x in ["INFRA_", "CENSO_", "FS_", "MICRO_"])]
-        df_final = df_final.with_columns([pl.col(c).fill_null(0) for c in cols_fill]).drop(["RUBRICA_UPPER", "ANO_OCORRENCIA"])
+        df_final = df_final.with_columns([pl.col(c).fill_null(0) for c in cols_fill])
+
+        # =================================================================
+        # ✨ 6.1 REDUÇÃO DE DIMENSIONALIDADE: MACRO CLASSES DE CNAE
+        # =================================================================
+        print("🏢 Agrupando CNAEs em Macro Classes de Risco...", flush=True)
+        
+        cnae_macros = {
+            "MACRO_FINANCEIRO": ["INFRA_DIV_64", "INFRA_DIV_65", "INFRA_DIV_66"],
+            "MACRO_LAZER_NOTURNO": ["INFRA_DIV_56", "INFRA_DIV_90", "INFRA_DIV_93"],
+            "MACRO_VAREJO": ["INFRA_DIV_45", "INFRA_DIV_47"],
+            "MACRO_LOGISTICA_INDUSTRIA": ["INFRA_DIV_49", "INFRA_DIV_52", "INFRA_DIV_53"] + [f"INFRA_DIV_{i}" for i in range(10, 34)],
+            "MACRO_SERVICOS_BASE": ["INFRA_DIV_84", "INFRA_DIV_85", "INFRA_DIV_86"]
+        }
+
+        for macro_name, div_list in cnae_macros.items():
+            cols_existentes = [c for c in div_list if c in df_final.columns]
+            if cols_existentes:
+                df_final = df_final.with_columns(pl.sum_horizontal(cols_existentes).alias(macro_name))
+            else:
+                df_final = df_final.with_columns(pl.lit(0).alias(macro_name))
+
+        # Expurgo das divisões brutas para limpar o ruído
+        cols_cnae_brutos = [c for c in df_final.columns if c.startswith("INFRA_DIV_")]
+        df_final = df_final.drop(cols_cnae_brutos + ["RUBRICA_UPPER", "ANO_OCORRENCIA"])
 
         # =================================================================
         # 7. SALVAMENTO E AUDITORIA
@@ -197,7 +221,7 @@ class ArquitetoSafeDriverOuro:
             f"🏆 **[Ouro] Pipeline Finalizada com Sucesso!**\n"
             f"```ml\n"
             f"• Registros ABT     : {df_final.height}\n"
-            f"• Colunas (Features): {len(df_final.columns)}\n"
+            f"• Colunas (Features): {len(df_final.columns)} (Pós-Redução CNAE)\n"
             f"• Feriados & FDS    : Injetados com Sucesso\n"
             f"• Hit Rate FS       : {fs_hit_rate:.1f}% com Histórico\n"
             f"• Tempo Total       : {duracao}s\n"
