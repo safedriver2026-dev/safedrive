@@ -93,7 +93,7 @@ class ArquitetoSafeDriverOuro:
         df_crimes = df_crimes.filter(pl.col("H3_INDEX").is_not_null())
 
         # =================================================================
-        # 3. FEATURE ENGINEERING & DIREITO PENAL
+        # 3. FEATURE ENGINEERING & DIREITO PENAL (O Advogado)
         # =================================================================
         print("⚖️ Tipificação Penal baseada no Código Penal Brasileiro...", flush=True)
         
@@ -157,7 +157,7 @@ class ArquitetoSafeDriverOuro:
         ]).drop("RUBRICA_UPPER")
 
         # =================================================================
-        # 3.5 🏪 FEATURE STORE: Histórico 
+        # 3.5 🏪 FEATURE STORE: Histórico (O Cientista de Dados)
         # =================================================================
         print("🏪 Construindo a Feature Store Histórica (Teoria das Janelas Quebradas)...", flush=True)
         
@@ -179,7 +179,7 @@ class ArquitetoSafeDriverOuro:
         )
 
         # =================================================================
-    
+        # 3.6 💾 MATERIALIZANDO A FEATURE STORE NO R2 (Para Produção)
         # =================================================================
         print("💾 Materializando a Feature Store offline no R2...", flush=True)
         fs_dir = "datalake/ouro/feature_store"
@@ -269,7 +269,7 @@ class ArquitetoSafeDriverOuro:
         # Log Detalhado (Dossiê)
         report = (
             f"==============================================================\n"
-            f" 🛡️ DOSSIÊ DE QUALIDADE DE DADOS CAMADA OURO \n"
+            f" 🛡️ DOSSIÊ DE QUALIDADE DE DADOS (CAMADA OURO PRO) 🛡️\n"
             f"==============================================================\n"
             f"📊 1. VOLUMETRIA E ARQUITETURA\n"
             f"   • Total de Registros (ABT) : {total_linhas}\n"
