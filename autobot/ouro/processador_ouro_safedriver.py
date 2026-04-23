@@ -26,6 +26,13 @@ class ArquitetoSafeDriverOuro:
         self.prata_crimes = "datalake/prata/crimes_trusted"
         self.prata_malha = "datalake/prata/malha_trusted"
         self.ouro_dir = "datalake/ouro"
+        
+        self.auditoria = {
+            "projeto": "SafeDriver - Camada Ouro",
+            "fase": "ABT Master + Holiday Integration + Feature Store",
+            "data_processamento": str(datetime.now()),
+            "metricas": {}
+        }
 
     def _notificar_discord(self, msg):
         if self.webhook_url:
@@ -108,14 +115,17 @@ class ArquitetoSafeDriverOuro:
             ])
 
         # =================================================================
-        # 4. DOSIMETRIA PENAL E CONTEXTO
+        # 4. DOSIMETRIA PENAL E CONTEXTO TEMPORAL PRO
         # =================================================================
-        print("⚖️ Aplicando Dosimetria Penal (Artigos 121, 157, 155, 33)...", flush=True)
+        print("⚖️ Aplicando Dosimetria Penal e Features de Fim de Semana...", flush=True)
         df_crimes = df_crimes.with_columns([
             pl.col("RUBRICA").fill_null("").str.to_uppercase().alias("RUBRICA_UPPER"),
             pl.col("DATAOCORRENCIA").dt.year().alias("ANO_OCORRENCIA"),
             pl.col("DATAOCORRENCIA").dt.weekday().fill_null(0).alias("FEAT_DIA_SEMANA"),
-            pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES")
+            pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES"),
+            
+            # ✨ FEATURE INTELIGENTE: Identifica se é Sábado (6) ou Domingo (7)
+            pl.col("DATAOCORRENCIA").dt.weekday().is_in([6, 7]).cast(pl.Int8).fill_null(0).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
         df_gold = df_crimes.with_columns([
@@ -188,7 +198,7 @@ class ArquitetoSafeDriverOuro:
             f"```ml\n"
             f"• Registros ABT     : {df_final.height}\n"
             f"• Colunas (Features): {len(df_final.columns)}\n"
-            f"• Feriados          : Injetados via JSON\n"
+            f"• Feriados & FDS    : Injetados com Sucesso\n"
             f"• Hit Rate FS       : {fs_hit_rate:.1f}% com Histórico\n"
             f"• Tempo Total       : {duracao}s\n"
             f"```"
