@@ -35,12 +35,12 @@ class TreinadorSafeDriver:
         # Inicialização do log de auditoria
         self.auditoria = {
             "projeto": "SafeDriver",
-            "fase": "Treinamento de Modelo Preditivo",
+            "fase": "Treinamento de Modelo Preditivo (High-Res)",
             "data_processamento": str(datetime.now()),
             "parametros_modelo": {
-                "iterations": 1000,
-                "learning_rate": 0.03,
-                "depth": 6,
+                "iterations": 2500,
+                "learning_rate": 0.005,
+                "depth": 8,
                 "loss_function": "Expectile:alpha=0.85"
             },
             "metricas": {}
@@ -123,25 +123,25 @@ class TreinadorSafeDriver:
             pdf_test[col] = pdf_test[col].fillna("DESCONHECIDO").astype(str)
 
         # =================================================================
-        # 5. TREINAMENTO DO MODELO (CATBOOST)
+        # 5. TREINAMENTO DO MODELO (CATBOOST HIGH-RES)
         # =================================================================
-        print("[INFO] Iniciando treinamento do modelo CatBoost (Expectile Regression)...")
+        print("[INFO] Iniciando treinamento do modelo CatBoost (Alta Resolução)...")
         train_pool = Pool(pdf_train[cols_features], pdf_train[target], cat_features=cat_features)
         test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
 
         modelo = CatBoostRegressor(
-            iterations=1000,          
-            learning_rate=0.03,       
-            depth=6,                  
-            l2_leaf_reg=5,
+            iterations=2500,          # Aumentado o teto
+            learning_rate=0.005,      # Passos bem menores para achar o detalhe
+            depth=8,                  # Árvore mais profunda para cruzar infra + contexto
+            l2_leaf_reg=3,            # Menos regulação, confia mais nos padrões finos
             loss_function='Expectile:alpha=0.85', 
             eval_metric='MAE',        
             od_type='Iter',
-            od_wait=100,
+            od_wait=300,              # Mais paciência antes de dar overfit
             use_best_model=True,
             thread_count=-1,
             random_seed=42,
-            verbose=100
+            verbose=200               # Printa a cada 200 para o log não estourar
         )
 
         modelo.fit(train_pool, eval_set=test_pool)
@@ -213,7 +213,7 @@ class TreinadorSafeDriver:
             f"   • Algoritmo               : CatBoostRegressor\n"
             f"   • Função de Perda         : Expectile (alpha=0.85)\n"
             f"   • Iterações Utilizadas    : {modelo.tree_count_}\n"
-            f"   • Profundidade da Árvore  : 6\n\n"
+            f"   • Profundidade da Árvore  : 8\n\n"
             f"3. PERFORMANCE EM VALIDAÇÃO (Contra o Mundo Real)\n"
             f"   • R² Score                : {r2:.4f}\n"
             f"   • Erro Médio Absoluto     : {mae:.4f}\n\n"
