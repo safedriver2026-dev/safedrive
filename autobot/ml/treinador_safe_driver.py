@@ -38,9 +38,9 @@ class TreinadorSafeDriver:
             "fase": "Treinamento de Modelo Preditivo",
             "data_processamento": str(datetime.now()),
             "parametros_modelo": {
-                "iterations": 1500,
-                "learning_rate": 0.01,
-                "depth": 8,
+                "iterations": 1000,
+                "learning_rate": 0.03,
+                "depth": 6,
                 "loss_function": "Expectile:alpha=0.85"
             },
             "metricas": {}
@@ -67,40 +67,43 @@ class TreinadorSafeDriver:
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         )
 
-        cols_features = [c for c in df.columns if any(c.startswith(pre) for pre in ["FEAT_", "INFRA_", "CENSO_", "MICRO_", "SAZON_", "FS_"])]
+        cols_features = [c for c in df.columns if any(c.startswith(pre) for pre in ["FEAT_", "MACRO_", "CENSO_", "MICRO_", "SAZON_", "FS_"])]
         cols_features.append("H3_INDEX")
         target = "LABEL_PESO_RISCO"
 
         # =================================================================
-        # 2. BALANCEAMENTO DA BASE (UNDERSAMPLING FÍSICO)
+        # 2. SPLIT TEMPORAL BLINDADO (Garante o desempate para reprodutibilidade)
         # =================================================================
-        print("[INFO] Aplicando undersampling baseado na distribuição do target...", flush=True)
+        print("[INFO] Executando split temporal (85/15)...", flush=True)
+        df = df.sort(["DATAOCORRENCIA", "H3_INDEX"])
         
-        df_graves = df.filter(pl.col(target) >= 4.0)
-        qtd_graves = df_graves.height
-        
-        df_leves = df.filter(pl.col(target) < 4.0)
-        n_amostra = min(qtd_graves * 3, df_leves.height)
-        df_leves_amostra = df_leves.sample(n=n_amostra, seed=42)
-        
-        df = pl.concat([df_graves, df_leves_amostra]).sample(fraction=1.0, seed=42)
-        linhas_balanceadas = df.height 
-        
-        print(f"[INFO] Volumetria ajustada: {linhas_balanceadas} registros mantidos.")
-
-        # =================================================================
-        # 3. SPLIT TEMPORAL
-        # =================================================================
-        print("[INFO] Executando split temporal (85/15)...")
-        df = df.sort("DATAOCORRENCIA")
         total_rows = df.height
         split_idx = int(total_rows * 0.85)
         
         train_df = df.slice(0, split_idx)
         test_df = df.slice(split_idx, total_rows - split_idx)
 
-        # Liberação explícita de memória
-        del df  
+        del df  # Limpeza de RAM
+
+        # =================================================================
+        # 3. BALANCEAMENTO (UNDERSAMPLING APENAS NO TREINO)
+        # =================================================================
+        print("[INFO] Aplicando undersampling baseado na distribuição do target...", flush=True)
+        
+        df_treino_graves = train_df.filter(pl.col(target) >= 4.0)
+        qtd_graves = df_treino_graves.height
+        
+        df_treino_leves = train_df.filter(pl.col(target) < 4.0)
+        n_amostra = min(qtd_graves * 3, df_treino_leves.height)
+        
+        df_treino_leves_amostra = df_treino_leves.sample(n=n_amostra, seed=42)
+        train_df = pl.concat([df_treino_graves, df_treino_leves_amostra]).sample(fraction=1.0, seed=42)
+        
+        linhas_balanceadas_treino = train_df.height
+        linhas_teste_real = test_df.height
+        
+        print(f"[INFO] Treino equilibrado: {linhas_balanceadas_treino} registros.")
+        print(f"[INFO] Teste (Mundo Real): {linhas_teste_real} registros.")
 
         # =================================================================
         # 4. PREPARAÇÃO DO DATASET (Conversão para Pandas)
@@ -108,7 +111,6 @@ class TreinadorSafeDriver:
         pdf_train = train_df.select(cols_features + [target]).to_pandas()
         pdf_test = test_df.select(cols_features + [target]).to_pandas()
         
-        # Adicionada FEAT_IS_FIM_DE_SEMANA como variável categórica explícita
         cat_features_declaradas = [
             "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
             "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_FERIADO", 
@@ -128,14 +130,14 @@ class TreinadorSafeDriver:
         test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
 
         modelo = CatBoostRegressor(
-            iterations=1500,
-            learning_rate=0.01,
-            depth=8,
+            iterations=1000,          
+            learning_rate=0.03,       
+            depth=6,                  
             l2_leaf_reg=5,
-            loss_function='Expectile:alpha=0.85', # Penalização assimétrica para minimizar falsos negativos
-            eval_metric='R2',         
+            loss_function='Expectile:alpha=0.85', 
+            eval_metric='MAE',        
             od_type='Iter',
-            od_wait=200,
+            od_wait=100,
             use_best_model=True,
             thread_count=-1,
             random_seed=42,
@@ -175,7 +177,7 @@ class TreinadorSafeDriver:
 
         self.auditoria["metricas"] = {
             "linhas_originais_abt": linhas_originais,
-            "linhas_pos_undersampling": linhas_balanceadas,
+            "linhas_pos_undersampling": linhas_balanceadas_treino,
             "r2_score_validacao": round(r2, 4),
             "mae_validacao": round(mae, 4),
             "tempo_execucao_segundos": round(duracao, 2),
@@ -191,9 +193,8 @@ class TreinadorSafeDriver:
         top_15 = shap_importance.head(15)
         resumo_shap_detalhado = "\n".join([f"   [{str(i+1).zfill(2)}] {r['feature'].ljust(30)} : {r['impacto_medio']:.4f}" for i, r in top_15.iterrows()])
         
-        # Agregadores de SHAP atualizados para incluir as novas features
         fs_impact = shap_importance[shap_importance['feature'].str.startswith('FS_')]['impacto_medio'].sum()
-        infra_impact = shap_importance[shap_importance['feature'].str.startswith('INFRA_')]['impacto_medio'].sum()
+        infra_impact = shap_importance[shap_importance['feature'].str.startswith('MACRO_')]['impacto_medio'].sum()
         contexto_impact = shap_importance[shap_importance['feature'].isin([
             'SAZON_PERIODO', 'FEAT_PERFIL_VITIMA', 'FEAT_CONTEXTO_CRITICO', 
             'FEAT_IS_FERIADO', 'FEAT_TIPO_FERIADO', 'FEAT_IS_PONTO_FACULTATIVO',
@@ -206,14 +207,14 @@ class TreinadorSafeDriver:
             f"==============================================================\n"
             f"1. VOLUMETRIA E BALANCEAMENTO\n"
             f"   • Base Original           : {linhas_originais} registros\n"
-            f"   • Base Treinamento        : {linhas_balanceadas} registros\n"
-            f"   • Retenção de Dados       : {(linhas_balanceadas / linhas_originais * 100):.2f}%\n\n"
+            f"   • Base Treinamento        : {linhas_balanceadas_treino} registros (Balanceada)\n"
+            f"   • Base Teste (Validação)  : {linhas_teste_real} registros (Mundo Real)\n\n"
             f"2. HIPERPARÂMETROS DO MODELO\n"
             f"   • Algoritmo               : CatBoostRegressor\n"
             f"   • Função de Perda         : Expectile (alpha=0.85)\n"
             f"   • Iterações Utilizadas    : {modelo.tree_count_}\n"
-            f"   • Profundidade da Árvore  : 8\n\n"
-            f"3. PERFORMANCE EM VALIDAÇÃO\n"
+            f"   • Profundidade da Árvore  : 6\n\n"
+            f"3. PERFORMANCE EM VALIDAÇÃO (Contra o Mundo Real)\n"
             f"   • R² Score                : {r2:.4f}\n"
             f"   • Erro Médio Absoluto     : {mae:.4f}\n\n"
             f"4. ANÁLISE DE IMPORTÂNCIA DE FEATURES (SHAP)\n"
@@ -222,7 +223,7 @@ class TreinadorSafeDriver:
             f"   --- Agregação por Grupo de Variáveis ---\n"
             f"   • Feature Store Histórica : {fs_impact:.4f}\n"
             f"   • Contexto (Temporal/Alvo): {contexto_impact:.4f}\n"
-            f"   • Infraestrutura Física   : {infra_impact:.4f}\n"
+            f"   • Infraestrutura (Macros) : {infra_impact:.4f}\n"
             f"==============================================================\n"
             f"Duração Total: {duracao/60:.2f} min | Status: Processamento Concluído\n"
             f"==============================================================\n"
