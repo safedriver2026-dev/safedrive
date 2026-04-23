@@ -7,7 +7,7 @@ import shap
 from catboost import CatBoostRegressor
 from botocore.config import Config
 
-class GeradorInteligenciaSafeDriver:
+class GeradorDossieSafeDriver:
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
@@ -21,21 +21,36 @@ class GeradorInteligenciaSafeDriver:
         self.modelo_local = "modelo_safedriver_catboost.cbm"
 
     def gerar_dados(self):
-        print("🧠 [MÓDULO 1] Carregando modelo e dados estruturados...")
+        print("🧠 [DOSSIÊ MÓDULO 1] Baixando IA e lendo a base Ouro na íntegra...")
+        
+        if not os.path.exists(self.modelo_local):
+            self.s3.download_file(self.bucket, f"modelos/{self.modelo_local}", self.modelo_local)
+        
         modelo = CatBoostRegressor().load_model(self.modelo_local)
         
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
         # =================================================================
-        # 1. EXTRAÇÃO DE DNA DE RISCO (SHAP POR BAIRRO)
+        # 1. PREDICAÇÃO MASSIVA (Linha a Linha)
         # =================================================================
-        print("🧬 Analisando DNA de risco via valores SHAP...")
-        # Amostragem para não estourar a RAM no cálculo de SHAP
+        print("⚡ Rodando o modelo em todos os milhões de registros reais...")
+        X_all = df_ouro.select(modelo.feature_names_).to_pandas()
+        
+        for col in X_all.select_dtypes(['object', 'category']).columns: 
+            X_all[col] = X_all[col].astype(str)
+            
+        df_dossie = df_ouro.with_columns(
+            pl.Series("RISCO_PREDITO_IA", modelo.predict(X_all)).round(2)
+        )
+
+        # =================================================================
+        # 2. DNA DE RISCO (SHAP POR BAIRRO)
+        # =================================================================
+        print("🧬 Extraindo o DNA criminal (SHAP) por Bairro...")
         df_shap_sample = df_ouro.sample(n=min(50000, df_ouro.height), seed=42)
         X_shap = df_shap_sample.select(modelo.feature_names_).to_pandas()
         
-        # Cast de variáveis categóricas
         for col in X_shap.select_dtypes(['object', 'category']).columns: 
             X_shap[col] = X_shap[col].astype(str)
         
@@ -48,54 +63,21 @@ class GeradorInteligenciaSafeDriver:
         ], axis=1).groupby(["CIDADE", "BAIRRO"]).mean().reset_index()
 
         # =================================================================
-        # 2. GERAÇÃO DE CENÁRIOS MULTIDIMENSIONAIS (FATO PREDIÇÃO)
+        # 3. EXPORTAÇÃO PARA O R2
         # =================================================================
-        print("🔮 Simulando a resposta da cidade aos cenários de risco...")
-        df_base_geo = df_ouro.unique(subset="H3_INDEX")
+        print("📦 Salvando o Dossiê completo no Cloudflare R2...")
         
-        cenarios = [
-            {"ID": "Terca_Tarde_Pedestre", "DIA": "2", "PERIODO": "TARDE", "ALVO": "PEDESTRE", "FDS": "0"},
-            {"ID": "Sexta_Noite_Motorista", "DIA": "5", "PERIODO": "NOITE", "ALVO": "MOTORISTA", "FDS": "0"},
-            {"ID": "Sabado_Madruga_Geral", "DIA": "7", "PERIODO": "MADRUGADA", "ALVO": "GERAL", "FDS": "1"}
-        ]
-
-        preds_final = []
-        for c in cenarios:
-            df_c = df_base_geo.with_columns([
-                pl.lit(c["DIA"]).alias("FEAT_DIA_SEMANA"),
-                pl.lit(c["PERIODO"]).alias("SAZON_PERIODO"),
-                pl.lit(c["ALVO"]).alias("FEAT_PERFIL_VITIMA"),
-                pl.lit(f"{c['PERIODO']}_{c['ALVO']}").alias("FEAT_CONTEXTO_CRITICO"),
-                pl.lit(c["FDS"]).alias("FEAT_IS_FIM_DE_SEMANA"),
-                pl.lit("0").alias("FEAT_IS_FERIADO"),
-                pl.lit("DIA_UTIL").alias("FEAT_TIPO_FERIADO"),
-                pl.lit("6").alias("FEAT_MES")
-            ])
-            
-            X_c = df_c.select(modelo.feature_names_).to_pandas()
-            for col in X_c.select_dtypes(['object', 'category']).columns: 
-                X_c[col] = X_c[col].astype(str)
-            
-            # Exportamos apenas a Chave (H3) e os Dados Dinâmicos para a Tabela Fato
-            df_res = df_c.select(["H3_INDEX"]).with_columns([
-                pl.lit(c["ID"]).alias("CENARIO_ID"),
-                pl.Series("RISCO_SCORE", modelo.predict(X_c)).round(2)
-            ])
-            preds_final.append(df_res)
-
-        # =================================================================
-        # 3. EXPORTAÇÃO PARA O DATA LAKE (R2)
-        # =================================================================
-        print("📦 Salvando artefatos de inteligência no Cloudflare R2...")
-        buf_mapa = io.BytesIO()
-        pl.concat(preds_final).write_parquet(buf_mapa, compression="zstd")
-        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_fact_predicoes.parquet", Body=buf_mapa.getvalue())
+        # Salvamos o Dossiê Eventos (Tabela Gigante)
+        buf_eventos = io.BytesIO()
+        df_dossie.write_parquet(buf_eventos, compression="zstd")
+        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_eventos.getvalue())
         
+        # Salvamos a Dimensão SHAP
         buf_shap = io.BytesIO()
         pl.from_pandas(df_shap_geo).write_parquet(buf_shap, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_shap.parquet", Body=buf_shap.getvalue())
         
-        print("✅ [MÓDULO 1 CONCLUÍDO] Inteligência gerada e salva com sucesso.")
+        print("✅ [DOSSIÊ MÓDULO 1 CONCLUÍDO] Base bruta com inteligência gerada!")
 
 if __name__ == "__main__":
-    GeradorInteligenciaSafeDriver().gerar_dados()
+    GeradorDossieSafeDriver().gerar_dados()
