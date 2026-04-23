@@ -10,8 +10,12 @@ from botocore.config import Config
 class GeradorDossieSafeDriver:
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-        endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         
+        # --- CORREÇÃO: Limpeza do Endpoint R2 idêntica à do Treinador ---
+        endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
+        if endpoint.endswith(f"/{self.bucket}"):
+            endpoint = endpoint[: -len(f"/{self.bucket}")]
+            
         self.s3 = boto3.client(
             's3', endpoint_url=endpoint, 
             aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
@@ -23,18 +27,21 @@ class GeradorDossieSafeDriver:
     def gerar_dados(self):
         print("🧠 [DOSSIÊ MÓDULO 1] Baixando IA e lendo a base Ouro na íntegra...")
         
+        # Faz o download do modelo treinado do R2
         if not os.path.exists(self.modelo_local):
+            print(f"📥 Baixando {self.modelo_local} do bucket...")
             self.s3.download_file(self.bucket, f"modelos/{self.modelo_local}", self.modelo_local)
         
         modelo = CatBoostRegressor().load_model(self.modelo_local)
         
+        print("📥 Lendo a ABT Ouro...")
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
         # =================================================================
         # 1. PREDICAÇÃO MASSIVA (Linha a Linha)
         # =================================================================
-        print("⚡ Rodando o modelo em todos os milhões de registros reais...")
+        print("⚡ Rodando o modelo em todos os registros reais...")
         X_all = df_ouro.select(modelo.feature_names_).to_pandas()
         
         for col in X_all.select_dtypes(['object', 'category']).columns: 
@@ -67,12 +74,10 @@ class GeradorDossieSafeDriver:
         # =================================================================
         print("📦 Salvando o Dossiê completo no Cloudflare R2...")
         
-        # Salvamos o Dossiê Eventos (Tabela Gigante)
         buf_eventos = io.BytesIO()
         df_dossie.write_parquet(buf_eventos, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_eventos.getvalue())
         
-        # Salvamos a Dimensão SHAP
         buf_shap = io.BytesIO()
         pl.from_pandas(df_shap_geo).write_parquet(buf_shap, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_shap.parquet", Body=buf_shap.getvalue())
