@@ -2,13 +2,19 @@ import os
 import boto3
 import polars as pl
 import io
-import requests
 import time
+import requests
 import json
 from botocore.config import Config
 from datetime import datetime
 
 class ArquitetoSafeDriverOuro:
+    """
+    Componente responsavel pela consolidacao da Analytical Base Table (ABT).
+    Integra a malha de infraestrutura urbana, eventos criminais historicos e 
+    calendarios de feriados. Implementa dosimetria penal e a geracao de 
+    Features Espaco-Temporais.
+    """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
@@ -35,40 +41,71 @@ class ArquitetoSafeDriverOuro:
         }
 
     def _notificar_discord(self, msg):
+        """Dispara notificacao de telemetria operacional."""
         if self.webhook_url:
             try: requests.post(self.webhook_url, json={"content": msg}, timeout=10)
             except: pass
 
     def _ler_parquet_r2(self, key):
+        """Leitura de arquivos colunares em nuvem utilizando stream de memoria."""
         try:
-            print(f"   -> Lendo: {key}", flush=True)
+            print(f"   -> Lendo artefato: {key}", flush=True)
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
             return pl.read_parquet(io.BytesIO(obj['Body'].read()))
         except: return None
 
+    def _normalizar_texto_pl(self, coluna):
+        """
+        Rotina de normalizacao padronizada para atributos textuais.
+        Remove acentuacoes, espacos invisiveis e impoe tipagem em caixa alta.
+        Garante a integridade referencial entre bases governamentais distintas.
+        """
+        return (
+            pl.col(coluna)
+            .str.to_uppercase()
+            .str.strip_chars()
+            .str.replace_all(r"[ÁÀÂÃÄ]", "A")
+            .str.replace_all(r"[ÉÈÊË]", "E")
+            .str.replace_all(r"[ÍÌÎÏ]", "I")
+            .str.replace_all(r"[ÓÒÔÕÖ]", "O")
+            .str.replace_all(r"[ÚÙÛÜ]", "U")
+            .str.replace_all(r"[Ç]", "C")
+            .str.replace_all(r"[^A-Z0-9\s_]", "")
+        )
+
+    def _aplicar_normalizacao_global(self, df):
+        """
+        Aplica a rotina de normalizacao a todas as colunas identificadas 
+        como tipo string no DataFrame de entrada.
+        """
+        colunas_string = [col for col, dtype in zip(df.columns, df.dtypes) if dtype == pl.Utf8]
+        if colunas_string:
+            df = df.with_columns([self._normalizar_texto_pl(col).alias(col) for col in colunas_string])
+        return df
+
     def construir_abt_final(self):
         inicio_timer = time.time()
-        print("🚀 [OURO] Iniciando Consolidação da Tabela Master...", flush=True)
+        print("[OURO] Iniciando Consolidacao da Tabela Master...", flush=True)
         
-        # =================================================================
-        # 1. CARREGAMENTO DA MALHA FÍSICA
-        # =================================================================
-        print("📥 Carregando Infraestrutura e Sociedade...", flush=True)
+        # 1. CARREGAMENTO DA MALHA FÍSICA E SOCIAL
+        print("Carregando bases de infraestrutura e dados socioeconomicos...", flush=True)
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
         
         if df_infra is None: 
-            raise FileNotFoundError("Base de Infraestrutura não encontrada no R2.")
+            raise FileNotFoundError("Base de Infraestrutura ausente no repositorio de nuvem.")
             
         if df_social is None:
             df_social = pl.DataFrame({"H3_INDEX": df_infra["H3_INDEX"].unique()})
 
+        # Normalizacao da Malha antes do cruzamento
+        df_infra = self._aplicar_normalizacao_global(df_infra)
+        df_social = self._aplicar_normalizacao_global(df_social)
+
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
 
-        # =================================================================
-        # 2. CARREGAMENTO DOS CRIMES
-        # =================================================================
-        print("📥 Consolidando Boletins de Ocorrência...", flush=True)
+        # 2. CARREGAMENTO E CONSOLIDAÇÃO DOS EVENTOS CRIMINAIS
+        print("Consolidando base historica de boletins de ocorrencia...", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
             obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
@@ -77,65 +114,57 @@ class ArquitetoSafeDriverOuro:
         
         lista_crimes = [df for f in crime_files if (df := self._ler_parquet_r2(f)) is not None]
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
+        
+        # Aplicacao de Normalizacao Global em todos os dados de seguranca publica
+        print("Iniciando normalizacao textual global no conjunto de ocorrencias...", flush=True)
+        df_crimes = self._aplicar_normalizacao_global(df_crimes)
 
-        # =================================================================
-        # 3. INTEGRAÇÃO SEGURA DE FERIADOS (JSON)
-        # =================================================================
-        print("🗓️ Acoplando Calendário de Feriados (JSON)...", flush=True)
+        # 3. INTEGRAÇÃO SEGURA DE CALENDARIO (FERIADOS E DIAS UTEIS)
+        print("Acoplando matriz temporal de feriados...", flush=True)
         try:
             obj_feriados = self.s3.get_object(Bucket=self.bucket, Key="datalake/prata/referencias/feriados_sp_2022_2026.json")
             json_feriados = json.loads(obj_feriados['Body'].read().decode('utf-8'))
             
-            # Converte com parsing SEGURO de Datas e Booleanos
             df_feriados = pl.DataFrame(json_feriados)
             df_feriados = df_feriados.select([
                 pl.col("data").str.to_date("%Y-%m-%d", strict=False).alias("DATA_CHAVE"),
                 pl.lit(1).alias("FEAT_IS_FERIADO"),
-                pl.col("feriado_tipo").alias("FEAT_TIPO_FERIADO"),
+                self._normalizar_texto_pl("feriado_tipo").alias("FEAT_TIPO_FERIADO"),
                 pl.col("is_ponto_facultativo").cast(pl.Int8).alias("FEAT_IS_PONTO_FACULTATIVO")
             ])
             
-            # Tipagem segura da Base de Crimes antes do Join
             df_crimes = df_crimes.with_columns(pl.col("DATAOCORRENCIA").cast(pl.Date, strict=False))
             df_crimes = df_crimes.join(df_feriados, left_on="DATAOCORRENCIA", right_on="DATA_CHAVE", how="left")
             
-            # Preenchimento para os dias em que NÃO há feriado (A grande maioria)
             df_crimes = df_crimes.with_columns([
                 pl.col("FEAT_IS_FERIADO").fill_null(0),
                 pl.col("FEAT_TIPO_FERIADO").fill_null("DIA_UTIL"),
                 pl.col("FEAT_IS_PONTO_FACULTATIVO").fill_null(0)
             ])
-            print("   [OK] Feriados cruzados com a base de eventos.")
         except Exception as e:
-            print(f"   [AVISO] Falha ao processar feriados: {e}. Seguindo com dias úteis.")
+            print(f"Falha ao acoplar base de feriados: {e}. Contingencia: Atribuindo dias uteis globais.", flush=True)
             df_crimes = df_crimes.with_columns([
                 pl.lit(0).alias("FEAT_IS_FERIADO"),
                 pl.lit("DIA_UTIL").alias("FEAT_TIPO_FERIADO"),
                 pl.lit(0).alias("FEAT_IS_PONTO_FACULTATIVO")
             ])
 
-        # =================================================================
-        # 4. DOSIMETRIA PENAL E CONTEXTO TEMPORAL PRO
-        # =================================================================
-        print("⚖️ Aplicando Dosimetria Penal e Features de Fim de Semana...", flush=True)
+        # 4. ENGENHARIA DE ATRIBUTOS E DOSIMETRIA PENAL
+        print("Executando calculo de dosimetria penal e criacao de features derivativas...", flush=True)
         df_crimes = df_crimes.with_columns([
-            pl.col("RUBRICA").fill_null("").str.to_uppercase().alias("RUBRICA_UPPER"),
+            pl.col("RUBRICA").fill_null("").alias("RUBRICA_UPPER"),
             pl.col("DATAOCORRENCIA").dt.year().alias("ANO_OCORRENCIA"),
             pl.col("DATAOCORRENCIA").dt.weekday().fill_null(0).alias("FEAT_DIA_SEMANA"),
             pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES"),
-            
-            # ✨ FEATURE INTELIGENTE: Identifica se é Sábado (6) ou Domingo (7)
             pl.col("DATAOCORRENCIA").dt.weekday().is_in([6, 7]).cast(pl.Int8).fill_null(0).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
         df_gold = df_crimes.with_columns([
-            # Perfil da Vítima
-            pl.when(pl.col("RUBRICA_UPPER").str.contains(r"VEICULO|VEÍCULO|CARGA")).then(pl.lit("MOTORISTA"))
+            pl.when(pl.col("RUBRICA_UPPER").str.contains(r"VEICULO|CARGA")).then(pl.lit("MOTORISTA"))
             .when(pl.col("RUBRICA_UPPER").str.contains(r"TRANSEUNTE|CELULAR|PESSOA")).then(pl.lit("PEDESTRE"))
             .when(pl.col("RUBRICA_UPPER").str.contains(r"RESIDENCIA|ESTABELECIMENTO|BANCO|COMERCIO")).then(pl.lit("PATRIMONIO_FIXO"))
             .otherwise(pl.lit("GERAL")).alias("FEAT_PERFIL_VITIMA"),
 
-            # Pesos Penais
             pl.when(pl.col("RUBRICA_UPPER").str.contains(r"ART(?:IGO)?\s*121|LATROC")).then(pl.lit(10.0))
             .when(pl.col("RUBRICA_UPPER").str.contains(r"ART(?:IGO)?\s*15[89]|EXTORSAO|SEQUESTRO")).then(pl.lit(8.0))
             .when(pl.col("RUBRICA_UPPER").str.contains(r"ART(?:IGO)?\s*33|TRAFICO")).then(pl.lit(7.0))
@@ -145,12 +174,9 @@ class ArquitetoSafeDriverOuro:
             .otherwise(pl.lit(1.0)).alias("LABEL_PESO_RISCO")
         ])
 
-        # =================================================================
-        # 5. FEATURE STORE HISTÓRICA (O Segredo do Modelo)
-        # =================================================================
-        print("🏪 Construindo Histórico Espaço-Temporal...", flush=True)
+        # 5. CONSTRUÇÃO DA FEATURE STORE (HISTÓRICO ESPAÇO-TEMPORAL)
+        print("Processando variaveis de defasagem temporal (Feature Store)...", flush=True)
         
-        # Agregação 1: Hexágono Inteiro (Macro)
         df_fs_hex = df_gold.group_by(["H3_INDEX", "ANO_OCORRENCIA"]).agg([
             pl.len().alias("FS_VOL_CRIMES_ANO_ANT"),
             pl.col("LABEL_PESO_RISCO").sum().alias("FS_RISCO_TOTAL_ANO_ANT"),
@@ -158,34 +184,27 @@ class ArquitetoSafeDriverOuro:
             (pl.col("LABEL_PESO_RISCO") >= 5).sum().alias("FS_CRIMES_GRAVES_ANO_ANT")
         ]).with_columns((pl.col("ANO_OCORRENCIA") + 1).alias("ANO_JOIN"))
 
-        # Agregação 2: Hexágono + Período do Dia (Micro)
         df_fs_periodo = df_gold.group_by(["H3_INDEX", "SAZON_PERIODO", "ANO_OCORRENCIA"]).agg([
             pl.col("LABEL_PESO_RISCO").sum().alias("FS_RISCO_PERIODO_ANO_ANT")
         ]).with_columns((pl.col("ANO_OCORRENCIA") + 1).alias("ANO_JOIN"))
 
-        # Materializando as duas visões pro Looker usar depois
         for name, df_fs in [("macro_hex", df_fs_hex), ("micro_periodo", df_fs_periodo)]:
             buf = io.BytesIO()
             df_fs.drop("ANO_JOIN").write_parquet(buf, compression="zstd")
             self.s3.put_object(Bucket=self.bucket, Key=f"{self.ouro_dir}/feature_store/fs_{name}_historico.parquet", Body=buf.getvalue())
 
-        # =================================================================
-        # 6. ENRIQUECIMENTO FINAL (JOIN GIGANTE)
-        # =================================================================
-        print("🏙️ Fundindo Base Estática, Histórica e Eventos...", flush=True)
+        # 6. ENRIQUECIMENTO FINAL DA BASE ANALÍTICA (JOIN MULTIDIMENSIONAL)
+        print("Executando fusao de bases operacionais, infraestrutura e historicas...", flush=True)
         
         df_final = df_gold.join(df_universo_h3, on="H3_INDEX", how="left") \
                           .join(df_fs_hex.drop("ANO_OCORRENCIA"), left_on=["H3_INDEX", "ANO_OCORRENCIA"], right_on=["H3_INDEX", "ANO_JOIN"], how="left") \
                           .join(df_fs_periodo.drop("ANO_OCORRENCIA"), left_on=["H3_INDEX", "SAZON_PERIODO", "ANO_OCORRENCIA"], right_on=["H3_INDEX", "SAZON_PERIODO", "ANO_JOIN"], how="left")
         
-        # Limpeza de Nulos: O que não foi achado no passado/espaço, vira Zero.
         cols_fill = [c for c in df_final.columns if any(x in c for x in ["INFRA_", "CENSO_", "FS_", "MICRO_"])]
         df_final = df_final.with_columns([pl.col(c).fill_null(0) for c in cols_fill])
 
-        # =================================================================
-        # ✨ 6.1 REDUÇÃO DE DIMENSIONALIDADE: MACRO CLASSES DE CNAE
-        # =================================================================
-        print("🏢 Agrupando CNAEs em Macro Classes de Risco...", flush=True)
+        # 6.1 REDUÇÃO DE DIMENSIONALIDADE: MACRO CLASSES DE CNAE
+        print("Agrupando subsetores economicos em Macro Classes de Risco Urbano...", flush=True)
         
         cnae_macros = {
             "MACRO_FINANCEIRO": ["INFRA_DIV_64", "INFRA_DIV_65", "INFRA_DIV_66"],
@@ -202,14 +221,11 @@ class ArquitetoSafeDriverOuro:
             else:
                 df_final = df_final.with_columns(pl.lit(0).alias(macro_name))
 
-        # Expurgo das divisões brutas para limpar o ruído
         cols_cnae_brutos = [c for c in df_final.columns if c.startswith("INFRA_DIV_")]
         df_final = df_final.drop(cols_cnae_brutos + ["RUBRICA_UPPER", "ANO_OCORRENCIA"])
 
-        # =================================================================
-        # 7. SALVAMENTO E AUDITORIA
-        # =================================================================
-        print("📦 Gravando Master ABT no Data Lake...", flush=True)
+        # 7. EXPORTAÇÃO E AUDITORIA DO PIPELINE
+        print("Gravando ABT Final no Repositorio em Nuvem...", flush=True)
         buf_abt = io.BytesIO()
         df_final.write_parquet(buf_abt, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key=f"{self.ouro_dir}/safedriver_abt_treino.parquet", Body=buf_abt.getvalue())
@@ -218,17 +234,16 @@ class ArquitetoSafeDriverOuro:
         fs_hit_rate = (df_final.filter(pl.col("FS_VOL_CRIMES_ANO_ANT") > 0).height / df_final.height) * 100
         
         report = (
-            f"🏆 **[Ouro] Pipeline Finalizada com Sucesso!**\n"
-            f"```ml\n"
-            f"• Registros ABT     : {df_final.height}\n"
-            f"• Colunas (Features): {len(df_final.columns)} (Pós-Redução CNAE)\n"
-            f"• Feriados & FDS    : Injetados com Sucesso\n"
-            f"• Hit Rate FS       : {fs_hit_rate:.1f}% com Histórico\n"
-            f"• Tempo Total       : {duracao}s\n"
-            f"```"
+            f"Relatorio Operacional - Camada Ouro Concluida\n"
+            f"=============================================\n"
+            f"- Total de Registros (ABT): {df_final.height}\n"
+            f"- Quantidade de Atributos : {len(df_final.columns)}\n"
+            f"- Taxa Cobertura Histórica: {fs_hit_rate:.1f}%\n"
+            f"- Tempo de Execucao (s)   : {duracao}s\n"
+            f"============================================="
         )
         print(report)
-        self._notificar_discord(report)
+        self._notificar_discord(f"```text\n{report}\n```")
 
 if __name__ == "__main__":
     app = ArquitetoSafeDriverOuro()
