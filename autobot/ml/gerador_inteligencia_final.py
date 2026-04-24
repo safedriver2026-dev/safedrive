@@ -8,15 +8,19 @@ import time
 import requests
 import json
 import numpy as np
+import warnings
 from datetime import datetime
 from catboost import CatBoostRegressor
 from botocore.config import Config
 
+# Silencia avisos de deprecacao para manter o log limpo no GitHub Actions
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 class GeradorDossieSafeDriver:
     """
-    Componente dedicado exclusivamente a inferencia de dados geograficos massivos.
-    Asume que as variaveis preditivas e atributos textuais ja estao normalizados
-    pela integracao realizada na Camada Ouro da arquitetura de dados.
+    Componente responsavel pela inferencia preditiva em larga escala.
+    Implementa conversao rigorosa de tipos para compatibilidade com o core C++ do CatBoost,
+    garantindo que variaveis categoricas nao sejam interpretadas como floats.
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -41,43 +45,58 @@ class GeradorDossieSafeDriver:
         }
 
     def _notificar_discord(self, msg):
-        """Transmissao de metadados para auditoria em tempo real."""
         if self.webhook_url:
             try: requests.post(self.webhook_url, json={"content": msg}, timeout=15)
             except: pass
 
     def gerar_dados(self):
         inicio_processo = time.time()
-        print("Inicializando Motor de Inferencia Preditiva (Processamento Massivo)...", flush=True)
+        print("Inicializando Motor de Inferencia Preditiva...", flush=True)
         
-        # 1. CARREGAMENTO DOS ARTEFATOS
+        # 1. CARREGAMENTO DO MODELO
         if not os.path.exists(self.modelo_local):
             self.s3.download_file(self.bucket, f"modelos/{self.modelo_local}", self.modelo_local)
         modelo = CatBoostRegressor().load_model(self.modelo_local)
         
+        # Lista de features que o modelo exige que sejam categoricas (conforme o Treinador)
+        cat_features_originais = [
+            "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
+            "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_DIA"
+        ]
+
+        # 2. CARREGAMENTO DA BASE OURO
         print("Lendo a base pre-processada (Camada Ouro)...", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         total_linhas = df_ouro.height
         
-        # 2. INFERENCIA PREDITIVA
-        # A Base de dados ja esta isenta de ruidos ou variaveis brutas
-        print("Aplicando modelo estatistico a totalidade dos registros...", flush=True)
+        # 3. PREPARACAO E CONVERSAO ESTRITA DE TIPOS
+        print("Executando conversao estrita de tipos categoricos...", flush=True)
         X_all = df_ouro.select(modelo.feature_names_).to_pandas()
-        for col in X_all.select_dtypes(['object', 'category']).columns: 
-            X_all[col] = X_all[col].astype(str)
+        
+        # Loop de seguranca: Forca todas as cat_features a virarem String pura
+        # Isso remove o erro de '3.0' que o CatBoost reportou.
+        for col in X_all.columns:
+            if col in cat_features_originais:
+                # Preenche nulos, converte para string e remove sufixos decimais acidentais
+                X_all[col] = X_all[col].fillna("DESCONHECIDO").astype(str).str.replace(r'\.0$', '', regex=True)
             
+        # 4. INFERENCIA PREDITIVA
+        print("Aplicando modelo estatistico aos registros...", flush=True)
         preds = modelo.predict(X_all)
         df_dossie = df_ouro.with_columns(
             pl.Series("RISCO_PREDITO_IA", preds).round(2)
         )
 
-        # 3. EXTRACAO DO DNA CRIMINAL (SHAP)
-        print("Realizando analise de explicabilidade geoespacial...", flush=True)
+        # 5. EXTRACAO DO DNA CRIMINAL (SHAP)
+        print("Realizando analise de explicabilidade (SHAP)...", flush=True)
         df_shap_sample = df_ouro.sample(n=min(50000, df_ouro.height), seed=42)
         X_shap = df_shap_sample.select(modelo.feature_names_).to_pandas()
-        for col in X_shap.select_dtypes(['object', 'category']).columns: 
-            X_shap[col] = X_shap[col].astype(str)
+        
+        # Repete a limpeza de tipos para a amostra do SHAP
+        for col in X_shap.columns:
+            if col in cat_features_originais:
+                X_shap[col] = X_shap[col].fillna("DESCONHECIDO").astype(str).str.replace(r'\.0$', '', regex=True)
         
         explainer = shap.TreeExplainer(modelo)
         shap_vals = explainer.shap_values(X_shap)
@@ -87,8 +106,8 @@ class GeradorDossieSafeDriver:
             pd.DataFrame(shap_vals, columns=[f"SHAP_{f}" for f in modelo.feature_names_])
         ], axis=1).groupby(["CIDADE", "BAIRRO"]).mean().reset_index()
 
-        # 4. ARMAZENAMENTO E SINCRONIZACAO COM DATA LAKEHOUSE
-        print("Sincronizando Dossie de Vulnerabilidade no Repositorio de Dados...", flush=True)
+        # 6. SINCRONIZACAO COM DATA LAKEHOUSE
+        print("Sincronizando artefatos refinados no R2...", flush=True)
         buf_eventos = io.BytesIO()
         df_dossie.write_parquet(buf_eventos, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_eventos.getvalue())
@@ -97,7 +116,7 @@ class GeradorDossieSafeDriver:
         pl.from_pandas(df_shap_geo).write_parquet(buf_shap, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_shap.parquet", Body=buf_shap.getvalue())
 
-        # 5. GERACAO DE LOG E TELEMETRIA
+        # 7. TELEMETRIA FINAL
         duracao = time.time() - inicio_processo
         media_risco = float(np.mean(preds))
         max_risco = float(np.max(preds))
@@ -114,15 +133,12 @@ class GeradorDossieSafeDriver:
         self.s3.put_object(Bucket=self.bucket, Key="modelos/AUDITORIA_DOSSIE_INTELIGENCIA.json", Body=buf_log.getvalue())
 
         report = (
-            f"Relatorio Operacional - Dossiê de Inteligencia\n"
+            f"Relatorio Operacional - Dossie de Inteligencia\n"
             f"==============================================================\n"
-            f"   - Ocorrencias Analisadas      : {total_linhas}\n"
-            f"   - Localidades Segmentadas     : {len(df_shap_geo)}\n"
-            f"   - Vulnerabilidade Media       : {media_risco:.4f}\n"
-            f"   - Teto Estimado de Risco      : {max_risco:.4f}\n"
-            f"   - Tempo de Geracao (s)        : {duracao:.2f}\n"
+            f"Status: Sucesso (Conversao Estrita de Tipos Aplicada)\n"
+            f"Registros Inferred: {total_linhas}\n"
+            f"Tempo de Inferencia: {duracao:.2f}s\n"
             f"==============================================================\n"
-            f"Artefatos sincronizados para integracao via Data Warehouse.\n"
         )
         print(report)
         self._notificar_discord(f"```text\n{report}\n```")
