@@ -60,29 +60,11 @@ class ArquitetoSafeDriverPrata:
             try: requests.post(self.webhook_url, json={"content": msg}, timeout=10)
             except: pass
 
-    # ==========================================
-    # A MÁGICA DA LIMPEZA (ROLO COMPRESSOR)
-    # ==========================================
-    def _limpar_tabela_toda(self, df):
-        """Transforma tudo em maiúsculo, remove acentos e lixo de todas as strings."""
-        cols_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Utf8]
-        if not cols_texto: return df
-        return df.with_columns([
-            pl.col(c)
-            .str.to_uppercase()
-            .str.strip_chars()
-            .str.replace_all(r"[ÁÀÂÃÄ]", "A")
-            .str.replace_all(r"[ÉÈÊË]", "E")
-            .str.replace_all(r"[ÍÌÎÏ]", "I")
-            .str.replace_all(r"[ÓÒÔÕÖ]", "O")
-            .str.replace_all(r"[ÚÙÛÜ]", "U")
-            .str.replace_all(r"Ç", "C")
-            .str.replace_all(r"[^A-Z0-9\s_]", " ")
-            .str.replace_all(r"\s+", " ")
-            .fill_null("DESCONHECIDO")
-            .alias(c)
-            for c in cols_texto
-        ])
+    def _normalizar_texto(self, valor):
+        if valor is None or str(valor).upper() in ["NULL", "NAN", ".", "", "NONE", "NAO INFORMADO"]: 
+            return "DESCONHECIDO"
+        texto = "".join(c for c in unicodedata.normalize('NFKD', str(valor)) if unicodedata.category(c) != 'Mn')
+        return re.sub(r'[^a-zA-Z0-9\s]', '', texto).upper().strip()
 
     def _buscar_arquivo_flexivel(self, padrao):
         print(f"📂 Buscando por: {padrao}...", flush=True)
@@ -93,14 +75,26 @@ class ArquitetoSafeDriverPrata:
 
     def _ler_csv_agnostico(self, filepath):
         print(f"🔍 Auto-detetando formato do CSV: {filepath}", flush=True)
-        # Forçando o encoding que o IBGE usa por padrão (iso-8859-1) para evitar erro de utf-8
+        encodings_to_try = ['utf-8', 'iso-8859-1', 'cp1252', 'latin1']
+        used_enc = 'utf-8'
+        sample_text = ""
+        for enc in encodings_to_try:
+            try:
+                with open(filepath, 'r', encoding=enc) as f:
+                    sample_text = f.read(10000)
+                used_enc = enc
+                break
+            except:
+                continue
         try:
-            sep = ';'
-            return pl.read_csv(filepath, separator=sep, encoding="iso-8859-1", infer_schema_length=0, ignore_errors=True)
+            sep = csv.Sniffer().sniff(sample_text).delimiter
         except:
-            return pl.read_csv(filepath, separator=',', encoding="utf8", infer_schema_length=0, ignore_errors=True)
+            sep = ';' if sample_text.count(';') > sample_text.count(',') else ','
+        pl_encoding = 'utf8' if used_enc == 'utf-8' else 'iso-8859-1'
+        return pl.read_csv(filepath, separator=sep, encoding=pl_encoding, infer_schema_length=0, ignore_errors=True)
 
     def _limpar_cd_setor(self, coluna):
+        """Força o CD_SETOR a ser uma string limpa de 15 dígitos, matando floats e sufixos"""
         return pl.col(coluna).cast(pl.Utf8) \
                  .str.replace(r"\.0$", "") \
                  .str.replace_all(r"\D", "") \
@@ -121,6 +115,7 @@ class ArquitetoSafeDriverPrata:
         print("✅ Bronze carregada localmente.")
 
     def upload_r2(self):
+        """Faz o upload de todos os arquivos da pasta Prata para o bucket R2 na nova hierarquia"""
         print("📤 Enviando arquivos da Malha Prata para o R2...", flush=True)
         arquivos_prata = glob.glob(f"{self.prata_dir}/*")
         
@@ -130,6 +125,7 @@ class ArquitetoSafeDriverPrata:
 
         for filepath in arquivos_prata:
             filename = os.path.basename(filepath)
+            # PADRONIZAÇÃO DO DATA LAKE APLICADA AQUI:
             s3_key = f"datalake/prata/malha_trusted/{filename}"
             print(f"   -> Subindo: {filename} para {s3_key}...", flush=True)
             try:
@@ -171,9 +167,6 @@ class ArquitetoSafeDriverPrata:
                 pl.col("V0002").cast(pl.Utf8).str.replace(",", ".").cast(pl.Float64, strict=False).alias("CENSO_RENDA") if "V0002" in cols else pl.lit(0.0).alias("CENSO_RENDA")
             ]).filter(pl.col("CD_SETOR").str.len_chars() == 15)
 
-            # APLICA LIMPEZA NO CENSO
-            df_censo = self._limpar_tabela_toda(df_censo)
-
             # =================================================================
             # 2. CARREGAR RUAS (JSON) E EQUALIZAR CD_SETOR
             # =================================================================
@@ -199,9 +192,6 @@ class ArquitetoSafeDriverPrata:
 
             df_ruas_raw = pl.concat(list_vias_df)
             df_ruas_raw = df_ruas_raw.with_columns(self._limpar_cd_setor("CD_SETOR").alias("CD_SETOR"))
-
-            # APLICA LIMPEZA NAS RUAS
-            df_ruas_raw = self._limpar_tabela_toda(df_ruas_raw)
 
             print("--- Cruzando Ruas e Censo (Join Relacional) ---")
             df_ruas_censo = df_ruas_raw.join(df_censo, on="CD_SETOR", how="left")
@@ -235,12 +225,14 @@ class ArquitetoSafeDriverPrata:
             df_h3_mapeado = self.con.execute(query_espacial).pl()
             sucesso_poligono = df_h3_mapeado.select(pl.sum("MATCH_POLIGONAL")).item()
 
-            # APLICA LIMPEZA NO NOME DE BAIRROS DA PREFEITURA
-            df_h3_mapeado = self._limpar_tabela_toda(df_h3_mapeado)
+            df_h3_mapeado = df_h3_mapeado.with_columns([
+                pl.col("CIDADE").map_elements(self._normalizar_texto, return_dtype=pl.Utf8),
+                pl.col("BAIRRO").map_elements(self._normalizar_texto, return_dtype=pl.Utf8)
+            ])
 
             df_vias_completo = df_ruas_h3.drop(["CID_CENSO", "BAI_CENSO"]).join(
                 df_h3_mapeado.drop("MATCH_POLIGONAL"), on="H3_INDEX", how="left"
-            )
+            ).with_columns(pl.col("RUA").map_elements(self._normalizar_texto, return_dtype=pl.Utf8))
 
             # =================================================================
             # 4. EXPORTAÇÕES (Ouro/Prata)
@@ -273,15 +265,17 @@ class ArquitetoSafeDriverPrata:
                 df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
                 
                 df_infra_hierarquica = df_pivot.join(df_h3_mapeado.select(["H3_INDEX", "CIDADE", "BAIRRO"]), on="H3_INDEX", how="left")
-                
-                # APLICA LIMPEZA NOS BAIRROS E CIDADES DA INFRAESTRUTURA
-                df_infra_hierarquica = self._limpar_tabela_toda(df_infra_hierarquica)
-                
                 df_infra_hierarquica.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet", compression="zstd")
 
             # =================================================================
             # 6. TELEMETRIA, UPLOAD R2 E FINALIZAÇÃO
             # =================================================================
+            
+            # Contagens Exatas para a Auditoria
+            qtd_cidades = df_vias_completo.select("CIDADE").unique().height
+            qtd_bairros = df_vias_completo.select(["CIDADE", "BAIRRO"]).unique().height
+            qtd_ruas = df_vias_completo.select(["CIDADE", "BAIRRO", "RUA"]).unique().height
+
             tempo_exec = round(time.time() - tempo_inicio, 2)
             sucesso_total = df_h3_mapeado.filter(pl.col("BAIRRO") != "DESCONHECIDO").height
             total_h3 = df_h3_mapeado.height
@@ -293,24 +287,36 @@ class ArquitetoSafeDriverPrata:
             self.auditoria["telemetria"] = {
                 "tempo_seg": tempo_exec,
                 "h3_unicos": total_h3,
+                "cidades_processadas": qtd_cidades,
+                "bairros_processados": qtd_bairros,
+                "ruas_processadas": qtd_ruas,
                 "faces_processadas": total_faces,
                 "faces_com_dados_censo": faces_com_censo,
                 "taxa_enriquecimento_censo_pct": taxa_join_censo,
                 "taxa_cobertura_nome_localidade_pct": taxa_sucesso_geral
             }
             
+            # Salva auditoria localmente
             with open(f"{self.prata_dir}/AUDITORIA_PRATA_MALHA.json", "w") as f:
                 json.dump(self.auditoria, f, indent=4)
 
+            # ✨ Upload de tudo para o R2 com a nova hierarquia
             self.upload_r2()
 
             msg = (
                 f"🗺️ **[SafeDriver] Malha Prata Híbrida OK**\n"
-                f"- Tempo: {tempo_exec}s\n"
-                f"- Cobertura Bairros: {taxa_sucesso_geral}%\n"
-                f"- Join Dados Censo (População/Renda): {taxa_join_censo}%\n"
-                f"- H3 Gerados: {total_h3}\n"
-                f"☁️ Arquivos sincronizados em `datalake/prata/malha_trusted/` no R2!"
+                f"- Tempo de Processamento: {tempo_exec}s\n"
+                f"--------------------------------------\n"
+                f"📍 **Volumetria Espacial:**\n"
+                f"  • Cidades Mapeadas: {qtd_cidades}\n"
+                f"  • Bairros Mapeados: {qtd_bairros}\n"
+                f"  • Logradouros Únicos: {qtd_ruas}\n"
+                f"  • Hexágonos (H3): {total_h3}\n"
+                f"--------------------------------------\n"
+                f"📊 **Qualidade dos Dados:**\n"
+                f"  • Cobertura de Bairros: {taxa_sucesso_geral}%\n"
+                f"  • Enriquecimento IBGE: {taxa_join_censo}%\n"
+                f"☁️ Arquivos sincronizados em `datalake/prata/malha_trusted/`"
             )
             print(f"\n✨ {msg}")
             self._notificar_discord(msg)
