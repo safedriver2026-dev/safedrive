@@ -9,20 +9,26 @@ from google.oauth2 import service_account
 from botocore.config import Config
 
 class DeploySafeDriverBigQuery:
+    """
+    Modulo de Analytics Engineering responsavel pela orquestracao do Data Warehouse.
+    Realiza a transferencia dos artefatos processados no Data Lake (Cloudflare R2)
+    para o Google BigQuery, estruturando o modelo analitico (Star Schema) atraves
+    da criacao de Views para consumo em plataformas de Business Intelligence.
+    """
     def __init__(self):
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
         self.dataset_id = os.getenv("BQ_DATASET_ID")
         
         bq_json_str = os.getenv("BQ_SERVICE_ACCOUNT_JSON")
         if not bq_json_str:
-            raise ValueError("Secret BQ_SERVICE_ACCOUNT_JSON ausente.")
+            raise ValueError("Credenciais de servico do BigQuery (Secret) ausentes.")
             
         credentials = service_account.Credentials.from_service_account_info(json.loads(bq_json_str))
         self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
         
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        # ---> A CORREÇÃO: Mesma limpeza de endpoint do R2 <---
+        # Tratamento de integridade do endpoint do Data Lake
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
             endpoint = endpoint[: -len(f"/{self.bucket}")]
@@ -35,27 +41,29 @@ class DeploySafeDriverBigQuery:
         )
 
     def _ler_parquet_r2(self, key):
-        print(f"📥 Baixando {key} do R2...", flush=True)
+        """Leitura de arquivos colunares em nuvem utilizando stream de memoria."""
+        print(f"Efetuando download do artefato: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         return pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
 
     def _upload_table(self, df_pandas, table_name):
+        """Executa a carga de dados (Upload Truncate) para o Data Warehouse."""
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
         job.result()
-        print(f"✔️ Tabela {table_name} cravada no BigQuery.", flush=True)
+        print(f"Tabela {table_name} sincronizada com sucesso no BigQuery.", flush=True)
 
     def executar_deploy(self):
-        print("🚀 [DOSSIÊ MÓDULO 2] Iniciando carga massiva no Data Warehouse...", flush=True)
+        print("Iniciando pipeline de integracao com o Data Warehouse...", flush=True)
 
         # =================================================================
-        # 1. SOBE A BASE NA ÍNTEGRA
+        # 1. CARGA DA TABELA FATO (EVENTOS PREDITIVOS)
         # =================================================================
-        print("⏳ Subindo Dossiê de Eventos (Isso pode demorar alguns minutos)...", flush=True)
+        print("Processando Dossiê de Eventos (Tabela Fato)...", flush=True)
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         
-        # Tratamento de segurança para o BigQuery não reclamar de datas e horas zoadas
+        # Normalizacao de tipagem para conformidade com o schema estrito do BigQuery
         if 'DATAOCORRENCIA' in df_eventos.columns:
             df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
         if 'HORAOCORRENCIA' in df_eventos.columns:
@@ -64,25 +72,25 @@ class DeploySafeDriverBigQuery:
         self._upload_table(df_eventos, "tb_dossie_eventos")
 
         # =================================================================
-        # 2. SOBE O DNA SHAP
+        # 2. CARGA DA TABELA DIMENSÃO (EXPLICABILIDADE SHAP)
         # =================================================================
-        print("🧬 Subindo Dimensão de DNA SHAP...", flush=True)
+        print("Processando Dimensao de Inteligencia (Metricas SHAP)...", flush=True)
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
         self._upload_table(df_shap, "tb_dim_shap")
 
         # =================================================================
-        # 3. CRIA A MASTER VIEW DO DOSSIÊ
+        # 3. CONSTRUÇÃO DA CAMADA SEMÂNTICA (MASTER VIEW)
         # =================================================================
-        print("🌟 Forjando a Master View do Dossiê para o Looker Studio...", flush=True)
+        print("Construindo a Camada Semantica (Master View) via SQL...", flush=True)
         
         sql = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
         SELECT 
             e.*,
-            -- Converte as coordenadas para o formato Geográfico Nativo do BigQuery
+            -- Conversao de coordenadas decimais para o tipo geoespacial nativo do BigQuery
             ST_GEOGPOINT(CAST(e.LONGITUDE AS FLOAT64), CAST(e.LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
             
-            -- Calculando a diferença entre o Risco Real e o Risco que a IA previu
+            -- Metrica de auditoria: Delta entre Risco Preditivo (IA) e Risco Real Observado
             (e.RISCO_PREDITO_IA - e.LABEL_PESO_RISCO) AS DELTA_IA_REAL,
             
             s.* EXCEPT(CIDADE, BAIRRO)
@@ -93,7 +101,7 @@ class DeploySafeDriverBigQuery:
         """
         
         self.bq_client.query(sql).result()
-        print("🏆 [DOSSIÊ CONCLUÍDO] View 'vw_safedriver_dossie_master' no ar!", flush=True)
+        print("Deploy concluido. View 'vw_safedriver_dossie_master' instanciada com sucesso.", flush=True)
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
