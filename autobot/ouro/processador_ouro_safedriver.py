@@ -12,8 +12,8 @@ class ArquitetoSafeDriverOuro:
     """
     Componente responsavel pela consolidacao da Analytical Base Table (ABT).
     Integra a malha de infraestrutura urbana, eventos criminais historicos e 
-    calendarios de feriados. Implementa dosimetria penal e a geracao de 
-    Features Espaco-Temporais.
+    calendarios de feriados. Implementa dosimetria penal, achatamento de features 
+    e a geracao da variavel de Contexto Critico.
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -98,7 +98,6 @@ class ArquitetoSafeDriverOuro:
         if df_social is None:
             df_social = pl.DataFrame({"H3_INDEX": df_infra["H3_INDEX"].unique()})
 
-        # Normalizacao da Malha antes do cruzamento
         df_infra = self._aplicar_normalizacao_global(df_infra)
         df_social = self._aplicar_normalizacao_global(df_social)
 
@@ -115,7 +114,6 @@ class ArquitetoSafeDriverOuro:
         lista_crimes = [df for f in crime_files if (df := self._ler_parquet_r2(f)) is not None]
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
         
-        # Aplicacao de Normalizacao Global em todos os dados de seguranca publica
         print("Iniciando normalizacao textual global no conjunto de ocorrencias...", flush=True)
         df_crimes = self._aplicar_normalizacao_global(df_crimes)
 
@@ -126,38 +124,51 @@ class ArquitetoSafeDriverOuro:
             json_feriados = json.loads(obj_feriados['Body'].read().decode('utf-8'))
             
             df_feriados = pl.DataFrame(json_feriados)
+            
+            # Captura o tipo de feriado ou ponto facultativo como uma classificacao pre-processada
             df_feriados = df_feriados.select([
                 pl.col("data").str.to_date("%Y-%m-%d", strict=False).alias("DATA_CHAVE"),
-                pl.lit(1).alias("FEAT_IS_FERIADO"),
-                self._normalizar_texto_pl("feriado_tipo").alias("FEAT_TIPO_FERIADO"),
-                pl.col("is_ponto_facultativo").cast(pl.Int8).alias("FEAT_IS_PONTO_FACULTATIVO")
+                pl.when(pl.col("feriado_tipo").is_not_null()).then(pl.lit("FERIADO"))
+                  .when(pl.col("is_ponto_facultativo") == True).then(pl.lit("PONTO_FACULTATIVO"))
+                  .otherwise(pl.lit("DIA_UTIL")).alias("CLASSIFICACAO_CALENDARIO")
             ])
             
             df_crimes = df_crimes.with_columns(pl.col("DATAOCORRENCIA").cast(pl.Date, strict=False))
             df_crimes = df_crimes.join(df_feriados, left_on="DATAOCORRENCIA", right_on="DATA_CHAVE", how="left")
-            
-            df_crimes = df_crimes.with_columns([
-                pl.col("FEAT_IS_FERIADO").fill_null(0),
-                pl.col("FEAT_TIPO_FERIADO").fill_null("DIA_UTIL"),
-                pl.col("FEAT_IS_PONTO_FACULTATIVO").fill_null(0)
-            ])
+            df_crimes = df_crimes.with_columns(pl.col("CLASSIFICACAO_CALENDARIO").fill_null("DIA_UTIL"))
         except Exception as e:
             print(f"Falha ao acoplar base de feriados: {e}. Contingencia: Atribuindo dias uteis globais.", flush=True)
-            df_crimes = df_crimes.with_columns([
-                pl.lit(0).alias("FEAT_IS_FERIADO"),
-                pl.lit("DIA_UTIL").alias("FEAT_TIPO_FERIADO"),
-                pl.lit(0).alias("FEAT_IS_PONTO_FACULTATIVO")
-            ])
+            df_crimes = df_crimes.with_columns(pl.lit("DIA_UTIL").alias("CLASSIFICACAO_CALENDARIO"))
 
-        # 4. ENGENHARIA DE ATRIBUTOS E DOSIMETRIA PENAL
-        print("Executando calculo de dosimetria penal e criacao de features derivativas...", flush=True)
+        # 4. ENGENHARIA DE ATRIBUTOS (ACHATAMENTO E DOSIMETRIA PENAL)
+        print("Executando achatamento de variaveis espaco-temporais e dosimetria penal...", flush=True)
+        
+        # Extracao estruturada da hora
+        df_crimes = df_crimes.with_columns([
+            pl.col("HORAOCORRENCIA").cast(pl.Utf8).str.slice(0, 2).cast(pl.Int8, strict=False).alias("HORA_INT")
+        ])
+
         df_crimes = df_crimes.with_columns([
             pl.col("RUBRICA").fill_null("").alias("RUBRICA_UPPER"),
             pl.col("DATAOCORRENCIA").dt.year().alias("ANO_OCORRENCIA"),
             pl.col("DATAOCORRENCIA").dt.weekday().fill_null(0).alias("FEAT_DIA_SEMANA"),
             pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES"),
-            pl.col("DATAOCORRENCIA").dt.weekday().is_in([6, 7]).cast(pl.Int8).fill_null(0).alias("FEAT_IS_FIM_DE_SEMANA")
+            
+            # Categorizacao Sociologica do Tempo (Sazonalidade)
+            pl.when(pl.col("HORA_INT") >= 18).then(pl.lit("NOITE"))
+            .when(pl.col("HORA_INT") >= 12).then(pl.lit("TARDE"))
+            .when(pl.col("HORA_INT") >= 6).then(pl.lit("MANHA"))
+            .when(pl.col("HORA_INT") >= 0).then(pl.lit("MADRUGADA"))
+            .otherwise(pl.lit("INCERTO")).alias("SAZON_PERIODO")
         ])
+
+        # Achatamento (Flattening): Consolida final de semana e feriados em uma unica coluna categorica
+        df_crimes = df_crimes.with_columns([
+            pl.when(pl.col("CLASSIFICACAO_CALENDARIO") == "FERIADO").then(pl.lit("FERIADO"))
+            .when(pl.col("FEAT_DIA_SEMANA").is_in([6, 7])).then(pl.lit("FIM_DE_SEMANA"))
+            .when(pl.col("CLASSIFICACAO_CALENDARIO") == "PONTO_FACULTATIVO").then(pl.lit("PONTO_FACULTATIVO"))
+            .otherwise(pl.lit("DIA_UTIL")).alias("FEAT_TIPO_DIA")
+        ]).drop(["HORA_INT", "CLASSIFICACAO_CALENDARIO"])
 
         df_gold = df_crimes.with_columns([
             pl.when(pl.col("RUBRICA_UPPER").str.contains(r"VEICULO|CARGA")).then(pl.lit("MOTORISTA"))
@@ -172,6 +183,12 @@ class ArquitetoSafeDriverOuro:
             .when(pl.col("RUBRICA_UPPER").str.contains(r"ART(?:IGO)?\s*129|LESAO")).then(pl.lit(4.0))
             .when(pl.col("RUBRICA_UPPER").str.contains(r"ART(?:IGO)?\s*155|FURTO")).then(pl.lit(2.0))
             .otherwise(pl.lit(1.0)).alias("LABEL_PESO_RISCO")
+        ])
+
+        # Criacao Direta da Variavel de Contexto Critico
+        print("Sintetizando a variavel de Contexto Critico (Sazonalidade + Perfil Alvo)...", flush=True)
+        df_gold = df_gold.with_columns([
+            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         ])
 
         # 5. CONSTRUÇÃO DA FEATURE STORE (HISTÓRICO ESPAÇO-TEMPORAL)
