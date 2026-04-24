@@ -16,7 +16,7 @@ import unicodedata
 from datetime import datetime
 from botocore.config import Config
 
-class ProcessadorMalhaPrata:
+class ArquitetoSafeDriverPrata:
     def __init__(self):
         self.H3_RES = 9 
         self.bronze_dir = "./data_raw"
@@ -47,8 +47,8 @@ class ProcessadorMalhaPrata:
         except:
             pass
 
-    def _limpar_texto_global(self, df):
-        """Passa o trator em todas as colunas de texto: sem acento, caixa alta, sem lixo."""
+    def _limpar_tabela_toda(self, df):
+        """Limpeza bruta em todas as colunas de texto da tabela."""
         cols_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Utf8]
         if not cols_texto:
             return df
@@ -74,7 +74,7 @@ class ProcessadorMalhaPrata:
         return pl.col(coluna).cast(pl.Utf8).str.replace(r"\.0$", "").str.replace_all(r"\D", "").str.slice(0, 15)
 
     def download_r2(self):
-        print("Sincronizando arquivos do Bronze...")
+        print("Sincronizando arquivos...")
         targets = ["SP_Faces_2022.zip", "SP_bairros_CD2022", "Agregados_por_setores_basico", "CNPJ_SP_HISTORICO_LOTE_"]
         pag = self.s3.get_paginator('list_objects_v2')
         for p in pag.paginate(Bucket=self.bucket):
@@ -86,7 +86,7 @@ class ProcessadorMalhaPrata:
                         self.s3.download_file(self.bucket, key, dest)
 
     def upload_r2(self):
-        print("Enviando arquivos processados para o R2...")
+        print("Enviando para o R2...")
         arquivos = glob.glob(f"{self.prata_dir}/*")
         for filepath in arquivos:
             filename = os.path.basename(filepath)
@@ -95,15 +95,11 @@ class ProcessadorMalhaPrata:
 
     def processar(self):
         tempo_inicio = time.time()
-        print("Iniciando processamento da malha...")
-        
         try:
-            # 1. Dados do Censo (CORREÇÃO DE ENCODING AQUI)
-            arqs_csv = glob.glob(f"**/Agregados_por_setores_basico*.csv", recursive=True)
-            if not arqs_csv: raise FileNotFoundError("CSV do Censo nao encontrado.")
-            
-            # Forca encoding iso-8859-1 para evitar erro de UTF-8
-            df_censo = pl.read_csv(arqs_csv[0], infer_schema_length=0, ignore_errors=True, encoding="iso-8859-1")
+            # 1. Censo (Corrigido Separador e Encoding)
+            csv_f = glob.glob(f"**/Agregados_por_setores_basico*.csv", recursive=True)[0]
+            # O SEGREDO ESTÁ AQUI: separator=";" e encoding="iso-8859-1"
+            df_censo = pl.read_csv(csv_f, separator=";", encoding="iso-8859-1", infer_schema_length=0, ignore_errors=True)
             df_censo.columns = [c.strip().upper() for c in df_censo.columns]
             
             df_censo = df_censo.select([
@@ -112,14 +108,12 @@ class ProcessadorMalhaPrata:
                 pl.col("V0001").cast(pl.Utf8).str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0).alias("CENSO_POPULACAO"),
                 pl.col("V0002").cast(pl.Utf8).str.replace(",", ".").cast(pl.Float64, strict=False).fill_null(0).alias("CENSO_RENDA")
             ])
-            df_censo = self._limpar_texto_global(df_censo)
+            df_censo = self._limpar_tabela_toda(df_censo)
 
-            # 2. Dados de Ruas (Faces JSON)
-            arqs_zip = glob.glob(f"**/SP_Faces_2022.zip", recursive=True)
-            if not arqs_zip: raise FileNotFoundError("Zip de Faces nao encontrado.")
-            
+            # 2. Ruas (Faces JSON)
+            zip_f = glob.glob(f"**/SP_Faces_2022.zip", recursive=True)[0]
             vias_list = []
-            with zipfile.ZipFile(arqs_zip[0], 'r') as z:
+            with zipfile.ZipFile(zip_f, 'r') as z:
                 json_files = [f for f in z.namelist() if f.endswith('.json')]
                 for f in json_files:
                     z.extract(f, self.temp_extract_dir)
@@ -130,25 +124,21 @@ class ProcessadorMalhaPrata:
 
             df_ruas = pl.concat(vias_list)
             df_ruas = df_ruas.with_columns(self._limpar_cd_setor("CD_SETOR").alias("CD_SETOR"))
-            df_ruas = self._limpar_texto_global(df_ruas)
+            df_ruas = self._limpar_tabela_toda(df_ruas)
 
             # 3. Cruzamento e H3
-            df_ruas_censo = df_ruas.join(df_censo, on="CD_SETOR", how="left").fill_null(0)
-            df_ruas_h3 = df_ruas_censo.with_columns(
+            df_ruas_h3 = df_ruas.join(df_censo, on="CD_SETOR", how="left").fill_null(0)
+            df_ruas_h3 = df_ruas_h3.with_columns(
                 pl.struct(["LAT", "LON"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["LAT"], x["LON"], self.H3_RES) for x in s])).alias("H3_INDEX")
             )
 
-            # 4. Join Espacial com Bairros (SHP)
+            # 4. Join Espacial (Bairros SHP)
             df_h3_coords = df_ruas_h3.group_by("H3_INDEX").agg([
                 pl.col("LAT").first().alias("LAT"), pl.col("LON").first().alias("LON"),
                 pl.col("CID_CENSO").first().alias("CID_CENSO")
             ])
-            
             self.con.register("tabela_h3", df_h3_coords.to_arrow())
-            arqs_shp = glob.glob(f"**/*bairros_CD2022*.shp", recursive=True)
-            if not arqs_shp: raise FileNotFoundError("SHP de Bairros nao encontrado.")
-            
-            shp_path = arqs_shp[0].replace("\\", "/")
+            shp_path = glob.glob(f"**/*bairros_CD2022*.shp", recursive=True)[0].replace("\\", "/")
             sql_spatial = f"""
                 SELECT h3.H3_INDEX, 
                 COALESCE(ibge.NM_MUN, h3.CID_CENSO, 'DESCONHECIDO') AS CIDADE,
@@ -156,46 +146,36 @@ class ProcessadorMalhaPrata:
                 FROM tabela_h3 h3 LEFT JOIN ST_Read('{shp_path}') ibge ON ST_Contains(ibge.geom, ST_Point(h3.LON, h3.LAT))
             """
             df_geo = self.con.execute(sql_spatial).pl()
-            df_geo = self._limpar_texto_global(df_geo)
+            df_geo = self._limpar_tabela_toda(df_geo)
 
-            # 5. Exportacao Final (TUDO NORMALIZADO)
+            # 5. Exportação (TUDO LIMPO)
             df_vias_final = df_ruas_h3.drop(["CID_CENSO"]).join(df_geo, on="H3_INDEX", how="left")
-            df_vias_final = self._limpar_texto_global(df_vias_final)
+            df_vias_final = self._limpar_tabela_toda(df_vias_final)
+            df_vias_final.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet")
 
-            # Social
-            df_social_final = df_vias_final.group_by("H3_INDEX").agg([
-                pl.sum("TOT_RES").alias("MICRO_POPULACAO_FACES"),
-                pl.mean("CENSO_POPULACAO").alias("CENSO_MEDIA_V0001"),
-                pl.mean("CENSO_RENDA").alias("CENSO_MEDIA_V0002")
-            ])
-            df_social_final.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet")
-
-            # Infraestrutura
+            # 6. Infraestrutura (CNAEs)
             infra_files = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             if infra_files:
                 df_infra = pl.scan_parquet(infra_files).filter(pl.col("lat").is_not_null()) \
                     .with_columns(pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")) \
                     .collect()
-                
                 df_infra = df_infra.with_columns(
                     pl.struct(["lat", "lon"]).map_batches(lambda s: pl.Series([h3.latlng_to_cell(x["lat"], x["lon"], self.H3_RES) for x in s])).alias("H3_INDEX")
                 )
-                
                 df_pivot = df_infra.group_by(["H3_INDEX", "CNAE_DIV"]).len() \
                     .pivot(values="len", index="H3_INDEX", on="CNAE_DIV").fill_null(0)
-                
                 df_pivot = df_pivot.rename({c: f"INFRA_DIV_{c}" for c in df_pivot.columns if c != "H3_INDEX"})
                 df_infra_final = df_pivot.join(df_geo, on="H3_INDEX", how="left")
-                df_infra_final = self._limpar_texto_global(df_infra_final)
+                df_infra_final = self._limpar_tabela_toda(df_infra_final)
                 df_infra_final.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet")
 
             self.upload_r2()
-            print(f"Malha Prata finalizada em {time.time() - tempo_inicio:.2f}s")
+            print(f"Malha Prata OK em {time.time() - tempo_inicio:.2f}s")
 
         finally:
             self.con.close()
 
 if __name__ == "__main__":
-    p = ProcessadorMalhaPrata()
-    p.download_r2()
-    p.processar()
+    app = ArquitetoSafeDriverPrata()
+    app.download_r2()
+    app.processar()
