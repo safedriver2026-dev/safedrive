@@ -17,9 +17,13 @@ class DeploySafeDriverBigQuery:
     otimizada para ferramentas de Business Intelligence e analise geoespacial.
     """
     def __init__(self):
+        # Prioriza o ID definido pelo usuario nas correcoes de historico
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
         self.dataset_id = os.getenv("BQ_DATASET_ID")
         
+        if not self.dataset_id:
+            raise ValueError("A variavel BQ_DATASET_ID precisa estar configurada.")
+            
         # Inicializacao das credenciais de servico via Secret
         bq_json_str = os.getenv("BQ_SERVICE_ACCOUNT_JSON")
         if not bq_json_str:
@@ -43,20 +47,32 @@ class DeploySafeDriverBigQuery:
         )
 
     def _ler_parquet_r2(self, key):
-        """Leitura eficiente de arquivos Parquet via buffer de memoria."""
+        """Leitura eficiente de arquivos Parquet via buffer de memoria com blindagem NaN."""
         print(f"Acessando artefato no Data Lake: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        # O Polars realiza a leitura inicial pela performance, convertendo para Pandas para o BQ Client
-        return pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
+        
+        # Le com Polars e converte para Pandas
+        df_pandas = pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
+        
+        # BLINDAGEM: BigQuery nao aceita Float NaN do Pandas em colunas genericas.
+        # Converte strings vazias/NaNs de forma aceitavel pelo conector do BQ.
+        df_pandas = df_pandas.fillna(pd.NA)
+        return df_pandas
 
     def _upload_table(self, df_pandas, table_name):
         """Executa a persistencia de dados no Data Warehouse (Modo Write Truncate)."""
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
-        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         
+        # O autodetect salva o pipeline caso a Camada Ouro crie uma coluna nova
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            autodetect=True 
+        )
+        
+        print(f"Iniciando job de carga para {table_id}...", flush=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
-        job.result()
-        print(f"Carga finalizada: Tabela {table_name} atualizada no BigQuery.", flush=True)
+        job.result() # Aguarda a conclusao da API do BQ
+        print(f"✅ Carga finalizada: Tabela {table_name} atualizada no BigQuery.", flush=True)
 
     def executar_deploy(self):
         print("Iniciando pipeline de Deploy Analitico (Sincronizacao R2 -> BQ)...", flush=True)
@@ -64,7 +80,7 @@ class DeploySafeDriverBigQuery:
         # =================================================================
         # 1. CARGA DA TABELA FATO: EVENTOS COM PREDICAO DE RISCO
         # =================================================================
-        print("Processando Dossie de Vulnerabilidade (Tabela Fato)...", flush=True)
+        print("\nProcessando Dossie de Vulnerabilidade (Tabela Fato)...", flush=True)
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         
         # Ajuste de tipos primitivos para conformidade com o BigQuery
@@ -78,14 +94,14 @@ class DeploySafeDriverBigQuery:
         # =================================================================
         # 2. CARGA DA TABELA DIMENSAO: DNA CRIMINAL (VALORES SHAP)
         # =================================================================
-        print("Processando Metricas de Explicabilidade SHAP (Tabela Dimensao)...", flush=True)
+        print("\nProcessando Metricas de Explicabilidade SHAP (Tabela Dimensao)...", flush=True)
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
         self._upload_table(df_shap, "tb_dim_shap")
 
         # =================================================================
         # 3. INSTANCIACAO DA CAMADA SEMANTICA (MASTER VIEW)
         # =================================================================
-        print("Gerando Camada Semantica Geoespacial (Star Schema View)...", flush=True)
+        print("\nGerando Camada Semantica Geoespacial (Star Schema View)...", flush=True)
         
         sql = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
@@ -107,7 +123,7 @@ class DeploySafeDriverBigQuery:
         
         self.bq_client.query(sql).result()
         print(f"Deploy executado com sucesso em {datetime.now().strftime('%d/%m/%Y %H:%M')}.", flush=True)
-        print("Objeto 'vw_safedriver_dossie_master' pronto para consumo no Looker Studio.", flush=True)
+        print(f"Objeto '{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master' pronto para consumo no Looker Studio.", flush=True)
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
