@@ -125,7 +125,6 @@ class ArquitetoSafeDriverOuro:
             
             df_feriados = pl.DataFrame(json_feriados)
             
-            # Captura o tipo de feriado ou ponto facultativo como uma classificacao pre-processada
             df_feriados = df_feriados.select([
                 pl.col("data").str.to_date("%Y-%m-%d", strict=False).alias("DATA_CHAVE"),
                 pl.when(pl.col("feriado_tipo").is_not_null()).then(pl.lit("FERIADO"))
@@ -143,9 +142,15 @@ class ArquitetoSafeDriverOuro:
         # 4. ENGENHARIA DE ATRIBUTOS (ACHATAMENTO E DOSIMETRIA PENAL)
         print("Executando achatamento de variaveis espaco-temporais e dosimetria penal...", flush=True)
         
-        # Extracao estruturada da hora
+        # Extracao robusta da hora (separa pelo dois-pontos, pega a primeira parte, converte para numero)
         df_crimes = df_crimes.with_columns([
-            pl.col("HORAOCORRENCIA").cast(pl.Utf8).str.slice(0, 2).cast(pl.Int8, strict=False).alias("HORA_INT")
+            pl.col("HORAOCORRENCIA")
+            .cast(pl.Utf8)
+            .str.split(":")
+            .list.first()
+            .str.strip_chars()
+            .cast(pl.Int8, strict=False)
+            .alias("HORA_INT")
         ])
 
         df_crimes = df_crimes.with_columns([
@@ -154,15 +159,15 @@ class ArquitetoSafeDriverOuro:
             pl.col("DATAOCORRENCIA").dt.weekday().fill_null(0).alias("FEAT_DIA_SEMANA"),
             pl.col("DATAOCORRENCIA").dt.month().fill_null(0).alias("FEAT_MES"),
             
-            # Categorizacao Sociologica do Tempo (Sazonalidade)
-            pl.when(pl.col("HORA_INT") >= 18).then(pl.lit("NOITE"))
-            .when(pl.col("HORA_INT") >= 12).then(pl.lit("TARDE"))
-            .when(pl.col("HORA_INT") >= 6).then(pl.lit("MANHA"))
-            .when(pl.col("HORA_INT") >= 0).then(pl.lit("MADRUGADA"))
+            # Categorizacao Sociologica do Tempo
+            pl.when((pl.col("HORA_INT") >= 18) & (pl.col("HORA_INT") <= 23)).then(pl.lit("NOITE"))
+            .when((pl.col("HORA_INT") >= 12) & (pl.col("HORA_INT") < 18)).then(pl.lit("TARDE"))
+            .when((pl.col("HORA_INT") >= 6) & (pl.col("HORA_INT") < 12)).then(pl.lit("MANHA"))
+            .when((pl.col("HORA_INT") >= 0) & (pl.col("HORA_INT") < 6)).then(pl.lit("MADRUGADA"))
             .otherwise(pl.lit("INCERTO")).alias("SAZON_PERIODO")
         ])
 
-        # Achatamento (Flattening): Consolida final de semana e feriados em uma unica coluna categorica
+        # Achatamento Temporal (Calendario consolidado em uma unica feature)
         df_crimes = df_crimes.with_columns([
             pl.when(pl.col("CLASSIFICACAO_CALENDARIO") == "FERIADO").then(pl.lit("FERIADO"))
             .when(pl.col("FEAT_DIA_SEMANA").is_in([6, 7])).then(pl.lit("FIM_DE_SEMANA"))
@@ -185,7 +190,7 @@ class ArquitetoSafeDriverOuro:
             .otherwise(pl.lit(1.0)).alias("LABEL_PESO_RISCO")
         ])
 
-        # Criacao Direta da Variavel de Contexto Critico
+        # Criacao da Variavel Derivada (Contexto Critico)
         print("Sintetizando a variavel de Contexto Critico (Sazonalidade + Perfil Alvo)...", flush=True)
         df_gold = df_gold.with_columns([
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
@@ -241,6 +246,11 @@ class ArquitetoSafeDriverOuro:
         cols_cnae_brutos = [c for c in df_final.columns if c.startswith("INFRA_DIV_")]
         df_final = df_final.drop(cols_cnae_brutos + ["RUBRICA_UPPER", "ANO_OCORRENCIA"])
 
+        # Calculo de Auditoria Temporal
+        dist_sazon = df_final.group_by("SAZON_PERIODO").len().to_dict(as_series=False)
+        # Formata o dicionario de saida para ser facilmente lido no terminal
+        sazon_dict = {row[0]: row[1] for row in zip(dist_sazon['SAZON_PERIODO'], dist_sazon['len'])}
+
         # 7. EXPORTAÇÃO E AUDITORIA DO PIPELINE
         print("Gravando ABT Final no Repositorio em Nuvem...", flush=True)
         buf_abt = io.BytesIO()
@@ -253,10 +263,17 @@ class ArquitetoSafeDriverOuro:
         report = (
             f"Relatorio Operacional - Camada Ouro Concluida\n"
             f"=============================================\n"
-            f"- Total de Registros (ABT): {df_final.height}\n"
-            f"- Quantidade de Atributos : {len(df_final.columns)}\n"
-            f"- Taxa Cobertura Histórica: {fs_hit_rate:.1f}%\n"
-            f"- Tempo de Execucao (s)   : {duracao}s\n"
+            f"- Total de Registros (ABT)   : {df_final.height}\n"
+            f"- Quantidade de Atributos    : {len(df_final.columns)}\n"
+            f"- Taxa Cobertura Histórica   : {fs_hit_rate:.1f}%\n"
+            f"- Tempo de Execucao          : {duracao}s\n"
+            f"---------------------------------------------\n"
+            f"Auditoria de Extracao Temporal (Sazonalidade):\n"
+            f"  > MANHA      : {sazon_dict.get('MANHA', 0)}\n"
+            f"  > TARDE      : {sazon_dict.get('TARDE', 0)}\n"
+            f"  > NOITE      : {sazon_dict.get('NOITE', 0)}\n"
+            f"  > MADRUGADA  : {sazon_dict.get('MADRUGADA', 0)}\n"
+            f"  > INCERTO    : {sazon_dict.get('INCERTO', 0)}\n"
             f"============================================="
         )
         print(report)
