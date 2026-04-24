@@ -12,6 +12,7 @@ import io
 import shutil
 import time
 import requests
+import unicodedata
 from datetime import datetime
 from botocore.config import Config
 
@@ -47,9 +48,9 @@ class ProcessadorMalhaPrata:
             pass
 
     def _limpar_texto_global(self, df):
-        """Aplica normalizacao em todas as colunas de texto do dataframe."""
-        colunas_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Utf8]
-        if not colunas_texto:
+        """Passa o trator em todas as colunas de texto: sem acento, caixa alta, sem lixo."""
+        cols_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Utf8]
+        if not cols_texto:
             return df
         
         return df.with_columns([
@@ -66,14 +67,8 @@ class ProcessadorMalhaPrata:
             .str.replace_all(r"\s+", " ")
             .fill_null("DESCONHECIDO")
             .alias(c)
-            for c in colunas_texto
+            for c in cols_texto
         ])
-
-    def _buscar_arquivo(self, padrao):
-        arqs = glob.glob(f"**/{padrao}", recursive=True)
-        if not arqs:
-            raise FileNotFoundError(f"Arquivo {padrao} nao encontrado.")
-        return arqs[0]
 
     def _limpar_cd_setor(self, coluna):
         return pl.col(coluna).cast(pl.Utf8).str.replace(r"\.0$", "").str.replace_all(r"\D", "").str.slice(0, 15)
@@ -103,9 +98,12 @@ class ProcessadorMalhaPrata:
         print("Iniciando processamento da malha...")
         
         try:
-            # 1. Dados do Censo
-            csv_f = self._buscar_arquivo("Agregados_por_setores_basico*.csv")
-            df_censo = pl.read_csv(csv_f, infer_schema_length=0, ignore_errors=True)
+            # 1. Dados do Censo (CORREÇÃO DE ENCODING AQUI)
+            arqs_csv = glob.glob(f"**/Agregados_por_setores_basico*.csv", recursive=True)
+            if not arqs_csv: raise FileNotFoundError("CSV do Censo nao encontrado.")
+            
+            # Forca encoding iso-8859-1 para evitar erro de UTF-8
+            df_censo = pl.read_csv(arqs_csv[0], infer_schema_length=0, ignore_errors=True, encoding="iso-8859-1")
             df_censo.columns = [c.strip().upper() for c in df_censo.columns]
             
             df_censo = df_censo.select([
@@ -117,9 +115,11 @@ class ProcessadorMalhaPrata:
             df_censo = self._limpar_texto_global(df_censo)
 
             # 2. Dados de Ruas (Faces JSON)
-            zip_f = self._buscar_arquivo("SP_Faces_2022.zip")
+            arqs_zip = glob.glob(f"**/SP_Faces_2022.zip", recursive=True)
+            if not arqs_zip: raise FileNotFoundError("Zip de Faces nao encontrado.")
+            
             vias_list = []
-            with zipfile.ZipFile(zip_f, 'r') as z:
+            with zipfile.ZipFile(arqs_zip[0], 'r') as z:
                 json_files = [f for f in z.namelist() if f.endswith('.json')]
                 for f in json_files:
                     z.extract(f, self.temp_extract_dir)
@@ -145,33 +145,35 @@ class ProcessadorMalhaPrata:
             ])
             
             self.con.register("tabela_h3", df_h3_coords.to_arrow())
-            shp_f = self._buscar_arquivo("SP_bairros_CD2022*.shp").replace("\\", "/")
+            arqs_shp = glob.glob(f"**/*bairros_CD2022*.shp", recursive=True)
+            if not arqs_shp: raise FileNotFoundError("SHP de Bairros nao encontrado.")
+            
+            shp_path = arqs_shp[0].replace("\\", "/")
             sql_spatial = f"""
                 SELECT h3.H3_INDEX, 
                 COALESCE(ibge.NM_MUN, h3.CID_CENSO, 'DESCONHECIDO') AS CIDADE,
                 COALESCE(ibge.NM_BAIRRO, 'DESCONHECIDO') AS BAIRRO
-                FROM tabela_h3 h3 LEFT JOIN ST_Read('{shp_f}') ibge ON ST_Contains(ibge.geom, ST_Point(h3.LON, h3.LAT))
+                FROM tabela_h3 h3 LEFT JOIN ST_Read('{shp_path}') ibge ON ST_Contains(ibge.geom, ST_Point(h3.LON, h3.LAT))
             """
             df_geo = self.con.execute(sql_spatial).pl()
             df_geo = self._limpar_texto_global(df_geo)
 
-            # 5. Exportacao Final
+            # 5. Exportacao Final (TUDO NORMALIZADO)
             df_vias_final = df_ruas_h3.drop(["CID_CENSO"]).join(df_geo, on="H3_INDEX", how="left")
             df_vias_final = self._limpar_texto_global(df_vias_final)
 
             # Social
-            df_social = df_vias_final.group_by("H3_INDEX").agg([
+            df_social_final = df_vias_final.group_by("H3_INDEX").agg([
                 pl.sum("TOT_RES").alias("MICRO_POPULACAO_FACES"),
                 pl.mean("CENSO_POPULACAO").alias("CENSO_MEDIA_V0001"),
                 pl.mean("CENSO_RENDA").alias("CENSO_MEDIA_V0002")
             ])
-            df_social.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet")
+            df_social_final.write_parquet(f"{self.prata_dir}/PRATA_MALHA_SOCIAL_H3.parquet")
 
             # Infraestrutura
             infra_files = glob.glob(f"**/CNPJ_SP_HISTORICO_LOTE_*.parquet", recursive=True)
             if infra_files:
-                df_infra = pl.scan_parquet(infra_files) \
-                    .filter(pl.col("lat").is_not_null()) \
+                df_infra = pl.scan_parquet(infra_files).filter(pl.col("lat").is_not_null()) \
                     .with_columns(pl.col("cnae_fiscal_principal").cast(pl.Utf8).str.slice(0, 2).alias("CNAE_DIV")) \
                     .collect()
                 
@@ -188,7 +190,7 @@ class ProcessadorMalhaPrata:
                 df_infra_final.write_parquet(f"{self.prata_dir}/PRATA_MALHA_INFRA_AGREGADA.parquet")
 
             self.upload_r2()
-            print(f"Processamento concluido em {time.time() - tempo_inicio:.2f}s")
+            print(f"Malha Prata finalizada em {time.time() - tempo_inicio:.2f}s")
 
         finally:
             self.con.close()
