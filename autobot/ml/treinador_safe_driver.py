@@ -15,9 +15,8 @@ from datetime import datetime
 
 class TreinadorSafeDriver:
     """
-    Modulo responsavel pelo treinamento do modelo preditivo de risco (CatBoost).
-    Executa o particionamento temporal, balanceamento de classes (undersampling),
-    modelagem de severidade via Expectile Loss e analise de explicabilidade (SHAP).
+    Modulo responsavel pelo treinamento do algoritmo preditivo de risco espacial.
+    Consome a ABT da Camada Ouro com as features ja achatadas e normalizadas.
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -38,7 +37,7 @@ class TreinadorSafeDriver:
         
         self.auditoria = {
             "projeto": "SafeDriver",
-            "fase": "Treinamento de Modelo Preditivo (High-Res)",
+            "fase": "Treinamento de Modelo Preditivo",
             "data_processamento": str(datetime.now()),
             "parametros_modelo": {
                 "iterations": 2500,
@@ -50,7 +49,7 @@ class TreinadorSafeDriver:
         }
 
     def _notificar_discord(self, msg):
-        """Transmite os logs de execucao para a plataforma de telemetria."""
+        """Transmite log operacional de auditoria."""
         if self.webhook_url:
             try: requests.post(self.webhook_url, json={"content": msg}, timeout=15)
             except: pass
@@ -59,18 +58,18 @@ class TreinadorSafeDriver:
         inicio_processo = time.time()
         print("Iniciando carregamento da Analytical Base Table (Camada Ouro)...", flush=True)
         
-        # 1. CARREGAMENTO DOS DADOS E MAPEAMENTO DE FEATURES
+        # 1. CARREGAMENTO DOS DADOS (Variaveis ja preparadas pela Engenharia de Dados)
         obj = self.s3.get_object(Bucket=self.bucket, Key=self.caminho_abt)
         df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         linhas_originais = df.height
         
-        # O mapeamento varre a ABT e seleciona apenas os atributos de modelagem
+        # O mapeamento varre a ABT e seleciona os atributos de modelagem
         cols_features = [c for c in df.columns if any(c.startswith(pre) for pre in ["FEAT_", "MACRO_", "CENSO_", "MICRO_", "SAZON_", "FS_"])]
         cols_features.append("H3_INDEX")
         target = "LABEL_PESO_RISCO"
 
-        # 2. PARTICIONAMENTO TEMPORAL BLINDADO (Data Leakage Prevention)
-        print("Executando particionamento temporal (Split 85/15)...", flush=True)
+        # 2. PARTICIONAMENTO TEMPORAL (Prevencao de Vazamento de Dados)
+        print("Executando particionamento cronologico (Split 85/15)...", flush=True)
         df = df.sort(["DATAOCORRENCIA", "H3_INDEX"])
         
         total_rows = df.height
@@ -78,12 +77,10 @@ class TreinadorSafeDriver:
         
         train_df = df.slice(0, split_idx)
         test_df = df.slice(split_idx, total_rows - split_idx)
+        del df  
 
-        del df  # Liberacao de memoria volatil
-
-        # 3. BALANCEAMENTO DA BASE DE TREINO (Undersampling Direcionado)
-        print("Aplicando balanceamento de classes na base de treinamento...", flush=True)
-        
+        # 3. BALANCEAMENTO DE CLASSES (Undersampling)
+        print("Aplicando balanceamento de frequencias no conjunto de treinamento...", flush=True)
         df_treino_graves = train_df.filter(pl.col(target) >= 4.0)
         qtd_graves = df_treino_graves.height
         
@@ -95,15 +92,12 @@ class TreinadorSafeDriver:
         
         linhas_balanceadas_treino = train_df.height
         linhas_teste_real = test_df.height
-        
-        print(f"Base de treinamento equilibrada: {linhas_balanceadas_treino} registros.")
-        print(f"Base de validacao (Mundo Real): {linhas_teste_real} registros.")
 
-        # 4. PREPARAÇÃO DO DATASET PARA ALGORITMO CATBOOST
+        # 4. DECLARACAO DE VARIAVEIS CATEGORICAS
         pdf_train = train_df.select(cols_features + [target]).to_pandas()
         pdf_test = test_df.select(cols_features + [target]).to_pandas()
         
-        # Atualizacao do vetor categorico para refletir a nova estrutura da Camada Ouro
+        # As variaveis refletem o achatamento (FEAT_TIPO_DIA) executado na Camada Ouro
         cat_features_declaradas = [
             "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
             "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_DIA"
@@ -114,8 +108,8 @@ class TreinadorSafeDriver:
             pdf_train[col] = pdf_train[col].fillna("DESCONHECIDO").astype(str)
             pdf_test[col] = pdf_test[col].fillna("DESCONHECIDO").astype(str)
 
-        # 5. TREINAMENTO DE MODELO DE ALTA RESOLUÇÃO
-        print("Iniciando otimizacao do modelo CatBoostRegressor...", flush=True)
+        # 5. TREINAMENTO (Otimizacao do Modelo)
+        print("Iniciando treinamento estrutural CatBoostRegressor...", flush=True)
         train_pool = Pool(pdf_train[cols_features], pdf_train[target], cat_features=cat_features)
         test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
 
@@ -123,7 +117,6 @@ class TreinadorSafeDriver:
             iterations=2500,
             learning_rate=0.005,
             depth=8,
-            l2_leaf_reg=3,
             loss_function='Expectile:alpha=0.85', 
             eval_metric='MAE',        
             od_type='Iter',
@@ -133,11 +126,10 @@ class TreinadorSafeDriver:
             random_seed=42,
             verbose=200
         )
-
         modelo.fit(train_pool, eval_set=test_pool)
         
-        # 6. EXPLICABILIDADE DE INTELIGÊNCIA ARTIFICIAL (Valores SHAP)
-        print("Processando analise de importancia global (Metodo SHAP)...", flush=True)
+        # 6. EXTRACAO DE EXPLICABILIDADE (DNA CRIMINAL VIA SHAP)
+        print("Processando metricas de explicabilidade (Metodo SHAP)...", flush=True)
         explainer = shap.TreeExplainer(modelo)
         sample_test = pdf_test[cols_features].sample(min(5000, len(pdf_test)))
         shap_values = explainer.shap_values(sample_test)
@@ -147,13 +139,13 @@ class TreinadorSafeDriver:
             'impacto_medio': np.abs(shap_values).mean(0)
         }).sort_values(by='impacto_medio', ascending=False)
 
-        # 7. AVALIAÇÃO DE DESEMPENHO E EXPORTAÇÃO
+        # 7. AVALIACAO DE PERFORMANCE 
         y_pred = modelo.predict(pdf_test[cols_features])
         mae = mean_absolute_error(pdf_test[target], y_pred)
         r2 = r2_score(pdf_test[target], y_pred)
         duracao = time.time() - inicio_processo
 
-        print("Sincronizando artefatos preditivos com o Data Lake...", flush=True)
+        print("Sincronizando modelo e metadados no Repositorio em Nuvem...", flush=True)
         modelo.save_model(self.modelo_local)
         with open(self.modelo_local, "rb") as f:
             self.s3.put_object(Bucket=self.bucket, Key=f"modelos/{self.modelo_local}", Body=f.read())
@@ -173,42 +165,34 @@ class TreinadorSafeDriver:
         buf_json_auditoria = io.BytesIO(json.dumps(self.auditoria, indent=4).encode())
         self.s3.put_object(Bucket=self.bucket, Key="modelos/AUDITORIA_TREINO_CATBOOST.json", Body=buf_json_auditoria.getvalue())
 
-        # 8. CONSOLIDAÇÃO DO RELATÓRIO DE AUDITORIA
+        # 8. GERACAO DE RELATORIO DE TELEMETRIA
         top_15 = shap_importance.head(15)
         resumo_shap_detalhado = "\n".join([f"   [{str(i+1).zfill(2)}] {r['feature'].ljust(30)} : {r['impacto_medio']:.4f}" for i, r in top_15.iterrows()])
         
         fs_impact = shap_importance[shap_importance['feature'].str.startswith('FS_')]['impacto_medio'].sum()
         infra_impact = shap_importance[shap_importance['feature'].str.startswith('MACRO_')]['impacto_medio'].sum()
-        
-        # Atualizado para contemplar a unificacao da FEAT_TIPO_DIA
         contexto_impact = shap_importance[shap_importance['feature'].isin([
             'SAZON_PERIODO', 'FEAT_PERFIL_VITIMA', 'FEAT_CONTEXTO_CRITICO', 
             'FEAT_TIPO_DIA', 'FEAT_DIA_SEMANA', 'FEAT_MES'
         ])]['impacto_medio'].sum()
 
         report = (
-            f"Relatorio de Avaliacao do Modelo Preditivo\n"
+            f"Relatorio Executivo - Avaliacao de Modelo Preditivo\n"
             f"==============================================================\n"
-            f"1. ESTATISTICA DA BASE DE DADOS\n"
-            f"   - Ocorrencias Brutas          : {linhas_originais} registros\n"
-            f"   - Treinamento (Balanceado)    : {linhas_balanceadas_treino} registros\n"
-            f"   - Validacao (Mundo Real)      : {linhas_teste_real} registros\n\n"
-            f"2. CONFIGURACAO DO ALGORITMO (CatBoostRegressor)\n"
-            f"   - Funcao de Perda             : Expectile (alpha=0.85)\n"
-            f"   - Profundidade (Depth)        : 8\n"
-            f"   - Iteracoes Convergidas       : {modelo.tree_count_}\n\n"
-            f"3. PERFORMANCE EM DADOS NAO VISTOS\n"
-            f"   - R-Squared Score             : {r2:.4f}\n"
-            f"   - Mean Absolute Error (MAE)   : {mae:.4f}\n\n"
-            f"4. ANALISE GLOBAL DE IMPORTANCIA (Metodo SHAP)\n"
-            f"   --- Fatores de Maior Contribuicao ---\n"
+            f"1. VOLUMETRIA E ESTRATIFICACAO\n"
+            f"   - Observacoes Originais       : {linhas_originais}\n"
+            f"   - Coorte de Treinamento       : {linhas_balanceadas_treino}\n"
+            f"   - Coorte de Validacao         : {linhas_teste_real}\n\n"
+            f"2. DESEMPENHO PREDITIVO (Hold-Out Set)\n"
+            f"   - Convergencia Alcancada      : {modelo.tree_count_} iteracoes\n"
+            f"   - Mean Absolute Error (MAE)   : {mae:.4f}\n"
+            f"   - R-Squared Score             : {r2:.4f}\n\n"
+            f"3. IMPORTANCIA ESTRUTURAL DE ATRIBUTOS (SHAP)\n"
             f"{resumo_shap_detalhado}\n\n"
-            f"   --- Impacto Agregado por Dimensao ---\n"
-            f"   - Dinamica Temporal / Alvo    : {contexto_impact:.4f}\n"
-            f"   - Historico Criminal Previo   : {fs_impact:.4f}\n"
-            f"   - Distribuicao de Atividades  : {infra_impact:.4f}\n"
-            f"==============================================================\n"
-            f"Tempo de Processamento: {duracao/60:.2f} min\n"
+            f"   --- Agregacao Macro ---\n"
+            f"   - Contextualizacao Temporal   : {contexto_impact:.4f}\n"
+            f"   - Base Historica Criminal     : {fs_impact:.4f}\n"
+            f"   - Infraestrutura Demografica  : {infra_impact:.4f}\n"
             f"==============================================================\n"
         )
         print(report)
