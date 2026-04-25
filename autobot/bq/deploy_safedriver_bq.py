@@ -39,8 +39,7 @@ class DeploySafeDriverBigQuery:
     def _ler_parquet_r2(self, key):
         print(f"Acessando artefato: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        df_pandas = pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
-        return df_pandas.fillna(pd.NA)
+        return pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
 
     def _upload_table(self, df_pandas, table_name):
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
@@ -110,7 +109,7 @@ class DeploySafeDriverBigQuery:
             *,
             -- A. STATUS DE PREDIÇÃO (Filtro Rápido: Realidade vs Futuro)
             CASE 
-                WHEN LABEL_PESO_RISCO IS NULL OR LABEL_PESO_RISCO = 0 THEN 'PREVISÃO' 
+                WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'PREVISÃO' 
                 ELSE 'HISTÓRICO REAL' 
             END AS STATUS_DADO,
 
@@ -130,7 +129,7 @@ class DeploySafeDriverBigQuery:
 
             -- D. QUALIDADE DA INFERÊNCIA (Auditoria do Algoritmo)
             CASE
-                WHEN LABEL_PESO_RISCO = 0 OR LABEL_PESO_RISCO IS NULL THEN 'N/A (Previsão)'
+                WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'N/A (Previsão)'
                 WHEN ABS(RISCO_PREDITO_IA - LABEL_PESO_RISCO) <= 1.5 THEN 'ALTA PRECISÃO'
                 WHEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO) > 1.5 THEN 'FALSO POSITIVO (Alarmista)'
                 ELSE 'FALSO NEGATIVO (Subestimado)'
