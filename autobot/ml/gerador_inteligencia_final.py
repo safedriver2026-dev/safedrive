@@ -74,10 +74,11 @@ class GeradorDossieSafeDriver:
         df_historico = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
         # =====================================================================
-        # NOVA ROTINA: GERAÇÃO DA MALHA FUTURA (2026)
+        # NOVA ROTINA: GERAÇÃO DA MALHA FUTURA (2026) COM PANDAS
         # =====================================================================
         print("Gerando Matriz Sintética para Previsões Futuras (2026)...", flush=True)
         
+        # Extrai o "DNA" atual de todos os bairros
         df_dna_bairros = df_historico.select([
             "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO_right", 
             "MICRO_POPULACAO_FACES", "CENSO_MEDIA_V0001", "CENSO_MEDIA_V0002",
@@ -85,6 +86,7 @@ class GeradorDossieSafeDriver:
             "FS_VOL_CRIMES_ANO_ANT", "FS_RISCO_MEDIO_ANO_ANT"
         ]).unique(subset=["H3_INDEX"], maintain_order=True)
 
+        # Cria todos os cenários possíveis para 2026
         turnos = ["MANHA", "TARDE", "NOITE", "MADRUGADA"]
         tipos_dia = ["DIA_UTIL", "FIM_DE_SEMANA"]
         perfis = ["MOTORISTA", "PEDESTRE"]
@@ -97,27 +99,40 @@ class GeradorDossieSafeDriver:
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         ).unique()
 
+        # Junta os bairros com os cenários futuros
         df_futuro = df_dna_bairros.join(df_cenarios, how="cross")
         
         data_futura = date(2026, 6, 15)
         
-        # Correção: Adicionamos a extração de Dia da Semana e Mês para o modelo não falhar!
+        # Adiciona as colunas estáticas (sem mexer em tipos complexos no Polars)
         df_futuro = df_futuro.with_columns([
             pl.lit(data_futura).alias("DATAOCORRENCIA"),
             pl.lit(0.0).alias("LABEL_PESO_RISCO"),
             pl.col("BAIRRO_right").alias("BAIRRO"),
             pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN")
-        ]).with_columns([
-            pl.col("DATAOCORRENCIA").dt.weekday().cast(pl.Float64).alias("FEAT_DIA_SEMANA"),
-            pl.col("DATAOCORRENCIA").dt.month().cast(pl.Float64).alias("FEAT_MES")
         ])
         
         print("Fundindo Histórico (Passado) com Matriz Sintética (Futuro)...", flush=True)
-        cols_comuns = list(set(df_historico.columns).intersection(set(df_futuro.columns)))
-        df_completo = pl.concat([df_historico.select(cols_comuns), df_futuro.select(cols_comuns)], how="vertical")
         
-        # =====================================================================
-        # FIM DA NOVA ROTINA
+        # Converte ambos para Pandas para resolver conflitos de schema
+        df_hist_pd = df_historico.to_pandas()
+        df_fut_pd = df_futuro.to_pandas()
+        
+        # Cria as features temporais nativamente no Pandas
+        df_fut_pd['DATAOCORRENCIA'] = pd.to_datetime(df_fut_pd['DATAOCORRENCIA'])
+        df_fut_pd['FEAT_DIA_SEMANA'] = df_fut_pd['DATAOCORRENCIA'].dt.weekday
+        df_fut_pd['FEAT_MES'] = df_fut_pd['DATAOCORRENCIA'].dt.month
+        
+        # Força o tipo EXATO do histórico no futuro
+        df_fut_pd['FEAT_DIA_SEMANA'] = df_fut_pd['FEAT_DIA_SEMANA'].astype(df_hist_pd['FEAT_DIA_SEMANA'].dtype)
+        df_fut_pd['FEAT_MES'] = df_fut_pd['FEAT_MES'].astype(df_hist_pd['FEAT_MES'].dtype)
+
+        # União segura via Pandas
+        cols_comuns = list(set(df_hist_pd.columns).intersection(set(df_fut_pd.columns)))
+        df_completo_pd = pd.concat([df_hist_pd[cols_comuns], df_fut_pd[cols_comuns]], ignore_index=True)
+        
+        # Retorna para Polars para o processo de inferência e salvamento
+        df_completo = pl.from_pandas(df_completo_pd)
         # =====================================================================
 
         # 3. CONVERSAO ESTRITA E INFERENCIA
@@ -175,4 +190,3 @@ class GeradorDossieSafeDriver:
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
-    
