@@ -10,14 +10,14 @@ from datetime import datetime
 
 class ArquitetoSafeDriverOuro:
     """
-    Arquiteto da Camada Ouro: Responsável pela Feature Store e ABT (Analytical Base Table).
-    Esta camada transforma dados limpos (Prata) em inteligência para o modelo (Ouro).
+    Engine de Construção da Analytical Base Table (ABT).
+    Focado em Dosimetria Penal, Feature Store Geospacial e Redução de Dimensionalidade.
     """
     def __init__(self):
-        # 1. IDENTIDADE E SINCRONIA: Chave para evitar NoSuchKey
+        # 1. IDENTIDADE SINCRONIZADA (Evita NoSuchKey)
         self.projeto = os.getenv("NOME_PROJETO", "safedriver").strip().lower()
-        
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
+        
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
             endpoint = endpoint[: -len(f"/{self.bucket}")]
@@ -40,21 +40,16 @@ class ArquitetoSafeDriverOuro:
             except: pass
 
     def _limpar_tabela_toda(self, df):
-        """Normalização universal de strings: UPPER, sem acentos, sem lixo."""
+        """Normalização Universal de Texto."""
         cols_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Utf8]
         if not cols_texto: return df
-        
         return df.with_columns([
-            pl.col(c)
-            .str.to_uppercase()
-            .str.strip_chars()
+            pl.col(c).str.to_uppercase().str.strip_chars()
             .str.replace_all(r"[ÁÀÂÃÄ]", "A").str.replace_all(r"[ÉÈÊË]", "E")
             .str.replace_all(r"[ÍÌÎÏ]", "I").str.replace_all(r"[ÓÒÔÕÖ]", "O")
             .str.replace_all(r"[ÚÙÛÜ]", "U").str.replace_all(r"[Ç]", "C")
-            .str.replace_all(r"[^A-Z0-9\s_]", " ")
-            .str.replace_all(r"\s+", " ")
-            .fill_null("DESCONHECIDO")
-            .alias(c)
+            .str.replace_all(r"[^A-Z0-9\s_]", " ").str.replace_all(r"\s+", " ")
+            .fill_null("DESCONHECIDO").alias(c)
             for c in cols_texto
         ])
 
@@ -63,22 +58,25 @@ class ArquitetoSafeDriverOuro:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
             return pl.read_parquet(io.BytesIO(obj['Body'].read()))
         except Exception as e: 
-            print(f"❌ Erro ao ler {key}: {e}")
+            print(f"⚠️ Erro ao ler {key}: {e}")
             return None
 
     def construir_abt_final(self):
         inicio_timer = time.time()
-        print(f"🚀 [OURO] Iniciando construção da ABT para o projeto: {self.projeto}")
-        
-        # --- 1. CARREGAMENTO DO UNIVERSO GEOGRÁFICO ---
+        print(f"🚀 [INÍCIO] Iniciando construção da Camada Ouro para: {self.projeto}")
+
+        # --- 1. CARREGAMENTO DO UNIVERSO ---
+        print("📂 Carregando malhas geográficas (Infra + Social)...")
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
         
         df_infra = self._limpar_tabela_toda(df_infra)
         df_social = self._limpar_tabela_toda(df_social)
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
+        print(f"✅ Malha consolidada: {df_universo_h3.height} hexágonos únicos.")
 
         # --- 2. CONSOLIDAÇÃO DOS CRIMES ---
+        print("🔍 Coletando fragmentos de crimes na Camada Prata...")
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
             obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
@@ -88,8 +86,10 @@ class ArquitetoSafeDriverOuro:
         lista_crimes = [df for f in crime_files if (df := self._ler_parquet_r2(f)) is not None]
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
         df_crimes = self._limpar_tabela_toda(df_crimes)
+        print(f"✅ Total de crimes carregados: {df_crimes.height}")
 
-        # --- 3. ENGENHARIA DE FEATURES TEMPORAIS ---
+        # --- 3. ENGENHARIA DE FEATURES (TEMPO & SAZONALIDADE) ---
+        print("🕒 Processando engenharia temporal e turnos...")
         df_crimes = df_crimes.with_columns(
             pl.col("HORAOCORRENCIA").cast(pl.Utf8).str.replace_all(r"\D", "").alias("_tmp_hora")
         ).with_columns(
@@ -98,6 +98,7 @@ class ArquitetoSafeDriverOuro:
         ).with_columns([
             pl.col("DATAOCORRENCIA").dt.year().alias("ANO_OCORRENCIA"),
             pl.col("DATAOCORRENCIA").dt.weekday().alias("FEAT_DIA_SEMANA"),
+            pl.col("DATAOCORRENCIA").dt.month().alias("FEAT_MES"),
             pl.when((pl.col("HORA_INT") >= 18) & (pl.col("HORA_INT") <= 23)).then(pl.lit("NOITE"))
             .when((pl.col("HORA_INT") >= 12) & (pl.col("HORA_INT") < 18)).then(pl.lit("TARDE"))
             .when((pl.col("HORA_INT") >= 6) & (pl.col("HORA_INT") < 12)).then(pl.lit("MANHA"))
@@ -107,7 +108,8 @@ class ArquitetoSafeDriverOuro:
             .otherwise(pl.lit("DIA_UTIL")).alias("FEAT_TIPO_DIA")
         ])
 
-        # --- 4. DOSIMETRIA PENAL E TARGET ---
+        # --- 4. DOSIMETRIA PENAL & TARGET ---
+        print("⚖️ Aplicando Dosimetria Penal (Pesos de Risco)...")
         df_gold = df_crimes.with_columns([
             pl.when(pl.col("RUBRICA").str.contains(r"VEICULO|CARGA")).then(pl.lit("MOTORISTA"))
             .when(pl.col("RUBRICA").str.contains(r"TRANSEUNTE|CELULAR|PESSOA")).then(pl.lit("PEDESTRE"))
@@ -120,17 +122,18 @@ class ArquitetoSafeDriverOuro:
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         )
 
-        # --- 5. MEMÓRIA HISTÓRICA (FEATURE STORE) ---
+        # --- 5. FEATURE STORE (LAG HISTÓRICO) ---
+        print("🕰️ Gerando lags históricos (Feature Store de 1 ano)...")
         df_fs_hex = df_gold.group_by(["H3_INDEX", "ANO_OCORRENCIA"]).agg([
             pl.len().alias("FS_VOL_CRIMES_ANO_ANT"),
             pl.col("LABEL_PESO_RISCO").mean().alias("FS_RISCO_MEDIO_ANO_ANT")
         ]).with_columns((pl.col("ANO_OCORRENCIA") + 1).alias("ANO_JOIN"))
 
-        # Join Master
         df_final = df_gold.join(df_universo_h3, on="H3_INDEX", how="left") \
                           .join(df_fs_hex.drop("ANO_OCORRENCIA"), left_on=["H3_INDEX", "ANO_OCORRENCIA"], right_on=["H3_INDEX", "ANO_JOIN"], how="left")
         
         # --- 6. REDUÇÃO DE DIMENSIONALIDADE (MACROS) ---
+        print("📊 Agrupando CNAEs em Macros de Comportamento Urbano...")
         cnae_macros = {
             "MACRO_FINANCEIRO": ["INFRA_DIV_64", "INFRA_DIV_65", "INFRA_DIV_66"],
             "MACRO_LAZER_NOTURNO": ["INFRA_DIV_56", "INFRA_DIV_90", "INFRA_DIV_93"],
@@ -140,21 +143,35 @@ class ArquitetoSafeDriverOuro:
             existentes = [c for c in divs if c in df_final.columns]
             df_final = df_final.with_columns(pl.sum_horizontal(existentes).alias(macro)) if existentes else df_final.with_columns(pl.lit(0).alias(macro))
 
-        # Cleanup final e Drop de lixo
         df_final = self._limpar_tabela_toda(df_final).drop([
             c for c in df_final.columns if c.startswith("INFRA_DIV_")
         ] + ["ANO_OCORRENCIA", "HORA_INT", "_tmp_hora"])
 
-        # --- 7. EXPORTAÇÃO SINCRONIZADA ---
+        # --- 7. EXPORTAÇÃO & RELATÓRIO FINAL ---
+        print("📤 Sincronizando com o Cloudflare R2...")
         key_final = f"{self.ouro_dir}/{self.projeto}_abt_treino.parquet"
         buf = io.BytesIO()
         df_final.write_parquet(buf, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key=key_final, Body=buf.getvalue())
 
+        # GERAÇÃO DE LOGS DE AUDITORIA
         duracao = round(time.time() - inicio_timer, 2)
-        report = f"🏆 **[Ouro]** ABT Gerada com sucesso! \n- Linhas: {df_final.height} \n- Tempo: {duracao}s \n- Destino: {key_final}"
+        dist_risco = df_final["LABEL_PESO_RISCO"].value_counts().sort("LABEL_PESO_RISCO")
+        
+        report = (
+            f"🏆 **RELATÓRIO CAMADA OURO - {self.projeto.upper()}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔹 **Volume ABT:** {df_final.height:,} linhas\n"
+            f"🔹 **Tempo:** {duracao}s\n"
+            f"🔹 **Path:** `{key_final}`\n\n"
+            f"⚖️ **Dosimetria (Distribuição de Risco):**\n"
+        )
+        for row in dist_risco.iter_rows():
+            report += f"  • Peso {row[0]}: {row[1]:,} crimes\n"
+        
         print(report)
         self._notificar_discord(report)
+        print(f"✨ [SUCESSO] Pipeline Ouro concluído.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriverOuro().construir_abt_final()
