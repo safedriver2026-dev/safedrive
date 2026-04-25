@@ -175,3 +175,4 @@ class GeradorDossieSafeDriver:
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
+    
