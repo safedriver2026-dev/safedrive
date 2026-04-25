@@ -19,6 +19,7 @@ class GeradorDossieSafeDriver:
     """
     Motor de Inteligência Preditiva (Versão Estável R2).
     Gera Dossiê do Passado + Projeções para 2026 com Min/Max e SHAP Values.
+    Blindagem de Titânio contra tipagem Pandas (NaN).
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -109,7 +110,7 @@ class GeradorDossieSafeDriver:
         ])
 
         # =================================================================
-        # 4. PREDIÇÃO E BLINDAGEM DE TIPAGEM (A Marreta)
+        # 4. PREDIÇÃO E A MARRETA DE TITÂNIO
         # =================================================================
         print("⚡ Rodando predição (Histórico + Projeções 2026)...", flush=True)
         df_hist_pd = df_ouro.to_pandas()
@@ -120,7 +121,6 @@ class GeradorDossieSafeDriver:
         
         X_all = df_completo_pd[modelo.feature_names_].copy()
         
-        # Blindagem rigorosa para evitar erro de float em categoria (ex: "3.0")
         cat_features_declaradas = [
             "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
             "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_FERIADO", 
@@ -128,9 +128,13 @@ class GeradorDossieSafeDriver:
         ]
         cat_features = [c for c in cat_features_declaradas if c in X_all.columns]
         
+        # A Marreta de Titânio: Mata o NaN real e o NaN em texto
         for col in cat_features:
-            X_all[col] = X_all[col].astype(str).str.replace(r'\.0$', '', regex=True)
-            X_all[col] = X_all[col].replace(['nan', 'NaN', 'None'], 'DESCONHECIDO').astype(object)
+            X_all[col] = X_all[col].fillna('DESCONHECIDO') # Pega np.nan injetado pelo pd.concat
+            X_all[col] = X_all[col].astype(str)            # Força string nativa
+            X_all[col] = X_all[col].str.replace(r'\.0$', '', regex=True) # Tira casa decimal fantasma
+            X_all[col] = X_all[col].replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO')
+            X_all[col] = X_all[col].astype(object)         # Tranca o tipo para o CatBoost
             
         preds_raw = modelo.predict(X_all)
         preds_clipped = np.clip(preds_raw, 0, 10) # Trava de segurança (0 a 10)
@@ -140,15 +144,19 @@ class GeradorDossieSafeDriver:
         )
 
         # =================================================================
-        # 5. DNA DE RISCO (SHAP)
+        # 5. DNA DE RISCO (SHAP) COM BLINDAGEM REPLICADA
         # =================================================================
         print("🧬 Analisando DNA criminal (SHAP) geográfico...", flush=True)
         df_shap_sample = df_dossie.sample(n=min(35000, df_dossie.height), seed=42)
         X_shap = df_shap_sample.select(modelo.feature_names_).to_pandas()
         
-        # Reaplica a blindagem na amostra do SHAP
+        # Reaplica a marreta na amostra do SHAP para evitar que quebre aqui
         for col in cat_features:
-            X_shap[col] = X_shap[col].astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'NaN', 'None'], 'DESCONHECIDO').astype(object)
+            X_shap[col] = X_shap[col].fillna('DESCONHECIDO')
+            X_shap[col] = X_shap[col].astype(str)
+            X_shap[col] = X_shap[col].str.replace(r'\.0$', '', regex=True)
+            X_shap[col] = X_shap[col].replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO')
+            X_shap[col] = X_shap[col].astype(object)
         
         explainer = shap.TreeExplainer(modelo)
         shap_vals = explainer.shap_values(X_shap)
@@ -172,7 +180,6 @@ class GeradorDossieSafeDriver:
 
         duracao = time.time() - inicio_processo
         
-        # Extração de Métricas Solicitadas (Min, Mean, Max)
         min_risco = float(np.min(preds_clipped))
         media_risco = float(np.mean(preds_clipped))
         max_risco = float(np.max(preds_clipped))
