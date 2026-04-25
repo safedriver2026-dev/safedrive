@@ -74,6 +74,45 @@ class DeploySafeDriverBigQuery:
         job.result() # Aguarda a conclusao da API do BQ
         print(f"✅ Carga finalizada: Tabela {table_name} atualizada no BigQuery.", flush=True)
 
+    def _construir_dim_calendario(self):
+        """
+        Gera uma Dimensão de Calendário robusta nativamente no BigQuery.
+        Cobre 10 anos de dados para suportar a Fato sem falhas temporais.
+        """
+        print("\nGerando Dimensao Calendario nativa no BigQuery...", flush=True)
+        
+        sql_calendario = f"""
+        CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_dim_calendario` AS
+        WITH datas AS (
+            SELECT dt AS DATA_BASE
+            FROM UNNEST(GENERATE_DATE_ARRAY('2020-01-01', '2030-12-31', INTERVAL 1 DAY)) AS dt
+        )
+        SELECT
+            DATA_BASE,
+            CAST(FORMAT_DATE('%Y%m%d', DATA_BASE) AS INT64) AS ID_TEMPO,
+            EXTRACT(YEAR FROM DATA_BASE) AS ANO,
+            EXTRACT(MONTH FROM DATA_BASE) AS MES_NUM,
+            EXTRACT(DAY FROM DATA_BASE) AS DIA,
+            EXTRACT(DAYOFWEEK FROM DATA_BASE) AS DIA_SEMANA_NUM,
+            FORMAT_DATE('%B', DATA_BASE) AS NOME_MES_EN,
+            -- Tradução do mês para o Dash
+            CASE EXTRACT(MONTH FROM DATA_BASE)
+                WHEN 1 THEN 'Janeiro' WHEN 2 THEN 'Fevereiro' WHEN 3 THEN 'Março'
+                WHEN 4 THEN 'Abril' WHEN 5 THEN 'Maio' WHEN 6 THEN 'Junho'
+                WHEN 7 THEN 'Julho' WHEN 8 THEN 'Agosto' WHEN 9 THEN 'Setembro'
+                WHEN 10 THEN 'Outubro' WHEN 11 THEN 'Novembro' WHEN 12 THEN 'Dezembro'
+            END AS NOME_MES_PT,
+            -- Identificação de Fim de Semana (1=Domingo, 7=Sábado no BQ)
+            CASE WHEN EXTRACT(DAYOFWEEK FROM DATA_BASE) IN (1, 7) THEN 'FIM DE SEMANA' 
+                 ELSE 'DIA UTIL' 
+            END AS TIPO_DIA,
+            EXTRACT(QUARTER FROM DATA_BASE) AS TRIMESTRE
+        FROM datas;
+        """
+        
+        self.bq_client.query(sql_calendario).result()
+        print("✅ Tabela 'tb_dim_calendario' gerada com sucesso.", flush=True)
+
     def executar_deploy(self):
         print("Iniciando pipeline de Deploy Analitico (Sincronizacao R2 -> BQ)...", flush=True)
 
@@ -99,7 +138,12 @@ class DeploySafeDriverBigQuery:
         self._upload_table(df_shap, "tb_dim_shap")
 
         # =================================================================
-        # 3. INSTANCIACAO DA CAMADA SEMANTICA (MASTER VIEW)
+        # 3. GERAÇÃO DA DIMENSÃO CALENDÁRIO
+        # =================================================================
+        self._construir_dim_calendario()
+
+        # =================================================================
+        # 4. INSTANCIACAO DA CAMADA SEMANTICA (MASTER VIEW)
         # =================================================================
         print("\nGerando Camada Semantica Geoespacial (Star Schema View)...", flush=True)
         
@@ -114,16 +158,26 @@ class DeploySafeDriverBigQuery:
             (e.RISCO_PREDITO_IA - e.LABEL_PESO_RISCO) AS DELTA_IA_REAL,
             
             -- Join com a Dimensao SHAP para analise de DNA Criminal por localidade
-            s.* EXCEPT(CIDADE, BAIRRO)
+            s.* EXCEPT(CIDADE, BAIRRO),
+
+            -- Dados da Dimensao Tempo (Calendario)
+            cal.ANO,
+            cal.MES_NUM,
+            cal.NOME_MES_PT,
+            cal.DIA_SEMANA_NUM,
+            cal.TIPO_DIA AS CAL_TIPO_DIA,
+            cal.TRIMESTRE
             
         FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos` e
         LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s 
             ON e.CIDADE = s.CIDADE AND e.BAIRRO = s.BAIRRO
+        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_calendario` cal
+            ON DATE(e.DATAOCORRENCIA) = cal.DATA_BASE
         """
         
         self.bq_client.query(sql).result()
-        print(f"Deploy executado com sucesso em {datetime.now().strftime('%d/%m/%Y %H:%M')}.", flush=True)
-        print(f"Objeto '{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master' pronto para consumo no Looker Studio.", flush=True)
+        print(f"✨ Deploy executado com sucesso em {datetime.now().strftime('%d/%m/%Y %H:%M')}.", flush=True)
+        print(f"🗺️ Objeto '{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master' pronto para consumo no Looker Studio.", flush=True)
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
