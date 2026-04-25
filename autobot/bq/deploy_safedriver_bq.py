@@ -10,31 +10,21 @@ from botocore.config import Config
 from datetime import datetime
 
 class DeploySafeDriverBigQuery:
-    """
-    Componente de Analytics Engineering responsavel pela sustentacao do Data Warehouse.
-    Orquestra a carga dos artefatos processados pelo modelo de Machine Learning
-    para o Google BigQuery, estruturando a camada semantica (Star Schema) 
-    otimizada para ferramentas de Business Intelligence e analise geoespacial.
-    """
     def __init__(self):
-        # Prioriza o ID definido pelo usuario nas correcoes de historico
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
         self.dataset_id = os.getenv("BQ_DATASET_ID")
         
         if not self.dataset_id:
             raise ValueError("A variavel BQ_DATASET_ID precisa estar configurada.")
             
-        # Inicializacao das credenciais de servico via Secret
         bq_json_str = os.getenv("BQ_SERVICE_ACCOUNT_JSON")
         if not bq_json_str:
-            raise ValueError("Credenciais de servico do BigQuery (Secret) ausentes.")
+            raise ValueError("Credenciais de servico do BigQuery ausentes.")
             
         credentials = service_account.Credentials.from_service_account_info(json.loads(bq_json_str))
         self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
         
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
-        
-        # Configuracao de integridade para o endpoint do Cloudflare R2
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
             endpoint = endpoint[: -len(f"/{self.bucket}")]
@@ -47,41 +37,23 @@ class DeploySafeDriverBigQuery:
         )
 
     def _ler_parquet_r2(self, key):
-        """Leitura eficiente de arquivos Parquet via buffer de memoria com blindagem NaN."""
-        print(f"Acessando artefato no Data Lake: {key}", flush=True)
+        print(f"Acessando artefato: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        
-        # Le com Polars e converte para Pandas
         df_pandas = pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
-        
-        # BLINDAGEM: BigQuery nao aceita Float NaN do Pandas em colunas genericas.
-        # Converte strings vazias/NaNs de forma aceitavel pelo conector do BQ.
-        df_pandas = df_pandas.fillna(pd.NA)
-        return df_pandas
+        # Blindagem contra NaNs que o BigQuery rejeita
+        return df_pandas.fillna(pd.NA)
 
     def _upload_table(self, df_pandas, table_name):
-        """Executa a persistencia de dados no Data Warehouse (Modo Write Truncate)."""
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
-        
-        # O autodetect salva o pipeline caso a Camada Ouro crie uma coluna nova
-        job_config = bigquery.LoadJobConfig(
-            write_disposition="WRITE_TRUNCATE",
-            autodetect=True 
-        )
-        
-        print(f"Iniciando job de carga para {table_id}...", flush=True)
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
+        print(f"Subindo tabela {table_id}...", flush=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
-        job.result() # Aguarda a conclusao da API do BQ
-        print(f"✅ Carga finalizada: Tabela {table_name} atualizada no BigQuery.", flush=True)
+        job.result()
+        print(f"✅ Tabela {table_name} atualizada.", flush=True)
 
     def _construir_dim_calendario(self):
-        """
-        Gera uma Dimensão de Calendário robusta nativamente no BigQuery.
-        Cobre 10 anos de dados para suportar a Fato sem falhas temporais.
-        """
-        print("\nGerando Dimensao Calendario nativa no BigQuery...", flush=True)
-        
-        sql_calendario = f"""
+        print("\nGerando Dimensao Calendario nativa (2020-2030)...", flush=True)
+        sql = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_dim_calendario` AS
         WITH datas AS (
             SELECT dt AS DATA_BASE
@@ -89,84 +61,54 @@ class DeploySafeDriverBigQuery:
         )
         SELECT
             DATA_BASE,
-            CAST(FORMAT_DATE('%Y%m%d', DATA_BASE) AS INT64) AS ID_TEMPO,
             EXTRACT(YEAR FROM DATA_BASE) AS ANO,
-            EXTRACT(MONTH FROM DATA_BASE) AS MES_NUM,
-            EXTRACT(DAY FROM DATA_BASE) AS DIA,
-            EXTRACT(DAYOFWEEK FROM DATA_BASE) AS DIA_SEMANA_NUM,
-            FORMAT_DATE('%B', DATA_BASE) AS NOME_MES_EN,
-            -- Tradução do mês para o Dash
             CASE EXTRACT(MONTH FROM DATA_BASE)
                 WHEN 1 THEN 'Janeiro' WHEN 2 THEN 'Fevereiro' WHEN 3 THEN 'Março'
                 WHEN 4 THEN 'Abril' WHEN 5 THEN 'Maio' WHEN 6 THEN 'Junho'
                 WHEN 7 THEN 'Julho' WHEN 8 THEN 'Agosto' WHEN 9 THEN 'Setembro'
                 WHEN 10 THEN 'Outubro' WHEN 11 THEN 'Novembro' WHEN 12 THEN 'Dezembro'
             END AS NOME_MES_PT,
-            -- Identificação de Fim de Semana (1=Domingo, 7=Sábado no BQ)
-            CASE WHEN EXTRACT(DAYOFWEEK FROM DATA_BASE) IN (1, 7) THEN 'FIM DE SEMANA' 
-                 ELSE 'DIA UTIL' 
-            END AS TIPO_DIA,
-            EXTRACT(QUARTER FROM DATA_BASE) AS TRIMESTRE
+            CASE WHEN EXTRACT(DAYOFWEEK FROM DATA_BASE) IN (1, 7) THEN 'FIM DE SEMANA' ELSE 'DIA UTIL' END AS CAL_TIPO_DIA
         FROM datas;
         """
-        
-        self.bq_client.query(sql_calendario).result()
-        print("✅ Tabela 'tb_dim_calendario' gerada com sucesso.", flush=True)
+        self.bq_client.query(sql).result()
 
     def executar_deploy(self):
-        print("Iniciando pipeline de Deploy Analitico (Sincronizacao R2 -> BQ)...", flush=True)
+        print("Iniciando Deploy Analitico...", flush=True)
 
-        # =================================================================
-        # 1. CARGA DA TABELA FATO: EVENTOS COM PREDICAO DE RISCO
-        # =================================================================
-        print("\nProcessando Dossie de Vulnerabilidade (Tabela Fato)...", flush=True)
+        # 1. Carga Fato e Dimensão SHAP
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
-        
-        # Ajuste de tipos primitivos para conformidade com o BigQuery
         if 'DATAOCORRENCIA' in df_eventos.columns:
             df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
-        if 'HORAOCORRENCIA' in df_eventos.columns:
-            df_eventos['HORAOCORRENCIA'] = df_eventos['HORAOCORRENCIA'].astype(str)
-            
         self._upload_table(df_eventos, "tb_dossie_eventos")
 
-        # =================================================================
-        # 2. CARGA DA TABELA DIMENSAO: DNA CRIMINAL (VALORES SHAP)
-        # =================================================================
-        print("\nProcessando Metricas de Explicabilidade SHAP (Tabela Dimensao)...", flush=True)
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
         self._upload_table(df_shap, "tb_dim_shap")
 
-        # =================================================================
-        # 3. GERAÇÃO DA DIMENSÃO CALENDÁRIO
-        # =================================================================
+        # 2. Calendário
         self._construir_dim_calendario()
 
-        # =================================================================
-        # 4. INSTANCIACAO DA CAMADA SEMANTICA (MASTER VIEW)
-        # =================================================================
-        print("\nGerando Camada Semantica Geoespacial (Star Schema View)...", flush=True)
-        
-        sql = f"""
+        # 3. Master View com DATA_BASE exposta
+        print("\nRecriando Master View com Calendario Funcional...", flush=True)
+        sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
         SELECT 
             e.*,
-            -- Conversao dinamica de coordenadas para o tipo GEOGRAPHY nativo
             ST_GEOGPOINT(CAST(e.LONGITUDE AS FLOAT64), CAST(e.LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
             
-            -- Calculo de Residuos: Divergencia entre Risco Observado e Risco Preditivo
-            (e.RISCO_PREDITO_IA - e.LABEL_PESO_RISCO) AS DELTA_IA_REAL,
-            
-            -- Join com a Dimensao SHAP para analise de DNA Criminal por localidade
-            s.* EXCEPT(CIDADE, BAIRRO),
+            -- Lógica de Previsão: Se o risco real for nulo ou zero, é uma previsão da IA
+            CASE 
+                WHEN e.LABEL_PESO_RISCO IS NULL OR e.LABEL_PESO_RISCO = 0 THEN 'PREVISÃO 2026' 
+                ELSE 'DADO HISTÓRICO' 
+            END AS STATUS_DADO,
 
-            -- Dados da Dimensao Tempo (Calendario)
+            (e.RISCO_PREDITO_IA - COALESCE(e.LABEL_PESO_RISCO, 0)) AS DELTA_IA_REAL,
+            
+            -- Campos do Calendário projetados para o Looker
+            cal.DATA_BASE,
             cal.ANO,
-            cal.MES_NUM,
             cal.NOME_MES_PT,
-            cal.DIA_SEMANA_NUM,
-            cal.TIPO_DIA AS CAL_TIPO_DIA,
-            cal.TRIMESTRE
+            cal.CAL_TIPO_DIA
             
         FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos` e
         LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s 
@@ -174,10 +116,8 @@ class DeploySafeDriverBigQuery:
         LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_calendario` cal
             ON DATE(e.DATAOCORRENCIA) = cal.DATA_BASE
         """
-        
-        self.bq_client.query(sql).result()
-        print(f"✨ Deploy executado com sucesso em {datetime.now().strftime('%d/%m/%Y %H:%M')}.", flush=True)
-        print(f"🗺️ Objeto '{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master' pronto para consumo no Looker Studio.", flush=True)
+        self.bq_client.query(sql_view).result()
+        print(f"✨ Deploy finalizado. Objeto pronto para o Looker Studio.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
