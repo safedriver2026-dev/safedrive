@@ -78,7 +78,6 @@ class GeradorDossieSafeDriver:
         # =====================================================================
         print("Gerando Matriz Sintética para Previsões Futuras (2026)...", flush=True)
         
-        # Extrai o "DNA" atual de todos os bairros
         df_dna_bairros = df_historico.select([
             "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO_right", 
             "MICRO_POPULACAO_FACES", "CENSO_MEDIA_V0001", "CENSO_MEDIA_V0002",
@@ -86,7 +85,6 @@ class GeradorDossieSafeDriver:
             "FS_VOL_CRIMES_ANO_ANT", "FS_RISCO_MEDIO_ANO_ANT"
         ]).unique(subset=["H3_INDEX"], maintain_order=True)
 
-        # Cria todos os cenários possíveis para 2026
         turnos = ["MANHA", "TARDE", "NOITE", "MADRUGADA"]
         tipos_dia = ["DIA_UTIL", "FIM_DE_SEMANA"]
         perfis = ["MOTORISTA", "PEDESTRE"]
@@ -99,25 +97,27 @@ class GeradorDossieSafeDriver:
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         ).unique()
 
-        # Junta os bairros com os cenários futuros
         df_futuro = df_dna_bairros.join(df_cenarios, how="cross")
         
-        # =====================================================================
-        # CORREÇÃO DA DATA: Usando objeto 'date' real em vez de string
-        # =====================================================================
         data_futura = date(2026, 6, 15)
         
+        # Correção: Adicionamos a extração de Dia da Semana e Mês para o modelo não falhar!
         df_futuro = df_futuro.with_columns([
-            pl.lit(data_futura).alias("DATAOCORRENCIA"), # Agora é do tipo Date real
+            pl.lit(data_futura).alias("DATAOCORRENCIA"),
             pl.lit(0.0).alias("LABEL_PESO_RISCO"),
             pl.col("BAIRRO_right").alias("BAIRRO"),
-            pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN") # Garante compatibilidade de inteiro
+            pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN")
+        ]).with_columns([
+            pl.col("DATAOCORRENCIA").dt.weekday().cast(pl.Float64).alias("FEAT_DIA_SEMANA"),
+            pl.col("DATAOCORRENCIA").dt.month().cast(pl.Float64).alias("FEAT_MES")
         ])
         
         print("Fundindo Histórico (Passado) com Matriz Sintética (Futuro)...", flush=True)
-        # Seleciona apenas colunas em comum
         cols_comuns = list(set(df_historico.columns).intersection(set(df_futuro.columns)))
         df_completo = pl.concat([df_historico.select(cols_comuns), df_futuro.select(cols_comuns)], how="vertical")
+        
+        # =====================================================================
+        # FIM DA NOVA ROTINA
         # =====================================================================
 
         # 3. CONVERSAO ESTRITA E INFERENCIA
