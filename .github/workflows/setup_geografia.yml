@@ -2,11 +2,11 @@ name: "SafeDriver: Pipeline de Produção"
 
 on:
   # 🕒 GATILHO AUTOMÁTICO MENSAL
-  # Roda às 04:00 (UTC) no dia 28 de cada mês (Garante que a SSP já atualizou a base)
+  # Roda às 04:00 (UTC) no dia 28 de cada mês
   schedule:
     - cron: '0 4 28 * *'
     
-  # 🚀 GATILHO MANUAL (Mantido para testes)
+  # 🚀 GATILHO MANUAL
   workflow_dispatch:
     inputs:
       job:
@@ -52,7 +52,7 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_bronze.outcome }}" == "success" ]; then
-            MSG="📦 **[Bronze]** Ingestão SSP finalizada. Dados novos baixados."
+            MSG="📦 **[Bronze]** Ingestão SSP finalizada com sucesso."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
             MSG="🚨 **[Bronze]** Falha crítica na extração dos dados da SSP."
@@ -95,10 +95,10 @@ jobs:
         if: always()
         run: |
           if [[ "${{ steps.prata_crimes.outcome }}" == "failure" || "${{ steps.prata_mapa.outcome }}" == "failure" ]]; then
-            MSG="🚨 **[Prata]** Erro no processamento de limpeza."
+            MSG="🚨 **[Prata]** Erro no processamento de limpeza e normalização."
             URL="${{ secrets.DISCORD_ERRO }}"
           else
-            MSG="🥈 **[Prata]** Transformação concluída. Dados normalizados."
+            MSG="🥈 **[Prata]** Transformação concluída. Dados prontos para Feature Store."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
@@ -113,6 +113,8 @@ jobs:
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      # SINCRONIZAÇÃO: Mapeia o segredo para a variável que o Python busca
+      NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -130,7 +132,7 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_ouro.outcome }}" == "success" ]; then
-            MSG="🏆 **[Ouro]** ABT e Feature Store Geradas. Prontas para IA."
+            MSG="🏆 **[Ouro]** Tabela Ouro gerada com sucesso para o projeto: ${{ secrets.MY_PROJECT_NAME }}."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
             MSG="🚨 **[Ouro]** Falha ao consolidar a Tabela Ouro."
@@ -141,7 +143,8 @@ jobs:
   # --- CAMADA TREINO (MACHINE LEARNING) ---
   camada-treino:
     needs: [camada-ouro]
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'TREINAR_IA' || github.event.inputs.job == 'FLUXO_CRIMES')
+    # Removemos o always() aqui para evitar erro de NoSuchKey se a Ouro falhar
+    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'TREINAR_IA' || github.event.inputs.job == 'FLUXO_CRIMES'
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -149,6 +152,8 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+      # SINCRONIZAÇÃO CRÍTICA:
+      NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -156,7 +161,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🧠 [TREINO] IA e SHAP"
+      - name: "🧠 [TREINO] IA e Auditoria Tweedie"
         id: run_treino
         run: |
           pip install boto3 polars pyarrow pandas catboost scikit-learn shap requests
@@ -166,10 +171,10 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_treino.outcome }}" == "success" ]; then
-            MSG="🧠 **[ML]** Modelo CatBoost treinado com novos dados da SSP!"
+            MSG="🧠 **[ML]** Treinamento concluído. Modelo e Auditoria salvos no R2."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[ML]** Erro durante o treinamento."
+            MSG="🚨 **[ML]** Falha no treinamento do modelo preditivo."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
@@ -177,7 +182,7 @@ jobs:
   # --- CAMADA INTELIGÊNCIA GEOGRÁFICA ---
   camada-inteligencia:
     needs: [camada-treino]
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'INTELIGENCIA_FINAL' || github.event.inputs.job == 'FLUXO_CRIMES')
+    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'INTELIGENCIA_FINAL' || github.event.inputs.job == 'FLUXO_CRIMES'
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -185,6 +190,8 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+      # SINCRONIZAÇÃO:
+      NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -192,7 +199,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🧬 [MÓDULO 1] Gerar DNA SHAP e Cenários"
+      - name: "🧬 [INTELIGÊNCIA] Gerar DNA SHAP e Malha 2026"
         id: run_intel
         run: |
           pip install boto3 polars pyarrow pandas catboost shap requests
@@ -202,10 +209,10 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_intel.outcome }}" == "success" ]; then
-            MSG="🧬 **[Inteligência]** Cenários de risco e DNA SHAP gerados e salvos no R2!"
+            MSG="🧬 **[Inteligência]** Matriz de Risco e DNA SHAP sincronizados!"
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[Inteligência]** Falha ao gerar matriz de inteligência."
+            MSG="🚨 **[Inteligência]** Erro ao gerar matriz de inferência."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
@@ -213,7 +220,7 @@ jobs:
   # --- CAMADA DEPLOY BIGQUERY ---
   camada-bigquery:
     needs: [camada-inteligencia]
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'DEPLOY_BQ' || github.event.inputs.job == 'FLUXO_CRIMES')
+    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'DEPLOY_BQ' || github.event.inputs.job == 'FLUXO_CRIMES'
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -224,6 +231,8 @@ jobs:
       BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
       BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
       DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
+      # SINCRONIZAÇÃO:
+      NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
       - name: 🔍 Checkout
         uses: actions/checkout@v4
@@ -231,7 +240,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🌐 [MÓDULO 2] Sincronizar Data Warehouse (Star Schema)"
+      - name: "🌐 [DW] Deploy Master View e Star Schema"
         id: run_bq
         run: |
           pip install boto3 polars pyarrow pandas google-cloud-bigquery db-dtypes requests
@@ -241,10 +250,10 @@ jobs:
         if: always()
         run: |
           if [ "${{ steps.run_bq.outcome }}" == "success" ]; then
-            MSG="🚀 **[Deploy BQ]** Arquitetura Star Schema atualizada! Master View 'vw_safedriver_master_star' pronta para o Looker Studio."
+            MSG="🚀 **[Deploy BQ]** Pipeline Finalizado! Dados prontos no Looker Studio."
             URL="${{ secrets.DISCORD_SUCESSO }}"
           else
-            MSG="🚨 **[Deploy BQ]** Erro ao fazer deploy no BigQuery."
+            MSG="🚨 **[Deploy BQ]** Erro ao atualizar o Data Warehouse."
             URL="${{ secrets.DISCORD_ERRO }}"
           fi
           curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
