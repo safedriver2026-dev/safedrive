@@ -11,6 +11,7 @@ from datetime import datetime
 
 class DeploySafeDriverBigQuery:
     def __init__(self):
+        # ID do projeto já retificado conforme seu ambiente
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
         self.dataset_id = os.getenv("BQ_DATASET_ID")
         
@@ -86,7 +87,7 @@ class DeploySafeDriverBigQuery:
         # 2. Calendário
         self._construir_dim_calendario()
 
-        # 3. Master View Arquitetural Definitiva
+        # 3. Master View Arquitetural Definitiva (O Motor do Dashboard)
         print("\nConstruindo Master View Analítica...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
@@ -107,19 +108,19 @@ class DeploySafeDriverBigQuery:
 
         SELECT
             *,
-            -- A. STATUS DE PREDIÇÃO (Filtro Rápido: Realidade vs Futuro)
+            -- A. STATUS DE PREDIÇÃO (A Máquina do Tempo do Dashboard)
             CASE 
                 WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'PREVISÃO' 
                 ELSE 'HISTÓRICO REAL' 
             END AS STATUS_DADO,
 
-            -- B. DELTA DE PRECISÃO (Avaliação do Erro do Modelo)
+            -- B. DELTA DE PRECISÃO (Auditoria de Erro)
             CASE 
                 WHEN LABEL_PESO_RISCO > 0 THEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO)
                 ELSE NULL 
             END AS DELTA_IA_REAL,
 
-            -- C. CLASSIFICAÇÃO SEMÂNTICA (Cores Rápidas no Mapa)
+            -- C. CLASSIFICAÇÃO SEMÂNTICA (A Paleta de Cores do Mapa)
             CASE
                 WHEN RISCO_PREDITO_IA >= 7.0 THEN '1 - CRÍTICO'
                 WHEN RISCO_PREDITO_IA >= 4.0 THEN '2 - ALTO'
@@ -127,18 +128,23 @@ class DeploySafeDriverBigQuery:
                 ELSE '4 - BAIXO'
             END AS NIVEL_ALERTA,
 
-            -- D. QUALIDADE DA INFERÊNCIA (Auditoria do Algoritmo)
+            -- D. QUALIDADE DA INFERÊNCIA (O Gestor confia no dado?)
             CASE
                 WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'N/A (Previsão)'
                 WHEN ABS(RISCO_PREDITO_IA - LABEL_PESO_RISCO) <= 1.5 THEN 'ALTA PRECISÃO'
                 WHEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO) > 1.5 THEN 'FALSO POSITIVO (Alarmista)'
                 ELSE 'FALSO NEGATIVO (Subestimado)'
-            END AS QUALIDADE_PREDICAO
+            END AS QUALIDADE_PREDICAO,
+
+            -- E. CONTEXTO DO CRIME (O Filtro Mágico / Rubrica)
+            -- O 'e.*' já traz todas as colunas originais (incluindo sua rubrica original).
+            -- Mas aqui padronizamos o contexto critico para ser o coração do seu gráfico de barras horizontais:
+            REPLACE(FEAT_CONTEXTO_CRITICO, '_', ' ') AS RUBRICA_CENARIO
 
         FROM Base_Enriquecida;
         """
         self.bq_client.query(sql_view).result()
-        print(f"✨ Deploy finalizado. A melhor Master View possivel esta pronta no BQ.")
+        print(f"✨ Deploy finalizado. A melhor Master View para o Looker Studio esta pronta no BQ.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
