@@ -11,7 +11,6 @@ from datetime import datetime
 
 class DeploySafeDriverBigQuery:
     def __init__(self):
-        # ID do projeto já retificado conforme seu ambiente
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
         self.dataset_id = os.getenv("BQ_DATASET_ID")
         
@@ -73,9 +72,9 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql).result()
 
     def executar_deploy(self):
-        print("Iniciando Deploy Analitico...", flush=True)
+        print("Iniciando Deploy Analitico Honesto...", flush=True)
 
-        # 1. Carga Fato e Dimensão SHAP
+        # 1. Carga de Dados
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         if 'DATAOCORRENCIA' in df_eventos.columns:
             df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
@@ -84,11 +83,10 @@ class DeploySafeDriverBigQuery:
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
         self._upload_table(df_shap, "tb_dim_shap")
 
-        # 2. Calendário
         self._construir_dim_calendario()
 
-        # 3. Master View Arquitetural Definitiva (O Motor do Dashboard)
-        print("\nConstruindo Master View Analítica...", flush=True)
+        # 3. Master View Arquitetural de Alta Sensibilidade
+        print("\nConstruindo Master View Analítica de Alta Sensibilidade...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
 
@@ -108,19 +106,21 @@ class DeploySafeDriverBigQuery:
 
         SELECT
             *,
-            -- A. STATUS DE PREDIÇÃO (A Máquina do Tempo do Dashboard)
+            -- 1. STATUS TEMPORAL (Baseado em 2026)
             CASE 
                 WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'PREVISÃO' 
                 ELSE 'HISTÓRICO REAL' 
             END AS STATUS_DADO,
 
-            -- B. DELTA DE PRECISÃO (Auditoria de Erro)
-            CASE 
-                WHEN LABEL_PESO_RISCO > 0 THEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO)
-                ELSE NULL 
-            END AS DELTA_IA_REAL,
+            -- 2. SCORE DE IMPACTO (Aumenta a sensibilidade para evitar diluição)
+            -- Eleva o risco ao quadrado para dar peso desproporcional a alertas reais
+            ROUND(POW(RISCO_PREDITO_IA, 2) / 10, 2) AS SCORE_IMPACTO_PONDERADO,
 
-            -- C. CLASSIFICAÇÃO SEMÂNTICA (A Paleta de Cores do Mapa)
+            -- 3. FLAG DE SINAL ALTO (Para filtros de BigNumber)
+            -- Identifica se a linha é um ruído ou um evento de risco real
+            CASE WHEN RISCO_PREDITO_IA >= 5.0 THEN 1 ELSE 0 END AS IS_HIGH_SIGNAL,
+
+            -- 4. CLASSIFICAÇÃO SEMÂNTICA
             CASE
                 WHEN RISCO_PREDITO_IA >= 7.0 THEN '1 - CRÍTICO'
                 WHEN RISCO_PREDITO_IA >= 4.0 THEN '2 - ALTO'
@@ -128,23 +128,21 @@ class DeploySafeDriverBigQuery:
                 ELSE '4 - BAIXO'
             END AS NIVEL_ALERTA,
 
-            -- D. QUALIDADE DA INFERÊNCIA (O Gestor confia no dado?)
+            -- 5. AUDITORIA DA IA
             CASE
                 WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'N/A (Previsão)'
                 WHEN ABS(RISCO_PREDITO_IA - LABEL_PESO_RISCO) <= 1.5 THEN 'ALTA PRECISÃO'
-                WHEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO) > 1.5 THEN 'FALSO POSITIVO (Alarmista)'
-                ELSE 'FALSO NEGATIVO (Subestimado)'
+                WHEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO) > 1.5 THEN 'FALSO POSITIVO'
+                ELSE 'FALSO NEGATIVO'
             END AS QUALIDADE_PREDICAO,
 
-            -- E. CONTEXTO DO CRIME (O Filtro Mágico / Rubrica)
-            -- O 'e.*' já traz todas as colunas originais (incluindo sua rubrica original).
-            -- Mas aqui padronizamos o contexto critico para ser o coração do seu gráfico de barras horizontais:
-            REPLACE(FEAT_CONTEXTO_CRITICO, '_', ' ') AS RUBRICA_CENARIO
+            -- 6. RUBRICA TRATADA
+            UPPER(REPLACE(FEAT_CONTEXTO_CRITICO, '_', ' ')) AS RUBRICA_CENARIO
 
         FROM Base_Enriquecida;
         """
         self.bq_client.query(sql_view).result()
-        print(f"✨ Deploy finalizado. A melhor Master View para o Looker Studio esta pronta no BQ.")
+        print(f"✨ Deploy Finalizado. Master View 'Honesta' disponível no BQ.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
