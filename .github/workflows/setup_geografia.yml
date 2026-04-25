@@ -1,12 +1,9 @@
 name: "SafeDriver: Pipeline de Produção"
 
 on:
-  # 🕒 GATILHO AUTOMÁTICO MENSAL
-  # Roda às 04:00 (UTC) no dia 28 de cada mês
   schedule:
     - cron: '0 4 28 * *'
     
-  # 🚀 GATILHO MANUAL
   workflow_dispatch:
     inputs:
       job:
@@ -28,7 +25,7 @@ on:
 jobs:
   # --- CAMADA BRONZE ---
   camada-bronze:
-    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'BRONZE_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
+    if: github.event_name == 'schedule' || contains(fromJSON('["tudo", "BRONZE_CRIMES", "FLUXO_CRIMES"]'), github.event.inputs.job)
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -36,10 +33,8 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
     steps:
-      - name: 🔍 Checkout
-        uses: actions/checkout@v4
-      - name: 🐍 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: "📦 [BRONZE] Ingestão SSP"
@@ -47,23 +42,12 @@ jobs:
         run: |
           pip install boto3 requests polars h3 python-calamine fastexcel
           python autobot/reg_crimes/ingestor_safe_driver.py bronze
-      
-      - name: 📢 Notificar Bronze
-        if: always()
-        run: |
-          if [ "${{ steps.run_bronze.outcome }}" == "success" ]; then
-            MSG="📦 **[Bronze]** Ingestão SSP finalizada com sucesso."
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-          else
-            MSG="🚨 **[Bronze]** Falha crítica na extração dos dados da SSP."
-            URL="${{ secrets.DISCORD_ERRO }}"
-          fi
-          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
 
   # --- CAMADA PRATA ---
   camada-prata:
     needs: [camada-bronze]
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || contains(github.event.inputs.job, 'PRATA_') || github.event.inputs.job == 'FLUXO_CRIMES')
+    # O segredo é o !cancelled(): ele roda se o anterior passou OU se foi pulado
+    if: always() && !cancelled() && (github.event_name == 'schedule' || contains(fromJSON('["tudo", "PRATA_CRIMES", "PRATA_MAPA", "FLUXO_CRIMES"]'), github.event.inputs.job))
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -72,155 +56,85 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       LGPD_PEPPER: ${{ secrets.LGPD_PEPPER }}
     steps:
-      - name: 🔍 Checkout
-        uses: actions/checkout@v4
-      - name: 🐍 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "⚙️ Instalar Dependências"
-        run: pip install boto3 polars h3 pyarrow requests duckdb python-calamine fastexcel
-      
+      - run: pip install boto3 polars h3 pyarrow requests duckdb python-calamine fastexcel
       - name: "🛡️ [PRATA-A] Crimes SSP"
         id: prata_crimes
-        if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_CRIMES' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/reg_crimes/ingestor_safe_driver.py prata
-
       - name: "🏗️ [PRATA-B] Malha Geográfica"
         id: prata_mapa
-        if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'PRATA_MAPA' || github.event.inputs.job == 'FLUXO_CRIMES'
         run: python autobot/prata/malha_geografica/malha_geo_infra_social.py
-
-      - name: 📢 Notificar Prata
-        if: always()
-        run: |
-          if [[ "${{ steps.prata_crimes.outcome }}" == "failure" || "${{ steps.prata_mapa.outcome }}" == "failure" ]]; then
-            MSG="🚨 **[Prata]** Erro no processamento de limpeza e normalização."
-            URL="${{ secrets.DISCORD_ERRO }}"
-          else
-            MSG="🥈 **[Prata]** Transformação concluída. Dados prontos para Feature Store."
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-          fi
-          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
 
   # --- CAMADA OURO ---
   camada-ouro:
     needs: [camada-prata]
-    if: always() && (github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'OURO_COMPLETA' || github.event.inputs.job == 'FLUXO_CRIMES')
+    if: always() && !cancelled() && (github.event_name == 'schedule' || contains(fromJSON('["tudo", "OURO_COMPLETA", "FLUXO_CRIMES"]'), github.event.inputs.job))
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      # SINCRONIZAÇÃO: Mapeia o segredo para a variável que o Python busca
       NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
-      - name: 🔍 Checkout
-        uses: actions/checkout@v4
-      - name: 🐍 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🏆 [OURO] Gerar ABT e Feature Store"
-        id: run_ouro
+      - name: "🏆 [OURO] Gerar ABT"
         run: |
           pip install boto3 polars pyarrow requests
           python autobot/ouro/processador_ouro_safedriver.py
-      
-      - name: 📢 Notificar Ouro
-        if: always()
-        run: |
-          if [ "${{ steps.run_ouro.outcome }}" == "success" ]; then
-            MSG="🏆 **[Ouro]** Tabela Ouro gerada com sucesso para o projeto: ${{ secrets.MY_PROJECT_NAME }}."
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-          else
-            MSG="🚨 **[Ouro]** Falha ao consolidar a Tabela Ouro."
-            URL="${{ secrets.DISCORD_ERRO }}"
-          fi
-          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
 
-  # --- CAMADA TREINO (MACHINE LEARNING) ---
+  # --- CAMADA TREINO ---
   camada-treino:
     needs: [camada-ouro]
-    # Removemos o always() aqui para evitar erro de NoSuchKey se a Ouro falhar
-    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'TREINAR_IA' || github.event.inputs.job == 'FLUXO_CRIMES'
+    if: always() && !cancelled() && (github.event_name == 'schedule' || contains(fromJSON('["tudo", "TREINAR_IA", "FLUXO_CRIMES"]'), github.event.inputs.job))
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-      # SINCRONIZAÇÃO CRÍTICA:
       NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
-      - name: 🔍 Checkout
-        uses: actions/checkout@v4
-      - name: 🐍 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🧠 [TREINO] IA e Auditoria Tweedie"
-        id: run_treino
+      - name: "🧠 [TREINO] CatBoost Tweedie"
         run: |
           pip install boto3 polars pyarrow pandas catboost scikit-learn shap requests
           python autobot/ml/treinador_safe_driver.py
-      
-      - name: 📢 Notificar Treino
-        if: always()
-        run: |
-          if [ "${{ steps.run_treino.outcome }}" == "success" ]; then
-            MSG="🧠 **[ML]** Treinamento concluído. Modelo e Auditoria salvos no R2."
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-          else
-            MSG="🚨 **[ML]** Falha no treinamento do modelo preditivo."
-            URL="${{ secrets.DISCORD_ERRO }}"
-          fi
-          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
 
-  # --- CAMADA INTELIGÊNCIA GEOGRÁFICA ---
+  # --- CAMADA INTELIGÊNCIA ---
   camada-inteligencia:
     needs: [camada-treino]
-    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'INTELIGENCIA_FINAL' || github.event.inputs.job == 'FLUXO_CRIMES'
+    if: always() && !cancelled() && (github.event_name == 'schedule' || contains(fromJSON('["tudo", "INTELIGENCIA_FINAL", "FLUXO_CRIMES"]'), github.event.inputs.job))
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-      # SINCRONIZAÇÃO:
       NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
-      - name: 🔍 Checkout
-        uses: actions/checkout@v4
-      - name: 🐍 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🧬 [INTELIGÊNCIA] Gerar DNA SHAP e Malha 2026"
-        id: run_intel
+      - name: "🧬 [INTELIGÊNCIA] SHAP e Previsão"
         run: |
           pip install boto3 polars pyarrow pandas catboost shap requests
           python autobot/ml/gerador_inteligencia_final.py
 
-      - name: 📢 Notificar Inteligência
-        if: always()
-        run: |
-          if [ "${{ steps.run_intel.outcome }}" == "success" ]; then
-            MSG="🧬 **[Inteligência]** Matriz de Risco e DNA SHAP sincronizados!"
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-          else
-            MSG="🚨 **[Inteligência]** Erro ao gerar matriz de inferência."
-            URL="${{ secrets.DISCORD_ERRO }}"
-          fi
-          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
-
   # --- CAMADA DEPLOY BIGQUERY ---
   camada-bigquery:
     needs: [camada-inteligencia]
-    if: github.event_name == 'schedule' || github.event.inputs.job == 'tudo' || github.event.inputs.job == 'DEPLOY_BQ' || github.event.inputs.job == 'FLUXO_CRIMES'
+    if: always() && !cancelled() && (github.event_name == 'schedule' || contains(fromJSON('["tudo", "DEPLOY_BQ", "FLUXO_CRIMES"]'), github.event.inputs.job))
     runs-on: ubuntu-latest
     env:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -230,30 +144,13 @@ jobs:
       BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
       BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
       BQ_SERVICE_ACCOUNT_JSON: ${{ secrets.BQ_SERVICE_ACCOUNT_JSON }}
-      DISCORD_SUCESSO: ${{ secrets.DISCORD_SUCESSO }}
-      # SINCRONIZAÇÃO:
       NOME_PROJETO: ${{ secrets.MY_PROJECT_NAME }}
     steps:
-      - name: 🔍 Checkout
-        uses: actions/checkout@v4
-      - name: 🐍 Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: "🌐 [DW] Deploy Master View e Star Schema"
-        id: run_bq
+      - name: "🌐 [DW] Deploy BigQuery"
         run: |
           pip install boto3 polars pyarrow pandas google-cloud-bigquery db-dtypes requests
           python autobot/bq/deploy_safedriver_bq.py
-
-      - name: 📢 Notificar BigQuery
-        if: always()
-        run: |
-          if [ "${{ steps.run_bq.outcome }}" == "success" ]; then
-            MSG="🚀 **[Deploy BQ]** Pipeline Finalizado! Dados prontos no Looker Studio."
-            URL="${{ secrets.DISCORD_SUCESSO }}"
-          else
-            MSG="🚨 **[Deploy BQ]** Erro ao atualizar o Data Warehouse."
-            URL="${{ secrets.DISCORD_ERRO }}"
-          fi
-          curl -s -H "Content-Type: application/json" -d "{\"content\": \"$MSG\"}" $URL
