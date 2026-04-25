@@ -4,147 +4,130 @@ import json
 import boto3
 import polars as pl
 import pandas as pd
-from google.cloud import bigquery
-from google.oauth2 import service_account
-from botocore.config import Config
+import numpy as np
+import time
+import warnings
 from datetime import datetime
+from catboost import CatBoostRegressor, Pool
+from botocore.config import Config
 
-class DeploySafeDriverBigQuery:
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+class TreinadorSafeDriver:
+    """
+    Motor de Treinamento Anti-Diluição com Auditoria Detalhada.
+    Implementa Tweedie Regression para dados zero-inflados:
+    Loss Function: $$P(y| \mu, \phi, p) = \exp \left( \frac{y \cdot \frac{\mu^{1-p}}{1-p} - \frac{\mu^{2-p}}{2-p}}{\phi} + a(y, \phi, p) \right)$$
+    """
     def __init__(self):
-        # ID do projeto já retificado conforme seu ambiente
-        self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
-        self.dataset_id = os.getenv("BQ_DATASET_ID")
-        
-        if not self.dataset_id:
-            raise ValueError("A variavel BQ_DATASET_ID precisa estar configurada.")
-            
-        bq_json_str = os.getenv("BQ_SERVICE_ACCOUNT_JSON")
-        if not bq_json_str:
-            raise ValueError("Credenciais de servico do BigQuery ausentes.")
-            
-        credentials = service_account.Credentials.from_service_account_info(json.loads(bq_json_str))
-        self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
-        
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
-        if endpoint.endswith(f"/{self.bucket}"):
-            endpoint = endpoint[: -len(f"/{self.bucket}")]
-            
+        
         self.s3 = boto3.client(
-            's3', endpoint_url=endpoint, 
+            's3', endpoint_url=endpoint,
             aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
             aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
-            config=Config(signature_version='s3v4', retries={'max_attempts': 3})
+            config=Config(signature_version='s3v4', retries={'max_attempts': 5})
         )
+        
+        self.modelo_nome = "modelo_safedriver_catboost.cbm"
+        self.log_nome = "AUDITORIA_TREINAMENTO_MODELO.json"
+        self.target = "LABEL_PESO_RISCO"
+        self.cat_features = [
+            "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
+            "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_DIA"
+        ]
+        self.telemetria = {
+            "projeto": "SafeDriver",
+            "timestamp": str(datetime.now()),
+            "metricas_final": {},
+            "importancia_features": {}
+        }
 
-    def _ler_parquet_r2(self, key):
-        print(f"Acessando artefato: {key}", flush=True)
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        return pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
+    def _sincronizar_r2(self, local_path, s3_key):
+        print(f"☁️ Enviando {local_path} para o Data Lake...", flush=True)
+        self.s3.upload_file(local_path, self.bucket, s3_key)
 
-    def _upload_table(self, df_pandas, table_name):
-        table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
-        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
-        print(f"Subindo tabela {table_id}...", flush=True)
-        job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
-        job.result()
-        print(f"✅ Tabela {table_name} atualizada.", flush=True)
+    def carregar_dados(self):
+        print("📥 Extraindo ABT Ouro para treinamento...", flush=True)
+        obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
+        df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+        
+        # Log da distribuição do target para auditoria
+        zeros = df.filter(pl.col(self.target) == 0).height
+        total = df.height
+        self.telemetria["distribuicao_target"] = {
+            "total_registros": total,
+            "registros_zero": zeros,
+            "percentual_zero": round((zeros / total) * 100, 2),
+            "media_target": round(df[self.target].mean(), 4)
+        }
+        return df
 
-    def _construir_dim_calendario(self):
-        print("\nGerando Dimensao Calendario nativa (2020-2030)...", flush=True)
-        sql = f"""
-        CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_dim_calendario` AS
-        WITH datas AS (
-            SELECT dt AS DATA_BASE
-            FROM UNNEST(GENERATE_DATE_ARRAY('2020-01-01', '2030-12-31', INTERVAL 1 DAY)) AS dt
-        )
-        SELECT
-            DATA_BASE,
-            EXTRACT(YEAR FROM DATA_BASE) AS ANO,
-            CASE EXTRACT(MONTH FROM DATA_BASE)
-                WHEN 1 THEN 'Janeiro' WHEN 2 THEN 'Fevereiro' WHEN 3 THEN 'Março'
-                WHEN 4 THEN 'Abril' WHEN 5 THEN 'Maio' WHEN 6 THEN 'Junho'
-                WHEN 7 THEN 'Julho' WHEN 8 THEN 'Agosto' WHEN 9 THEN 'Setembro'
-                WHEN 10 THEN 'Outubro' WHEN 11 THEN 'Novembro' WHEN 12 THEN 'Dezembro'
-            END AS NOME_MES_PT,
-            CASE WHEN EXTRACT(DAYOFWEEK FROM DATA_BASE) IN (1, 7) THEN 'FIM DE SEMANA' ELSE 'DIA UTIL' END AS CAL_TIPO_DIA
-        FROM datas;
-        """
-        self.bq_client.query(sql).result()
+    def treinar(self):
+        inicio_geral = time.time()
+        df = self.carregar_dados()
+        df_pd = df.to_pandas()
 
-    def executar_deploy(self):
-        print("Iniciando Deploy Analitico...", flush=True)
+        features = [col for col in df_pd.columns if col not in [self.target, "DATAOCORRENCIA", "ANO_JOIN"]]
+        X = df_pd[features]
+        y = df_pd[self.target]
+        
+        # Pesos: 10x de importância para crimes reais (Dosimetria Ouro)
+        pesos = np.where(y > 0, 10.0, 1.0)
 
-        # 1. Carga Fato e Dimensão SHAP
-        df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
-        if 'DATAOCORRENCIA' in df_eventos.columns:
-            df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
-        self._upload_table(df_eventos, "tb_dossie_eventos")
+        # Saneamento estrito de categorias
+        for col in self.cat_features:
+            if col in X.columns:
+                X[col] = X[col].fillna("DESCONHECIDO").astype(str).str.replace(r'\.0$', '', regex=True)
 
-        df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
-        self._upload_table(df_shap, "tb_dim_shap")
+        print(f"🚀 Iniciando Treinamento (Algoritmo: CatBoost Tweedie)...", flush=True)
+        train_pool = Pool(X, y, cat_features=self.cat_features, weight=pesos)
 
-        # 2. Calendário
-        self._construir_dim_calendario()
+        params = {
+            'iterations': 3000,
+            'learning_rate': 0.02,
+            'depth': 8,
+            'l2_leaf_reg': 1.5,      # Regularização agressiva para manter picos
+            'loss_function': 'Tweedie:variance_power=1.6', 
+            'eval_metric': 'MAE',
+            'random_seed': 42,
+            'verbose': 250,
+            'task_type': 'CPU',
+            'bootstrap_type': 'Bernoulli',
+            'subsample': 0.85
+        }
 
-        # 3. Master View Arquitetural Definitiva (O Motor do Dashboard)
-        print("\nConstruindo Master View Analítica...", flush=True)
-        sql_view = f"""
-        CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
+        modelo = CatBoostRegressor(**params)
+        modelo.fit(train_pool)
 
-        WITH Base_Enriquecida AS (
-            SELECT 
-                e.* EXCEPT(DATAOCORRENCIA), 
-                DATE(e.DATAOCORRENCIA) AS DATA_FATO,
-                ST_GEOGPOINT(CAST(e.LONGITUDE AS FLOAT64), CAST(e.LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
-                s.* EXCEPT(CIDADE, BAIRRO),
-                cal.* EXCEPT(DATA_BASE)
-            FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos` e
-            LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s 
-                ON e.CIDADE = s.CIDADE AND e.BAIRRO = s.BAIRRO
-            LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_calendario` cal
-                ON DATE(e.DATAOCORRENCIA) = cal.DATA_BASE
-        )
+        # --- PÓS-TREINAMENTO: GERAÇÃO DE LOGS ---
+        duracao = round(time.time() - inicio_geral, 2)
+        
+        # 1. Extração de Importância
+        importancias = modelo.get_feature_importance()
+        feat_imp = sorted(zip(features, importancias), key=lambda x: x[1], reverse=True)
+        self.telemetria["importancia_features"] = {f: round(i, 2) for f, i in feat_imp}
 
-        SELECT
-            *,
-            -- A. STATUS DE PREDIÇÃO (A Máquina do Tempo do Dashboard)
-            CASE 
-                WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'PREVISÃO' 
-                ELSE 'HISTÓRICO REAL' 
-            END AS STATUS_DADO,
+        # 2. Métricas de Performance Internas
+        self.telemetria["metricas_final"] = {
+            "tempo_treinamento_seg": duracao,
+            "best_loss": modelo.get_best_score().get('learn', {}).get('Tweedie', 0),
+            "mae_final": modelo.get_best_score().get('learn', {}).get('MAE', 0)
+        }
 
-            -- B. DELTA DE PRECISÃO (Auditoria de Erro)
-            CASE 
-                WHEN LABEL_PESO_RISCO > 0 THEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO)
-                ELSE NULL 
-            END AS DELTA_IA_REAL,
+        # 3. Salvamento de Artefatos
+        modelo.save_model(self.modelo_nome)
+        with open(self.log_nome, 'w', encoding='utf-8') as f:
+            json.dump(self.telemetria, f, indent=4, ensure_ascii=False)
 
-            -- C. CLASSIFICAÇÃO SEMÂNTICA (A Paleta de Cores do Mapa)
-            CASE
-                WHEN RISCO_PREDITO_IA >= 7.0 THEN '1 - CRÍTICO'
-                WHEN RISCO_PREDITO_IA >= 4.0 THEN '2 - ALTO'
-                WHEN RISCO_PREDITO_IA >= 2.0 THEN '3 - MODERADO'
-                ELSE '4 - BAIXO'
-            END AS NIVEL_ALERTA,
+        # 4. Sincronização Cloud
+        self._sincronizar_r2(self.modelo_nome, f"modelos/{self.modelo_nome}")
+        self._sincronizar_r2(self.log_nome, f"modelos/{self.log_nome}")
 
-            -- D. QUALIDADE DA INFERÊNCIA (O Gestor confia no dado?)
-            CASE
-                WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'N/A (Previsão)'
-                WHEN ABS(RISCO_PREDITO_IA - LABEL_PESO_RISCO) <= 1.5 THEN 'ALTA PRECISÃO'
-                WHEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO) > 1.5 THEN 'FALSO POSITIVO (Alarmista)'
-                ELSE 'FALSO NEGATIVO (Subestimado)'
-            END AS QUALIDADE_PREDICAO,
-
-            -- E. CONTEXTO DO CRIME (O Filtro Mágico / Rubrica)
-            -- O 'e.*' já traz todas as colunas originais (incluindo sua rubrica original).
-            -- Mas aqui padronizamos o contexto critico para ser o coração do seu gráfico de barras horizontais:
-            REPLACE(FEAT_CONTEXTO_CRITICO, '_', ' ') AS RUBRICA_CENARIO
-
-        FROM Base_Enriquecida;
-        """
-        self.bq_client.query(sql_view).result()
-        print(f"✨ Deploy finalizado. A melhor Master View para o Looker Studio esta pronta no BQ.")
+        print(f"\n🏆 TREINAMENTO CONCLUÍDO EM {duracao}s")
+        print(f"📊 Principais Features: {list(self.telemetria['importancia_features'].keys())[:5]}")
+        print(f"📑 Auditoria salva em: modelos/{self.log_nome}")
 
 if __name__ == "__main__":
-    DeploySafeDriverBigQuery().executar_deploy()
+    TreinadorSafeDriver().treinar()
