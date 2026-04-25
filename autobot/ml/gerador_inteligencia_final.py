@@ -118,14 +118,24 @@ class GeradorDossieSafeDriver:
         df_hist_pd = df_historico.to_pandas()
         df_fut_pd = df_futuro.to_pandas()
         
-        # Cria as features temporais nativamente no Pandas
+        # 1. Garante que as features temporais existam no HISTÓRICO também
+        if 'DATAOCORRENCIA' in df_hist_pd.columns:
+            df_hist_pd['DATAOCORRENCIA'] = pd.to_datetime(df_hist_pd['DATAOCORRENCIA'])
+            if 'FEAT_DIA_SEMANA' not in df_hist_pd.columns:
+                df_hist_pd['FEAT_DIA_SEMANA'] = df_hist_pd['DATAOCORRENCIA'].dt.weekday
+            if 'FEAT_MES' not in df_hist_pd.columns:
+                df_hist_pd['FEAT_MES'] = df_hist_pd['DATAOCORRENCIA'].dt.month
+
+        # 2. Cria as features temporais nativamente no Pandas para o FUTURO
         df_fut_pd['DATAOCORRENCIA'] = pd.to_datetime(df_fut_pd['DATAOCORRENCIA'])
         df_fut_pd['FEAT_DIA_SEMANA'] = df_fut_pd['DATAOCORRENCIA'].dt.weekday
         df_fut_pd['FEAT_MES'] = df_fut_pd['DATAOCORRENCIA'].dt.month
         
-        # Força o tipo EXATO do histórico no futuro
-        df_fut_pd['FEAT_DIA_SEMANA'] = df_fut_pd['FEAT_DIA_SEMANA'].astype(df_hist_pd['FEAT_DIA_SEMANA'].dtype)
-        df_fut_pd['FEAT_MES'] = df_fut_pd['FEAT_MES'].astype(df_hist_pd['FEAT_MES'].dtype)
+        # 3. Força o tipo EXATO do histórico no futuro com segurança
+        if 'FEAT_DIA_SEMANA' in df_hist_pd.columns:
+            df_fut_pd['FEAT_DIA_SEMANA'] = df_fut_pd['FEAT_DIA_SEMANA'].astype(df_hist_pd['FEAT_DIA_SEMANA'].dtype)
+        if 'FEAT_MES' in df_hist_pd.columns:
+            df_fut_pd['FEAT_MES'] = df_fut_pd['FEAT_MES'].astype(df_hist_pd['FEAT_MES'].dtype)
 
         # União segura via Pandas
         cols_comuns = list(set(df_hist_pd.columns).intersection(set(df_fut_pd.columns)))
