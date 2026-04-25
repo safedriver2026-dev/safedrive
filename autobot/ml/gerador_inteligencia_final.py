@@ -19,7 +19,7 @@ class GeradorDossieSafeDriver:
     """
     Motor de Inteligência Preditiva (Versão Estável R2).
     Gera Dossiê do Passado + Projeções para 2026 com Min/Max e SHAP Values.
-    Blindagem de Titânio contra tipagem Pandas (NaN).
+    Blindagem de Titânio contra tipagem Pandas (NaN) + Calibração (0.5 a 10.0).
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -110,7 +110,7 @@ class GeradorDossieSafeDriver:
         ])
 
         # =================================================================
-        # 4. PREDIÇÃO E A MARRETA DE TITÂNIO
+        # 4. PREDIÇÃO, A MARRETA DE TITÂNIO E CALIBRAÇÃO (PISO 0.5)
         # =================================================================
         print("⚡ Rodando predição (Histórico + Projeções 2026)...", flush=True)
         df_hist_pd = df_ouro.to_pandas()
@@ -137,7 +137,22 @@ class GeradorDossieSafeDriver:
             X_all[col] = X_all[col].astype(object)         # Tranca o tipo para o CatBoost
             
         preds_raw = modelo.predict(X_all)
-        preds_clipped = np.clip(preds_raw, 0, 10) # Trava de segurança (0 a 10)
+        
+        # --- A MÁGICA DA CALIBRAÇÃO (0.5 a 10.0) ---
+        print("📏 Calibrando termômetro de risco para escala exata de 0.5 a 10...", flush=True)
+        p_min = preds_raw.min()
+        p_max = preds_raw.max()
+        
+        piso_risco = 0.5
+        teto_risco = 10.0
+        
+        if p_max > p_min:
+            preds_calibrados = piso_risco + (preds_raw - p_min) * (teto_risco - piso_risco) / (p_max - p_min)
+        else:
+            preds_calibrados = preds_raw
+            
+        # Trava de segurança respeitando o novo piso
+        preds_clipped = np.clip(preds_calibrados, piso_risco, teto_risco) 
         
         df_dossie = pl.from_pandas(df_completo_pd).with_columns(
             pl.Series("RISCO_PREDITO_IA", preds_clipped).round(2)
@@ -207,7 +222,7 @@ class GeradorDossieSafeDriver:
             f"   • Projeções Futuras (26)  : {df_futuro.height:,}\n"
             f"   • Total Consolidado       : {df_dossie.height:,}\n"
             f"   • Bairros Mapeados (DNA)  : {len(df_shap_geo)}\n\n"
-            f"2. PERFORMANCE DA IA (ESCALA DE RISCO 0 A 10)\n"
+            f"2. PERFORMANCE DA IA (ESCALA DE RISCO 0.5 A 10)\n"
             f"   • Risco Mínimo Detectado  : {min_risco:.4f}\n"
             f"   • Risco Médio Predito     : {media_risco:.4f}\n"
             f"   • Risco Máximo Detectado  : {max_risco:.4f}\n\n"
