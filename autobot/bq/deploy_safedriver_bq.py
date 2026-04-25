@@ -40,7 +40,6 @@ class DeploySafeDriverBigQuery:
         print(f"Acessando artefato: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         df_pandas = pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
-        # Blindagem contra NaNs que o BigQuery rejeita
         return df_pandas.fillna(pd.NA)
 
     def _upload_table(self, df_pandas, table_name):
@@ -88,36 +87,59 @@ class DeploySafeDriverBigQuery:
         # 2. Calendário
         self._construir_dim_calendario()
 
-        # 3. Master View com DATA_BASE exposta
-        print("\nRecriando Master View com Calendario Funcional...", flush=True)
+        # 3. Master View Arquitetural Definitiva
+        print("\nConstruindo Master View Analítica...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
-        SELECT 
-            e.*,
-            ST_GEOGPOINT(CAST(e.LONGITUDE AS FLOAT64), CAST(e.LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
-            
-            -- Lógica de Previsão: Se o risco real for nulo ou zero, é uma previsão da IA
+
+        WITH Base_Enriquecida AS (
+            SELECT 
+                e.* EXCEPT(DATAOCORRENCIA), 
+                DATE(e.DATAOCORRENCIA) AS DATA_FATO,
+                ST_GEOGPOINT(CAST(e.LONGITUDE AS FLOAT64), CAST(e.LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
+                s.* EXCEPT(CIDADE, BAIRRO),
+                cal.* EXCEPT(DATA_BASE)
+            FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos` e
+            LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s 
+                ON e.CIDADE = s.CIDADE AND e.BAIRRO = s.BAIRRO
+            LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_calendario` cal
+                ON DATE(e.DATAOCORRENCIA) = cal.DATA_BASE
+        )
+
+        SELECT
+            *,
+            -- A. STATUS DE PREDIÇÃO (Filtro Rápido: Realidade vs Futuro)
             CASE 
-                WHEN e.LABEL_PESO_RISCO IS NULL OR e.LABEL_PESO_RISCO = 0 THEN 'PREVISÃO 2026' 
-                ELSE 'DADO HISTÓRICO' 
+                WHEN LABEL_PESO_RISCO IS NULL OR LABEL_PESO_RISCO = 0 THEN 'PREVISÃO' 
+                ELSE 'HISTÓRICO REAL' 
             END AS STATUS_DADO,
 
-            (e.RISCO_PREDITO_IA - COALESCE(e.LABEL_PESO_RISCO, 0)) AS DELTA_IA_REAL,
-            
-            -- Campos do Calendário projetados para o Looker
-            cal.DATA_BASE,
-            cal.ANO,
-            cal.NOME_MES_PT,
-            cal.CAL_TIPO_DIA
-            
-        FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos` e
-        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s 
-            ON e.CIDADE = s.CIDADE AND e.BAIRRO = s.BAIRRO
-        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_calendario` cal
-            ON DATE(e.DATAOCORRENCIA) = cal.DATA_BASE
+            -- B. DELTA DE PRECISÃO (Avaliação do Erro do Modelo)
+            CASE 
+                WHEN LABEL_PESO_RISCO > 0 THEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO)
+                ELSE NULL 
+            END AS DELTA_IA_REAL,
+
+            -- C. CLASSIFICAÇÃO SEMÂNTICA (Cores Rápidas no Mapa)
+            CASE
+                WHEN RISCO_PREDITO_IA >= 7.0 THEN '1 - CRÍTICO'
+                WHEN RISCO_PREDITO_IA >= 4.0 THEN '2 - ALTO'
+                WHEN RISCO_PREDITO_IA >= 2.0 THEN '3 - MODERADO'
+                ELSE '4 - BAIXO'
+            END AS NIVEL_ALERTA,
+
+            -- D. QUALIDADE DA INFERÊNCIA (Auditoria do Algoritmo)
+            CASE
+                WHEN LABEL_PESO_RISCO = 0 OR LABEL_PESO_RISCO IS NULL THEN 'N/A (Previsão)'
+                WHEN ABS(RISCO_PREDITO_IA - LABEL_PESO_RISCO) <= 1.5 THEN 'ALTA PRECISÃO'
+                WHEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO) > 1.5 THEN 'FALSO POSITIVO (Alarmista)'
+                ELSE 'FALSO NEGATIVO (Subestimado)'
+            END AS QUALIDADE_PREDICAO
+
+        FROM Base_Enriquecida;
         """
         self.bq_client.query(sql_view).result()
-        print(f"✨ Deploy finalizado. Objeto pronto para o Looker Studio.")
+        print(f"✨ Deploy finalizado. A melhor Master View possivel esta pronta no BQ.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
