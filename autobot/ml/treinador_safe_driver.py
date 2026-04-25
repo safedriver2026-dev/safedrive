@@ -16,30 +16,34 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class TreinadorSafeDriver:
     """
     Motor de Treinamento Anti-Diluição.
-    Implementa Tweedie Regression para dados zero-inflados (Zero-Inflated Data).
-    Matemática: $$P(y| \mu, \phi, p) = \exp \left( \frac{y \cdot \frac{\mu^{1-p}}{1-p} - \frac{\mu^{2-p}}{2-p}}{\phi} + a(y, \phi, p) \right)$$
+    Implementa Tweedie Regression para dados zero-inflados.
     """
     def __init__(self):
-        # 1. SINCRONIZAÇÃO DE IDENTIDADE
+        # 1. IDENTIDADE SINCRONIZADA
         self.projeto = os.getenv("NOME_PROJETO", "safedriver").strip().lower()
         self.bucket = os.getenv("R2_BUCKET_NAME", "safedriver").strip()
         
-        # 2. INFRAESTRUTURA R2
+        # 2. INFRAESTRUTURA R2 (Configuração Ultra-Compatível)
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
+        
+        # R2 exige 'auto' como região e 'path' como estilo de endereçamento em muitos casos
         self.s3 = boto3.client(
-            's3', endpoint_url=endpoint,
+            's3', 
+            endpoint_url=endpoint,
             aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
             aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
-            config=Config(signature_version='s3v4', retries={'max_attempts': 5})
+            region_name='auto', 
+            config=Config(
+                signature_version='s3v4',
+                retries={'max_attempts': 5},
+                s3={'addressing_style': 'path'} 
+            )
         )
         
-        # 3. CAMINHOS (Equalizados com o Arquiteto Ouro)
-        # O arquivo está na raiz do bucket: datalake/ouro/...
+        # 3. CAMINHOS E METADADOS
         self.ouro_dir = "datalake/ouro"
         self.modelo_nome = "modelo_safedriver_catboost.cbm"
         self.log_nome = "AUDITORIA_TREINAMENTO_MODELO.json"
-        
-        # 4. DEFINIÇÕES DE MODELAGEM
         self.target = "LABEL_PESO_RISCO"
         self.cat_features = [
             "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
@@ -56,19 +60,23 @@ class TreinadorSafeDriver:
         }
 
     def _sincronizar_r2(self, local_path, s3_key):
-        print(f"☁️ Sincronizando: {local_path} -> {s3_key}...", flush=True)
+        print(f"☁️ Enviando artefato: {local_path} -> {s3_key}...", flush=True)
         self.s3.upload_file(local_path, self.bucket, s3_key)
 
     def carregar_dados(self):
-        """Carrega a ABT Ouro garantindo a estrutura correta de pastas."""
+        """Tenta carregar a ABT Ouro com lógica de contingência."""
+        # Caminho oficial: datalake/ouro/safedriver_abt_treino.parquet
         key_ouro = f"{self.ouro_dir}/{self.projeto}_abt_treino.parquet"
-        print(f"📥 Buscando ABT Ouro em: {key_ouro}", flush=True)
+        
+        print(f"🕵️ Buscando ABT Ouro no bucket '{self.bucket}'...")
+        print(f"📍 Key alvo: {key_ouro}")
         
         try:
+            # Tenta a leitura direta
             obj = self.s3.get_object(Bucket=self.bucket, Key=key_ouro)
             df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
             
-            # Auditoria de Sinais (Anti-Diluição)
+            # Telemetria de sinais
             zeros = df.filter(pl.col(self.target) == 0).height
             total = df.height
             self.telemetria["distribuicao_target"] = {
@@ -76,55 +84,68 @@ class TreinadorSafeDriver:
                 "percentual_zero": round((zeros / total) * 100, 2),
                 "media_risco": round(df[self.target].mean(), 4)
             }
+            print("✅ Dados carregados com sucesso!")
             return df
+
         except Exception as e:
-            print(f"❌ ERRO: Não achei o arquivo '{key_ouro}' no bucket '{self.bucket}'.")
-            print("📂 BLOCO DETETIVE: Listando o que existe na pasta Ouro:")
+            print(f"❌ Falha direta na Key '{key_ouro}'. Iniciando varredura de emergência...")
+            
+            # VARREDURA DE EMERGÊNCIA: Lista tudo no bucket para achar o arquivo
             try:
-                res = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=self.ouro_dir)
-                for o in res.get('Contents', []): print(f"  -> {o['Key']}")
-            except: print("  -> Falha ao listar o bucket. Verifique permissões API.")
+                paginator = self.s3.get_paginator('list_objects_v2')
+                found_keys = []
+                for page in paginator.paginate(Bucket=self.bucket):
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            found_keys.append(obj['Key'])
+                
+                if found_keys:
+                    print("📂 Arquivos encontrados no bucket:")
+                    for k in found_keys: print(f"  -> {k}")
+                else:
+                    print("⚠️ O bucket parece estar vazio ou o Token não tem permissão de listagem.")
+            except Exception as list_err:
+                print(f"🚨 Erro crítico de permissão/conexão: {list_err}")
+                print("💡 Verifique se o seu Token API no R2 tem permissão 'Admin' ou 'ListBucket'.")
+            
             raise e
 
     def treinar(self):
         inicio_geral = time.time()
         
-        # 1. Preparação da Tabela de Treino
+        # 1. Carga e conversão
         df = self.carregar_dados()
         df_pd = df.to_pandas()
 
-        # Seleção Estrita: Mantemos Macros e FS, excluímos nomes de texto
+        # 2. Seleção de Features (Elimina IDs e nomes de texto puro)
         colunas_excluir = [self.target, "DATAOCORRENCIA", "ANO_JOIN", "CIDADE", "BAIRRO", "BAIRRO_right"]
-        features = [col for col in df_pd.columns if col not in colunas_excluir]
+        features = [col for col in df_pd.columns if col in self.cat_features or "MACRO_" in col or "FS_" in col or "INFRA_" in col or "CENSO_" in col]
         
         X = df_pd[features]
         y = df_pd[self.target]
         
-        # 2. DOSIMETRIA DE PESOS (O Soco de 10x)
-        # Força o CatBoost a priorizar os hexágonos onde o crime real ocorreu
+        # 3. Dosimetria de Pesos (Amplifica o sinal de crime real em 10x)
         pesos = np.where(y > 0, 10.0, 1.0)
 
-        # 3. Blindagem de Tipagem Categórica
+        # 4. Tratamento de Categóricas
         for col in self.cat_features:
             if col in X.columns:
                 X[col] = X[col].fillna("DESCONHECIDO").astype(str)
 
-        print(f"🚀 Iniciando Engine Tweedie ($p=1.6$) para {self.projeto}...", flush=True)
-        train_pool = Pool(X, y, cat_features=self.cat_features, weight=pesos)
+        print(f"🚀 Treinando CatBoost Tweedie ($p=1.6$) para o projeto {self.projeto}...")
+        train_pool = Pool(X, y, cat_features=[c for c in self.cat_features if c in features], weight=pesos)
 
-        # 4. Hiperparâmetros Calibrados para Segurança Pública
+        # Hiperparâmetros otimizados para detecção de anomalias criminais
         params = {
-            'iterations': 3500,
-            'learning_rate': 0.02,
-            'depth': 8,              # Profundidade para interações geográficas micro
-            'l2_leaf_reg': 1.8,      # Regularização para evitar picos falsos
-            'loss_function': 'Tweedie:variance_power=1.6', 
-            'eval_metric': 'MAE',    # Erro médio absoluto para controle de diluição
+            'iterations': 3000,
+            'learning_rate': 0.03,
+            'depth': 8,
+            'l2_leaf_reg': 2.0,
+            'loss_function': 'Tweedie:variance_power=1.6',
+            'eval_metric': 'MAE',
             'random_seed': 42,
-            'verbose': 500,
-            'task_type': 'CPU',
-            'bootstrap_type': 'Bernoulli',
-            'subsample': 0.8
+            'verbose': 250,
+            'task_type': 'CPU'
         }
 
         modelo = CatBoostRegressor(**params)
@@ -132,28 +153,21 @@ class TreinadorSafeDriver:
 
         duracao = round(time.time() - inicio_geral, 2)
         
-        # 5. Extração de Importância das Variáveis
+        # 5. Inteligência e Persistência
         importancias = modelo.get_feature_importance()
-        feat_imp = sorted(zip(features, importancias), key=lambda x: x[1], reverse=True)
-        self.telemetria["importancia_features"] = {f: round(i, 2) for f, i in feat_imp}
-        
-        self.telemetria["metricas_final"] = {
-            "tempo_treinamento_seg": duracao,
-            "mae_final": modelo.get_best_score().get('learn', {}).get('MAE', 0)
-        }
+        self.telemetria["importancia_features"] = {f: round(i, 2) for f, i in sorted(zip(features, importancias), key=lambda x: x[1], reverse=True)}
+        self.telemetria["metricas_final"] = {"tempo_seg": duracao, "mae": modelo.get_best_score().get('learn', {}).get('MAE', 0)}
 
-        # 6. Persistência de Artefatos
         modelo.save_model(self.modelo_nome)
         with open(self.log_nome, 'w', encoding='utf-8') as f:
             json.dump(self.telemetria, f, indent=4, ensure_ascii=False)
 
-        # 7. Sincronização Cloud (projeto/modelos/...)
+        # 6. Sincronização Cloud
         self._sincronizar_r2(self.modelo_nome, f"modelos/{self.modelo_nome}")
         self._sincronizar_r2(self.log_nome, f"modelos/{self.log_nome}")
 
         print(f"\n🏆 TREINAMENTO CONCLUÍDO EM {duracao}s")
-        print(f"📊 Top 3 Features: {list(self.telemetria['importancia_features'].keys())[:3]}")
-        print(f"📑 Auditoria salva em: modelos/{self.log_nome}")
+        print(f"📊 Top Sinais: {list(self.telemetria['importancia_features'].keys())[:3]}")
 
 if __name__ == "__main__":
     TreinadorSafeDriver().treinar()
