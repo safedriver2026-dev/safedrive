@@ -10,11 +10,11 @@ from datetime import datetime
 
 class ArquitetoSafeDriverOuro:
     """
-    Arquiteto da Camada Ouro: Responsável pela Feature Store e ABT Final.
-    Sincronizado via Secrets para evitar erros de NoSuchKey no Data Lake.
+    Arquiteto da Camada Ouro: Responsável pela Feature Store e ABT (Analytical Base Table).
+    Esta camada transforma dados limpos (Prata) em inteligência para o modelo (Ouro).
     """
     def __init__(self):
-        # 1. IDENTIDADE DO PROJETO (A chave para a sincronia)
+        # 1. IDENTIDADE E SINCRONIA: Chave para evitar NoSuchKey
         self.projeto = os.getenv("NOME_PROJETO", "safedriver").strip().lower()
         
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -40,7 +40,7 @@ class ArquitetoSafeDriverOuro:
             except: pass
 
     def _limpar_tabela_toda(self, df):
-        """Padronização de texto e remoção de caracteres especiais."""
+        """Normalização universal de strings: UPPER, sem acentos, sem lixo."""
         cols_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Utf8]
         if not cols_texto: return df
         
@@ -68,9 +68,9 @@ class ArquitetoSafeDriverOuro:
 
     def construir_abt_final(self):
         inicio_timer = time.time()
-        print(f"🚀 Iniciando reconstrução Ouro para o projeto: {self.projeto}")
+        print(f"🚀 [OURO] Iniciando construção da ABT para o projeto: {self.projeto}")
         
-        # 1. CARREGAMENTO DA MALHA (INFRA + SOCIAL)
+        # --- 1. CARREGAMENTO DO UNIVERSO GEOGRÁFICO ---
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
         
@@ -78,7 +78,7 @@ class ArquitetoSafeDriverOuro:
         df_social = self._limpar_tabela_toda(df_social)
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
 
-        # 2. CARREGAMENTO DOS CRIMES
+        # --- 2. CONSOLIDAÇÃO DOS CRIMES ---
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
             obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
@@ -89,7 +89,7 @@ class ArquitetoSafeDriverOuro:
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
         df_crimes = self._limpar_tabela_toda(df_crimes)
 
-        # 3. TRATAMENTO TEMPORAL E SAZONAL
+        # --- 3. ENGENHARIA DE FEATURES TEMPORAIS ---
         df_crimes = df_crimes.with_columns(
             pl.col("HORAOCORRENCIA").cast(pl.Utf8).str.replace_all(r"\D", "").alias("_tmp_hora")
         ).with_columns(
@@ -107,7 +107,7 @@ class ArquitetoSafeDriverOuro:
             .otherwise(pl.lit("DIA_UTIL")).alias("FEAT_TIPO_DIA")
         ])
 
-        # 4. DOSIMETRIA PENAL (TARGET DO MODELO)
+        # --- 4. DOSIMETRIA PENAL E TARGET ---
         df_gold = df_crimes.with_columns([
             pl.when(pl.col("RUBRICA").str.contains(r"VEICULO|CARGA")).then(pl.lit("MOTORISTA"))
             .when(pl.col("RUBRICA").str.contains(r"TRANSEUNTE|CELULAR|PESSOA")).then(pl.lit("PEDESTRE"))
@@ -120,16 +120,17 @@ class ArquitetoSafeDriverOuro:
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         )
 
-        # 5. FEATURE STORE E JOIN FINAL
+        # --- 5. MEMÓRIA HISTÓRICA (FEATURE STORE) ---
         df_fs_hex = df_gold.group_by(["H3_INDEX", "ANO_OCORRENCIA"]).agg([
             pl.len().alias("FS_VOL_CRIMES_ANO_ANT"),
             pl.col("LABEL_PESO_RISCO").mean().alias("FS_RISCO_MEDIO_ANO_ANT")
         ]).with_columns((pl.col("ANO_OCORRENCIA") + 1).alias("ANO_JOIN"))
 
+        # Join Master
         df_final = df_gold.join(df_universo_h3, on="H3_INDEX", how="left") \
                           .join(df_fs_hex.drop("ANO_OCORRENCIA"), left_on=["H3_INDEX", "ANO_OCORRENCIA"], right_on=["H3_INDEX", "ANO_JOIN"], how="left")
         
-        # Redução de Dimensionalidade (Macros)
+        # --- 6. REDUÇÃO DE DIMENSIONALIDADE (MACROS) ---
         cnae_macros = {
             "MACRO_FINANCEIRO": ["INFRA_DIV_64", "INFRA_DIV_65", "INFRA_DIV_66"],
             "MACRO_LAZER_NOTURNO": ["INFRA_DIV_56", "INFRA_DIV_90", "INFRA_DIV_93"],
@@ -139,19 +140,21 @@ class ArquitetoSafeDriverOuro:
             existentes = [c for c in divs if c in df_final.columns]
             df_final = df_final.with_columns(pl.sum_horizontal(existentes).alias(macro)) if existentes else df_final.with_columns(pl.lit(0).alias(macro))
 
-        df_final = self._limpar_tabela_toda(df_final).drop([c for c in df_final.columns if c.startswith("INFRA_DIV_")] + ["ANO_OCORRENCIA", "HORA_INT", "_tmp_hora"])
+        # Cleanup final e Drop de lixo
+        df_final = self._limpar_tabela_toda(df_final).drop([
+            c for c in df_final.columns if c.startswith("INFRA_DIV_")
+        ] + ["ANO_OCORRENCIA", "HORA_INT", "_tmp_hora"])
 
-        # 6. EXPORTAÇÃO SINCRONIZADA (O PULO DO GATO)
-        # O nome do arquivo agora depende do seu Secret do GitHub
+        # --- 7. EXPORTAÇÃO SINCRONIZADA ---
         key_final = f"{self.ouro_dir}/{self.projeto}_abt_treino.parquet"
-        
         buf = io.BytesIO()
         df_final.write_parquet(buf, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key=key_final, Body=buf.getvalue())
 
         duracao = round(time.time() - inicio_timer, 2)
-        print(f"✨ ABT Ouro finalizada e salva em: {key_final}")
-        self._notificar_discord(f"🏆 **[Ouro]** ABT Gerada: {df_final.height} linhas em {duracao}s.")
+        report = f"🏆 **[Ouro]** ABT Gerada com sucesso! \n- Linhas: {df_final.height} \n- Tempo: {duracao}s \n- Destino: {key_final}"
+        print(report)
+        self._notificar_discord(report)
 
 if __name__ == "__main__":
     ArquitetoSafeDriverOuro().construir_abt_final()
