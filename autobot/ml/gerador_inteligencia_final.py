@@ -9,7 +9,7 @@ import requests
 import json
 import numpy as np
 import warnings
-from datetime import datetime
+from datetime import datetime, date
 from catboost import CatBoostRegressor
 from botocore.config import Config
 
@@ -78,7 +78,7 @@ class GeradorDossieSafeDriver:
         # =====================================================================
         print("Gerando Matriz Sintética para Previsões Futuras (2026)...", flush=True)
         
-        # Extrai o "DNA" atual de todos os bairros (ignorando dados temporais velhos)
+        # Extrai o "DNA" atual de todos os bairros
         df_dna_bairros = df_historico.select([
             "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO_right", 
             "MICRO_POPULACAO_FACES", "CENSO_MEDIA_V0001", "CENSO_MEDIA_V0002",
@@ -102,25 +102,25 @@ class GeradorDossieSafeDriver:
         # Junta os bairros com os cenários futuros
         df_futuro = df_dna_bairros.join(df_cenarios, how="cross")
         
-        # Adiciona colunas mockadas para que o formato seja idêntico ao histórico
+        # =====================================================================
+        # CORREÇÃO DA DATA: Usando objeto 'date' real em vez de string
+        # =====================================================================
+        data_futura = date(2026, 6, 15)
+        
         df_futuro = df_futuro.with_columns([
-            pl.lit("2026-06-15 12:00:00").alias("DATAOCORRENCIA"), # Data fake no futuro
-            pl.lit(0.0).alias("LABEL_PESO_RISCO"), # Zero indica que é previsão
+            pl.lit(data_futura).alias("DATAOCORRENCIA"), # Agora é do tipo Date real
+            pl.lit(0.0).alias("LABEL_PESO_RISCO"),
             pl.col("BAIRRO_right").alias("BAIRRO"),
-            pl.lit(2026).alias("ANO_JOIN")
+            pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN") # Garante compatibilidade de inteiro
         ])
         
-        # Concatena o Histórico (Passado) com a Matriz Futura (2026)
         print("Fundindo Histórico (Passado) com Matriz Sintética (Futuro)...", flush=True)
-        # Seleciona apenas colunas em comum para evitar erros
+        # Seleciona apenas colunas em comum
         cols_comuns = list(set(df_historico.columns).intersection(set(df_futuro.columns)))
         df_completo = pl.concat([df_historico.select(cols_comuns), df_futuro.select(cols_comuns)], how="vertical")
-        
-        # =====================================================================
-        # FIM DA NOVA ROTINA
         # =====================================================================
 
-        # 3. CONVERSAO ESTRITA E INFERENCIA (Agora roda para TUDO)
+        # 3. CONVERSAO ESTRITA E INFERENCIA
         print("Ajustando tipagem vetorial e executando inferência massiva...", flush=True)
         X_all = df_completo.select(modelo.feature_names_).to_pandas()
         for col in X_all.columns:
