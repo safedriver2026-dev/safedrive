@@ -19,13 +19,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class TreinadorSafeDriver:
     """
     Motor de Treinamento SafeDriver.
-    Plumbing de conexão R2 ultra-estável + Engine Tweedie Otimizada para Velocidade.
+    Tweedie Puro (Sem Undersampling) + Peso Dinâmico + Blindagem de Tipagem.
     """
     def __init__(self):
         self.projeto = os.getenv("NOME_PROJETO", "safedriver").strip().lower()
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        # 1. A MÁGICA DA CONEXÃO QUE FUNCIONA
+        # --- Conexão Estável R2 ---
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
             endpoint = endpoint[: -len(f"/{self.bucket}")]
@@ -43,7 +43,7 @@ class TreinadorSafeDriver:
         
         self.auditoria = {
             "projeto": self.projeto,
-            "fase": "Treinamento CatBoost (Tweedie Regression - High Speed)",
+            "fase": "Treinamento CatBoost (Tweedie Puro - Base Total)",
             "data_processamento": str(datetime.now()),
             "metricas": {}
         }
@@ -69,7 +69,7 @@ class TreinadorSafeDriver:
         target = "LABEL_PESO_RISCO"
 
         # =================================================================
-        # 2. SPLIT TEMPORAL
+        # 2. SPLIT TEMPORAL (85/15)
         # =================================================================
         print("[INFO] Executando split temporal (85/15)...", flush=True)
         df = df.sort(["DATAOCORRENCIA", "H3_INDEX"])
@@ -79,24 +79,14 @@ class TreinadorSafeDriver:
         test_df = df.slice(split_idx, df.height - split_idx)
         del df # Libera RAM imediatamente
 
-        # =================================================================
-        # 3. BALANCEAMENTO (UNDERSAMPLING OTIMIZADO)
-        # =================================================================
-        print("[INFO] Aplicando undersampling no treino...", flush=True)
-        df_treino_graves = train_df.filter(pl.col(target) >= 4.0)
-        df_treino_leves = train_df.filter(pl.col(target) < 4.0)
-        
-        n_amostra = min(df_treino_graves.height * 3, df_treino_leves.height)
-        df_treino_leves_amostra = df_treino_leves.sample(n=n_amostra, seed=42)
-        
-        train_df = pl.concat([df_treino_graves, df_treino_leves_amostra]).sample(fraction=1.0, seed=42)
-        
-        linhas_balanceadas_treino = train_df.height
+        # Sem Undersampling: Tweedie precisa ver a realidade (massa de zeros)
+        linhas_treino_real = train_df.height
         linhas_teste_real = test_df.height
 
         # =================================================================
-        # 4. PREPARAÇÃO PARA O CATBOOST
+        # 3. PREPARAÇÃO PARA O CATBOOST E BLINDAGEM DE TIPAGEM
         # =================================================================
+        print("[INFO] Protegendo tipagem categórica (Marreta Pandas)...", flush=True)
         pdf_train = train_df.select(cols_features + [target]).to_pandas()
         pdf_test = test_df.select(cols_features + [target]).to_pandas()
         
@@ -107,34 +97,41 @@ class TreinadorSafeDriver:
         ]
         cat_features = [c for c in cat_features_declaradas if c in pdf_train.columns]
         
+        # A Marreta de Titânio: Mata o NaN real, NaN em texto e floats ".0"
         for col in cat_features:
-            pdf_train[col] = pdf_train[col].fillna("DESCONHECIDO").astype(str)
-            pdf_test[col] = pdf_test[col].fillna("DESCONHECIDO").astype(str)
+            pdf_train[col] = pdf_train[col].fillna('DESCONHECIDO').astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO').astype(object)
+            pdf_test[col] = pdf_test[col].fillna('DESCONHECIDO').astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO').astype(object)
 
-        pesos_treino = np.where(pdf_train[target] > 0, 10.0, 1.0)
+        # =================================================================
+        # 4. PESO DINÂMICO (BASEADO NA REALIDADE DA BASE)
+        # =================================================================
+        peso_real_maximo = float(pdf_train[target].max())
+        if peso_real_maximo <= 0: peso_real_maximo = 1.0 # Fallback caso a base não tenha crime
+        
+        print(f"[INFO] Teto de Risco detectado no treino: {peso_real_maximo}. Aplicando peso dinâmico...", flush=True)
+        pesos_treino = np.where(pdf_train[target] > 0, peso_real_maximo, 1.0)
 
         # =================================================================
         # 5. TREINAMENTO (ENGINE TWEEDIE HIGH-SPEED)
         # =================================================================
-        print("[INFO] Iniciando CatBoost (Tweedie Regression - Fast Mode)...")
+        print("[INFO] Iniciando CatBoost (Tweedie Regression - Base Total)...", flush=True)
         train_pool = Pool(pdf_train[cols_features], pdf_train[target], cat_features=cat_features, weight=pesos_treino)
         test_pool = Pool(pdf_test[cols_features], pdf_test[target], cat_features=cat_features)
 
         modelo = CatBoostRegressor(
-            iterations=2500,         # Teto levemente menor, Early Stopping vai parar antes
-            learning_rate=0.05,      # 5x mais rápido para convergir (era 0.01)
-            depth=6,                 # O SEGREDO DA VELOCIDADE: Árvores otimizadas
-            l2_leaf_reg=3.0,         # Leve aumento na regulação para compensar a velocidade
+            iterations=2500,
+            learning_rate=0.05,
+            depth=6,                 
+            l2_leaf_reg=3.0,         
             loss_function='Tweedie:variance_power=1.6', 
             eval_metric='MAE',
             od_type='Iter',
-            od_wait=100,             # Freio inteligente: para se não melhorar em 100 iterações
-            thread_count=-1,         # Força o uso de todos os núcleos da CPU do GitHub Actions
+            od_wait=100,             
+            thread_count=-1,         
             random_seed=42,
-            verbose=250              # Log mais limpo
+            verbose=250              
         )
 
-        # O eval_set é OBRIGATÓRIO para o od_wait (freio automático) funcionar!
         modelo.fit(train_pool, eval_set=test_pool)
 
         # =================================================================
@@ -142,7 +139,6 @@ class TreinadorSafeDriver:
         # =================================================================
         print("[INFO] Calculando SHAP e Métricas...")
         explainer = shap.TreeExplainer(modelo)
-        # Reduzi a amostra do SHAP para acelerar a explicabilidade sem perder a precisão da média
         sample_test = pdf_test[cols_features].sample(min(3000, len(pdf_test)), random_state=42)
         shap_values = explainer.shap_values(sample_test)
         
@@ -170,6 +166,7 @@ class TreinadorSafeDriver:
 
         self.auditoria["metricas"] = {
             "linhas_originais": linhas_originais,
+            "peso_dinamico_aplicado": peso_real_maximo,
             "arvores_treinadas": modelo.tree_count_,
             "r2_score_validacao": round(r2, 4),
             "mae_validacao": round(mae, 4),
@@ -187,14 +184,15 @@ class TreinadorSafeDriver:
         
         report = (
             f"==============================================================\n"
-            f" RELATÓRIO DE TREINAMENTO - {self.projeto.upper()} (TWEEDIE FAST) \n"
+            f" RELATÓRIO DE TREINAMENTO - {self.projeto.upper()} (TWEEDIE PURO) \n"
             f"==============================================================\n"
-            f"1. VOLUMETRIA E BALANCEAMENTO\n"
-            f"   • Base Original           : {linhas_originais} registros\n"
-            f"   • Base Treinamento        : {linhas_balanceadas_treino} registros (Undersampled)\n"
-            f"   • Base Validação          : {linhas_teste_real} registros\n\n"
+            f"1. VOLUMETRIA E DADOS REAIS\n"
+            f"   • Base Original           : {linhas_originais:,} registros\n"
+            f"   • Base Treinamento        : {linhas_treino_real:,} registros (Base Total)\n"
+            f"   • Base Validação          : {linhas_teste_real:,} registros\n"
+            f"   • Multiplicador de Peso   : {peso_real_maximo}x (Teto Dinâmico)\n\n"
             f"2. PERFORMANCE (ALVO: PESO DE RISCO)\n"
-            f"   • Árvores Utilizadas      : {modelo.tree_count_} (Early Stop ativado)\n"
+            f"   • Árvores Utilizadas      : {modelo.tree_count_} (Early Stop)\n"
             f"   • R² Score                : {r2:.4f}\n"
             f"   • Erro Médio (MAE)        : {mae:.4f}\n\n"
             f"3. DNA DO CRIME (TOP 15 SHAP VALUES)\n"
