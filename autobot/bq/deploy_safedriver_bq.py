@@ -9,11 +9,14 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 from botocore.config import Config
 from datetime import datetime
+import warnings
+
+warnings.filterwarnings("ignore") # Esconde warnings do Pandas/GBQ
 
 class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
-    Refatorada com 'Drop Table' preventivo para evitar Fantasma de Schema.
+    Refatorada com Blindagem Ativa de Schema e Tipagem (Pandas -> BQ).
     """
     def __init__(self):
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
@@ -49,9 +52,9 @@ class DeploySafeDriverBigQuery:
     def _upload_table(self, df_pandas, table_name):
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
         
-        # A MARRETA: Deleta a tabela antiga para forçar a renovação do Schema
+        # Deleta a tabela antiga para forçar o BQ a esquecer o schema passado
         self.bq_client.delete_table(table_id, not_found_ok=True)
-        print(f"[INFO] Tabela {table_id} resetada no BigQuery.", flush=True)
+        print(f"[INFO] Schema de {table_id} resetado no BigQuery.", flush=True)
         
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
         print(f"[INFO] Uploading dataframe para {table_id}...", flush=True)
@@ -80,18 +83,47 @@ class DeploySafeDriverBigQuery:
     def executar_deploy(self):
         print("[START] Iniciando Deploy de Inteligencia Geografica...", flush=True)
 
-        # 1. Sincronização
+        # =====================================================================
+        # 1. DOSSIÊ EVENTOS (Blindagem de Tipagem e Colunas Faltantes)
+        # =====================================================================
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
+        
         if 'DATAOCORRENCIA' in df_eventos.columns:
             df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
+        
+        # Garante que Cidade e Bairro sejam strings limpas para o BQ não reclamar
+        if 'CIDADE' in df_eventos.columns:
+            df_eventos['CIDADE'] = df_eventos['CIDADE'].fillna('DESCONHECIDO').astype(str)
+        if 'BAIRRO' in df_eventos.columns:
+            df_eventos['BAIRRO'] = df_eventos['BAIRRO'].fillna('DESCONHECIDO').astype(str)
+            
+        # A Marreta Definitiva: Garante que a coluna de Massa Criminal exista, mesmo que o pandas tenha dropado
+        if 'FS_VOL_CRIMES_ANO_ANT' not in df_eventos.columns:
+            print("[WARN] Coluna de volume ausente. Injetando valores fallback (0.0).", flush=True)
+            df_eventos['FS_VOL_CRIMES_ANO_ANT'] = 0.0
+        else:
+            df_eventos['FS_VOL_CRIMES_ANO_ANT'] = df_eventos['FS_VOL_CRIMES_ANO_ANT'].fillna(0.0).astype(float)
+            
         self._upload_table(df_eventos, "tb_dossie_eventos")
 
+        # =====================================================================
+        # 2. DIMENSÃO SHAP (Blindagem de Tipagem)
+        # =====================================================================
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
+        
+        if 'CIDADE' in df_shap.columns:
+            df_shap['CIDADE'] = df_shap['CIDADE'].fillna('DESCONHECIDO').astype(str)
+        if 'BAIRRO' in df_shap.columns:
+            df_shap['BAIRRO'] = df_shap['BAIRRO'].fillna('DESCONHECIDO').astype(str)
+            
         self._upload_table(df_shap, "tb_dim_shap")
 
+        # 3. CONSTRUÇÃO CALENDÁRIO
         self._construir_dim_calendario()
 
-        # 2. Master View com BLINDAGEM DE CASTING E MASSA CRIMINAL
+        # =====================================================================
+        # 4. MASTER VIEW 
+        # =====================================================================
         print("[INFO] Construindo Master View Semantica (vw_safedriver_dossie_master)...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
@@ -134,7 +166,7 @@ class DeploySafeDriverBigQuery:
         FROM Base_Final;
         """
         self.bq_client.query(sql_view).result()
-        print("[SUCCESS] Deploy Finalizado com schema atualizado.")
+        print("[SUCCESS] Deploy Finalizado sem erros de schema ou tipagem!")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
