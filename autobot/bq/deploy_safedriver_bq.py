@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore") # Esconde warnings do Pandas/GBQ
 class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
-    Refatorada com Blindagem Ativa de Schema e Tipagem (Pandas -> BQ).
+    Blindagem Extrema: Reconstrução On-The-Fly de colunas dropadas pela interseção.
     """
     def __init__(self):
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
@@ -52,7 +52,6 @@ class DeploySafeDriverBigQuery:
     def _upload_table(self, df_pandas, table_name):
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
         
-        # Deleta a tabela antiga para forçar o BQ a esquecer o schema passado
         self.bq_client.delete_table(table_id, not_found_ok=True)
         print(f"[INFO] Schema de {table_id} resetado no BigQuery.", flush=True)
         
@@ -84,30 +83,37 @@ class DeploySafeDriverBigQuery:
         print("[START] Iniciando Deploy de Inteligencia Geografica...", flush=True)
 
         # =====================================================================
-        # 1. DOSSIÊ EVENTOS (Blindagem de Tipagem e Colunas Faltantes)
+        # 1. DOSSIÊ EVENTOS (Blindagem e Reconstrução On-The-Fly)
         # =====================================================================
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         
         if 'DATAOCORRENCIA' in df_eventos.columns:
             df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
         
-        # Garante que Cidade e Bairro sejam strings limpas para o BQ não reclamar
         if 'CIDADE' in df_eventos.columns:
             df_eventos['CIDADE'] = df_eventos['CIDADE'].fillna('DESCONHECIDO').astype(str)
         if 'BAIRRO' in df_eventos.columns:
             df_eventos['BAIRRO'] = df_eventos['BAIRRO'].fillna('DESCONHECIDO').astype(str)
             
-        # A Marreta Definitiva: Garante que a coluna de Massa Criminal exista, mesmo que o pandas tenha dropado
+        # Reconstrução da Massa Criminal
         if 'FS_VOL_CRIMES_ANO_ANT' not in df_eventos.columns:
             print("[WARN] Coluna de volume ausente. Injetando valores fallback (0.0).", flush=True)
             df_eventos['FS_VOL_CRIMES_ANO_ANT'] = 0.0
         else:
             df_eventos['FS_VOL_CRIMES_ANO_ANT'] = df_eventos['FS_VOL_CRIMES_ANO_ANT'].fillna(0.0).astype(float)
             
+        # Reconstrução do Contexto Crítico
+        if 'FEAT_CONTEXTO_CRITICO' not in df_eventos.columns:
+            print("[WARN] Coluna FEAT_CONTEXTO_CRITICO ausente. Reconstruindo na memoria...", flush=True)
+            if 'SAZON_PERIODO' in df_eventos.columns and 'FEAT_PERFIL_VITIMA' in df_eventos.columns:
+                df_eventos['FEAT_CONTEXTO_CRITICO'] = df_eventos['SAZON_PERIODO'].astype(str) + "_" + df_eventos['FEAT_PERFIL_VITIMA'].astype(str)
+            else:
+                df_eventos['FEAT_CONTEXTO_CRITICO'] = 'DESCONHECIDO'
+            
         self._upload_table(df_eventos, "tb_dossie_eventos")
 
         # =====================================================================
-        # 2. DIMENSÃO SHAP (Blindagem de Tipagem)
+        # 2. DIMENSÃO SHAP
         # =====================================================================
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
         
@@ -118,11 +124,10 @@ class DeploySafeDriverBigQuery:
             
         self._upload_table(df_shap, "tb_dim_shap")
 
-        # 3. CONSTRUÇÃO CALENDÁRIO
         self._construir_dim_calendario()
 
         # =====================================================================
-        # 4. MASTER VIEW 
+        # 3. MASTER VIEW 
         # =====================================================================
         print("[INFO] Construindo Master View Semantica (vw_safedriver_dossie_master)...", flush=True)
         sql_view = f"""
