@@ -24,7 +24,6 @@ class GeradorDossieSafeDriver:
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         
-        # --- Conexão Estável R2 (Testada e Aprovada) ---
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
             endpoint = endpoint[: -len(f"/{self.bucket}")]
@@ -39,7 +38,6 @@ class GeradorDossieSafeDriver:
         self.webhook_url = os.getenv("DISCORD_SUCESSO")
         self.modelo_local = "modelo_safedriver_catboost.cbm"
         
-        # Inicialização da Auditoria
         self.auditoria = {
             "projeto": "SafeDriver",
             "fase": "Dossiê de Inteligência Geográfica (Histórico + Futuro)",
@@ -56,33 +54,23 @@ class GeradorDossieSafeDriver:
         inicio_processo = time.time()
         print("🧠 [DOSSIÊ] Iniciando motor de inteligência...", flush=True)
         
-        # =================================================================
         # 1. DOWNLOAD E CARGA DO MODELO
-        # =================================================================
         if not os.path.exists(self.modelo_local):
             print(f"📥 Baixando {self.modelo_local} do bucket...", flush=True)
             self.s3.download_file(self.bucket, f"modelos/{self.modelo_local}", self.modelo_local)
         
         modelo = CatBoostRegressor().load_model(self.modelo_local)
         
-        # =================================================================
-        # 2. CARGA DA ABT OURO
-        # =================================================================
+        # 2. CARGA DA ABT OURO (REFORMA)
         print("📥 Lendo a base Ouro para inferência massiva...", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         total_historico = df_ouro.height
-        
-        print("⚙️ Recriando Feature Cross (Sazonalidade x Perfil)...", flush=True)
-        df_ouro = df_ouro.with_columns(
-            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
-        )
 
-        # =================================================================
         # 3. GERAÇÃO DA MALHA FUTURA (2026)
-        # =================================================================
         print("🔮 Projetando cenários futuros para 2026...", flush=True)
         
+        # Identifica as colunas de DNA geográfico e Feature Store
         colunas_dna = [c for c in df_ouro.columns if c in [
             "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO",
             "MICRO_POPULACAO_FACES", "CENSO_MEDIA_V0001", "CENSO_MEDIA_V0002"
@@ -90,7 +78,7 @@ class GeradorDossieSafeDriver:
         
         df_dna_bairros = df_ouro.select(colunas_dna).unique(subset=["H3_INDEX"])
 
-        # 16 Combinações: Turno x Dia x Vítima
+        # Cenários expandidos para 2026
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"] * 4,
             "FEAT_TIPO_DIA": ["DIA_UTIL"] * 8 + ["FIM_DE_SEMANA"] * 8,
@@ -109,9 +97,7 @@ class GeradorDossieSafeDriver:
             pl.lit(data_ref.weekday()).alias("FEAT_DIA_SEMANA")
         ])
 
-        # =================================================================
         # 4. PREDIÇÃO, A MARRETA E O CÁLCULO DE MASSA CRIMINAL
-        # =================================================================
         print("⚡ Rodando predição (Histórico + Projeções 2026)...", flush=True)
         df_hist_pd = df_ouro.to_pandas()
         df_fut_pd = df_futuro.to_pandas()
@@ -128,19 +114,14 @@ class GeradorDossieSafeDriver:
         ]
         cat_features = [c for c in cat_features_declaradas if c in X_all.columns]
         
-        # A Marreta de Titânio: Mata o NaN real e o NaN em texto
         for col in cat_features:
-            X_all[col] = X_all[col].fillna('DESCONHECIDO') 
-            X_all[col] = X_all[col].astype(str)            
-            X_all[col] = X_all[col].str.replace(r'\.0$', '', regex=True) 
-            X_all[col] = X_all[col].replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO')
-            X_all[col] = X_all[col].astype(object)         
+            X_all[col] = X_all[col].fillna('DESCONHECIDO').astype(str).str.replace(r'\.0$', '', regex=True)
+            X_all[col] = X_all[col].replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO').astype(object)
             
         preds_raw = modelo.predict(X_all)
         
-        # --- CÁLCULO DE MASSA CRIMINAL (FREQUÊNCIA x SEVERIDADE) ---
+        # --- CÁLCULO DE MASSA CRIMINAL (A SUA SACADA) ---
         print("⚖️ Calculando Risco de Exposição (Densidade x Gravidade)...", flush=True)
-        
         if "FS_VOL_CRIMES_ANO_ANT" in df_completo_pd.columns:
             volume_historico = df_completo_pd["FS_VOL_CRIMES_ANO_ANT"].fillna(0).astype(float)
         else:
@@ -150,75 +131,60 @@ class GeradorDossieSafeDriver:
         massa_criminal = preds_raw * fator_frequencia
         
         # --- CALIBRAÇÃO FINAL DO LOOKER (0.5 a 10.0) ---
-        print("📏 Calibrando mapa de calor para a escala exata de 0.5 a 10...", flush=True)
-        p_min = massa_criminal.min()
-        p_max = massa_criminal.max()
-        
-        piso_risco = 0.5
-        teto_risco = 10.0
+        p_min, p_max = massa_criminal.min(), massa_criminal.max()
+        piso_risco, teto_risco = 0.5, 10.0
         
         if p_max > p_min:
             preds_calibrados = piso_risco + (massa_criminal - p_min) * (teto_risco - piso_risco) / (p_max - p_min)
         else:
             preds_calibrados = massa_criminal
             
-        # Trava de segurança
         preds_clipped = np.clip(preds_calibrados, piso_risco, teto_risco) 
         
         df_dossie = pl.from_pandas(df_completo_pd).with_columns(
             pl.Series("RISCO_PREDITO_IA", preds_clipped).round(2)
         )
 
-        # =================================================================
-        # 5. DNA DE RISCO (SHAP) COM BLINDAGEM REPLICADA
-        # =================================================================
+        # 5. DNA DE RISCO (SHAP) COM FIX DE AGRUPAMENTO
         print("🧬 Analisando DNA criminal (SHAP) geográfico...", flush=True)
         df_shap_sample = df_dossie.sample(n=min(35000, df_dossie.height), seed=42)
         X_shap = df_shap_sample.select(modelo.feature_names_).to_pandas()
         
-        # Reaplica a marreta na amostra do SHAP para evitar que quebre aqui
         for col in cat_features:
-            X_shap[col] = X_shap[col].fillna('DESCONHECIDO')
-            X_shap[col] = X_shap[col].astype(str)
-            X_shap[col] = X_shap[col].str.replace(r'\.0$', '', regex=True)
-            X_shap[col] = X_shap[col].replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO')
-            X_shap[col] = X_shap[col].astype(object)
+            X_shap[col] = X_shap[col].fillna('DESCONHECIDO').astype(str).str.replace(r'\.0$', '', regex=True)
+            X_shap[col] = X_shap[col].replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO').astype(object)
         
         explainer = shap.TreeExplainer(modelo)
         shap_vals = explainer.shap_values(X_shap)
         
-        df_shap_geo = pd.concat([
-            df_shap_sample.select(["CIDADE", "BAIRRO"]).to_pandas(),
-            pd.DataFrame(shap_vals, columns=[f"SHAP_{f}" for f in modelo.feature_names_])
-        ], axis=1).groupby(["CIDADE", "BAIRRO"]).mean().reset_index()
+        # Limpeza Geográfica para o SHAP
+        df_chaves_geo = df_shap_sample.select(["CIDADE", "BAIRRO"]).to_pandas()
+        df_chaves_geo["CIDADE"] = df_chaves_geo["CIDADE"].fillna("DESCONHECIDO").astype(str)
+        df_chaves_geo["BAIRRO"] = df_chaves_geo["BAIRRO"].fillna("DESCONHECIDO").astype(str)
 
-        # =================================================================
+        df_shap_geo = pd.concat([
+            df_chaves_geo,
+            pd.DataFrame(shap_vals, columns=[f"SHAP_{f}" for f in modelo.feature_names_])
+        ], axis=1).groupby(["CIDADE", "BAIRRO"], dropna=False).mean().reset_index()
+
         # 6. SALVAMENTO E RELATÓRIO
-        # =================================================================
         print("📦 Sincronizando resultados com o R2...", flush=True)
-        buf_eventos = io.BytesIO()
-        df_dossie.write_parquet(buf_eventos, compression="zstd")
-        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_eventos.getvalue())
-        
-        buf_shap = io.BytesIO()
-        pl.from_pandas(df_shap_geo).write_parquet(buf_shap, compression="zstd")
-        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_shap.parquet", Body=buf_shap.getvalue())
+        for key, data in [("looker_dossie_eventos.parquet", df_dossie), 
+                         ("looker_dim_shap.parquet", pl.from_pandas(df_shap_geo))]:
+            buf = io.BytesIO()
+            data.write_parquet(buf, compression="zstd")
+            self.s3.put_object(Bucket=self.bucket, Key=f"datalake/ouro/{key}", Body=buf.getvalue())
 
         duracao = time.time() - inicio_processo
         
-        min_risco = float(np.min(preds_clipped))
-        media_risco = float(np.mean(preds_clipped))
-        max_risco = float(np.max(preds_clipped))
-        
         self.auditoria["metricas"] = {
-            "historico_processado": total_historico,
-            "futuro_gerado_2026": df_futuro.height,
-            "total_processado_geral": df_dossie.height,
-            "min_risco_detectado": round(min_risco, 4),
-            "media_risco_predito": round(media_risco, 4),
-            "max_risco_detectado": round(max_risco, 4),
-            "bairros_analisados": len(df_shap_geo),
-            "tempo_execucao_s": round(duracao, 2)
+            "historico": total_historico,
+            "futuro": df_futuro.height,
+            "bairros": len(df_shap_geo),
+            "min": round(float(np.min(preds_clipped)), 4),
+            "media": round(float(np.mean(preds_clipped)), 4),
+            "max": round(float(np.max(preds_clipped)), 4),
+            "tempo_s": round(duracao, 2)
         }
 
         buf_log = io.BytesIO(json.dumps(self.auditoria, indent=4).encode())
@@ -228,21 +194,14 @@ class GeradorDossieSafeDriver:
             f"==============================================================\n"
             f" 🛡️ RELATÓRIO DE INTELIGÊNCIA - SAFEDRIVER \n"
             f"==============================================================\n"
-            f"1. VOLUMETRIA DO DOSSIÊ\n"
-            f"   • Histórico Processado    : {total_historico:,}\n"
-            f"   • Projeções Futuras (26)  : {df_futuro.height:,}\n"
+            f"1. VOLUMETRIA\n"
             f"   • Total Consolidado       : {df_dossie.height:,}\n"
             f"   • Bairros Mapeados (DNA)  : {len(df_shap_geo)}\n\n"
-            f"2. PERFORMANCE DA IA (ESCALA DE RISCO DE EXPOSIÇÃO 0.5 A 10)\n"
-            f"   • Risco Mínimo Detectado  : {min_risco:.4f}\n"
-            f"   • Risco Médio Predito     : {media_risco:.4f}\n"
-            f"   • Risco Máximo Detectado  : {max_risco:.4f}\n\n"
+            f"2. PERFORMANCE (ESCALA 0.5 A 10)\n"
+            f"   • Risco Médio Predito     : {self.auditoria['metricas']['media']:.4f}\n"
+            f"   • Risco Máximo Detectado  : {self.auditoria['metricas']['max']:.4f}\n\n"
             f"3. STATUS DO DEPLOY\n"
-            f"   • Dossiê Eventos (R2)     : Sincronizado\n"
-            f"   • Dimensão SHAP (R2)      : Sincronizado\n"
-            f"   • Log de Auditoria        : Gerado\n"
-            f"==============================================================\n"
-            f"Duração: {duracao/60:.2f} min | Status: Pronto para BigQuery\n"
+            f"   • Dossiê e SHAP (R2)      : Sincronizados\n"
             f"==============================================================\n"
         )
         print(report)
