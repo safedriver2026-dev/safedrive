@@ -19,7 +19,7 @@ class GeradorDossieSafeDriver:
     """
     Motor de Inteligência Preditiva (Versão Estável R2).
     Gera Dossiê do Passado + Projeções para 2026 com Min/Max e SHAP Values.
-    Blindagem de Titânio contra tipagem Pandas (NaN) + Calibração (0.5 a 10.0).
+    Blindagem de Titânio contra tipagem Pandas (NaN) + Massa Criminal + Calibração (0.5 a 10.0).
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -110,7 +110,7 @@ class GeradorDossieSafeDriver:
         ])
 
         # =================================================================
-        # 4. PREDIÇÃO, A MARRETA DE TITÂNIO E CALIBRAÇÃO (PISO 0.5)
+        # 4. PREDIÇÃO, A MARRETA E O CÁLCULO DE MASSA CRIMINAL
         # =================================================================
         print("⚡ Rodando predição (Histórico + Projeções 2026)...", flush=True)
         df_hist_pd = df_ouro.to_pandas()
@@ -130,28 +130,39 @@ class GeradorDossieSafeDriver:
         
         # A Marreta de Titânio: Mata o NaN real e o NaN em texto
         for col in cat_features:
-            X_all[col] = X_all[col].fillna('DESCONHECIDO') # Pega np.nan injetado pelo pd.concat
-            X_all[col] = X_all[col].astype(str)            # Força string nativa
-            X_all[col] = X_all[col].str.replace(r'\.0$', '', regex=True) # Tira casa decimal fantasma
+            X_all[col] = X_all[col].fillna('DESCONHECIDO') 
+            X_all[col] = X_all[col].astype(str)            
+            X_all[col] = X_all[col].str.replace(r'\.0$', '', regex=True) 
             X_all[col] = X_all[col].replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO')
-            X_all[col] = X_all[col].astype(object)         # Tranca o tipo para o CatBoost
+            X_all[col] = X_all[col].astype(object)         
             
         preds_raw = modelo.predict(X_all)
         
-        # --- A MÁGICA DA CALIBRAÇÃO (0.5 a 10.0) ---
-        print("📏 Calibrando termômetro de risco para escala exata de 0.5 a 10...", flush=True)
-        p_min = preds_raw.min()
-        p_max = preds_raw.max()
+        # --- CÁLCULO DE MASSA CRIMINAL (FREQUÊNCIA x SEVERIDADE) ---
+        print("⚖️ Calculando Risco de Exposição (Densidade x Gravidade)...", flush=True)
+        
+        if "FS_VOL_CRIMES_ANO_ANT" in df_completo_pd.columns:
+            volume_historico = df_completo_pd["FS_VOL_CRIMES_ANO_ANT"].fillna(0).astype(float)
+        else:
+            volume_historico = np.zeros(len(df_completo_pd))
+            
+        fator_frequencia = np.log1p(volume_historico) + 1.0
+        massa_criminal = preds_raw * fator_frequencia
+        
+        # --- CALIBRAÇÃO FINAL DO LOOKER (0.5 a 10.0) ---
+        print("📏 Calibrando mapa de calor para a escala exata de 0.5 a 10...", flush=True)
+        p_min = massa_criminal.min()
+        p_max = massa_criminal.max()
         
         piso_risco = 0.5
         teto_risco = 10.0
         
         if p_max > p_min:
-            preds_calibrados = piso_risco + (preds_raw - p_min) * (teto_risco - piso_risco) / (p_max - p_min)
+            preds_calibrados = piso_risco + (massa_criminal - p_min) * (teto_risco - piso_risco) / (p_max - p_min)
         else:
-            preds_calibrados = preds_raw
+            preds_calibrados = massa_criminal
             
-        # Trava de segurança respeitando o novo piso
+        # Trava de segurança
         preds_clipped = np.clip(preds_calibrados, piso_risco, teto_risco) 
         
         df_dossie = pl.from_pandas(df_completo_pd).with_columns(
@@ -222,7 +233,7 @@ class GeradorDossieSafeDriver:
             f"   • Projeções Futuras (26)  : {df_futuro.height:,}\n"
             f"   • Total Consolidado       : {df_dossie.height:,}\n"
             f"   • Bairros Mapeados (DNA)  : {len(df_shap_geo)}\n\n"
-            f"2. PERFORMANCE DA IA (ESCALA DE RISCO 0.5 A 10)\n"
+            f"2. PERFORMANCE DA IA (ESCALA DE RISCO DE EXPOSIÇÃO 0.5 A 10)\n"
             f"   • Risco Mínimo Detectado  : {min_risco:.4f}\n"
             f"   • Risco Médio Predito     : {media_risco:.4f}\n"
             f"   • Risco Máximo Detectado  : {max_risco:.4f}\n\n"
