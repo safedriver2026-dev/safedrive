@@ -13,7 +13,7 @@ from datetime import datetime
 class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
-    Sincroniza Artefatos do R2 e consolida a Master View de Exposicao ao Risco.
+    Refatorada para evitar erros de tipagem (INT64 vs STRING) no Join.
     """
     def __init__(self):
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
@@ -48,7 +48,7 @@ class DeploySafeDriverBigQuery:
 
     def _upload_table(self, df_pandas, table_name):
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
-        # WRITE_TRUNCATE garante a idempotencia do pipeline de deploy
+        # Força o autodetect, mas a View fará o saneamento final
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
         print(f"[INFO] Uploading dataframe para {table_id}...", flush=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
@@ -56,7 +56,7 @@ class DeploySafeDriverBigQuery:
         print(f"[SUCCESS] Tabela {table_name} atualizada.", flush=True)
 
     def _construir_dim_calendario(self):
-        print("[INFO] Gerando Dimensao Calendario (Looker-Ready)...", flush=True)
+        print("[INFO] Gerando Dimensao Calendario...", flush=True)
         sql = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_dim_calendario` AS
         WITH datas AS (
@@ -76,7 +76,7 @@ class DeploySafeDriverBigQuery:
     def executar_deploy(self):
         print("[START] Iniciando Deploy de Inteligencia Geografica...", flush=True)
 
-        # 1. Sincronizacao de Tabelas Fato e Dimensao
+        # 1. Sincronização
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         if 'DATAOCORRENCIA' in df_eventos.columns:
             df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
@@ -87,7 +87,7 @@ class DeploySafeDriverBigQuery:
 
         self._construir_dim_calendario()
 
-        # 2. Criacao da Master View Analitica (Semantica de Risco)
+        # 2. Master View com BLINDAGEM DE CASTING
         print("[INFO] Construindo Master View Semantica (vw_safedriver_dossie_master)...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
@@ -96,36 +96,29 @@ class DeploySafeDriverBigQuery:
             SELECT 
                 e.* EXCEPT(DATAOCORRENCIA), 
                 DATE(e.DATAOCORRENCIA) AS DATA_FATO,
-                -- Conversao para Geometria Nativa do BigQuery para Mapas de Calor
                 ST_GEOGPOINT(CAST(e.LONGITUDE AS FLOAT64), CAST(e.LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
                 s.* EXCEPT(CIDADE, BAIRRO),
                 cal.* EXCEPT(DATA_BASE)
             FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos` e
             LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s 
-                ON e.CIDADE = s.CIDADE AND e.BAIRRO = s.BAIRRO
+                -- O SEGREDO ESTÁ NO CAST EXPLÍCITO ABAIXO:
+                ON CAST(e.CIDADE AS STRING) = CAST(s.CIDADE AS STRING) 
+                AND CAST(e.BAIRRO AS STRING) = CAST(s.BAIRRO AS STRING)
             LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_calendario` cal
                 ON DATE(e.DATAOCORRENCIA) = cal.DATA_BASE
         )
 
         SELECT
             *,
-            -- 1. IDENTIFICADOR DE ORIGEM (HISTORICO VS PREVISAO)
             CASE 
                 WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'PREVISÃO' 
                 ELSE 'HISTÓRICO REAL' 
             END AS ORIGEM_DADO,
 
-            -- 2. ANALISE DE EXPOSICAO AO RISCO (PONDERACAO)
-            -- RISCO_PREDITO_IA ja contem a Massa Criminal (Frequencia x Severidade)
             RISCO_PREDITO_IA AS RISCO_EXPOSICAO_FINAL,
-            
-            -- 3. DECOMPOSICAO DO RISCO (Para explicabilidade no Looker)
-            -- Severidade Original (Baseada no Tipo de Crime)
             LABEL_PESO_RISCO AS SEVERIDADE_CRIME_BASE,
-            -- Frequencia Historica (Volume de ocorrencias no hexágono)
             FS_VOL_CRIMES_ANO_ANT AS FREQUENCIA_CRIMINAL_HIST,
 
-            -- 4. CATEGORIZACAO OPERACIONAL (NIVEL DE ALERTA)
             CASE
                 WHEN RISCO_PREDITO_IA >= 8.5 THEN '🔴 1 - CRÍTICO (ZONA VERMELHA)'
                 WHEN RISCO_PREDITO_IA >= 6.0 THEN '🟠 2 - ALTO (ATENÇÃO MÁXIMA)'
@@ -133,13 +126,12 @@ class DeploySafeDriverBigQuery:
                 ELSE '🟢 4 - BAIXO (RISCO RESIDUAL)'
             END AS STATUS_ALERTA,
 
-            -- 5. TRATAMENTO DE TEXTO PARA FILTROS
             UPPER(REPLACE(FEAT_CONTEXTO_CRITICO, '_', ' ')) AS CENARIO_AVALIADO
 
         FROM Base_Final;
         """
         self.bq_client.query(sql_view).result()
-        print("[SUCCESS] Deploy Finalizado. Master View sincronizada com Massa Criminal.")
+        print("[SUCCESS] Deploy Finalizado com blindagem de tipos.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
