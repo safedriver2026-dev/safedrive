@@ -12,7 +12,7 @@ from datetime import datetime
 class ArquitetoSafeDriverOuro:
     """
     Engine de Construção da ABT SafeDriver Autobot.
-    Reforma: Engenharia Temporal Completa, Contexto Crítico Nativo e Saneamento Espacial.
+    Refatorada: Consumo da Dimensão Geográfica Dedicada e Prevenção de Colisões (Duplicate Columns).
     """
     def __init__(self):
         self.projeto = "SafeDriver Autobot"
@@ -40,7 +40,6 @@ class ArquitetoSafeDriverOuro:
             except: pass
 
     def _limpar_tabela_toda(self, df):
-        # Atualizado para pl.String (substitui pl.Utf8 nas versões mais recentes do Polars)
         cols_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.String or t == pl.Utf8]
         if not cols_texto: return df
         return df.with_columns([
@@ -62,24 +61,40 @@ class ArquitetoSafeDriverOuro:
 
     def construir_abt_final(self):
         inicio_timer = time.time()
-        print(f"[INFO] Iniciando construcao da Camada Ouro: {self.projeto}")
+        print(f"[INFO] Iniciando construcao da Camada Ouro: {self.projeto}", flush=True)
 
         # =================================================================
-        # 1. CARREGAMENTO (MALHA GEOGRAFICA)
+        # 1. CARREGAMENTO (DIMENSÃO GEOGRÁFICA E MALHA)
         # =================================================================
+        print("--- Consolidando Malha e Dimensões Geográficas ---", flush=True)
+        
+        # 1.1 Single Source of Truth: Dimensão Bairro H3
+        df_dim_bairro = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_DIM_BAIRRO_H3.parquet")
+        if df_dim_bairro is None:
+            # Fallback de segurança extrema
+            df_dim_bairro = pl.DataFrame({"H3_INDEX": pl.Series(dtype=pl.String), "CIDADE": pl.Series(dtype=pl.String), "BAIRRO": pl.Series(dtype=pl.String)})
+
+        # 1.2 Bases de Infraestrutura e Sociodemográficas
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
         
-        df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
+        # 1.3 Prevenção de Colisão: Removemos CIDADE e BAIRRO caso venham nessas bases
+        if df_infra is not None: df_infra = df_infra.drop(["CIDADE", "BAIRRO"], strict=False)
+        if df_social is not None: df_social = df_social.drop(["CIDADE", "BAIRRO"], strict=False)
 
-        if "CIDADE" in df_social.columns and "BAIRRO" in df_social.columns:
-            df_dim_bairro = df_social.select(["H3_INDEX", "CIDADE", "BAIRRO"]).unique("H3_INDEX")
-        else:
-            df_dim_bairro = pl.DataFrame({"H3_INDEX": [], "CIDADE": [], "BAIRRO": []})
+        # 1.4 Construção do Universo H3 ancorado na Dimensão Geográfica
+        df_universo_h3 = df_dim_bairro
+        if df_infra is not None:
+            df_universo_h3 = df_universo_h3.join(df_infra, on="H3_INDEX", how="left")
+        if df_social is not None:
+            df_universo_h3 = df_universo_h3.join(df_social, on="H3_INDEX", how="left")
+            
+        df_universo_h3 = df_universo_h3.fill_null(0) # Zera contagens onde não há infra/pessoas
 
         # =================================================================
-        # 2. CONSOLIDAÇÃO DE CRIMES E APLICAÇÃO GEOGRÁFICA
+        # 2. CONSOLIDAÇÃO DE CRIMES E MAPEAMENTO
         # =================================================================
+        print("--- Processando Matriz de Crimes ---", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
             obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
@@ -89,13 +104,13 @@ class ArquitetoSafeDriverOuro:
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
         df_crimes = self._limpar_tabela_toda(df_crimes)
 
+        # Junta os crimes estritamente à Dimensão Bairro (Single Source of Truth)
         if not df_dim_bairro.is_empty():
             df_crimes = df_crimes.drop(["CIDADE", "BAIRRO"], strict=False).join(df_dim_bairro, on="H3_INDEX", how="left")
 
         # =================================================================
-        # 3. ENGENHARIA TEMPORAL COMPLETA (Reforma)
+        # 3. ENGENHARIA TEMPORAL
         # =================================================================
-        # Extração limpa de hora, dia da semana e tipos de dia para o CatBoost
         df_crimes = df_crimes.with_columns(
             pl.col("HORAOCORRENCIA").cast(pl.String).str.replace_all(r"\D", "").alias("_tmp_hora")
         ).with_columns(
@@ -104,7 +119,7 @@ class ArquitetoSafeDriverOuro:
         ).with_columns([
             pl.col("DATAOCORRENCIA").dt.year().alias("ANO_OCORRENCIA"),
             pl.col("DATAOCORRENCIA").dt.month().alias("FEAT_MES"),
-            pl.col("DATAOCORRENCIA").dt.weekday().alias("FEAT_DIA_SEMANA"), # 1 (Seg) a 7 (Dom)
+            pl.col("DATAOCORRENCIA").dt.weekday().alias("FEAT_DIA_SEMANA"),
             (pl.col("DATAOCORRENCIA").dt.year() * 12 + pl.col("DATAOCORRENCIA").dt.month()).alias("MES_ABSOLUTO"),
             pl.when((pl.col("HORA_INT") >= 18) & (pl.col("HORA_INT") <= 23)).then(pl.lit("NOITE"))
             .when((pl.col("HORA_INT") >= 12) & (pl.col("HORA_INT") < 18)).then(pl.lit("TARDE"))
@@ -112,7 +127,6 @@ class ArquitetoSafeDriverOuro:
             .otherwise(pl.lit("MADRUGADA")).alias("SAZON_PERIODO")
         ])
 
-        # Flags Booleanas/Categóricas exigidas pelo modelo preditivo
         df_crimes = df_crimes.with_columns([
             pl.when(pl.col("FEAT_DIA_SEMANA") >= 6).then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA"),
             pl.when(pl.col("FEAT_DIA_SEMANA") >= 6).then(pl.lit("FIM_DE_SEMANA")).otherwise(pl.lit("DIA_UTIL")).alias("FEAT_TIPO_DIA")
@@ -130,16 +144,14 @@ class ArquitetoSafeDriverOuro:
             .when(pl.col("RUBRICA").str.contains(r"ART.*157|ROUBO")).then(pl.lit(5.0))
             .when(pl.col("RUBRICA").str.contains(r"ART.*155|FURTO")).then(pl.lit(2.0))
             .otherwise(pl.lit(1.0)).alias("LABEL_PESO_RISCO")
-        ])
-
-        # Feature Cross nativa na base Ouro
-        df_gold = df_gold.with_columns(
+        ]).with_columns(
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         )
 
         # =================================================================
         # 5. FEATURE STORE (MOMENTUM E MASSA CRIMINAL)
         # =================================================================
+        print("--- Calculando Feature Store (Risco e Volume Histórico) ---", flush=True)
         df_fs_ano = df_gold.group_by(["H3_INDEX", "ANO_OCORRENCIA"]).agg([
             pl.col("LABEL_PESO_RISCO").mean().alias("FS_RISCO_MEDIO_ANO_ANT"),
             pl.len().alias("FS_VOL_CRIMES_ANO_ANT") 
@@ -149,18 +161,14 @@ class ArquitetoSafeDriverOuro:
             pl.col("LABEL_PESO_RISCO").mean().alias("FS_RISCO_MEDIO_MES_ANT")
         ]).with_columns((pl.col("MES_ABSOLUTO") + 1).alias("MES_JOIN"))
 
-        df_final = df_gold.join(df_universo_h3, on="H3_INDEX", how="left") \
+        # Prevenção de Colisão Final: Dropa a Geografia do Universo, já que o df_gold tem a oficial
+        df_final = df_gold.join(df_universo_h3.drop(["CIDADE", "BAIRRO"], strict=False), on="H3_INDEX", how="left") \
                           .join(df_fs_ano.drop("ANO_OCORRENCIA"), left_on=["H3_INDEX", "ANO_OCORRENCIA"], right_on=["H3_INDEX", "ANO_JOIN"], how="left") \
                           .join(df_fs_mes.drop("MES_ABSOLUTO"), left_on=["H3_INDEX", "MES_ABSOLUTO"], right_on=["H3_INDEX", "MES_JOIN"], how="left")
         
-        # Saneamento robusto de nulos para garantir a matemática no Looker e no CatBoost
-        if "CIDADE" in df_final.columns and "BAIRRO" in df_final.columns:
-            df_final = df_final.with_columns([
-                pl.col("CIDADE").fill_null("DESCONHECIDO"),
-                pl.col("BAIRRO").fill_null("DESCONHECIDO")
-            ])
-
         df_final = df_final.with_columns([
+            pl.col("CIDADE").fill_null("DESCONHECIDO"),
+            pl.col("BAIRRO").fill_null("DESCONHECIDO"),
             pl.col("FS_RISCO_MEDIO_ANO_ANT").fill_null(0.1),
             pl.col("FS_RISCO_MEDIO_MES_ANT").fill_null(0.1),
             pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0) 
@@ -169,8 +177,9 @@ class ArquitetoSafeDriverOuro:
         )
 
         # =================================================================
-        # 6. EXPORTACAO (Compressao maxima aplicada)
+        # 6. EXPORTACAO (Compressao maxima)
         # =================================================================
+        print("--- Exportando Matriz Final ---", flush=True)
         key_final = f"{self.ouro_dir}/safedriver_abt_treino.parquet"
         buf = io.BytesIO()
         df_final.write_parquet(buf, compression="zstd", compression_level=22) 
@@ -184,7 +193,7 @@ class ArquitetoSafeDriverOuro:
         report_lines = [
             f"RELATORIO DE PROCESSAMENTO: CAMADA OURO - {self.projeto.upper()}",
             "--------------------------------------------------",
-            f"Volume Total Processado: {df_final.height} registros",
+            f"Volume Total Processado: {df_final.height:,} registros",
             f"Tempo de Execucao: {duracao} segundos",
             "",
             "ANALISE DE DISTRIBUICAO (TOP 10 RUBRICAS):"
@@ -193,7 +202,7 @@ class ArquitetoSafeDriverOuro:
         for row in mapeamento_rubricas.iter_rows():
             rubrica_nome = row[0][:40].ljust(45)
             peso_val = f"Peso: {row[1]:.1f}".ljust(12)
-            qtd_val = f"Qtd: {row[2]}"
+            qtd_val = f"Qtd: {row[2]:,}"
             report_lines.append(f"  - {rubrica_nome} | {peso_val} | {qtd_val}")
         
         teto_encontrado = df_final["LABEL_PESO_RISCO"].max()
@@ -208,7 +217,7 @@ class ArquitetoSafeDriverOuro:
         report = "\n".join(report_lines)
         print(report)
         self._notificar_discord(f"```text\n{report}\n```")
-        print("[INFO] Pipeline executado com sucesso. Arquivo exportado.")
+        print("[INFO] Pipeline executado com sucesso. Arquivo exportado.", flush=True)
 
 if __name__ == "__main__":
     ArquitetoSafeDriverOuro().construir_abt_final()
