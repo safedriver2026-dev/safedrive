@@ -5,13 +5,14 @@ import polars as pl
 import time
 import requests
 import json
+import numpy as np
 from botocore.config import Config
 from datetime import datetime
 
 class ArquitetoSafeDriverOuro:
     """
-    Engine de Construção da ABT SafeDriver Autobot.
-    Incorporate auditoria dinâmica de rubricas e feedback de dosimetria.
+    Engine de Construcao da ABT SafeDriver Autobot.
+    Implementa calculo de Frequencia Historica, Saneamento de Dosimetria e Dimensao Geografica.
     """
     def __init__(self):
         self.projeto = "SafeDriver Autobot"
@@ -55,19 +56,28 @@ class ArquitetoSafeDriverOuro:
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
             return pl.read_parquet(io.BytesIO(obj['Body'].read()))
-        except Exception as e: 
+        except Exception: 
             return None
 
     def construir_abt_final(self):
         inicio_timer = time.time()
-        print(f"🚀 [INÍCIO] Construindo Camada Ouro: {self.projeto}")
+        print(f"[INFO] Iniciando construcao da Camada Ouro: {self.projeto}")
 
-        # 1. CARREGAMENTO
+        # 1. CARREGAMENTO (MALHA GEOGRAFICA)
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
         df_social = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_SOCIAL_H3.parquet")
+        
+        # Garante a base de hexágonos mesmo para áreas sem crime
         df_universo_h3 = df_infra.join(df_social, on="H3_INDEX", how="full", coalesce=True).fill_null(0)
 
-        # 2. CONSOLIDAÇÃO
+        # Criacao da Dimensao Bairro para saneamento geográfico
+        # Assume que a malha social contem as colunas CIDADE e BAIRRO
+        if "CIDADE" in df_social.columns and "BAIRRO" in df_social.columns:
+            df_dim_bairro = df_social.select(["H3_INDEX", "CIDADE", "BAIRRO"]).unique("H3_INDEX")
+        else:
+            df_dim_bairro = pl.DataFrame({"H3_INDEX": [], "CIDADE": [], "BAIRRO": []})
+
+        # 2. CONSOLIDADCAO DE CRIMES
         paginator = self.s3.get_paginator('list_objects_v2')
         crime_files = [
             obj['Key'] for p in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prata_crimes}/")
@@ -76,6 +86,10 @@ class ArquitetoSafeDriverOuro:
         lista_crimes = [df for f in crime_files if (df := self._ler_parquet_r2(f)) is not None]
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
         df_crimes = self._limpar_tabela_toda(df_crimes)
+
+        # Aplica a Dimensao Bairro aos crimes para padronizacao
+        if not df_dim_bairro.is_empty():
+            df_crimes = df_crimes.drop(["CIDADE", "BAIRRO"], strict=False).join(df_dim_bairro, on="H3_INDEX", how="left")
 
         # 3. ENGENHARIA TEMPORAL
         df_crimes = df_crimes.with_columns(
@@ -93,20 +107,23 @@ class ArquitetoSafeDriverOuro:
             .otherwise(pl.lit("MADRUGADA")).alias("SAZON_PERIODO")
         ])
 
-        # 4. DOSIMETRIA PENAL (O Retorno/Feedback começa aqui)
+        # 4. DOSIMETRIA PENAL (Saneamento de Pesos)
         df_gold = df_crimes.with_columns([
             pl.when(pl.col("RUBRICA").str.contains(r"VEICULO|CARGA")).then(pl.lit("MOTORISTA"))
             .when(pl.col("RUBRICA").str.contains(r"TRANSEUNTE|CELULAR|PESSOA")).then(pl.lit("PEDESTRE"))
             .otherwise(pl.lit("GERAL")).alias("FEAT_PERFIL_VITIMA"),
-            pl.when(pl.col("RUBRICA").str.contains(r"ART.*121|LATROC")).then(pl.lit(10.0))
+            
+            # Mapeamento estrito para evitar pesos órfãos
+            pl.when(pl.col("RUBRICA").str.contains(r"ART.*121|LATROC|HOMICIDIO")).then(pl.lit(10.0))
             .when(pl.col("RUBRICA").str.contains(r"ART.*157|ROUBO")).then(pl.lit(5.0))
             .when(pl.col("RUBRICA").str.contains(r"ART.*155|FURTO")).then(pl.lit(2.0))
             .otherwise(pl.lit(1.0)).alias("LABEL_PESO_RISCO")
         ])
 
-        # 5. FEATURE STORE (MOMENTUM)
+        # 5. FEATURE STORE (MOMENTUM E FREQUENCIA HISTORICA)
         df_fs_ano = df_gold.group_by(["H3_INDEX", "ANO_OCORRENCIA"]).agg([
-            pl.col("LABEL_PESO_RISCO").mean().alias("FS_RISCO_MEDIO_ANO_ANT")
+            pl.col("LABEL_PESO_RISCO").mean().alias("FS_RISCO_MEDIO_ANO_ANT"),
+            pl.len().alias("FS_VOL_CRIMES_ANO_ANT") # <-- Pre-calculo do volume para Massa Criminal
         ]).with_columns((pl.col("ANO_OCORRENCIA") + 1).alias("ANO_JOIN"))
 
         df_fs_mes = df_gold.group_by(["H3_INDEX", "MES_ABSOLUTO"]).agg([
@@ -118,41 +135,52 @@ class ArquitetoSafeDriverOuro:
                           .join(df_fs_mes.drop("MES_ABSOLUTO"), left_on=["H3_INDEX", "MES_ABSOLUTO"], right_on=["H3_INDEX", "MES_JOIN"], how="left")
         
         df_final = df_final.with_columns([
-            pl.col("FS_RISCO_MEDIO_ANO_ANT").fill_null(0.1), # Piso para evitar Momentum Infinito
-            pl.col("FS_RISCO_MEDIO_MES_ANT").fill_null(0.1)
+            pl.col("FS_RISCO_MEDIO_ANO_ANT").fill_null(0.1),
+            pl.col("FS_RISCO_MEDIO_MES_ANT").fill_null(0.1),
+            pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0) # Zeros explicitos para locais sem historico
         ]).with_columns(
             (pl.col("FS_RISCO_MEDIO_MES_ANT") / pl.col("FS_RISCO_MEDIO_ANO_ANT")).alias("FS_MOMENTUM_RISCO")
         )
 
-        # 6. EXPORTAÇÃO
+        # 6. EXPORTACAO (Compressao maxima aplicada)
         key_final = f"{self.ouro_dir}/safedriver_abt_treino.parquet"
         buf = io.BytesIO()
-        df_final.write_parquet(buf, compression="zstd")
+        df_final.write_parquet(buf, compression="zstd", compression_level=22) # Nivel maximo de compressao zstd
         self.s3.put_object(Bucket=self.bucket, Key=key_final, Body=buf.getvalue())
 
-        # --- 7. SISTEMA DE RETORNO (AUDITORIA) ---
+        # --- 7. SISTEMA DE RETORNO (AUDITORIA TECNICA) ---
         duracao = round(time.time() - inicio_timer, 2)
         top_rubricas = df_final["RUBRICA"].value_counts().sort("count", descending=True).head(10)
         mapeamento_rubricas = df_final.group_by("RUBRICA").agg(pl.col("LABEL_PESO_RISCO").first()).join(top_rubricas, on="RUBRICA").sort("count", descending=True)
 
-        report = (
-            f"🏆 **RELATÓRIO OURO - {self.projeto.upper()}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔹 **Volume Total:** {df_final.height:,} linhas\n"
-            f"🔹 **Tempo Processamento:** {duracao}s\n\n"
-            f"🔍 **ANÁLISE DE RETORNO (TOP 10 RUBRICAS):**\n"
-        )
+        report_lines = [
+            f"RELATORIO DE PROCESSAMENTO: CAMADA OURO - {self.projeto.upper()}",
+            "--------------------------------------------------",
+            f"Volume Total Processado: {df_final.height} registros",
+            f"Tempo de Execucao: {duracao} segundos",
+            "",
+            "ANALISE DE DISTRIBUICAO (TOP 10 RUBRICAS):"
+        ]
+        
         for row in mapeamento_rubricas.iter_rows():
-            report += f"  • {row[0][:30]} | Peso: {row[1]} | Qtd: {row[2]:,}\n"
+            rubrica_nome = row[0][:40].ljust(45)
+            peso_val = f"Peso: {row[1]:.1f}".ljust(12)
+            qtd_val = f"Qtd: {row[2]}"
+            report_lines.append(f"  - {rubrica_nome} | {peso_val} | {qtd_val}")
         
         teto_encontrado = df_final["LABEL_PESO_RISCO"].max()
-        report += f"\n⚖️ **Teto de Risco na Base:** {teto_encontrado}\n"
+        report_lines.extend([
+            "",
+            f"Limite Superior de Dosimetria Aplicado: {teto_encontrado:.1f}"
+        ])
+        
         if teto_encontrado < 10.0:
-            report += "⚠️ *Atenção: Nenhum crime de Peso 10 (Latrocínio) detectado nesta carga.*\n"
+            report_lines.append("ALERTA DE INTEGRIDADE: Ausencia de registros com classificacao de severidade maxima (Peso 10.0) na presente amostragem.")
 
-        print(report)  # <--- LOG NA TELA ADICIONADO AQUI
-        self._notificar_discord(report)
-        print(f"✨ Pipeline concluído com retorno de auditoria.")
+        report = "\n".join(report_lines)
+        print(report)
+        self._notificar_discord(f"```text\n{report}\n```")
+        print("[INFO] Pipeline executado com sucesso. Arquivo exportado.")
 
 if __name__ == "__main__":
     ArquitetoSafeDriverOuro().construir_abt_final()
