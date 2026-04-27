@@ -148,8 +148,9 @@ class ArquitetoSafeDriverOuro:
         teto_encontrado = df_final["LABEL_PESO_RISCO"].max()
         report += f"\n⚖️ **Teto de Risco na Base:** {teto_encontrado}\n"
         if teto_encontrado < 10.0:
-            report += "⚠️ *Atenção: Nenhum crime de Peso 10 (Latrocínio) detectado nesta carga.*"
+            report += "⚠️ *Atenção: Nenhum crime de Peso 10 (Latrocínio) detectado nesta carga.*\n"
 
+        print(report)  # <--- LOG NA TELA ADICIONADO AQUI
         self._notificar_discord(report)
         print(f"✨ Pipeline concluído com retorno de auditoria.")
 
