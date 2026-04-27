@@ -4,22 +4,27 @@ import json
 import boto3
 import polars as pl
 import pandas as pd
+import numpy as np
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from botocore.config import Config
 from datetime import datetime
 
 class DeploySafeDriverBigQuery:
+    """
+    Engine de Deploy SafeDriver para Google BigQuery.
+    Sincroniza Artefatos do R2 e consolida a Master View de Exposicao ao Risco.
+    """
     def __init__(self):
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
         self.dataset_id = os.getenv("BQ_DATASET_ID")
         
         if not self.dataset_id:
-            raise ValueError("A variavel BQ_DATASET_ID precisa estar configurada.")
+            raise ValueError("Variavel BQ_DATASET_ID nao configurada.")
             
         bq_json_str = os.getenv("BQ_SERVICE_ACCOUNT_JSON")
         if not bq_json_str:
-            raise ValueError("Credenciais de servico do BigQuery ausentes.")
+            raise ValueError("Credenciais de servico BigQuery ausentes.")
             
         credentials = service_account.Credentials.from_service_account_info(json.loads(bq_json_str))
         self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
@@ -37,20 +42,21 @@ class DeploySafeDriverBigQuery:
         )
 
     def _ler_parquet_r2(self, key):
-        print(f"Acessando artefato: {key}", flush=True)
+        print(f"[INFO] Acessando artefato R2: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         return pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
 
     def _upload_table(self, df_pandas, table_name):
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
+        # WRITE_TRUNCATE garante a idempotencia do pipeline de deploy
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
-        print(f"Subindo tabela {table_id}...", flush=True)
+        print(f"[INFO] Uploading dataframe para {table_id}...", flush=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
         job.result()
-        print(f"✅ Tabela {table_name} atualizada.", flush=True)
+        print(f"[SUCCESS] Tabela {table_name} atualizada.", flush=True)
 
     def _construir_dim_calendario(self):
-        print("\nGerando Dimensao Calendario nativa (2020-2030)...", flush=True)
+        print("[INFO] Gerando Dimensao Calendario (Looker-Ready)...", flush=True)
         sql = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_dim_calendario` AS
         WITH datas AS (
@@ -59,22 +65,18 @@ class DeploySafeDriverBigQuery:
         )
         SELECT
             DATA_BASE,
-            EXTRACT(YEAR FROM DATA_BASE) AS ANO,
-            CASE EXTRACT(MONTH FROM DATA_BASE)
-                WHEN 1 THEN 'Janeiro' WHEN 2 THEN 'Fevereiro' WHEN 3 THEN 'Março'
-                WHEN 4 THEN 'Abril' WHEN 5 THEN 'Maio' WHEN 6 THEN 'Junho'
-                WHEN 7 THEN 'Julho' WHEN 8 THEN 'Agosto' WHEN 9 THEN 'Setembro'
-                WHEN 10 THEN 'Outubro' WHEN 11 THEN 'Novembro' WHEN 12 THEN 'Dezembro'
-            END AS NOME_MES_PT,
+            EXTRACT(YEAR FROM DATA_BASE) AS CAL_ANO,
+            EXTRACT(MONTH FROM DATA_BASE) AS CAL_MES,
+            FORMAT_DATE('%B', DATA_BASE) AS CAL_NOME_MES,
             CASE WHEN EXTRACT(DAYOFWEEK FROM DATA_BASE) IN (1, 7) THEN 'FIM DE SEMANA' ELSE 'DIA UTIL' END AS CAL_TIPO_DIA
         FROM datas;
         """
         self.bq_client.query(sql).result()
 
     def executar_deploy(self):
-        print("Iniciando Deploy Analitico Honesto...", flush=True)
+        print("[START] Iniciando Deploy de Inteligencia Geografica...", flush=True)
 
-        # 1. Carga de Dados
+        # 1. Sincronizacao de Tabelas Fato e Dimensao
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         if 'DATAOCORRENCIA' in df_eventos.columns:
             df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
@@ -85,15 +87,16 @@ class DeploySafeDriverBigQuery:
 
         self._construir_dim_calendario()
 
-        # 3. Master View Arquitetural de Alta Sensibilidade
-        print("\nConstruindo Master View Analítica de Alta Sensibilidade...", flush=True)
+        # 2. Criacao da Master View Analitica (Semantica de Risco)
+        print("[INFO] Construindo Master View Semantica (vw_safedriver_dossie_master)...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
 
-        WITH Base_Enriquecida AS (
+        WITH Base_Final AS (
             SELECT 
                 e.* EXCEPT(DATAOCORRENCIA), 
                 DATE(e.DATAOCORRENCIA) AS DATA_FATO,
+                -- Conversao para Geometria Nativa do BigQuery para Mapas de Calor
                 ST_GEOGPOINT(CAST(e.LONGITUDE AS FLOAT64), CAST(e.LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
                 s.* EXCEPT(CIDADE, BAIRRO),
                 cal.* EXCEPT(DATA_BASE)
@@ -106,43 +109,37 @@ class DeploySafeDriverBigQuery:
 
         SELECT
             *,
-            -- 1. STATUS TEMPORAL (Baseado em 2026)
+            -- 1. IDENTIFICADOR DE ORIGEM (HISTORICO VS PREVISAO)
             CASE 
                 WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'PREVISÃO' 
                 ELSE 'HISTÓRICO REAL' 
-            END AS STATUS_DADO,
+            END AS ORIGEM_DADO,
 
-            -- 2. SCORE DE IMPACTO (Aumenta a sensibilidade para evitar diluição)
-            -- Eleva o risco ao quadrado para dar peso desproporcional a alertas reais
-            ROUND(POW(RISCO_PREDITO_IA, 2) / 10, 2) AS SCORE_IMPACTO_PONDERADO,
+            -- 2. ANALISE DE EXPOSICAO AO RISCO (PONDERACAO)
+            -- RISCO_PREDITO_IA ja contem a Massa Criminal (Frequencia x Severidade)
+            RISCO_PREDITO_IA AS RISCO_EXPOSICAO_FINAL,
+            
+            -- 3. DECOMPOSICAO DO RISCO (Para explicabilidade no Looker)
+            -- Severidade Original (Baseada no Tipo de Crime)
+            LABEL_PESO_RISCO AS SEVERIDADE_CRIME_BASE,
+            -- Frequencia Historica (Volume de ocorrencias no hexágono)
+            FS_VOL_CRIMES_ANO_ANT AS FREQUENCIA_CRIMINAL_HIST,
 
-            -- 3. FLAG DE SINAL ALTO (Para filtros de BigNumber)
-            -- Identifica se a linha é um ruído ou um evento de risco real
-            CASE WHEN RISCO_PREDITO_IA >= 5.0 THEN 1 ELSE 0 END AS IS_HIGH_SIGNAL,
-
-            -- 4. CLASSIFICAÇÃO SEMÂNTICA
+            -- 4. CATEGORIZACAO OPERACIONAL (NIVEL DE ALERTA)
             CASE
-                WHEN RISCO_PREDITO_IA >= 7.0 THEN '1 - CRÍTICO'
-                WHEN RISCO_PREDITO_IA >= 4.0 THEN '2 - ALTO'
-                WHEN RISCO_PREDITO_IA >= 2.0 THEN '3 - MODERADO'
-                ELSE '4 - BAIXO'
-            END AS NIVEL_ALERTA,
+                WHEN RISCO_PREDITO_IA >= 8.5 THEN '🔴 1 - CRÍTICO (ZONA VERMELHA)'
+                WHEN RISCO_PREDITO_IA >= 6.0 THEN '🟠 2 - ALTO (ATENÇÃO MÁXIMA)'
+                WHEN RISCO_PREDITO_IA >= 3.0 THEN '🟡 3 - MODERADO (ESTADO DE ALERTA)'
+                ELSE '🟢 4 - BAIXO (RISCO RESIDUAL)'
+            END AS STATUS_ALERTA,
 
-            -- 5. AUDITORIA DA IA
-            CASE
-                WHEN EXTRACT(YEAR FROM DATA_FATO) >= 2026 THEN 'N/A (Previsão)'
-                WHEN ABS(RISCO_PREDITO_IA - LABEL_PESO_RISCO) <= 1.5 THEN 'ALTA PRECISÃO'
-                WHEN (RISCO_PREDITO_IA - LABEL_PESO_RISCO) > 1.5 THEN 'FALSO POSITIVO'
-                ELSE 'FALSO NEGATIVO'
-            END AS QUALIDADE_PREDICAO,
+            -- 5. TRATAMENTO DE TEXTO PARA FILTROS
+            UPPER(REPLACE(FEAT_CONTEXTO_CRITICO, '_', ' ')) AS CENARIO_AVALIADO
 
-            -- 6. RUBRICA TRATADA
-            UPPER(REPLACE(FEAT_CONTEXTO_CRITICO, '_', ' ')) AS RUBRICA_CENARIO
-
-        FROM Base_Enriquecida;
+        FROM Base_Final;
         """
         self.bq_client.query(sql_view).result()
-        print(f"✨ Deploy Finalizado. Master View 'Honesta' disponível no BQ.")
+        print("[SUCCESS] Deploy Finalizado. Master View sincronizada com Massa Criminal.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
