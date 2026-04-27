@@ -13,7 +13,7 @@ from datetime import datetime
 class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
-    Refatorada para evitar erros de tipagem (INT64 vs STRING) no Join.
+    Refatorada com 'Drop Table' preventivo para evitar Fantasma de Schema.
     """
     def __init__(self):
         self.project_id = os.getenv("BQ_PROJECT_ID", "safe-driver-fc3a9")
@@ -48,12 +48,16 @@ class DeploySafeDriverBigQuery:
 
     def _upload_table(self, df_pandas, table_name):
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
-        # Força o autodetect, mas a View fará o saneamento final
+        
+        # A MARRETA: Deleta a tabela antiga para forçar a renovação do Schema
+        self.bq_client.delete_table(table_id, not_found_ok=True)
+        print(f"[INFO] Tabela {table_id} resetada no BigQuery.", flush=True)
+        
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
         print(f"[INFO] Uploading dataframe para {table_id}...", flush=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
         job.result()
-        print(f"[SUCCESS] Tabela {table_name} atualizada.", flush=True)
+        print(f"[SUCCESS] Tabela {table_name} criada e populada.", flush=True)
 
     def _construir_dim_calendario(self):
         print("[INFO] Gerando Dimensao Calendario...", flush=True)
@@ -87,7 +91,7 @@ class DeploySafeDriverBigQuery:
 
         self._construir_dim_calendario()
 
-        # 2. Master View com BLINDAGEM DE CASTING
+        # 2. Master View com BLINDAGEM DE CASTING E MASSA CRIMINAL
         print("[INFO] Construindo Master View Semantica (vw_safedriver_dossie_master)...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
@@ -101,7 +105,6 @@ class DeploySafeDriverBigQuery:
                 cal.* EXCEPT(DATA_BASE)
             FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos` e
             LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s 
-                -- O SEGREDO ESTÁ NO CAST EXPLÍCITO ABAIXO:
                 ON CAST(e.CIDADE AS STRING) = CAST(s.CIDADE AS STRING) 
                 AND CAST(e.BAIRRO AS STRING) = CAST(s.BAIRRO AS STRING)
             LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_calendario` cal
@@ -131,7 +134,7 @@ class DeploySafeDriverBigQuery:
         FROM Base_Final;
         """
         self.bq_client.query(sql_view).result()
-        print("[SUCCESS] Deploy Finalizado com blindagem de tipos.")
+        print("[SUCCESS] Deploy Finalizado com schema atualizado.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
