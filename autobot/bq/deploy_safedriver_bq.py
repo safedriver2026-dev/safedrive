@@ -18,9 +18,8 @@ warnings.filterwarnings("ignore") # Proteção contra ruídos de log
 class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
-    Sincronizado com: GeradorDossieSafeDriver (Versão R2).
+    Blindagem Nível 10: Normalização de Coordenadas + Curadoria de Campos.
     Gera: tb_dossie_eventos, tb_dim_shap, tb_dim_calendario e tb_matriz_risco.
-    Foco: Curadoria de Campos e Suporte Geográfico (ST_GEOGPOINT).
     """
     def __init__(self):
         self.projeto = "SafeDriver"
@@ -63,7 +62,6 @@ class DeploySafeDriverBigQuery:
 
     def _upload_table(self, df_pandas, table_name):
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
-        
         self.bq_client.delete_table(table_id, not_found_ok=True)
         print(f"[INFO] Resetando tabela {table_id} no BigQuery...", flush=True)
         
@@ -72,37 +70,30 @@ class DeploySafeDriverBigQuery:
         job.result()
         print(f"[SUCCESS] Tabela {table_name} populada com sucesso.", flush=True)
 
-    def _construir_dim_calendario(self):
-        print("[INFO] Gerando Dimensão Calendário via SQL...", flush=True)
-        sql = f"""
-        CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_dim_calendario` AS
-        WITH datas AS (
-            SELECT dt AS DATA_BASE
-            FROM UNNEST(GENERATE_DATE_ARRAY('2020-01-01', '2030-12-31', INTERVAL 1 DAY)) AS dt
-        )
-        SELECT
-            DATA_BASE,
-            EXTRACT(YEAR FROM DATA_BASE) AS CAL_ANO,
-            EXTRACT(MONTH FROM DATA_BASE) AS CAL_MES,
-            FORMAT_DATE('%B', DATA_BASE) AS CAL_NOME_MES,
-            CASE WHEN EXTRACT(DAYOFWEEK FROM DATA_BASE) IN (1, 7) THEN 'FIM DE SEMANA' ELSE 'DIA UTIL' END AS CAL_TIPO_DIA
-        FROM datas;
-        """
-        self.bq_client.query(sql).result()
-
     def _construir_matriz_risco(self):
         print("[INFO] Gerando tb_matriz_risco (Frequência vs Severidade)...", flush=True)
         sql_matriz = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_matriz_risco` AS
-        WITH Base AS (
+        WITH Base_Limpando AS (
+          SELECT *,
+            -- Normalização de coordenadas gigantes (divisão por 10^8 se necessário)
+            CASE WHEN ABS(CAST(LATITUDE AS FLOAT64)) > 90 THEN CAST(LATITUDE AS FLOAT64) / 100000000 ELSE CAST(LATITUDE AS FLOAT64) END as lat_fix,
+            CASE WHEN ABS(CAST(LONGITUDE AS FLOAT64)) > 180 THEN CAST(LONGITUDE AS FLOAT64) / 100000000 ELSE CAST(LONGITUDE AS FLOAT64) END as lon_fix
+          FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
+        ),
+        Base AS (
           SELECT 
             H3_INDEX,
             MAX(CIDADE) as CIDADE,
             MAX(BAIRRO) as BAIRRO,
             COUNT(1) as VOLUME_REINCIDENCIA,
             AVG(RISCO_PREDITO_IA) as PERICULOSIDADE_MEDIA,
-            ANY_VALUE(ST_GEOGPOINT(CAST(LONGITUDE AS FLOAT64), CAST(LATITUDE AS FLOAT64))) as GEOMETRIA_H3
-          FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
+            -- Filtro de segurança para ST_GEOGPOINT
+            ANY_VALUE(CASE 
+              WHEN lat_fix BETWEEN -90 AND 90 AND lon_fix BETWEEN -180 AND 180 
+              THEN ST_GEOGPOINT(lon_fix, lat_fix) 
+              ELSE NULL END) as GEOMETRIA_H3
+          FROM Base_Limpando
           WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) < 2026 
           GROUP BY H3_INDEX
         ),
@@ -112,18 +103,13 @@ class DeploySafeDriverBigQuery:
             RUBRICA,
             COUNT(1) as qtd,
             ROW_NUMBER() OVER(PARTITION BY H3_INDEX ORDER BY COUNT(1) DESC) as rnk
-          FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
+          FROM Base_Limpando
           WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) < 2026
           GROUP BY H3_INDEX, RUBRICA
         )
         SELECT 
-          b.H3_INDEX,
-          b.CIDADE,
-          b.BAIRRO,
-          b.VOLUME_REINCIDENCIA,
-          b.PERICULOSIDADE_MEDIA,
-          c.RUBRICA as TOP_CRIME,
-          b.GEOMETRIA_H3,
+          b.H3_INDEX, b.CIDADE, b.BAIRRO, b.VOLUME_REINCIDENCIA, b.PERICULOSIDADE_MEDIA,
+          c.RUBRICA as TOP_CRIME, b.GEOMETRIA_H3,
           CASE 
             WHEN b.VOLUME_REINCIDENCIA >= 50 AND b.PERICULOSIDADE_MEDIA >= 3.0 THEN '🔴 1 - ZONA CRÍTICA'
             WHEN b.VOLUME_REINCIDENCIA < 50  AND b.PERICULOSIDADE_MEDIA >= 3.0 THEN '🟠 2 - RISCO VITAL'
@@ -137,85 +123,69 @@ class DeploySafeDriverBigQuery:
 
     def executar_deploy(self):
         inicio_deploy = time.time()
-        print("[START] Iniciando Deploy de Inteligência Geográfica...", flush=True)
+        print("[START] Iniciando Deploy SafeDriver...", flush=True)
 
-        # 1. PROCESSAMENTO DOS EVENTOS
+        # 1. CARGA DOS EVENTOS
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
-        
-        # Alinhamento de Tipagem
         df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
         df_eventos['CIDADE'] = df_eventos.get('CIDADE', 'DESCONHECIDO').fillna('DESCONHECIDO').astype(str)
         df_eventos['BAIRRO'] = df_eventos.get('BAIRRO', 'DESCONHECIDO').fillna('DESCONHECIDO').astype(str)
         df_eventos['RUBRICA'] = df_eventos.get('RUBRICA', 'DESCONHECIDO').fillna('DESCONHECIDO').astype(str)
-        
-        # Reconstrução da Massa Criminal
         df_eventos['FS_VOL_CRIMES_ANO_ANT'] = df_eventos.get('FS_VOL_CRIMES_ANO_ANT', 0.0).fillna(0.0).astype(float)
-
+        
         self._upload_table(df_eventos, "tb_dossie_eventos")
 
-        # 2. DIMENSÃO SHAP
+        # 2. CARGA DA DIMENSÃO SHAP
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
         self._upload_table(df_shap, "tb_dim_shap")
 
-        # 3. CONSTRUÇÃO DA CAMADA SEMÂNTICA (VIEW CURADA)
-        # Removido ID_BO para evitar erros de BadRequest (Unrecognized name)
-        print("[INFO] Criando Master View Curada com GEOMETRIA...", flush=True)
+        # 3. VIEW MASTER CURADA (COM FIX DE COORDENADAS)
+        print("[INFO] Criando Master View Curada...", flush=True)
         sql_view = f"""
         CREATE OR REPLACE VIEW `{self.project_id}.{self.dataset_id}.vw_safedriver_dossie_master` AS
+        WITH Base_Fix AS (
+          SELECT *,
+            CASE WHEN ABS(CAST(LATITUDE AS FLOAT64)) > 90 THEN CAST(LATITUDE AS FLOAT64) / 100000000 ELSE CAST(LATITUDE AS FLOAT64) END as lat_fix,
+            CASE WHEN ABS(CAST(LONGITUDE AS FLOAT64)) > 180 THEN CAST(LONGITUDE AS FLOAT64) / 100000000 ELSE CAST(LONGITUDE AS FLOAT64) END as lon_fix
+          FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
+        )
         SELECT 
-            -- Chaves e Geografia
-            DATAOCORRENCIA,
-            H3_INDEX,
-            CIDADE,
-            BAIRRO,
-            ST_GEOGPOINT(CAST(LONGITUDE AS FLOAT64), CAST(LATITUDE AS FLOAT64)) AS GEOMETRIA_PONTO,
-            
-            -- Contexto do Crime
-            RUBRICA AS TIPO_CRIME,
-            FEAT_PERFIL_VITIMA AS PERFIL_VITIMA,
-            SAZON_PERIODO AS PERIODO_DIA,
-            FEAT_TIPO_DIA AS TIPO_DIA,
+            DATAOCORRENCIA, H3_INDEX, CIDADE, BAIRRO,
+            -- Safe Geopoint: evita erro 400 se a coordenada for lixo
+            CASE WHEN lat_fix BETWEEN -90 AND 90 AND lon_fix BETWEEN -180 AND 180 
+                 THEN ST_GEOGPOINT(lon_fix, lat_fix) ELSE NULL END AS GEOMETRIA_PONTO,
+            RUBRICA AS TIPO_CRIME, FEAT_PERFIL_VITIMA AS PERFIL_VITIMA,
+            SAZON_PERIODO AS PERIODO_DIA, FEAT_TIPO_DIA AS TIPO_DIA,
             FEAT_CONTEXTO_CRITICO AS CENARIO_COMPLETO,
-            
-            -- Inteligência e Risco
             FS_VOL_CRIMES_ANO_ANT AS VOLUME_HISTORICO_LOCAL,
             RISCO_PREDITO_IA AS RISCO_EXPOSICAO,
-            
-            -- Classificações Temporais e de Alerta
             CASE WHEN EXTRACT(YEAR FROM DATAOCORRENCIA) >= 2026 THEN 'PREVISÃO' ELSE 'HISTÓRICO REAL' END AS ORIGEM_DADO,
-            
             CASE
                 WHEN RISCO_PREDITO_IA >= 8.5 THEN '🔴 1 - CRÍTICO'
                 WHEN RISCO_PREDITO_IA >= 6.0 THEN '🟠 2 - ALTO'
                 WHEN RISCO_PREDITO_IA >= 3.0 THEN '🟡 3 - MODERADO'
                 ELSE '🟢 4 - BAIXO'
             END AS STATUS_ALERTA
-
-        FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
+        FROM Base_Fix;
         """
         self.bq_client.query(sql_view).result()
 
-        # 4. DATA MARTS ADICIONAIS
-        self._construir_dim_calendario()
+        # 4. DIMENSÃO CALENDÁRIO
+        sql_cal = f"""
+        CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_dim_calendario` AS
+        SELECT dt AS DATA_BASE, EXTRACT(YEAR FROM dt) AS CAL_ANO, EXTRACT(MONTH FROM dt) AS CAL_MES,
+        FORMAT_DATE('%B', dt) AS CAL_NOME_MES,
+        CASE WHEN EXTRACT(DAYOFWEEK FROM dt) IN (1, 7) THEN 'FIM DE SEMANA' ELSE 'DIA UTIL' END AS CAL_TIPO_DIA
+        FROM UNNEST(GENERATE_DATE_ARRAY('2020-01-01', '2030-12-31', INTERVAL 1 DAY)) AS dt;
+        """
+        self.bq_client.query(sql_cal).result()
+
+        # 5. MATRIZ DE RISCO
         self._construir_matriz_risco()
 
         duracao = round(time.time() - inicio_deploy, 2)
-        
-        # Report Final
-        report = (
-            f"==============================================================\n"
-            f" 🌐 DEPLOY BIGQUERY CONCLUÍDO - {self.projeto.upper()} \n"
-            f"==============================================================\n"
-            f"📍 Camada Semântica Atualizada:\n"
-            f"   • Tabela Fato: tb_dossie_eventos ({len(df_eventos):,} linhas)\n"
-            f"   • View Master: vw_safedriver_dossie_master (View Curada)\n"
-            f"   • Data Mart: tb_matriz_risco (Agregado por Bairro/H3)\n"
-            f"==============================================================\n"
-            f"Tempo Total: {duracao}s | Disponível no Looker Studio\n"
-            f"==============================================================\n"
-        )
-        print(report)
-        self._notificar_discord(f"```text\n{report}\n```")
+        print(f"[SUCCESS] Deploy Concluído em {duracao}s!")
+        self._notificar_discord(f"🌐 Deploy BigQuery SafeDriver Finalizado. Coordenadas normalizadas.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
