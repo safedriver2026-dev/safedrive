@@ -101,7 +101,7 @@ class DeploySafeDriverBigQuery:
             COUNT(1) as VOLUME_REINCIDENCIA,
             AVG(RISCO_PREDITO_IA) as PERICULOSIDADE_MEDIA
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
-          WHERE ANO_JOIN != 2026 -- Mede a reincidência apenas com dados reais do passado
+          WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) < 2026 -- CORREÇÃO AQUI: Usa a data oficial para separar o histórico
           GROUP BY H3_INDEX
         ),
         CrimeRank AS (
@@ -111,7 +111,7 @@ class DeploySafeDriverBigQuery:
             COUNT(1) as qtd,
             ROW_NUMBER() OVER(PARTITION BY H3_INDEX ORDER BY COUNT(1) DESC) as rnk
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
-          WHERE ANO_JOIN != 2026
+          WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) < 2026 -- CORREÇÃO AQUI TAMBÉM
           GROUP BY H3_INDEX, RUBRICA
         )
         SELECT 
