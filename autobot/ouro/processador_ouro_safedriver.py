@@ -12,7 +12,7 @@ from datetime import datetime
 class ArquitetoSafeDriverOuro:
     """
     Engine de Construção da ABT SafeDriver Autobot.
-    Refatorada: Alinhamento Perfeito com Prata Crimes (MUNICIPIO -> CIDADE) + Coalesce Espacial.
+    Refatorada: Ditadura do H3 (Shapefile IBGE sobrescreve texto) + Dicionário Anti-Fantasma.
     """
     def __init__(self):
         self.projeto = "SafeDriver Autobot"
@@ -40,17 +40,40 @@ class ArquitetoSafeDriverOuro:
             except: pass
 
     def _limpar_tabela_toda(self, df):
-        # Protege o H3_INDEX de sofrer .to_uppercase() e quebrar o join depois
+        # 1. Limpeza Bruta: Protege o H3_INDEX e remove caracteres especiais
         cols_texto = [c for c, t in zip(df.columns, df.dtypes) if (t == pl.String or t == pl.Utf8) and c != "H3_INDEX"]
         if not cols_texto: return df
-        return df.with_columns([
+        
+        df_limpo = df.with_columns([
             pl.col(c).str.to_uppercase().str.strip_chars()
             .str.replace_all(r"[ÁÀÂÃÄ]", "A").str.replace_all(r"[ÉÈÊË]", "E")
             .str.replace_all(r"[ÍÌÎÏ]", "I").str.replace_all(r"[ÓÒÔÕÖ]", "O")
             .str.replace_all(r"[ÚÙÛÜ]", "U").str.replace_all(r"[Ç]", "C")
             .str.replace_all(r"[^A-Z0-9\s_]", " ").str.replace_all(r"\s+", " ")
-            .fill_null("DESCONHECIDO").alias(c)
+            .alias(c)
             for c in cols_texto
+        ])
+        
+        # 2. Tratamento Anti-Fantasma (Se já houver a coluna na base bruta)
+        for col_alvo in ["MUNICIPIO", "CIDADE"]:
+            if col_alvo in df_limpo.columns:
+                df_limpo = df_limpo.with_columns(
+                    pl.col(col_alvo)
+                    .str.replace(r"^S\sPAULO$", "SAO PAULO")
+                    .str.replace(r"^S\.PAULO$", "SAO PAULO")
+                    .str.replace(r"^S\sBERNARDO.*$", "SAO BERNARDO DO CAMPO")
+                    .str.replace(r"^S\sCAETANO.*$", "SAO CAETANO DO SUL")
+                    .str.replace(r"^S\sANDRE$", "SANTO ANDRE")
+                    .str.replace(r"^MOGI.*CRUZES$", "MOGI DAS CRUZES")
+                    .str.replace(r"^S\sJOSE.*CAMPOS$", "SAO JOSE DOS CAMPOS")
+                    .str.replace(r"^S\sJOSE.*RIO PRETO$", "SAO JOSE DO RIO PRETO")
+                    .str.replace(r"^STA\s", "SANTA ")
+                    .str.replace(r"^STO\s", "SANTO ")
+                )
+
+        # 3. Finaliza preenchendo os nulos
+        return df_limpo.with_columns([
+            pl.col(c).fill_null("DESCONHECIDO").alias(c) for c in cols_texto
         ])
 
     def _ler_parquet_r2(self, key):
@@ -73,7 +96,7 @@ class ArquitetoSafeDriverOuro:
         if df_dim_bairro is None:
             df_dim_bairro = pl.DataFrame({"H3_INDEX": pl.Series(dtype=pl.String), "CIDADE": pl.Series(dtype=pl.String), "BAIRRO": pl.Series(dtype=pl.String)})
         else:
-            # Garante que a dimensão bairro seja minúscula para facilitar o join
+            # Força lowercase na chave técnica
             df_dim_bairro = df_dim_bairro.with_columns(pl.col("H3_INDEX").str.to_lowercase())
 
         df_infra = self._ler_parquet_r2(f"{self.prata_malha}/PRATA_MALHA_INFRA_AGREGADA.parquet")
@@ -91,7 +114,7 @@ class ArquitetoSafeDriverOuro:
         df_universo_h3 = df_universo_h3.fill_null(0)
 
         # =================================================================
-        # 2. CONSOLIDAÇÃO DE CRIMES E MAPEAMENTO (ALINHAMENTO PRATA)
+        # 2. CONSOLIDAÇÃO DE CRIMES E MAPEAMENTO (DITADURA DO H3)
         # =================================================================
         print("--- Processando Matriz de Crimes ---", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
@@ -103,7 +126,7 @@ class ArquitetoSafeDriverOuro:
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
         df_crimes = self._limpar_tabela_toda(df_crimes)
 
-        # ALINHAMENTO COM A PRATA CRIMES: Renomeia MUNICIPIO para CIDADE
+        # Prepara a coluna para o Coalesce (Alinha com a Prata Crimes)
         if "MUNICIPIO" in df_crimes.columns and "CIDADE" not in df_crimes.columns:
             df_crimes = df_crimes.rename({"MUNICIPIO": "CIDADE"})
         elif "CIDADE" not in df_crimes.columns:
@@ -112,7 +135,9 @@ class ArquitetoSafeDriverOuro:
         if "BAIRRO" not in df_crimes.columns:
             df_crimes = df_crimes.with_columns(pl.lit("DESCONHECIDO").alias("BAIRRO"))
 
-        # COALESCE ESPACIAL: Cruza com a Malha e preserva o B.O. original se o H3 for cego
+        # COALESCE ESPACIAL (A Mágica da Unificação)
+        # Se 10 policiais escreveram o bairro de 10 formas diferentes, mas caíram no mesmo H3,
+        # o IBGE dita qual é o nome oficial e unifica todo mundo.
         if not df_dim_bairro.is_empty():
             df_crimes = df_crimes.with_columns(pl.col("H3_INDEX").str.to_lowercase())
             df_dim_bairro_join = df_dim_bairro.rename({"CIDADE": "CID_H3", "BAIRRO": "BAI_H3"})
@@ -120,6 +145,7 @@ class ArquitetoSafeDriverOuro:
             df_crimes = df_crimes.join(df_dim_bairro_join, on="H3_INDEX", how="left")
             
             df_crimes = df_crimes.with_columns([
+                # Prioridade 1: O Nome do Shapefile do IBGE (Via H3). Prioridade 2: O B.O. Limpo.
                 pl.coalesce(["CID_H3", "CIDADE"]).alias("CIDADE") if "CID_H3" in df_crimes.columns else pl.col("CIDADE"),
                 pl.coalesce(["BAI_H3", "BAIRRO"]).alias("BAIRRO") if "BAI_H3" in df_crimes.columns else pl.col("BAIRRO")
             ]).drop(["CID_H3", "BAI_H3"], strict=False)
@@ -217,7 +243,7 @@ class ArquitetoSafeDriverOuro:
             f"Tempo de Execucao: {duracao} segundos",
             "",
             "📍 AUDITORIA ESPACIAL (MÉTRICAS DE JOIN):",
-            f"  • Cidades Únicas Consolidadas: {cidades_unicas:,}",
+            f"  • Cidades Únicas Consolidadas: {cidades_unicas:,} (Meta: ~645 oficiais)",
             f"  • Bairros Únicos Consolidados: {bairros_unicos:,}",
             f"  • Registros 'DESCONHECIDOS' (Sem Match H3): {crimes_sem_bairro:,} ({(crimes_sem_bairro/total_linhas)*100:.2f}%)",
             "",
@@ -238,7 +264,8 @@ class ArquitetoSafeDriverOuro:
         
         report = "\n".join(report_lines)
         print(report)
-        self._notificar_discord(f"```text\n{report}\n```")
+        self._notificar_discord(f"
+```text\n{report}\n```")
         print("[INFO] Pipeline executado com sucesso. Arquivo exportado.", flush=True)
 
 if __name__ == "__main__":
