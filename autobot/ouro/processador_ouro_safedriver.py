@@ -264,8 +264,7 @@ class ArquitetoSafeDriverOuro:
         
         report = "\n".join(report_lines)
         print(report)
-        self._notificar_discord(f"
-```text\n{report}\n```")
+        self._notificar_discord(f"```text\n{report}\n```")
         print("[INFO] Pipeline executado com sucesso. Arquivo exportado.", flush=True)
 
 if __name__ == "__main__":
