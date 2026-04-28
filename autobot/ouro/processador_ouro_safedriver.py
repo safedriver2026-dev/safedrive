@@ -12,7 +12,7 @@ from datetime import datetime
 class ArquitetoSafeDriverOuro:
     """
     Engine de Construção da ABT SafeDriver Autobot.
-    Refatorada: Proteção H3 (Case Sensitive) + Auditoria Espacial no Log.
+    Refatorada: Alinhamento Perfeito com Prata Crimes (MUNICIPIO -> CIDADE) + Coalesce Espacial.
     """
     def __init__(self):
         self.projeto = "SafeDriver Autobot"
@@ -91,7 +91,7 @@ class ArquitetoSafeDriverOuro:
         df_universo_h3 = df_universo_h3.fill_null(0)
 
         # =================================================================
-        # 2. CONSOLIDAÇÃO DE CRIMES E MAPEAMENTO
+        # 2. CONSOLIDAÇÃO DE CRIMES E MAPEAMENTO (ALINHAMENTO PRATA)
         # =================================================================
         print("--- Processando Matriz de Crimes ---", flush=True)
         paginator = self.s3.get_paginator('list_objects_v2')
@@ -103,10 +103,26 @@ class ArquitetoSafeDriverOuro:
         df_crimes = pl.concat(lista_crimes, how="diagonal").filter(pl.col("H3_INDEX").is_not_null())
         df_crimes = self._limpar_tabela_toda(df_crimes)
 
-        # FORÇA A BLINDAGEM DE JOIN (MINÚSCULA)
+        # ALINHAMENTO COM A PRATA CRIMES: Renomeia MUNICIPIO para CIDADE
+        if "MUNICIPIO" in df_crimes.columns and "CIDADE" not in df_crimes.columns:
+            df_crimes = df_crimes.rename({"MUNICIPIO": "CIDADE"})
+        elif "CIDADE" not in df_crimes.columns:
+            df_crimes = df_crimes.with_columns(pl.lit("DESCONHECIDO").alias("CIDADE"))
+            
+        if "BAIRRO" not in df_crimes.columns:
+            df_crimes = df_crimes.with_columns(pl.lit("DESCONHECIDO").alias("BAIRRO"))
+
+        # COALESCE ESPACIAL: Cruza com a Malha e preserva o B.O. original se o H3 for cego
         if not df_dim_bairro.is_empty():
             df_crimes = df_crimes.with_columns(pl.col("H3_INDEX").str.to_lowercase())
-            df_crimes = df_crimes.drop(["CIDADE", "BAIRRO"], strict=False).join(df_dim_bairro, on="H3_INDEX", how="left")
+            df_dim_bairro_join = df_dim_bairro.rename({"CIDADE": "CID_H3", "BAIRRO": "BAI_H3"})
+            
+            df_crimes = df_crimes.join(df_dim_bairro_join, on="H3_INDEX", how="left")
+            
+            df_crimes = df_crimes.with_columns([
+                pl.coalesce(["CID_H3", "CIDADE"]).alias("CIDADE") if "CID_H3" in df_crimes.columns else pl.col("CIDADE"),
+                pl.coalesce(["BAI_H3", "BAIRRO"]).alias("BAIRRO") if "BAI_H3" in df_crimes.columns else pl.col("BAIRRO")
+            ]).drop(["CID_H3", "BAI_H3"], strict=False)
 
         # =================================================================
         # 3. ENGENHARIA TEMPORAL E SANEAMENTO
