@@ -86,7 +86,7 @@ jobs:
           python-version: '3.11'
       - name: "🏆 [OURO] Gerar ABT"
         run: |
-          pip install boto3 polars pyarrow requests
+          pip install boto3 polars pyarrow requests numpy pandas
           python autobot/ouro/processador_ouro_safedriver.py
 
   # --- CAMADA TREINO ---
@@ -107,7 +107,7 @@ jobs:
           python-version: '3.11'
       - name: "🧠 [TREINO] CatBoost Tweedie"
         run: |
-          pip install boto3 polars pyarrow pandas catboost scikit-learn shap requests
+          pip install boto3 polars pyarrow pandas numpy catboost scikit-learn shap requests
           python autobot/ml/treinador_safe_driver.py
 
   # --- CAMADA INTELIGÊNCIA ---
@@ -128,7 +128,7 @@ jobs:
           python-version: '3.11'
       - name: "🧬 [INTELIGÊNCIA] SHAP e Previsão"
         run: |
-          pip install boto3 polars pyarrow pandas catboost shap requests
+          pip install boto3 polars pyarrow pandas numpy catboost shap requests
           python autobot/ml/gerador_inteligencia_final.py
 
   # --- CAMADA DEPLOY BIGQUERY ---
@@ -152,5 +152,5 @@ jobs:
           python-version: '3.11'
       - name: "🌐 [DW] Deploy BigQuery"
         run: |
-          pip install boto3 polars pyarrow pandas google-cloud-bigquery db-dtypes requests
+          pip install boto3 polars pyarrow pandas numpy google-cloud-bigquery db-dtypes requests
           python autobot/bq/deploy_safedriver_bq.py
