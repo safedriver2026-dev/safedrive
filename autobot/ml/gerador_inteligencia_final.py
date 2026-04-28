@@ -78,14 +78,15 @@ class GeradorDossieSafeDriver:
         
         df_dna_bairros = df_ouro.select(colunas_dna).unique(subset=["H3_INDEX"])
 
-        # Cenários expandidos para 2026
+        # Cenários expandidos para 2026 (CORRIGIDO: Inclusão do FEAT_IS_FIM_DE_SEMANA)
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"] * 4,
             "FEAT_TIPO_DIA": ["DIA_UTIL"] * 8 + ["FIM_DE_SEMANA"] * 8,
             "FEAT_PERFIL_VITIMA": (["MOTORISTA"] * 4 + ["PEDESTRE"] * 4) * 2
-        }).with_columns(
-            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
-        )
+        }).with_columns([
+            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO"),
+            pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
+        ])
 
         df_futuro = df_dna_bairros.join(df_cenarios, how="cross")
         data_ref = date(2026, 6, 15)
@@ -120,7 +121,7 @@ class GeradorDossieSafeDriver:
             
         preds_raw = modelo.predict(X_all)
         
-        # --- CÁLCULO DE MASSA CRIMINAL (A SUA SACADA) ---
+        # --- CÁLCULO DE MASSA CRIMINAL ---
         print("⚖️ Calculando Risco de Exposição (Densidade x Gravidade)...", flush=True)
         if "FS_VOL_CRIMES_ANO_ANT" in df_completo_pd.columns:
             volume_historico = df_completo_pd["FS_VOL_CRIMES_ANO_ANT"].fillna(0).astype(float)
@@ -195,7 +196,7 @@ class GeradorDossieSafeDriver:
             f" 🛡️ RELATÓRIO DE INTELIGÊNCIA - SAFEDRIVER \n"
             f"==============================================================\n"
             f"1. VOLUMETRIA\n"
-            f"   • Total Consolidado       : {df_dossie.height:,}\n"
+            f"   • Total Consolidado        : {df_dossie.height:,}\n"
             f"   • Bairros Mapeados (DNA)  : {len(df_shap_geo)}\n\n"
             f"2. PERFORMANCE (ESCALA 0.5 A 10)\n"
             f"   • Risco Médio Predito     : {self.auditoria['metricas']['media']:.4f}\n"
