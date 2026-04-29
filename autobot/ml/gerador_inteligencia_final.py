@@ -17,9 +17,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class GeradorDossieSafeDriver:
     """
-    Motor de Inteligência Preditiva (Versão Estável R2).
-    Gera Dossiê do Passado + Projeções para 2026 com Min/Max e SHAP Values.
-    Blindagem de Titânio contra tipagem Pandas (NaN) + Massa Criminal + Calibração (0.5 a 10.0).
+    Motor de Inteligência Preditiva (Versão Storyteller).
+    Gera Dossiê Focado no Triênio (2024, 2025, 2026).
+    Cria Malha Mensal Completa (Jan-Dez) para a Previsão de 2026.
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -40,7 +40,7 @@ class GeradorDossieSafeDriver:
         
         self.auditoria = {
             "projeto": "SafeDriver",
-            "fase": "Dossiê de Inteligência Geográfica (Histórico + Futuro)",
+            "fase": "Dossiê de Inteligência Geográfica (Mensalizado)",
             "data_processamento": str(datetime.now()),
             "metricas": {}
         }
@@ -61,25 +61,30 @@ class GeradorDossieSafeDriver:
         
         modelo = CatBoostRegressor().load_model(self.modelo_local)
         
-        # 2. CARGA DA ABT OURO
+        # 2. CARGA DA ABT OURO E CORTE TEMPORAL (Foco 2024-2025)
         print("📥 Lendo a base Ouro para inferência massiva...", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
-        df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+        df_ouro_raw = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+        
+        # O Foco Laser: Mantém apenas o histórico recente para o Looker não ficar pesado
+        if "ANO_JOIN" in df_ouro_raw.columns:
+            df_ouro = df_ouro_raw.filter(pl.col("ANO_JOIN") >= 2024)
+        else:
+            df_ouro = df_ouro_raw
+            
         total_historico = df_ouro.height
 
-        # 3. GERAÇÃO DA MALHA FUTURA (2026)
-        print("🔮 Projetando cenários futuros para 2026...", flush=True)
+        # 3. GERAÇÃO DA MALHA FUTURA CONTÍNUA (Os 12 meses de 2026)
+        print("🔮 Projetando cenários futuros para todos os meses de 2026...", flush=True)
         
-        # Identifica as colunas de DNA geográfico que precisam ser mantidas
-        # Incluímos RUBRICA e ANO_JOIN para garantir o funcionamento do Data Mart no BigQuery
         colunas_preservadas = [c for c in df_ouro.columns if c in [
-            "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "RUBRICA", "ANO_JOIN",
+            "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO", "RUA", "RUBRICA", "ANO_JOIN",
             "MICRO_POPULACAO_FACES", "CENSO_MEDIA_V0001", "CENSO_MEDIA_V0002"
         ] or c.startswith("MACRO_") or c.startswith("FS_")]
         
         df_dna_geografico = df_ouro.select(colunas_preservadas).unique(subset=["H3_INDEX"])
 
-        # Cenários expandidos para 2026
+        # Cenários Base
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"] * 4,
             "FEAT_TIPO_DIA": ["DIA_UTIL"] * 8 + ["FIM_DE_SEMANA"] * 8,
@@ -89,30 +94,33 @@ class GeradorDossieSafeDriver:
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
-        df_futuro = df_dna_geografico.join(df_cenarios, how="cross")
-        data_ref = date(2026, 6, 15)
+        # Criação dos 12 meses de 2026 para a linha do tempo perfeita
+        df_meses_2026 = pl.DataFrame({
+            "DATA_REF_MES": [date(2026, mes, 15) for mes in range(1, 13)]
+        })
+
+        # Funde o Mapa (H3) com os Cenários e com os 12 Meses
+        df_futuro = df_dna_geografico.join(df_cenarios, how="cross").join(df_meses_2026, how="cross")
         
         df_futuro = df_futuro.with_columns([
-            pl.lit(data_ref).cast(pl.Date).alias("DATAOCORRENCIA"),
+            pl.col("DATA_REF_MES").cast(pl.Date).alias("DATAOCORRENCIA"),
             pl.lit(0.0).alias("LABEL_PESO_RISCO"),
-            pl.lit("PREVISÃO").alias("RUBRICA"), # Marca rubrica fictícia para o futuro
+            pl.lit("PREVISÃO").alias("RUBRICA"), 
             pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN"),
-            pl.lit(data_ref.month).alias("FEAT_MES"),
-            pl.lit(data_ref.weekday()).alias("FEAT_DIA_SEMANA")
-        ])
+            pl.col("DATA_REF_MES").dt.month().alias("FEAT_MES"),
+            pl.col("DATA_REF_MES").dt.weekday().alias("FEAT_DIA_SEMANA")
+        ]).drop("DATA_REF_MES")
 
         # 4. PREDIÇÃO E CÁLCULO DE MASSA CRIMINAL
-        print("⚡ Rodando predição (Histórico + Projeções 2026)...", flush=True)
+        print("⚡ Rodando predição unificada...", flush=True)
         df_hist_pd = df_ouro.to_pandas()
         df_fut_pd = df_futuro.to_pandas()
         
-        # Garante que as colunas batam exatamente entre histórico e futuro
         cols_comuns = list(set(df_hist_pd.columns).intersection(set(df_fut_pd.columns)))
         df_completo_pd = pd.concat([df_hist_pd[cols_comuns], df_fut_pd[cols_comuns]], ignore_index=True)
         
         X_all = df_completo_pd[modelo.feature_names_].copy()
         
-        # Tratamento de categorias para o CatBoost
         cat_features_declaradas = [
             "H3_INDEX", "SAZON_PERIODO", "FEAT_DIA_SEMANA", "FEAT_MES", 
             "FEAT_PERFIL_VITIMA", "FEAT_CONTEXTO_CRITICO", "FEAT_TIPO_FERIADO", 
@@ -126,13 +134,11 @@ class GeradorDossieSafeDriver:
             
         preds_raw = modelo.predict(X_all)
         
-        # --- CÁLCULO DE MASSA CRIMINAL ---
-        print("⚖️ Calculando Risco de Exposição (Volume x Gravidade)...", flush=True)
+        print("⚖️ Calculando Risco de Exposição (Calibração 0.5 - 10.0)...", flush=True)
         volume_historico = df_completo_pd["FS_VOL_CRIMES_ANO_ANT"].fillna(0).astype(float)
         fator_frequencia = np.log1p(volume_historico) + 1.0
         massa_criminal = preds_raw * fator_frequencia
         
-        # Calibração Final (0.5 a 10.0)
         p_min, p_max = massa_criminal.min(), massa_criminal.max()
         piso, teto = 0.5, 10.0
         preds_calibrados = piso + (massa_criminal - p_min) * (teto - piso) / (p_max - p_min)
@@ -143,7 +149,7 @@ class GeradorDossieSafeDriver:
         )
 
         # 5. DNA DE RISCO (SHAP)
-        print("🧬 Analisando DNA criminal (SHAP) por bairro...", flush=True)
+        print("🧬 Analisando DNA criminal (SHAP)...", flush=True)
         df_shap_sample = df_dossie.sample(n=min(35000, df_dossie.height), seed=42)
         X_shap = df_shap_sample.select(modelo.feature_names_).to_pandas()
         
@@ -161,7 +167,7 @@ class GeradorDossieSafeDriver:
         ], axis=1).groupby(["CIDADE", "BAIRRO"], dropna=False).mean().reset_index()
 
         # 6. SINCRONIZAÇÃO R2
-        print("📦 Sincronizando resultados finais...", flush=True)
+        print("📦 Sincronizando com o Datalake (Ouro)...", flush=True)
         for key, data in [("looker_dossie_eventos.parquet", df_dossie), 
                          ("looker_dim_shap.parquet", pl.from_pandas(df_shap_geo))]:
             buf = io.BytesIO()
@@ -170,7 +176,6 @@ class GeradorDossieSafeDriver:
 
         duracao = time.time() - inicio_processo
         
-        # Relatório Final
         self.auditoria["metricas"] = {
             "historico": total_historico,
             "futuro": df_futuro.height,
@@ -182,18 +187,19 @@ class GeradorDossieSafeDriver:
 
         report = (
             f"==============================================================\n"
-            f" 🛡️ RELATÓRIO DE INTELIGÊNCIA FINAL - SAFEDRIVER \n"
+            f" 🛡️ RELATÓRIO DE INTELIGÊNCIA MENSALIZADA - SAFEDRIVER \n"
             f"==============================================================\n"
-            f"1. VOLUMETRIA\n"
-            f"   • Base Consolidada        : {df_dossie.height:,}\n"
-            f"   • Projeções 2026 Geradas  : {df_futuro.height:,}\n\n"
+            f"1. VOLUMETRIA (Foco: 2024 a 2026)\n"
+            f"   • Histórico (24-25)       : {total_historico:,} eventos\n"
+            f"   • Malha Futura (12 Meses) : {df_futuro.height:,} projeções\n\n"
             f"2. RISCO (ESCALA 0.5 A 10)\n"
             f"   • Média de Risco Estado   : {self.auditoria['metricas']['media']:.4f}\n"
             f"   • Risco Máximo (Hotspots) : {self.auditoria['metricas']['max']:.4f}\n"
             f"==============================================================\n"
         )
         print(report)
-        self._notificar_discord(f"```text\n{report}\n```")
+        self._notificar_discord(f"```text\n{report}\n
+```")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
