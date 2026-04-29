@@ -18,7 +18,7 @@ class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
     Arquitetura: OBT Dimensional alinhada com a Estratégia BQ Free (2025-2026).
-    Atualizado: Suporte à métrica arquitetural VOLUME_EQUIVALENTE_LOOKER.
+    Atualizado: Suporte aos KPIs fidedignos (KPI_RISCO_MEDIO e KPI_VOLUME).
     """
     def __init__(self):
         self.projeto = "SafeDriver"
@@ -127,11 +127,12 @@ class DeploySafeDriverBigQuery:
             CASE WHEN e.lat_fix BETWEEN -90 AND 90 AND e.lon_fix BETWEEN -180 AND 180 
                  THEN ST_GEOGPOINT(e.lon_fix, e.lat_fix) ELSE NULL END AS GEOMETRIA_PONTO,
 
-            -- 3. CONTEXTO E RISCO IA E VOLUME UNIFICADO (A MÁGICA AQUI)
+            -- 3. CONTEXTO E RISCO IA E KPIS HOMOGENEIZADOS
             e.RUBRICA AS TIPO_CRIME, e.SAZON_PERIODO AS PERIODO_DIA, 
             e.FEAT_CONTEXTO_CRITICO AS CENARIO_COMPLETO,
             e.RISCO_PREDITO_IA AS RISCO_EXPOSICAO,
-            e.VOLUME_EQUIVALENTE_LOOKER,
+            e.KPI_RISCO_MEDIO,
+            e.KPI_VOLUME,
             
             CASE
                 WHEN e.RISCO_PREDITO_IA >= 8.5 THEN '🔴 1 - CRÍTICO'
@@ -191,7 +192,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SUCCESS] Deploy Concluído em {duracao}s!")
-        self._notificar_discord(f"🌐 Deploy Finalizado em {duracao}s! Tabela OBT Biênio (2025-2026) disponível no BigQuery com Métrica Unificada.")
+        self._notificar_discord(f"🌐 Deploy Finalizado em {duracao}s! Tabela OBT Biênio (2025-2026) disponível no BigQuery com KPIs Homogeneizados.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
