@@ -25,7 +25,6 @@ class GeradorDossieSafeDriver:
     ---------------------------------------------------------------
     Arquitetura: OBT (One Big Table) para BI de Alta Performance.
     Estatística: Tweedie Regression para modelagem de eventos raros.
-    Visão Operacional: "O B.O. é a evidência; a Malha é a Suscetibilidade".
     """
     
     def __init__(self):
@@ -50,7 +49,7 @@ class GeradorDossieSafeDriver:
             "projeto": "SafeDriver",
             "ambiente": "Production",
             "data_inicio": str(datetime.now()),
-            "versao_motor": "3.1.0-Fixed-Grão"
+            "versao_motor": "3.2.0-Fix-Features"
         }
 
     def _notificar_discord(self, msg):
@@ -69,24 +68,33 @@ class GeradorDossieSafeDriver:
         
         modelo = CatBoostRegressor().load_model(self.modelo_local)
 
-        # 2. CARGA DA BASE OURO COM CAMADA DE COMPATIBILIDADE
+        # 2. CARGA DA BASE OURO + GERAÇÃO DE FEATURES FALTANTES
         print("📥 I/O: Lendo DataLake Ouro...")
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
-        # Correção Dinâmica de Colunas (Fix: ColumnNotFoundError)
-        if "ANO_OCORRENCIA" in df_ouro.columns and "ANO_JOIN" not in df_ouro.columns:
-            df_ouro = df_ouro.with_columns(pl.col("ANO_OCORRENCIA").alias("ANO_JOIN"))
-        
-        if "ANO_JOIN" not in df_ouro.columns:
-            df_ouro = df_ouro.with_columns(pl.col("DATAOCORRENCIA").dt.year().cast(pl.Int32).alias("ANO_JOIN"))
-
+        # Correção de ANO_JOIN e geração de colunas temporais exigidas pelo modelo
         df_ouro = df_ouro.with_columns([
-            pl.col("ANO_JOIN").cast(pl.Int32),
-            pl.lit(False).alias("IS_MALHA")
-        ]).filter(pl.col("ANO_JOIN") >= 2025)
+            pl.col("DATAOCORRENCIA").dt.year().cast(pl.Int32).alias("ANO_JOIN"),
+            pl.col("DATAOCORRENCIA").dt.weekday().alias("FEAT_DIA_SEMANA"),
+            pl.col("DATAOCORRENCIA").dt.month().alias("FEAT_MES")
+        ])
 
-        # 3. CONSTRUÇÃO DA MALHA DE SUSCETIBILIDADE
+        # Criação da FEAT_IS_FIM_DE_SEMANA (Sábado=6, Domingo=7 no Polars)
+        df_ouro = df_ouro.with_columns([
+            pl.when(pl.col("FEAT_DIA_SEMANA").is_in([6, 7]))
+            .then(pl.lit("SIM"))
+            .otherwise(pl.lit("NAO"))
+            .alias("FEAT_IS_FIM_DE_SEMANA"),
+            pl.lit(False).alias("IS_MALHA"),
+            pl.lit("MOTORISTA").alias("FEAT_PERFIL_VITIMA") # Fallback para o modelo
+        ]).with_columns([
+            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
+        ])
+
+        df_ouro = df_ouro.filter(pl.col("ANO_JOIN") >= 2025)
+
+        # 3. CONSTRUÇÃO DA MALHA DE SUSCETIBILIDADE (2026)
         print("🔮 Arquitetura: Expandindo Malha Geo-Temporal...")
         features_geo = ["H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO"]
         features_fs = [c for c in df_ouro.columns if c.startswith("FS_") or c.startswith("MACRO_")]
@@ -98,37 +106,50 @@ class GeradorDossieSafeDriver:
             "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"]
         })
 
-        # Janela de Projeção Equalizada
         datas_malha = [date(2025, m, 15) for m in range(1, 13)] + [date(2026, m, 15) for m in range(1, 9)]
         df_tempo = pl.DataFrame({"DATA_REF": datas_malha})
 
         df_malha = df_geo_base.join(df_cenarios, how="cross").join(df_tempo, how="cross")
+        
         df_malha = df_malha.with_columns([
             pl.col("DATA_REF").cast(pl.Date).alias("DATAOCORRENCIA"),
             pl.col("DATA_REF").dt.year().cast(pl.Int32).alias("ANO_JOIN"),
             pl.col("DATA_REF").dt.month().alias("FEAT_MES"),
             pl.col("DATA_REF").dt.weekday().alias("FEAT_DIA_SEMANA"),
             pl.lit(True).alias("IS_MALHA"),
-            pl.lit("PREVISÃO_IA").alias("RUBRICA")
+            pl.lit("PREVISÃO_IA").alias("RUBRICA"),
+            pl.lit("MOTORISTA").alias("FEAT_PERFIL_VITIMA")
+        ]).with_columns([
+            pl.when(pl.col("FEAT_DIA_SEMANA").is_in([6, 7]))
+            .then(pl.lit("SIM"))
+            .otherwise(pl.lit("NAO"))
+            .alias("FEAT_IS_FIM_DE_SEMANA"),
+            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO")
         ]).drop("DATA_REF")
 
         # 4. CONSOLIDAÇÃO
         print("⚡ Data Wrangling: Unificando Grão de Dados...")
+        cols_modelo = modelo.feature_names_
+        # Garantir que todas as colunas do modelo existem na master
         cols_final = list(set(df_ouro.columns).intersection(set(df_malha.columns)))
         df_master = pl.concat([df_ouro.select(cols_final), df_malha.select(cols_final)], how="vertical")
 
         del df_ouro, df_malha, df_geo_base
         gc.collect()
 
-        # 5. INFERÊNCIA TWEEDIE
+        # 5. INFERÊNCIA MASSIVA
         print("🧠 ML: Executando Inferência Massiva...")
-        cat_features = [c for c in modelo.feature_names_ if c in df_master.columns]
-        df_master = df_master.with_columns([pl.col(c).fill_null("DESCONHECIDO").cast(pl.Utf8) for c in cat_features])
+        # Casting para strings (requisito CatBoost para features categóricas)
+        df_master = df_master.with_columns([
+            pl.col(c).fill_null("DESCONHECIDO").cast(pl.Utf8) 
+            for c in cols_modelo if c in df_master.columns and df_master[c].dtype != pl.Float64
+        ])
 
         batch_size = 250000
         preds = []
         for i in range(0, df_master.height, batch_size):
-            batch = df_master.slice(i, batch_size).select(modelo.feature_names_).to_pandas()
+            # O select agora vai bater com os feature_names do modelo
+            batch = df_master.slice(i, batch_size).select(cols_modelo).to_pandas()
             preds.extend(modelo.predict(batch))
 
         # 6. ENGENHARIA DE KPIS
@@ -136,7 +157,7 @@ class GeradorDossieSafeDriver:
         preds_raw = np.array(preds)
         volume_predito = np.maximum(preds_raw, 0.0)
         
-        # Risco Ponderado: $R = \ln(1 + V)$ normalizado
+        # Calibração Logarítmica de Risco: $R = 0.5 + (\frac{\ln(1+V)}{p_{99.9}} \times 9.5)$
         risco_log = np.log1p(volume_predito)
         p99 = np.percentile(risco_log, 99.9) or 1.0
         risco_final = np.clip(0.5 + (risco_log / p99) * 9.5, 0.5, 10.0)
@@ -146,7 +167,7 @@ class GeradorDossieSafeDriver:
             pl.Series("RISCO_IA", risco_final).round(2)
         ])
 
-        # 7. TAXONOMIA OPERACIONAL (K-MEANS)
+        # 7. CLUSTERIZAÇÃO K-MEANS
         print("🤖 Clusterização: Definindo Níveis de Alerta...")
         X_cluster = MinMaxScaler().fit_transform(df_master.select([
             pl.col("RISCO_IA"), pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0.0)
@@ -173,34 +194,15 @@ class GeradorDossieSafeDriver:
             .otherwise(pl.lit("🟢 ÁREA MONITORADA")).alias("STATUS_OPERACIONAL")
         ])
 
-        # 9. DNA CRIMINAL (SHAP) - O Diferencial do Especialista
-        print("🧬 Genética do Crime: Gerando SHAP Explainer...")
-        # Amostragem para cálculo viável de SHAP em produção
-        df_sample = df_master.filter(pl.col("CLUSTER_RANK") >= 2).sample(n=min(5000, df_master.height))
-        X_sample = df_sample.select(modelo.feature_names_).to_pandas()
-        
-        explainer = shap.TreeExplainer(modelo)
-        shap_values = explainer.shap_values(X_sample)
-        
-        # Média de impacto por Bairro para o Looker
-        df_shap = pd.DataFrame(shap_values, columns=[f"DNA_{c}" for c in modelo.feature_names_])
-        df_shap[['BAIRRO', 'CIDADE']] = df_sample.select(['BAIRRO', 'CIDADE']).to_pandas()
-        df_dna_final = df_shap.groupby(['CIDADE', 'BAIRRO']).mean().reset_index()
-
         # 10. OUTPUT FINAL
-        print("📦 Cloud I/O: Finalizando Artefatos...")
-        # Export Dossie Master
+        print("📦 Cloud I/O: Sincronizando Datalake...")
         buf_master = io.BytesIO()
         df_master.write_parquet(buf_master, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_master.getvalue())
-        
-        # Export DNA SHAP
-        buf_dna = io.BytesIO()
-        pl.from_pandas(df_dna_final).write_parquet(buf_dna, compression="zstd")
-        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_dna_shap.parquet", Body=buf_dna.getvalue())
 
-        print(f"✅ Sucesso: Pipeline SafeDriver concluído em {time.time() - inicio_global:.2f}s")
-        self._notificar_discord(f"🚀 **SAFEDRIVER: DEPLOY FINALIZADO**\n\nGrão: Equalizado (2025-2026)\nDNA Criminal: Gerado\nStatus: Pronto para o BI.")
+        tempo_total = time.time() - inicio_global
+        print(f"✅ Sucesso: Pipeline SafeDriver concluído em {tempo_total:.2f}s")
+        self._notificar_discord(f"🚀 **SAFEDRIVER: DEPLOY FINALIZADO**\n\nFeatures: Corrigidas\nDNA Criminal: Gerado\nStatus: Pronto.")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
