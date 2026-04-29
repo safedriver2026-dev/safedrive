@@ -6,6 +6,7 @@ import polars as pl
 import pandas as pd
 import time
 import requests
+import gc
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from botocore.config import Config
@@ -16,8 +17,7 @@ warnings.filterwarnings("ignore")
 class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
-    Arquitetura: OBT (One Big Table) Dimensional para Looker Studio.
-    Granularidade: Temporal (DATE_TRUNC mensal) e Geográfica (até LOGRADOURO).
+    Arquitetura: OBT Dimensional alinhada com a Estratégia BQ Free (2025-2026).
     """
     def __init__(self):
         self.projeto = "SafeDriver"
@@ -61,13 +61,14 @@ class DeploySafeDriverBigQuery:
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
         self.bq_client.delete_table(table_id, not_found_ok=True)
         
+        print(f"[INFO] Fazendo upload para o BigQuery: {table_name}...", flush=True)
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
         job.result()
-        print(f"[SUCCESS] {table_name} populada.", flush=True)
+        print(f"[SUCCESS] {table_name} populada com {len(df_pandas)} linhas.", flush=True)
 
     def _construir_matriz_risco_intermediaria(self):
-        print("[INFO] Gerando tb_matriz_risco (Apoio)...", flush=True)
+        print("[INFO] Gerando tb_matriz_risco (Apoio - Foco 2025)...", flush=True)
         sql_matriz = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_matriz_risco` AS
         WITH Base_Fix AS (
@@ -78,11 +79,11 @@ class DeploySafeDriverBigQuery:
         ),
         Base AS (
           SELECT H3_INDEX, COUNT(1) as VOLUME_REINCIDENCIA, AVG(RISCO_PREDITO_IA) as PERICULOSIDADE_MEDIA
-          FROM Base_Fix WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) < 2026 GROUP BY H3_INDEX
+          FROM Base_Fix WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) = 2025 GROUP BY H3_INDEX
         ),
         CrimeRank AS (
           SELECT H3_INDEX, RUBRICA, COUNT(1) as qtd, ROW_NUMBER() OVER(PARTITION BY H3_INDEX ORDER BY COUNT(1) DESC) as rnk
-          FROM Base_Fix WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) < 2026 GROUP BY H3_INDEX, RUBRICA
+          FROM Base_Fix WHERE EXTRACT(YEAR FROM DATAOCORRENCIA) = 2025 GROUP BY H3_INDEX, RUBRICA
         )
         SELECT 
           b.H3_INDEX, b.VOLUME_REINCIDENCIA, b.PERICULOSIDADE_MEDIA, c.RUBRICA as TOP_CRIME,
@@ -109,7 +110,7 @@ class DeploySafeDriverBigQuery:
         SELECT 
             -- 1. TEMPO (O Eixo Perfeito de Mensal/Sazonalidade)
             e.DATAOCORRENCIA,
-            DATE_TRUNC(CAST(e.DATAOCORRENCIA AS DATE), MONTH) AS DATA_REFERENCIA_MES, -- Essencial para Linha do Tempo contínua
+            DATE_TRUNC(CAST(e.DATAOCORRENCIA AS DATE), MONTH) AS DATA_REFERENCIA_MES,
             EXTRACT(YEAR FROM e.DATAOCORRENCIA) AS ANO,
             EXTRACT(MONTH FROM e.DATAOCORRENCIA) AS MES_NUMERO,
             CASE EXTRACT(MONTH FROM e.DATAOCORRENCIA)
@@ -150,13 +151,13 @@ class DeploySafeDriverBigQuery:
 
     def executar_deploy(self):
         inicio_deploy = time.time()
-        print("[START] Iniciando Deploy SafeDriver Arquitetura OBT...", flush=True)
+        print("[START] Iniciando Deploy SafeDriver Arquitetura OBT (BQ Free)...", flush=True)
 
-        # 1. Carregar Eventos e TRATAR COLUNAS (O fix do erro AttributeError está aqui)
+        # 1. Carregar Eventos e TRATAR COLUNAS
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
         
-        # Lógica Robusta para Logradouro (evita AttributeError)
+        # Lógica Robusta para Logradouro
         if 'LOGRADOURO' not in df_eventos.columns:
             if 'RUA' in df_eventos.columns:
                 df_eventos['LOGRADOURO'] = df_eventos['RUA']
@@ -170,17 +171,24 @@ class DeploySafeDriverBigQuery:
         
         self._upload_table(df_eventos, "tb_dossie_eventos")
 
+        # Libera a RAM pesada antes de prosseguir
+        del df_eventos
+        gc.collect()
+
         # 2. Carregar SHAP
         df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_shap.parquet")
         self._upload_table(df_shap, "tb_dim_shap")
+        
+        del df_shap
+        gc.collect()
 
-        # 3. Rodar SQLs de Fusão
+        # 3. Rodar SQLs de Fusão no BigQuery (O trabalho pesado acontece na nuvem agora)
         self._construir_matriz_risco_intermediaria()
         self._construir_obt_looker()
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SUCCESS] Deploy Concluído em {duracao}s!")
-        self._notificar_discord(f"🌐 Deploy Finalizado! Tabela `tb_looker_master_final` com Arquitetura OBT e DATA_REFERENCIA_MES disponível.")
+        self._notificar_discord(f"🌐 Deploy Finalizado em {duracao}s! Tabela OBT Biênio (2025-2026) disponível no BigQuery.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
