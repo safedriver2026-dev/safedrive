@@ -68,11 +68,12 @@ class GeradorDossieSafeDriver:
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro_raw = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
-        # O Foco Laser: Corta tudo antes de 2025
+        # FIX DE ARQUITETURA: Garante a existência do ANO_JOIN na base histórica
         if "ANO_JOIN" in df_ouro_raw.columns:
             df_ouro = df_ouro_raw.filter(pl.col("ANO_JOIN") >= 2025)
         else:
-            df_ouro = df_ouro_raw
+            # Se a coluna não existir, nós forçamos a criação para ela não ser apagada na intersecção
+            df_ouro = df_ouro_raw.with_columns(pl.lit(2025).cast(pl.Int32).alias("ANO_JOIN"))
             
         total_historico = df_ouro.height
 
@@ -96,7 +97,7 @@ class GeradorDossieSafeDriver:
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
-        # GAP CORRIGIDO: Previsão estendida para 8 meses (Até Agosto de 2026)
+        # Previsão estendida para 8 meses (Até Agosto de 2026)
         meses_alvo = [1, 2, 3, 4, 5, 6, 7, 8] 
         df_meses_futuro = pl.DataFrame({
             "DATA_REF_MES": [date(2026, mes, 15) for mes in meses_alvo]
@@ -151,10 +152,8 @@ class GeradorDossieSafeDriver:
         total_linhas = df_completo_pl.height
         
         for i in range(0, total_linhas, batch_size):
-            # Extrai apenas o pedaço de dados necessário
             df_batch = df_completo_pl.slice(i, batch_size).select(modelo.feature_names_).to_pandas()
             
-            # CatBoost precisa ver isso explicitamente como string no Pandas
             for col in cat_features:
                 if col in df_batch.columns:
                     df_batch[col] = df_batch[col].astype(str)
@@ -242,8 +241,7 @@ class GeradorDossieSafeDriver:
             f"==============================================================\n"
         )
         print(report)
-        self._notificar_discord(f"""```text\n{report}\n
-```""")
+        self._notificar_discord(f"""```text\n{report}\n```""")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
