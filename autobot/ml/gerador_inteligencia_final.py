@@ -18,8 +18,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class GeradorDossieSafeDriver:
     """
-    Motor de Inteligência Preditiva (Versão Anti-OOM).
+    Motor de Inteligência Preditiva (Versão Otimizada BQ Free).
     Gera Dossiê Focado no Biênio (2025 e 2026).
+    Usa Cenários Macro e recuo de 4 meses para poupar limites do BigQuery.
     Proteção nativa contra vazamento de RAM (Exit Code 137).
     """
     def __init__(self):
@@ -41,7 +42,7 @@ class GeradorDossieSafeDriver:
         
         self.auditoria = {
             "projeto": "SafeDriver",
-            "fase": "Dossiê de Inteligência Geográfica (Mensalizado/Anti-OOM)",
+            "fase": "Dossiê de Inteligência Geográfica (Otimizado/Anti-OOM)",
             "data_processamento": str(datetime.now()),
             "metricas": {}
         }
@@ -75,8 +76,8 @@ class GeradorDossieSafeDriver:
             
         total_historico = df_ouro.height
 
-        # 3. GERAÇÃO DA MALHA FUTURA CONTÍNUA (Os 12 meses de 2026)
-        print("🔮 Projetando cenários futuros para todos os meses de 2026...", flush=True)
+        # 3. GERAÇÃO DA MALHA FUTURA (Foco em Eficiência Financeira / BQ Free)
+        print("🔮 Projetando cenários macro-futuros (Otimização para BQ Free)...", flush=True)
         
         colunas_preservadas = [c for c in df_ouro.columns if c in [
             "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO", "RUA", "RUBRICA", "ANO_JOIN",
@@ -85,27 +86,29 @@ class GeradorDossieSafeDriver:
         
         df_dna_geografico = df_ouro.select(colunas_preservadas).unique(subset=["H3_INDEX"])
 
-        # Cenários Base
+        # OTIMIZAÇÃO DE CUSTO 1: Cenários Macro (Reduz de 16 para 4 cruzamentos por hexágono)
         df_cenarios = pl.DataFrame({
-            "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"] * 4,
-            "FEAT_TIPO_DIA": ["DIA_UTIL"] * 8 + ["FIM_DE_SEMANA"] * 8,
-            "FEAT_PERFIL_VITIMA": (["MOTORISTA"] * 4 + ["PEDESTRE"] * 4) * 2
+            "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"],
+            "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], # Agrupamento representativo
+            "FEAT_PERFIL_VITIMA": ["PEDESTRE", "MOTORISTA", "MOTORISTA", "PEDESTRE"] # Agrupamento representativo
         }).with_columns([
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO"),
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
-        # Criação dos 12 meses de 2026 para a linha do tempo
-        df_meses_2026 = pl.DataFrame({
-            "DATA_REF_MES": [date(2026, mes, 15) for mes in range(1, 13)]
+        # OTIMIZAÇÃO DE CUSTO 2: Projeta os próximos 4 meses da linha de tendência (Em vez de 12)
+        meses_alvo = [1, 2, 3, 4] 
+        df_meses_futuro = pl.DataFrame({
+            "DATA_REF_MES": [date(2026, mes, 15) for mes in meses_alvo]
         })
 
-        df_futuro = df_dna_geografico.join(df_cenarios, how="cross").join(df_meses_2026, how="cross")
+        # Funde o Mapa (H3) com os Cenários (Macro) e os Meses (Curtos)
+        df_futuro = df_dna_geografico.join(df_cenarios, how="cross").join(df_meses_futuro, how="cross")
         
         df_futuro = df_futuro.with_columns([
             pl.col("DATA_REF_MES").cast(pl.Date).alias("DATAOCORRENCIA"),
             pl.lit(0.0).alias("LABEL_PESO_RISCO"),
-            pl.lit("PREVISÃO").alias("RUBRICA"), 
+            pl.lit("PREVISÃO_MACRO").alias("RUBRICA"), # Marca que é uma previsão otimizada
             pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN"),
             pl.col("DATA_REF_MES").dt.month().alias("FEAT_MES"),
             pl.col("DATA_REF_MES").dt.weekday().alias("FEAT_DIA_SEMANA")
@@ -216,17 +219,16 @@ class GeradorDossieSafeDriver:
             f"==============================================================\n"
             f" 🛡️ RELATÓRIO DE INTELIGÊNCIA MENSALIZADA - SAFEDRIVER \n"
             f"==============================================================\n"
-            f"1. VOLUMETRIA (Foco: 2025 a 2026)\n"
-            f"   • Histórico (2025)        : {total_historico:,} eventos\n"
-            f"   • Malha Futura (12 Meses) : {total_linhas - total_historico:,} projeções\n\n"
+            f"1. VOLUMETRIA (Foco: 2025 a 2026 - BQ FREE)\n"
+            f"   • Histórico (2025)       : {total_historico:,} eventos\n"
+            f"   • Malha Futura (Macro - 4 Meses) : {total_linhas - total_historico:,} projeções\n\n"
             f"2. RISCO (ESCALA 0.5 A 10)\n"
-            f"   • Média de Risco Estado   : {self.auditoria['metricas']['media']:.4f}\n"
-            f"   • Risco Máximo (Hotspots) : {self.auditoria['metricas']['max']:.4f}\n"
+            f"   • Média de Risco Estado  : {self.auditoria['metricas']['media']:.4f}\n"
+            f"   • Risco Máximo (Hotspots): {self.auditoria['metricas']['max']:.4f}\n"
             f"==============================================================\n"
         )
         print(report)
-        self._notificar_discord(f"""```text\n{report}\n
-```""")
+        self._notificar_discord(f"""```text\n{report}\n```""")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
