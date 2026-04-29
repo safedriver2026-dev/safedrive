@@ -19,8 +19,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class GeradorDossieSafeDriver:
     """
-    ENGINE PREDITIVA (Sincronizada com o TreinadorSafeDriver).
-    Aplica a 'Marreta de Titânio' para garantir paridade de tipos.
+    Motor de Inferência Preditiva SafeDriver.
+    Realiza a projeção de malha espacial e enforce de tipagem para o modelo CatBoost.
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -37,37 +37,39 @@ class GeradorDossieSafeDriver:
         self.webhook_url = os.getenv("DISCORD_SUCESSO")
         self.modelo_local = "modelo_safedriver_catboost.cbm"
 
-    def _notificar_discord(self, msg):
+    def _notificar_webhook(self, msg):
+        """Dispara notificação de status de execução."""
         if self.webhook_url:
             try: requests.post(self.webhook_url, json={"content": msg}, timeout=15)
             except Exception: pass
 
     def gerar_dados(self):
         inicio_global = time.time()
-        print(f"🛡️ [SAFEDRIVER] Iniciando Engine Preditiva via Tweedie 1.6...")
+        print("[SISTEMA] Iniciando inferência preditiva (Tweedie Regression).")
 
-        # 1. DOWNLOAD DO MODELO
+        # 1. Download do artefato do modelo
         if not os.path.exists(self.modelo_local):
             self.s3.download_file(self.bucket, f"modelos/{self.modelo_local}", self.modelo_local)
         modelo = CatBoostRegressor().load_model(self.modelo_local)
 
-        # 2. CARGA DA BASE OURO (Fatos Reais)
+        # 2. Carga dos dados históricos
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
-        # Filtro de biênio conforme o Treinador
+        # Filtro temporal e definição de sinalizador de origem
         df_ouro = df_ouro.filter(pl.col("ANO_OCORRENCIA") >= 2025).with_columns([
             pl.col("ANO_OCORRENCIA").cast(pl.Int32).alias("ANO_JOIN"),
             pl.lit(False).alias("IS_MALHA")
         ])
 
-        # 3. CONSTRUÇÃO DA MALHA FUTURA (Preservando DNA do Treino)
+        # 3. Geração da malha sintética futura
         features_estruturais = [c for c in df_ouro.columns if any(c.startswith(pre) for pre in ["INFRA_", "FS_", "CENSO_", "MICRO_"])]
         features_geo = ["H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO"]
         
+        # Extração de localizações únicas
         df_dna_hex = df_ouro.select(features_geo + features_estruturais).unique(subset=["H3_INDEX"])
 
-        # Cenários Temporais (Sincronizados com cat_features_declaradas do Treinador)
+        # Definição dos cenários de predição
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"],
             "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], 
@@ -77,9 +79,11 @@ class GeradorDossieSafeDriver:
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
+        # Geração do vetor temporal
         datas_malha = [date(2025, m, 15) for m in range(1, 13)] + [date(2026, m, 15) for m in range(1, 9)]
         df_tempo = pl.DataFrame({"DATA_REF": datas_malha})
 
+        # Produto cartesiano espacial-temporal
         df_malha = df_dna_hex.join(df_cenarios, how="cross").join(df_tempo, how="cross")
         df_malha = df_malha.with_columns([
             pl.col("DATA_REF").cast(pl.Date).alias("DATAOCORRENCIA"),
@@ -92,7 +96,7 @@ class GeradorDossieSafeDriver:
             pl.lit(0.0).alias("LABEL_PESO_RISCO")
         ]).drop("DATA_REF")
 
-        # 4. UNIFICAÇÃO
+        # 4. Concatenação vertical
         cols_modelo = modelo.feature_names_
         cols_comuns = list(set(df_ouro.columns).intersection(set(df_malha.columns)))
         df_master = pl.concat([df_ouro.select(cols_comuns), df_malha.select(cols_comuns)], how="vertical")
@@ -100,29 +104,28 @@ class GeradorDossieSafeDriver:
         del df_ouro, df_malha, df_dna_hex
         gc.collect()
 
-        # 5. A MARRETA DE TITÂNIO (Sincronização de Tipos para o CatBoost)
-        # Importante: O CatBoost não aceita Float para Categóricas e odeia o ".0" no fim da string
+        # 5. Tratamento rigoroso de tipagem categórica
         cat_features_modelo = [cols_modelo[i] for i in modelo.get_cat_feature_indices()]
-        print(f"🔨 Aplicando Marreta de Titânio em {len(cat_features_modelo)} colunas...")
+        print(f"[PROCESSAMENTO] Realizando casting restrito em {len(cat_features_modelo)} colunas categóricas.")
 
         pdf_master = df_master.to_pandas()
         for col in cols_modelo:
             if col in cat_features_modelo:
-                # Lógica exata do seu Treinador: Remove .0, preenche nulos e força object/string
+                # Remoção de sufixos decimais gerados por conversões implícitas
                 pdf_master[col] = pdf_master[col].fillna('DESCONHECIDO').astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO').astype(object)
             else:
-                # Numéricas ganham float e zero no nulo
+                # Padronização contínua
                 pdf_master[col] = pdf_master[col].fillna(0.0).astype(float)
 
-        # 6. INFERÊNCIA MASSIVA
-        print("🧠 ML: Executando Inferência Massiva...")
+        # 6. Inferência preditiva em lotes
+        print("[SISTEMA] Executando inferência massiva no vetor de dados.")
         batch_size = 250000
         preds = []
         for i in range(0, len(pdf_master), batch_size):
             batch = pdf_master.iloc[i : i + batch_size][cols_modelo]
             preds.extend(modelo.predict(batch))
 
-        # 7. ENGENHARIA DE RISCO E CLUSTERIZAÇÃO
+        # 7. Engenharia da variável de risco
         volume_predito = np.maximum(np.array(preds), 0.0)
         risco_log = np.log1p(volume_predito)
         p99 = np.percentile(risco_log, 99.9) or 1.0
@@ -131,29 +134,51 @@ class GeradorDossieSafeDriver:
         pdf_master["VOLUME_TWEEDIE"] = volume_predito
         pdf_master["RISCO_IA"] = np.round(risco_final, 2)
 
-        # Clusterização Operacional
+        # Classificação por k-Means multivariado
         X_cluster = MinMaxScaler().fit_transform(pdf_master[["RISCO_IA", "FS_VOL_CRIMES_ANO_ANT"]].fillna(0))
         km = KMeans(n_clusters=4, random_state=42, n_init="auto")
         clusters = km.fit_predict(X_cluster)
         map_rank = {v: i for i, v in enumerate(np.argsort(km.cluster_centers_[:, 0]))}
         pdf_master["CLUSTER_RANK"] = np.vectorize(map_rank.get)(clusters)
 
-        # 8. KPIS DE STORYTELLING
+        # Derivação de indicadores
         pdf_master["KPI_RISCO_EVOLUCAO"] = np.where(pdf_master["CLUSTER_RANK"] >= 1, pdf_master["RISCO_IA"], np.nan)
         pdf_master["KPI_VOLUME_TOTAL"] = np.where(pdf_master["IS_MALHA"] == False, 1.0, 
                                                  np.where(pdf_master["ANO_JOIN"] == 2026, pdf_master["VOLUME_TWEEDIE"], 0.0))
         
-        status_map = {3: "🔴 ALERTA CRÍTICO", 2: "🟠 RISCO ALTO", 1: "🟡 ATENÇÃO MÉDIA", 0: "🟢 ÁREA MONITORADA"}
+        status_map = {3: "ALERTA CRITICO", 2: "RISCO ALTO", 1: "ATENCAO MEDIA", 0: "AREA MONITORADA"}
         pdf_master["STATUS_OPERACIONAL"] = pdf_master["CLUSTER_RANK"].map(status_map)
 
-        # 9. EXPORTAÇÃO
-        print("📦 Cloud I/O: Sincronizando resultados...")
-        buf = io.BytesIO()
-        pdf_master.to_parquet(buf, compression="zstd")
-        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf.getvalue())
+        # 8. Extração de explicabilidade global (SHAP) agregada por cidade
+        print("[PROCESSAMENTO] Calculando tensores SHAP e agregando dimensão espacial.")
+        explainer = shap.TreeExplainer(modelo)
+        
+        # Amostragem estratificada para otimização de processamento
+        tamanho_amostra = min(150000, len(pdf_master))
+        pdf_amostra = pdf_master.sample(tamanho_amostra, random_state=42)
+        
+        valores_shap = explainer.shap_values(pdf_amostra[cols_modelo])
+        df_shap = pd.DataFrame(np.abs(valores_shap), columns=[f"DNA_{c}" for c in cols_modelo])
+        df_shap['CIDADE'] = pdf_amostra['CIDADE'].values
+        
+        # Agregação da magnitude média do impacto por município
+        df_dna_cidade = df_shap.groupby('CIDADE').mean().reset_index()
 
-        tempo = time.time() - inicio_global
-        self._notificar_discord(f"🚀 **MOTOR SAFEDRIVER**\nPipeline concluído em {tempo:.2f}s. Marreta de Titânio aplicada com sucesso.")
+        # 9. Integração Cloud Storage
+        print("[SISTEMA] Exportando matrizes de dados (Eventos e Dimensão SHAP).")
+        
+        # Objeto principal de fatos
+        buf_eventos = io.BytesIO()
+        pdf_master.to_parquet(buf_eventos, compression="zstd")
+        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_eventos.getvalue())
+
+        # Objeto dimensional (DNA Criminal)
+        buf_dna = io.BytesIO()
+        df_dna_cidade.to_parquet(buf_dna, compression="zstd")
+        self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_dna_cidade.parquet", Body=buf_dna.getvalue())
+
+        tempo_execucao = time.time() - inicio_global
+        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Tipagem garantida e SHAP dimensional extraído.")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
