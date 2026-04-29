@@ -16,10 +16,9 @@ warnings.filterwarnings("ignore")
 
 class DeploySafeDriverBigQuery:
     """
-    ENGINE DE DEPLOY SAFEDRIVER - GOOGLE BIGQUERY
-    ------------------------------------------------
-    Arquitetura: OBT (One Big Table) para Storytelling Tático.
-    Integração: R2 Storage -> Pandas -> BigQuery.
+    Motor de Implantação SafeDriver no Google BigQuery.
+    Realiza a consolidação da One Big Table (OBT) unificando dados geoespaciais,
+    projeções preditivas e dimensões explicativas (SHAP).
     """
     def __init__(self):
         self.projeto = "SafeDriver"
@@ -36,7 +35,6 @@ class DeploySafeDriverBigQuery:
         credentials = service_account.Credentials.from_service_account_info(json.loads(bq_json_str))
         self.bq_client = bigquery.Client(credentials=credentials, project=self.project_id)
         
-        # Configuração R2 (S3 API)
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -50,32 +48,34 @@ class DeploySafeDriverBigQuery:
         )
         self.webhook_url = os.getenv("DISCORD_SUCESSO")
 
-    def _notificar_discord(self, msg):
+    def _notificar_webhook(self, msg):
+        """Notifica o encerramento das operações no canal de monitoramento."""
         if self.webhook_url:
             try: requests.post(self.webhook_url, json={"content": msg}, timeout=10)
-            except: pass
+            except Exception: pass
 
     def _ler_parquet_r2(self, key):
-        print(f"[INFO] Baixando artefato do R2: {key}", flush=True)
+        """Extrai artefatos gerados pelo motor preditivo."""
+        print(f"[SISTEMA] Extraindo artefato do repositório: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         return pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
 
     def _upload_table(self, df_pandas, table_name):
+        """Carrega os dataframes temporários no data warehouse."""
         table_id = f"{self.project_id}.{self.dataset_id}.{table_name}"
-        # Truncate para garantir que o grão equalizado não duplique dados
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True)
         
-        print(f"[INFO] Upload para o BigQuery: {table_name}...", flush=True)
+        print(f"[SISTEMA] Processando carga para tabela: {table_name}", flush=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
         job.result()
-        print(f"[SUCCESS] {table_name} populada com {len(df_pandas)} linhas.", flush=True)
+        print(f"[SISTEMA] Tabela {table_name} atualizada com {len(df_pandas)} registros.", flush=True)
 
     def _construir_matriz_risco_intermediaria(self):
         """
-        Calcula os Quadrantes de Risco baseados nos BOs de 2025.
-        Essencial para o gráfico de dispersão (Bolhas).
+        Gera os quadrantes de risco operacional com base nos registros históricos de 2025.
+        Utilizado para validação estatística no gráfico de dispersão.
         """
-        print("[INFO] Gerando tb_matriz_risco (Quadrantes 2025)...", flush=True)
+        print("[PROCESSAMENTO] Compilando matriz de risco operacional...", flush=True)
         sql_matriz = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_matriz_risco` AS
         WITH Base AS (
@@ -93,10 +93,10 @@ class DeploySafeDriverBigQuery:
         SELECT 
           b.H3_INDEX, b.VOLUME_REAL, b.RISCO_MEDIO_REAL, c.RUBRICA as TOP_CRIME,
           CASE 
-            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL >= 7.0 THEN '🔴 1 - ZONA CRÍTICA'
-            WHEN b.VOLUME_REAL < 30  AND b.RISCO_MEDIO_REAL >= 7.0 THEN '🟠 2 - RISCO VITAL'
-            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL < 7.0  THEN '🟡 3 - ATENÇÃO ALTA'
-            ELSE '🟢 4 - MONITORAMENTO'
+            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL >= 7.0 THEN '1 - ZONA CRITICA'
+            WHEN b.VOLUME_REAL < 30  AND b.RISCO_MEDIO_REAL >= 7.0 THEN '2 - RISCO VITAL'
+            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL < 7.0  THEN '3 - ATENCAO ALTA'
+            ELSE '4 - MONITORAMENTO'
           END AS QUADRANTE
         FROM Base b LEFT JOIN CrimeRank c ON b.H3_INDEX = c.H3_INDEX AND c.rnk = 1
         """
@@ -104,9 +104,10 @@ class DeploySafeDriverBigQuery:
 
     def _construir_obt_looker(self):
         """
-        Cria a One Big Table final com GEOGRAPHY e SHAP DNA integrados.
+        Sintetiza a tabela final (OBT), aplicando transformações geoespaciais
+        e integrando os tensores SHAP no nível municipal.
         """
-        print("[INFO] Fundindo dados na OBT Master Final...", flush=True)
+        print("[PROCESSAMENTO] Consolidando arquitetura OBT (One Big Table)...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Fix AS (
@@ -116,16 +117,16 @@ class DeploySafeDriverBigQuery:
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
         )
         SELECT 
-            -- 1. EIXO TEMPORAL
+            -- Temporalidade
             DATE_TRUNC(CAST(e.DATAOCORRENCIA AS DATE), MONTH) AS DATA_REFERENCIA_MES,
             e.ANO_JOIN AS ANO,
-            CASE WHEN e.IS_MALHA THEN 'PREVISÃO (MALHA)' ELSE 'HISTÓRICO (B.O.)' END AS TIPO_REGISTRO,
+            CASE WHEN e.IS_MALHA THEN 'PREVISAO (MALHA)' ELSE 'HISTORICO (BO)' END AS TIPO_REGISTRO,
 
-            -- 2. EIXO GEOGRÁFICO
+            -- Geografia espacial
             e.H3_INDEX, e.CIDADE, e.BAIRRO, e.LOGRADOURO,
             ST_GEOGPOINT(e.lon_fix, e.lat_fix) AS GEOMETRIA_PONTO,
 
-            -- 3. MÉTRICAS IA (Honrando Tweedie)
+            -- Indicadores de modelagem (Tweedie)
             e.RISCO_IA,
             e.VOLUME_TWEEDIE,
             e.KPI_RISCO_EVOLUCAO,
@@ -133,40 +134,39 @@ class DeploySafeDriverBigQuery:
             e.STATUS_OPERACIONAL,
             e.CLUSTER_RANK,
             
-            -- 4. CONTEXTO OPERACIONAL
-            COALESCE(m.QUADRANTE, '⚪ ÁREA SEM REGISTRO 2025') AS QUADRANTE_RISCO,
+            -- Contexto tático
+            COALESCE(m.QUADRANTE, 'AREA SEM REGISTRO 2025') AS QUADRANTE_RISCO,
             m.TOP_CRIME AS CRIME_PREDOMINANTE_H3,
             e.SAZON_PERIODO AS PERIODO_DIA,
             e.FEAT_CONTEXTO_CRITICO AS CENARIO_ALVO,
             
-            -- 5. DNA DO CRIME (SHAP)
-            s.* EXCEPT(CIDADE, BAIRRO)
+            -- Explicabilidade (SHAP agregado por Cidade)
+            s.* EXCEPT(CIDADE)
 
         FROM Base_Fix e
         LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_matriz_risco` m ON e.H3_INDEX = m.H3_INDEX
-        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_shap` s ON CAST(e.CIDADE AS STRING) = CAST(s.CIDADE AS STRING) 
-                                                                    AND CAST(e.BAIRRO AS STRING) = CAST(s.BAIRRO AS STRING)
+        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s ON CAST(e.CIDADE AS STRING) = CAST(s.CIDADE AS STRING) 
         """
         self.bq_client.query(sql_obt).result()
 
     def executar_deploy(self):
         inicio_deploy = time.time()
-        print(f"🌐 [START] Deploy SafeDriver Project: {self.project_id}", flush=True)
+        print(f"[SISTEMA] Iniciando pipeline de integração de dados - Projeto: {self.project_id}", flush=True)
 
-        # 1. Sincronização de Tabelas (R2 -> BQ)
+        # 1. Carga dos dados processados (Eventos e DNA Municipal)
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         self._upload_table(df_eventos, "tb_dossie_eventos")
         
-        df_shap = self._ler_parquet_r2("datalake/ouro/looker_dim_dna_shap.parquet")
-        self._upload_table(df_shap, "tb_dim_shap")
+        df_shap_cidade = self._ler_parquet_r2("datalake/ouro/looker_dim_dna_cidade.parquet")
+        self._upload_table(df_shap_cidade, "tb_dim_dna_cidade")
 
-        # 2. Refinamento SQL Dimensional
+        # 2. Execução das rotinas de transformação no DW
         self._construir_matriz_risco_intermediaria()
         self._construir_obt_looker()
 
         duracao = round(time.time() - inicio_deploy, 2)
-        print(f"✅ [FINISHED] Deploy concluído em {duracao}s")
-        self._notificar_discord(f"🌐 **DEPLOY SAFEDRIVER CONCLUÍDO**\n\nBigQuery OBT: Atualizada\nGrão: 2025-2026 Equalizado\nStatus: Pronto para Visualização.")
+        print(f"[SISTEMA] Processo de integração finalizado. Tempo de execução: {duracao}s")
+        self._notificar_webhook("[INFO] Pipeline BigQuery executado com sucesso. Tabela master estruturada e atualizada.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
