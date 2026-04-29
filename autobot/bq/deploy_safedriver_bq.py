@@ -17,7 +17,7 @@ class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
     Foco: OBT (One Big Table) para Performance Extrema no Looker Studio.
-    Fundimos Histórico, Previsão, SHAP e Matriz de Risco em uma única tabela plana.
+    Contém: Kit de Linha do Tempo Perfeita + Granularidade de Rua (Logradouro).
     """
     def __init__(self):
         self.projeto = "SafeDriver"
@@ -94,8 +94,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[INFO] Fundindo dados na OBT (One Big Table) para o Looker Studio...", flush=True)
-        # Transforma a View em uma Tabela Física. O Looker lê tabelas muito mais rápido que views complexas.
+        print("[INFO] Fundindo dados na OBT (One Big Table) com Kit de Tempo e Ruas...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Fix AS (
@@ -105,17 +104,25 @@ class DeploySafeDriverBigQuery:
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
         )
         SELECT 
-            -- 1. TEMPO (Já extraído para facilitar os filtros)
+            -- 1. TEMPO (Kit Definitivo para Linhas e Filtros)
             e.DATAOCORRENCIA,
+            FORMAT_DATE('%Y-%m', e.DATAOCORRENCIA) AS ANO_MES, -- Essencial para linha do tempo (Ex: 2024-01)
             EXTRACT(YEAR FROM e.DATAOCORRENCIA) AS ANO,
-            FORMAT_DATE('%B', e.DATAOCORRENCIA) AS MES_NOME,
-            CASE WHEN EXTRACT(DAYOFWEEK FROM e.DATAOCORRENCIA) IN (1, 7) THEN 'FIM DE SEMANA' ELSE 'DIA UTIL' END AS TIPO_DIA,
+            EXTRACT(MONTH FROM e.DATAOCORRENCIA) AS MES_NUMERO, -- Para ordernar as barras do gráfico
+            CASE EXTRACT(MONTH FROM e.DATAOCORRENCIA)
+                WHEN 1 THEN 'Janeiro' WHEN 2 THEN 'Fevereiro' WHEN 3 THEN 'Março'
+                WHEN 4 THEN 'Abril' WHEN 5 THEN 'Maio' WHEN 6 THEN 'Junho'
+                WHEN 7 THEN 'Julho' WHEN 8 THEN 'Agosto' WHEN 9 THEN 'Setembro'
+                WHEN 10 THEN 'Outubro' WHEN 11 THEN 'Novembro' WHEN 12 THEN 'Dezembro'
+            END AS MES_NOME,
+            CASE WHEN EXTRACT(DAYOFWEEK FROM e.DATAOCORRENCIA) IN (1, 7) THEN 'FIM DE SEMANA' ELSE 'DIA ÚTIL' END AS TIPO_DIA,
             CASE WHEN EXTRACT(YEAR FROM e.DATAOCORRENCIA) >= 2026 THEN 'PREVISÃO' ELSE 'HISTÓRICO REAL' END AS ORIGEM_DADO,
 
-            -- 2. GEOGRAFIA
+            -- 2. GEOGRAFIA (Descendo até a Rua)
             e.H3_INDEX, 
             e.CIDADE, 
             e.BAIRRO,
+            e.LOGRADOURO, -- <<< Agora o Looker sabe a Rua!
             CASE WHEN e.lat_fix BETWEEN -90 AND 90 AND e.lon_fix BETWEEN -180 AND 180 
                  THEN ST_GEOGPOINT(e.lon_fix, e.lat_fix) ELSE NULL END AS GEOMETRIA_PONTO,
 
@@ -135,7 +142,7 @@ class DeploySafeDriverBigQuery:
                 ELSE '🟢 4 - BAIXO'
             END AS STATUS_ALERTA,
 
-            -- 5. MATRIZ DE RISCO (Enriquecimento H3)
+            -- 5. MATRIZ DE RISCO
             COALESCE(m.QUADRANTE, '⚪ SEM CLASSIFICAÇÃO') AS QUADRANTE_RISCO,
             m.TOP_CRIME AS CRIME_PREDOMINANTE_H3,
 
@@ -158,8 +165,13 @@ class DeploySafeDriverBigQuery:
         # Carga Base
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         df_eventos['DATAOCORRENCIA'] = pd.to_datetime(df_eventos['DATAOCORRENCIA'], errors='coerce')
+        
+        # Blindagem de campos geográficos essenciais (incluindo a RUA)
         df_eventos['CIDADE'] = df_eventos.get('CIDADE', 'DESCONHECIDO').fillna('DESCONHECIDO').astype(str)
         df_eventos['BAIRRO'] = df_eventos.get('BAIRRO', 'DESCONHECIDO').fillna('DESCONHECIDO').astype(str)
+        # Tenta buscar LOGRADOURO (ou RUA), se não existir na base de origem, preenche com NÃO INFORMADO
+        df_eventos['LOGRADOURO'] = df_eventos.get('LOGRADOURO', df_eventos.get('RUA', 'NÃO INFORMADO')).fillna('NÃO INFORMADO').astype(str)
+        
         df_eventos['RUBRICA'] = df_eventos.get('RUBRICA', 'DESCONHECIDO').fillna('DESCONHECIDO').astype(str)
         self._upload_table(df_eventos, "tb_dossie_eventos")
 
@@ -172,7 +184,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SUCCESS] Deploy Concluído em {duracao}s!")
-        self._notificar_discord(f"🌐 Deploy BigQuery Finalizado. Tabela `tb_looker_master_final` pronta para o Looker Studio.")
+        self._notificar_discord(f"🌐 Deploy BigQuery Finalizado. Tabela `tb_looker_master_final` com Linha de Tempo e Ruas pronta.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
