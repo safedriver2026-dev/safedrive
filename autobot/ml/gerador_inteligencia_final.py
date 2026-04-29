@@ -21,8 +21,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class GeradorDossieSafeDriver:
     """
     Motor de Inteligência Preditiva (Visão de Arquitetura de Dados).
-    Gera Dossiê Focado no Biênio (2025 e 2026).
-    Camada de Dados no Azeite: K-Means para o Mapa + Matched-Set para Linha de Evolução.
+    Camada de Dados Equalizada: Superfície de Risco Unificada (2025-2026) + BOs Históricos.
+    A visão do arquiteto: "O B.O é a prova, mas o crime se espalha".
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -55,7 +55,7 @@ class GeradorDossieSafeDriver:
 
     def gerar_dados(self):
         inicio_processo = time.time()
-        print("🧠 [DOSSIÊ] Iniciando motor de inteligência...", flush=True)
+        print("🧠 [DOSSIÊ] Iniciando motor de inteligência equalizado...", flush=True)
         
         # 1. DOWNLOAD E CARGA DO MODELO
         if not os.path.exists(self.modelo_local):
@@ -64,8 +64,8 @@ class GeradorDossieSafeDriver:
         
         modelo = CatBoostRegressor().load_model(self.modelo_local)
         
-        # 2. CARGA DA ABT OURO E CORTE TEMPORAL (Foco 2025)
-        print("📥 Lendo a base Ouro para inferência massiva...", flush=True)
+        # 2. CARGA DA ABT OURO (Eventos Históricos Reais - A "Prova" do Crime)
+        print("📥 Lendo a base Ouro (Eventos Históricos)...", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro_raw = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
@@ -75,9 +75,12 @@ class GeradorDossieSafeDriver:
             df_ouro = df_ouro_raw.with_columns(pl.lit(2025).cast(pl.Int32).alias("ANO_JOIN"))
             
         total_historico = df_ouro.height
+        
+        # Marcador crucial: Isso é um BO real, tem volume 1.
+        df_ouro = df_ouro.with_columns(pl.lit(False).alias("IS_MALHA"))
 
-        # 3. GERAÇÃO DA MALHA FUTURA (Visão Arquitetura)
-        print("🔮 Projetando cenários macro-futuros (Estendido até Agosto)...", flush=True)
+        # 3. GERAÇÃO DA SUPERFÍCIE DE RISCO UNIFICADA (Visão Arquitetura)
+        print("🔮 Expandindo a malha espacial de risco (Jan/2025 a Ago/2026)...", flush=True)
         
         colunas_preservadas = [c for c in df_ouro.columns if c in [
             "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO", "RUA", "RUBRICA", "ANO_JOIN",
@@ -95,30 +98,34 @@ class GeradorDossieSafeDriver:
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
-        meses_alvo = [1, 2, 3, 4, 5, 6, 7, 8] 
-        df_meses_futuro = pl.DataFrame({
-            "DATA_REF_MES": [date(2026, mes, 15) for mes in meses_alvo]
+        # A GRANDE CORREÇÃO DE GRÃO: A malha agora cobre 2025 inteiro e 2026 até agosto.
+        datas_2025 = [date(2025, mes, 15) for mes in range(1, 13)]
+        datas_2026 = [date(2026, mes, 15) for mes in range(1, 9)]
+        df_meses_malha = pl.DataFrame({
+            "DATA_REF_MES": datas_2025 + datas_2026
         })
 
-        df_futuro = df_dna_geografico.join(df_cenarios, how="cross").join(df_meses_futuro, how="cross")
+        df_malha = df_dna_geografico.join(df_cenarios, how="cross").join(df_meses_malha, how="cross")
         
-        df_futuro = df_futuro.with_columns([
+        df_malha = df_malha.with_columns([
             pl.col("DATA_REF_MES").cast(pl.Date).alias("DATAOCORRENCIA"),
             pl.lit(0.0).alias("LABEL_PESO_RISCO"),
-            pl.lit("PREVISÃO_MACRO").alias("RUBRICA"), 
-            pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN"),
+            pl.lit("PREVISÃO_IA").alias("RUBRICA"), 
+            pl.col("DATA_REF_MES").dt.year().cast(pl.Int32).alias("ANO_JOIN"),
             pl.col("DATA_REF_MES").dt.month().alias("FEAT_MES"),
-            pl.col("DATA_REF_MES").dt.weekday().alias("FEAT_DIA_SEMANA")
+            pl.col("DATA_REF_MES").dt.weekday().alias("FEAT_DIA_SEMANA"),
+            # Marcador crucial: Isso é a superfície preditiva
+            pl.lit(True).alias("IS_MALHA") 
         ]).drop("DATA_REF_MES")
 
-        # 4. TRATAMENTO ANTI-OOM
-        print("⚡ Tratando colunas e unificando bases...", flush=True)
-        cols_comuns = list(set(df_ouro.columns).intersection(set(df_futuro.columns)))
-        df_completo_pl = pl.concat([df_ouro.select(cols_comuns), df_futuro.select(cols_comuns)], how="vertical")
+        # 4. TRATAMENTO E UNIÃO DAS BASES
+        print("⚡ Unificando Eventos Reais com a Superfície de Risco...", flush=True)
+        cols_comuns = list(set(df_ouro.columns).intersection(set(df_malha.columns)))
+        df_completo_pl = pl.concat([df_ouro.select(cols_comuns), df_malha.select(cols_comuns)], how="vertical")
 
         del df_ouro
         del df_ouro_raw
-        del df_futuro
+        del df_malha
         del df_dna_geografico
         gc.collect()
 
@@ -129,7 +136,7 @@ class GeradorDossieSafeDriver:
         ]
         cat_features = [c for c in cat_features_declaradas if c in df_completo_pl.columns]
 
-        print("🧹 Otimizando Strings na memória...", flush=True)
+        print("🧹 Otimizando Memória...", flush=True)
         exprs = []
         for col in cat_features:
             expr = pl.col(col).cast(pl.Utf8).fill_null("DESCONHECIDO")
@@ -139,8 +146,8 @@ class GeradorDossieSafeDriver:
 
         df_completo_pl = df_completo_pl.with_columns(exprs)
 
-        # 5. PREDIÇÃO EM LOTES
-        print("🧠 Rodando predição em lotes de segurança...", flush=True)
+        # 5. PREDIÇÃO MASSIVA DA SUPERFÍCIE E EVENTOS
+        print("🧠 Avaliando o Risco na Malha e nos Eventos...", flush=True)
         batch_size = 200000
         preds_list = []
         
@@ -156,7 +163,6 @@ class GeradorDossieSafeDriver:
 
         preds_raw = np.array(preds_list)
 
-        print("⚖️ Calculando Risco de Exposição (Calibração 0.5 - 10.0)...", flush=True)
         volume_historico = df_completo_pl["FS_VOL_CRIMES_ANO_ANT"].fill_null(0.0).cast(pl.Float64).to_numpy()
         fator_frequencia = np.log1p(volume_historico) + 1.0
         massa_criminal = preds_raw * fator_frequencia
@@ -171,9 +177,9 @@ class GeradorDossieSafeDriver:
         )
 
         # =====================================================================
-        # --- CLUSTERIZAÇÃO K-MEANS (PARA TAXONOMIA E MAPAS) ---
+        # --- CLUSTERIZAÇÃO K-MEANS ---
         # =====================================================================
-        print("🤖 Aplicando K-Means para mapeamento geográfico...", flush=True)
+        print("🤖 Aplicando K-Means na Superfície de Risco...", flush=True)
         X_raw = df_dossie.select([
             pl.col("RISCO_PREDITO_IA").fill_null(0.0),
             pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0.0)
@@ -195,40 +201,35 @@ class GeradorDossieSafeDriver:
         )
 
         # =====================================================================
-        # --- O DADO FIDEDIGNO BASEADO EM EVOLUÇÃO TEMPORAL ---
+        # --- A ENGENHARIA PERFEITA: KPIS DE RISCO E VOLUME ---
         # =====================================================================
-        print("🏗️ Preparando KPIs blindados para o Storytelling do BI...", flush=True)
+        print("🏗️ Preparando KPIs Equalizados para o BI...", flush=True)
         
-        # 1. Marca os locais que JÁ tiveram problema real (A base do Matched-Set)
-        df_dossie = df_dossie.with_columns(
-            pl.when(pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0.0) > 0)
-            .then(pl.lit(True))
-            .otherwise(pl.lit(False))
-            .alias("IS_HISTORIC_HOTSPOT")
-        )
-
         df_dossie = df_dossie.with_columns([
             
-            # KPI RISCO EVOLUÇÃO (A LINHA DA VERDADE NO BI):
-            # Compara exatamente a mesma geografia de Janeiro 25 a Agosto 26.
-            # Como esses locais têm histórico, NUNCA vai ser nulo e a linha não quebra.
-            pl.when(pl.col("IS_HISTORIC_HOTSPOT") == True)
+            # KPI RISCO EVOLUÇÃO (A linha do Gráfico)
+            # Como a malha espacial é matematicamente idêntica em 2025 e 2026,
+            # nós extraímos a predição contínua para os clusters que não são ruído puro.
+            pl.when(pl.col("CLUSTER_KMEANS") >= 1) 
             .then(pl.col("RISCO_PREDITO_IA"))
             .otherwise(pl.lit(None).cast(pl.Float64))
             .alias("KPI_RISCO_EVOLUCAO"),
 
-            # Apenas para facilitar a taxonomia de mapas e tabelas
+            # KPI VOLUME (As barras de quantidade)
+            # Respeita a "Prova do Crime". Em 2025, só soma as linhas de BO Real.
+            # Em 2026, projeta o volume fracionado na malha.
+            pl.when(pl.col("IS_MALHA") == False)
+            .then(pl.lit(1.0))
+            .otherwise(
+                pl.when(pl.col("ANO_JOIN") == 2026)
+                .then((pl.col("RISCO_PREDITO_IA") / 10.0) * (pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(1.0) / 12.0) / 4.0)
+                .otherwise(pl.lit(0.0))
+            ).alias("KPI_VOLUME"),
+
             pl.when(pl.col("CLUSTER_KMEANS") == 3).then(pl.lit("🔴 1 - CLUSTER CRÍTICO"))
             .when(pl.col("CLUSTER_KMEANS") == 2).then(pl.lit("🟠 2 - CLUSTER ALTO"))
             .when(pl.col("CLUSTER_KMEANS") == 1).then(pl.lit("🟡 3 - CLUSTER MÉDIO"))
-            .otherwise(pl.lit("🟢 4 - CLUSTER BAIXO")).alias("NOME_CLUSTER"),
-            
-            # KPI VOLUME (Para barras)
-            pl.when(pl.col("ANO_JOIN") < 2026)
-            .then(pl.lit(1.0))
-            .otherwise(
-                (pl.col("RISCO_PREDITO_IA") / 10.0) * (pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(1.0) / 12.0) / 4.0
-            ).alias("KPI_VOLUME")
+            .otherwise(pl.lit("🟢 4 - CLUSTER BAIXO")).alias("NOME_CLUSTER")
             
         ])
         # =====================================================================
@@ -274,13 +275,13 @@ class GeradorDossieSafeDriver:
             f"==============================================================\n"
             f" 🛡️ RELATÓRIO DE INTELIGÊNCIA MENSALIZADA - SAFEDRIVER \n"
             f"==============================================================\n"
-            f"1. VOLUMETRIA (Foco: 2025 a Agosto 2026)\n"
-            f"   • Histórico (2025)       : {total_historico:,} eventos\n"
-            f"   • Malha Futura (8 Meses) : {total_linhas - total_historico:,} projeções\n\n"
+            f"1. VOLUMETRIA (Foco: Jan/2025 a Ago/2026)\n"
+            f"   • Eventos Reais (BOs)    : {total_historico:,} registros\n"
+            f"   • Malha Espacial Gerada  : {total_linhas - total_historico:,} células\n\n"
             f"2. RISCO E TRADUÇÃO K-MEANS\n"
-            f"   • Clusters Criados (0 a 3) baseados em Risco e Densidade.\n"
-            f"   • Coluna Matched-Set 'KPI_RISCO_EVOLUCAO' criada com sucesso.\n"
-            f"   • Coluna 'KPI_VOLUME' injetada.\n"
+            f"   • Superfície de Risco equalizada (Grão Unificado).\n"
+            f"   • 'KPI_RISCO_EVOLUCAO' blindado contra quedas de granularidade.\n"
+            f"   • 'KPI_VOLUME' respeita provas reais (2025) e projeta frações (2026).\n"
             f"==============================================================\n"
         )
         print(report)
