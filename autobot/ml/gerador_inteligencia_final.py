@@ -198,8 +198,8 @@ class GeradorDossieSafeDriver:
             f"==============================================================\n"
         )
         print(report)
-        self._notificar_discord(f"```text\n{report}\n
-```")
+        # CORREÇÃO APLICADA AQUI: Uso de aspas triplas para evitar erro de sintaxe
+        self._notificar_discord(f"""```text\n{report}\n```""")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
