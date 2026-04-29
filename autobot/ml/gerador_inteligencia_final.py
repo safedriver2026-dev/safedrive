@@ -12,6 +12,8 @@ import gc
 from datetime import datetime, date
 from catboost import CatBoostRegressor
 from botocore.config import Config
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import MinMaxScaler
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -20,7 +22,7 @@ class GeradorDossieSafeDriver:
     """
     Motor de Inteligência Preditiva (Visão de Arquitetura de Dados).
     Gera Dossiê Focado no Biênio (2025 e 2026).
-    Camada de Dados Fidedigna: Homogeneização do Grão (KPI_RISCO e KPI_VOLUME).
+    Camada de Dados Fidedigna: Tradução de Linguagem via K-Means Clustering.
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -171,27 +173,58 @@ class GeradorDossieSafeDriver:
         )
 
         # =====================================================================
-        # --- O DADO FIDEDIGNO: HOMOGENEIZAÇÃO DO GRÃO (MAÇÃS COM MAÇÃS) ---
+        # --- A TRADUÇÃO DE LINGUAGEM: CLUSTERIZAÇÃO K-MEANS ---
         # =====================================================================
-        print("🏗️ Padronizando KPI de Risco e Volume para o BI...", flush=True)
+        print("🤖 Aplicando K-Means para unificar a taxonomia de risco (Passado/Futuro)...", flush=True)
+        
+        # Extrai as features para o K-Means (Risco da IA + Densidade Criminal)
+        X_raw = df_dossie.select([
+            pl.col("RISCO_PREDITO_IA").fill_null(0.0),
+            pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0.0)
+        ]).to_numpy()
+
+        # Normaliza (Crucial para o K-Means não ser engolido pelo Volume)
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X_raw)
+
+        # Treina o K-Means em 4 níveis de severidade
+        kmeans = KMeans(n_clusters=4, random_state=42, n_init="auto")
+        clusters_raw = kmeans.fit_predict(X_scaled)
+
+        # Ordena os clusters matematicamente (0 = Mais Seguro, 3 = Mais Crítico)
+        centros_risco = kmeans.cluster_centers_[:, 0]
+        ordenacao = np.argsort(centros_risco)
+        mapa_clusters = {ordenacao[i]: i for i in range(4)}
+        clusters_ordenados = np.vectorize(mapa_clusters.get)(clusters_raw)
+
+        df_dossie = df_dossie.with_columns(
+            pl.Series("CLUSTER_KMEANS", clusters_ordenados)
+        )
+
+        # =====================================================================
+        # --- O DADO FIDEDIGNO BASEADO NO CLUSTER ---
+        # =====================================================================
+        print("🏗️ Padronizando KPIs baseados nos Clusters K-Means...", flush=True)
         
         df_dossie = df_dossie.with_columns([
             
-            # 1. KPI RISCO (A linha não cai mais)
-            # Regra: Histórico mostra o risco da rua real.
-            # Previsão mostra o risco APENAS de quem bateu o limite (Hotspots >= 5.0). 
-            # O ruído (ruas pacatas) vira NULL e o Looker Studio ignora na média!
+            # KPI RISCO: Agora usa a linguagem matemática universal do Cluster
             pl.when(pl.col("ANO_JOIN") < 2026)
             .then(pl.col("RISCO_PREDITO_IA"))
             .otherwise(
-                pl.when(pl.col("RISCO_PREDITO_IA") >= 5.0)
+                # Só retém na média futura os H3s que caíram nos Clusters de Perigo (2 e 3)
+                pl.when(pl.col("CLUSTER_KMEANS") >= 2)
                 .then(pl.col("RISCO_PREDITO_IA"))
                 .otherwise(pl.lit(None).cast(pl.Float64))
             ).alias("KPI_RISCO_MEDIO"),
 
-            # 2. KPI VOLUME (Para gráficos de barras)
-            # Regra: 1 linha de 2025 = 1 crime absoluto.
-            # Em 2026, convertemos a nota em fração de volume esperado.
+            # Apenas para facilitar a leitura no Looker
+            pl.when(pl.col("CLUSTER_KMEANS") == 3).then(pl.lit("🔴 1 - CLUSTER CRÍTICO"))
+            .when(pl.col("CLUSTER_KMEANS") == 2).then(pl.lit("🟠 2 - CLUSTER ALTO"))
+            .when(pl.col("CLUSTER_KMEANS") == 1).then(pl.lit("🟡 3 - CLUSTER MÉDIO"))
+            .otherwise(pl.lit("🟢 4 - CLUSTER BAIXO")).alias("NOME_CLUSTER"),
+            
+            # KPI VOLUME: Mantido para gráficos de contagem
             pl.when(pl.col("ANO_JOIN") < 2026)
             .then(pl.lit(1.0))
             .otherwise(
@@ -245,8 +278,9 @@ class GeradorDossieSafeDriver:
             f"1. VOLUMETRIA (Foco: 2025 a Agosto 2026)\n"
             f"   • Histórico (2025)       : {total_historico:,} eventos\n"
             f"   • Malha Futura (8 Meses) : {total_linhas - total_historico:,} projeções\n\n"
-            f"2. RISCO E HOMOGENEIZAÇÃO BI\n"
-            f"   • Coluna 'KPI_RISCO_MEDIO' injetada (Ruído = NULL)\n"
+            f"2. RISCO E TRADUÇÃO K-MEANS\n"
+            f"   • Clusters Criados (0 a 3) baseados em Risco e Densidade.\n"
+            f"   • Coluna 'KPI_RISCO_MEDIO' injetada (Filtrada por Cluster >= 2)\n"
             f"   • Coluna 'KPI_VOLUME' injetada\n"
             f"==============================================================\n"
         )
