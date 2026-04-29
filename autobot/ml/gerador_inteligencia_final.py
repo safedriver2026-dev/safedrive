@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 class GeradorDossieSafeDriver:
     """
     ENGINE PREDITIVA (Totalmente Alinhada com a ABT Ouro).
-    Respeita a linhagem de dados estruturais (Infra, Social e População).
+    Arquitetura de respeito à linhagem de dados estruturais (Infra, Social e População).
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -63,15 +63,13 @@ class GeradorDossieSafeDriver:
         if "ANO_OCORRENCIA" in df_ouro.columns and "ANO_JOIN" not in df_ouro.columns:
             df_ouro = df_ouro.with_columns(pl.col("ANO_OCORRENCIA").alias("ANO_JOIN"))
         
-        # Filtro de biênio
         df_ouro = df_ouro.filter(pl.col("ANO_JOIN") >= 2025)
         df_ouro = df_ouro.with_columns(pl.lit(False).alias("IS_MALHA"))
 
         # 3. CONSTRUÇÃO DA MALHA FUTURA (DNA ESPACIAL COMPLETO)
         print("🔮 Arquitetura: Clonando DNA Estrutural para Malha 2026...")
         
-        # CORREÇÃO CRÍTICA: Captura TODAS as features necessárias para o CatBoost
-        # Incluindo as colunas MICRO_ (População) e CENSO_
+        # Captura TODAS as features estruturais (Infra, FS_, População e Censo)
         features_estruturais = [
             c for c in df_ouro.columns 
             if c.startswith("INFRA_") 
@@ -81,7 +79,6 @@ class GeradorDossieSafeDriver:
             or c in ["H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO"]
         ]
         
-        # Foto única dos hexágonos (Dicionário de Features Estruturais)
         df_dna_hex = df_ouro.select(features_estruturais).unique(subset=["H3_INDEX"])
 
         # Cenários Operacionais
@@ -98,7 +95,6 @@ class GeradorDossieSafeDriver:
         datas_malha = [date(2025, m, 15) for m in range(1, 13)] + [date(2026, m, 15) for m in range(1, 9)]
         df_tempo = pl.DataFrame({"DATA_REF": datas_malha})
 
-        # Expansão da Malha
         df_malha = df_dna_hex.join(df_cenarios, how="cross").join(df_tempo, how="cross")
         
         df_malha = df_malha.with_columns([
@@ -120,18 +116,26 @@ class GeradorDossieSafeDriver:
         del df_ouro, df_malha, df_dna_hex
         gc.collect()
 
-        # 5. INFERÊNCIA MASSIVA TWEEDIE
-        print("🧠 ML: Executando Inferência Massiva...")
+        # 5. INFERÊNCIA MASSIVA TWEEDIE (TRATAMENTO CIRÚRGICO DE TIPOS)
+        print("🧠 ML: Executando Inferência Massiva (Honrando Tipos de Features)...")
         
-        # Casting de segurança para o CatBoost
-        cat_features = [c for c in modelo.feature_names_ if c in df_master.columns]
-        df_master = df_master.with_columns([pl.col(c).fill_null("DESCONHECIDO").cast(pl.Utf8) for c in cat_features])
+        # Filtra apenas as features que o modelo realmente pede
+        cols_modelo = modelo.feature_names_
+        
+        # Tratamento de nulos inteligente para evitar o erro de conversão float
+        for col in cols_modelo:
+            if col in df_master.columns:
+                # Se for numérico, nulo vira 0.0. Se for texto, nulo vira DESCONHECIDO.
+                if df_master[col].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64, pl.Int8]:
+                    df_master = df_master.with_columns(pl.col(col).fill_null(0.0))
+                else:
+                    df_master = df_master.with_columns(pl.col(col).cast(pl.Utf8).fill_null("DESCONHECIDO"))
 
         batch_size = 250000
         preds = []
         for i in range(0, df_master.height, batch_size):
-            # O select agora garante a presença das colunas MICRO_POPULACAO e outras estruturais
-            batch = df_master.slice(i, batch_size).select(modelo.feature_names_).to_pandas()
+            batch = df_master.slice(i, batch_size).select(cols_modelo).to_pandas()
+            # CatBoost recebe o DataFrame do Pandas com os tipos corretos (float onde é float)
             preds.extend(modelo.predict(batch))
 
         volume_predito = np.maximum(np.array(preds), 0.0)
@@ -148,7 +152,6 @@ class GeradorDossieSafeDriver:
 
         # 7. CLUSTERIZAÇÃO OPERACIONAL
         print("🤖 Clusterização K-Means (Risco vs Volume)...")
-        # Preenche nulos estruturais para o clusterizador não quebrar
         X_cluster = MinMaxScaler().fit_transform(df_master.select([
             pl.col("RISCO_IA"), 
             pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0.0)
@@ -178,8 +181,9 @@ class GeradorDossieSafeDriver:
         df_master.write_parquet(buf, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf.getvalue())
 
-        print(f"✅ Pipeline concluído em {time.time() - inicio_global:.2f}s")
-        self._notificar_discord("🚀 **MOTOR SAFEDRIVER**\nMalha Inteligente gerada. DNA Populacional e Estrutural preservado.")
+        tempo_total = time.time() - inicio_global
+        print(f"✅ Pipeline concluído em {tempo_total:.2f}s")
+        self._notificar_discord(f"🚀 **MOTOR SAFEDRIVER**\nMalha Inteligente gerada com sucesso. Tipagem de dados validada.")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
