@@ -18,7 +18,7 @@ class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
     Arquitetura: OBT Dimensional alinhada com a Estratégia BQ Free (2025-2026).
-    Atualizado: Suporte aos KPIs fidedignos (KPI_RISCO_MEDIO e KPI_VOLUME).
+    Atualizado: Suporte aos KPIs fidedignos e Clusters K-Means.
     """
     def __init__(self):
         self.projeto = "SafeDriver"
@@ -131,6 +131,8 @@ class DeploySafeDriverBigQuery:
             e.RUBRICA AS TIPO_CRIME, e.SAZON_PERIODO AS PERIODO_DIA, 
             e.FEAT_CONTEXTO_CRITICO AS CENARIO_COMPLETO,
             e.RISCO_PREDITO_IA AS RISCO_EXPOSICAO,
+            e.CLUSTER_KMEANS,
+            e.NOME_CLUSTER,
             e.KPI_RISCO_MEDIO,
             e.KPI_VOLUME,
             
@@ -192,7 +194,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SUCCESS] Deploy Concluído em {duracao}s!")
-        self._notificar_discord(f"🌐 Deploy Finalizado em {duracao}s! Tabela OBT Biênio (2025-2026) disponível no BigQuery com KPIs Homogeneizados.")
+        self._notificar_discord(f"🌐 Deploy Finalizado em {duracao}s! Tabela OBT Biênio (2025-2026) disponível no BigQuery com KPIs Homogeneizados e Clusters K-Means.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
