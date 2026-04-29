@@ -4,13 +4,11 @@ import json
 import boto3
 import polars as pl
 import pandas as pd
-import numpy as np
 import time
 import requests
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from botocore.config import Config
-from datetime import datetime
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -18,8 +16,8 @@ warnings.filterwarnings("ignore")
 class DeploySafeDriverBigQuery:
     """
     Engine de Deploy SafeDriver para Google BigQuery.
-    Foco: OBT (One Big Table) para Performance no Looker Studio.
-    Correção: Blindagem de busca de Logradouro + Kit de Tempo + Coordenadas.
+    Arquitetura: OBT (One Big Table) Dimensional para Looker Studio.
+    Granularidade: Temporal (DATE_TRUNC mensal) e Geográfica (até LOGRADOURO).
     """
     def __init__(self):
         self.projeto = "SafeDriver"
@@ -109,9 +107,9 @@ class DeploySafeDriverBigQuery:
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
         )
         SELECT 
-            -- 1. TEMPO (Kit Storytelling)
+            -- 1. TEMPO (O Eixo Perfeito de Mensal/Sazonalidade)
             e.DATAOCORRENCIA,
-            FORMAT_DATE('%Y-%m', e.DATAOCORRENCIA) AS ANO_MES,
+            DATE_TRUNC(CAST(e.DATAOCORRENCIA AS DATE), MONTH) AS DATA_REFERENCIA_MES, -- Essencial para Linha do Tempo contínua
             EXTRACT(YEAR FROM e.DATAOCORRENCIA) AS ANO,
             EXTRACT(MONTH FROM e.DATAOCORRENCIA) AS MES_NUMERO,
             CASE EXTRACT(MONTH FROM e.DATAOCORRENCIA)
@@ -122,7 +120,7 @@ class DeploySafeDriverBigQuery:
             END AS MES_NOME,
             CASE WHEN EXTRACT(YEAR FROM e.DATAOCORRENCIA) >= 2026 THEN 'PREVISÃO' ELSE 'HISTÓRICO REAL' END AS ORIGEM_DADO,
 
-            -- 2. GEOGRAFIA (Até a Rua)
+            -- 2. GEOGRAFIA (Hierarquia Completa)
             e.H3_INDEX, e.CIDADE, e.BAIRRO, e.LOGRADOURO,
             CASE WHEN e.lat_fix BETWEEN -90 AND 90 AND e.lon_fix BETWEEN -180 AND 180 
                  THEN ST_GEOGPOINT(e.lon_fix, e.lat_fix) ELSE NULL END AS GEOMETRIA_PONTO,
@@ -152,7 +150,7 @@ class DeploySafeDriverBigQuery:
 
     def executar_deploy(self):
         inicio_deploy = time.time()
-        print("[START] Iniciando Deploy SafeDriver Storyteller...", flush=True)
+        print("[START] Iniciando Deploy SafeDriver Arquitetura OBT...", flush=True)
 
         # 1. Carregar Eventos e TRATAR COLUNAS (O fix do erro AttributeError está aqui)
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
@@ -182,7 +180,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SUCCESS] Deploy Concluído em {duracao}s!")
-        self._notificar_discord(f"🌐 Deploy Finalizado! Tabela `tb_looker_master_final` disponível para Storytelling.")
+        self._notificar_discord(f"🌐 Deploy Finalizado! Tabela `tb_looker_master_final` com Arquitetura OBT e DATA_REFERENCIA_MES disponível.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
