@@ -18,9 +18,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class GeradorDossieSafeDriver:
     """
-    Motor de Inteligência Preditiva (Versão Otimizada BQ Free).
+    Motor de Inteligência Preditiva (Visão de Arquitetura de Dados).
     Gera Dossiê Focado no Biênio (2025 e 2026).
-    Usa Cenários Macro e recuo de 4 meses para poupar limites do BigQuery.
+    Estendido até Agosto. Inclui Métrica Unificadora para Looker Studio.
     Proteção nativa contra vazamento de RAM (Exit Code 137).
     """
     def __init__(self):
@@ -76,8 +76,8 @@ class GeradorDossieSafeDriver:
             
         total_historico = df_ouro.height
 
-        # 3. GERAÇÃO DA MALHA FUTURA (Foco em Eficiência Financeira / BQ Free)
-        print("🔮 Projetando cenários macro-futuros (Otimização para BQ Free)...", flush=True)
+        # 3. GERAÇÃO DA MALHA FUTURA (Visão Arquitetura)
+        print("🔮 Projetando cenários macro-futuros (Estendido até Agosto)...", flush=True)
         
         colunas_preservadas = [c for c in df_ouro.columns if c in [
             "H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO", "RUA", "RUBRICA", "ANO_JOIN",
@@ -89,15 +89,15 @@ class GeradorDossieSafeDriver:
         # OTIMIZAÇÃO DE CUSTO 1: Cenários Macro (Reduz de 16 para 4 cruzamentos por hexágono)
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"],
-            "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], # Agrupamento representativo
-            "FEAT_PERFIL_VITIMA": ["PEDESTRE", "MOTORISTA", "MOTORISTA", "PEDESTRE"] # Agrupamento representativo
+            "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], 
+            "FEAT_PERFIL_VITIMA": ["PEDESTRE", "MOTORISTA", "MOTORISTA", "PEDESTRE"] 
         }).with_columns([
             pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO"),
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
-        # OTIMIZAÇÃO DE CUSTO 2: Projeta os próximos 4 meses da linha de tendência (Em vez de 12)
-        meses_alvo = [1, 2, 3, 4] 
+        # GAP CORRIGIDO: Previsão estendida para 8 meses (Até Agosto de 2026)
+        meses_alvo = [1, 2, 3, 4, 5, 6, 7, 8] 
         df_meses_futuro = pl.DataFrame({
             "DATA_REF_MES": [date(2026, mes, 15) for mes in meses_alvo]
         })
@@ -108,7 +108,7 @@ class GeradorDossieSafeDriver:
         df_futuro = df_futuro.with_columns([
             pl.col("DATA_REF_MES").cast(pl.Date).alias("DATAOCORRENCIA"),
             pl.lit(0.0).alias("LABEL_PESO_RISCO"),
-            pl.lit("PREVISÃO_MACRO").alias("RUBRICA"), # Marca que é uma previsão otimizada
+            pl.lit("PREVISÃO_MACRO").alias("RUBRICA"), 
             pl.lit(2026).cast(pl.Int32).alias("ANO_JOIN"),
             pl.col("DATA_REF_MES").dt.month().alias("FEAT_MES"),
             pl.col("DATA_REF_MES").dt.weekday().alias("FEAT_DIA_SEMANA")
@@ -178,6 +178,18 @@ class GeradorDossieSafeDriver:
             pl.Series("RISCO_PREDITO_IA", preds_clipped).round(2)
         )
 
+        # --- A MÁGICA DA ARQUITETURA DE DADOS: A Métrica Unificada ---
+        print("🏗️ Gerando Métrica Arquitetural de Volume Equivalente...", flush=True)
+        df_dossie = df_dossie.with_columns(
+            pl.when(pl.col("ANO_JOIN") < 2026)
+            .then(pl.lit(1.0)) # Histórico: 1 linha = 1 crime real
+            .otherwise(
+                # Futuro: Ponderação entre a predição da IA e a densidade criminal da área
+                (pl.col("RISCO_PREDITO_IA") / 10.0) * (pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(1.0) / 12.0) / 4.0
+            ).alias("VOLUME_EQUIVALENTE_LOOKER")
+        )
+        # -------------------------------------------------------------
+
         # 6. DNA DE RISCO (SHAP)
         print("🧬 Analisando DNA criminal (SHAP)...", flush=True)
         df_shap_sample = df_dossie.sample(n=min(35000, df_dossie.height), seed=42)
@@ -219,16 +231,19 @@ class GeradorDossieSafeDriver:
             f"==============================================================\n"
             f" 🛡️ RELATÓRIO DE INTELIGÊNCIA MENSALIZADA - SAFEDRIVER \n"
             f"==============================================================\n"
-            f"1. VOLUMETRIA (Foco: 2025 a 2026 - BQ FREE)\n"
+            f"1. VOLUMETRIA (Foco: 2025 a Agosto 2026 - BQ FREE)\n"
             f"   • Histórico (2025)       : {total_historico:,} eventos\n"
-            f"   • Malha Futura (Macro - 4 Meses) : {total_linhas - total_historico:,} projeções\n\n"
+            f"   • Malha Futura (Macro - 8 Meses) : {total_linhas - total_historico:,} projeções\n\n"
             f"2. RISCO (ESCALA 0.5 A 10)\n"
             f"   • Média de Risco Estado  : {self.auditoria['metricas']['media']:.4f}\n"
             f"   • Risco Máximo (Hotspots): {self.auditoria['metricas']['max']:.4f}\n"
+            f"3. ARQUITETURA\n"
+            f"   • Métrica Looker unificada: 'VOLUME_EQUIVALENTE_LOOKER' adicionada.\n"
             f"==============================================================\n"
         )
         print(report)
-        self._notificar_discord(f"""```text\n{report}\n```""")
+        self._notificar_discord(f"""```text\n{report}\n
+```""")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
