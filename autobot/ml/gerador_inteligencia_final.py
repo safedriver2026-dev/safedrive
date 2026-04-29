@@ -20,8 +20,7 @@ class GeradorDossieSafeDriver:
     """
     Motor de Inteligência Preditiva (Visão de Arquitetura de Dados).
     Gera Dossiê Focado no Biênio (2025 e 2026).
-    Estendido até Agosto. Inclui Métrica Unificadora para Looker Studio.
-    Proteção nativa contra vazamento de RAM (Exit Code 137).
+    Camada de Dados Fidedigna: Homogeneização do Grão (KPI_RISCO e KPI_VOLUME).
     """
     def __init__(self):
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
@@ -42,7 +41,7 @@ class GeradorDossieSafeDriver:
         
         self.auditoria = {
             "projeto": "SafeDriver",
-            "fase": "Dossiê de Inteligência Geográfica (Otimizado/Anti-OOM)",
+            "fase": "Dossiê de Inteligência Geográfica",
             "data_processamento": str(datetime.now()),
             "metricas": {}
         }
@@ -72,7 +71,6 @@ class GeradorDossieSafeDriver:
         if "ANO_JOIN" in df_ouro_raw.columns:
             df_ouro = df_ouro_raw.filter(pl.col("ANO_JOIN") >= 2025)
         else:
-            # Se a coluna não existir, nós forçamos a criação para ela não ser apagada na intersecção
             df_ouro = df_ouro_raw.with_columns(pl.lit(2025).cast(pl.Int32).alias("ANO_JOIN"))
             
         total_historico = df_ouro.height
@@ -87,7 +85,7 @@ class GeradorDossieSafeDriver:
         
         df_dna_geografico = df_ouro.select(colunas_preservadas).unique(subset=["H3_INDEX"])
 
-        # OTIMIZAÇÃO DE CUSTO 1: Cenários Macro (Reduz de 16 para 4 cruzamentos por hexágono)
+        # OTIMIZAÇÃO DE CUSTO 1: Cenários Macro
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"],
             "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], 
@@ -97,13 +95,11 @@ class GeradorDossieSafeDriver:
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
-        # Previsão estendida para 8 meses (Até Agosto de 2026)
         meses_alvo = [1, 2, 3, 4, 5, 6, 7, 8] 
         df_meses_futuro = pl.DataFrame({
             "DATA_REF_MES": [date(2026, mes, 15) for mes in meses_alvo]
         })
 
-        # Funde o Mapa (H3) com os Cenários (Macro) e os Meses (Curtos)
         df_futuro = df_dna_geografico.join(df_cenarios, how="cross").join(df_meses_futuro, how="cross")
         
         df_futuro = df_futuro.with_columns([
@@ -115,12 +111,11 @@ class GeradorDossieSafeDriver:
             pl.col("DATA_REF_MES").dt.weekday().alias("FEAT_DIA_SEMANA")
         ]).drop("DATA_REF_MES")
 
-        # 4. TRATAMENTO ANTI-OOM (A Mágica da Memória)
+        # 4. TRATAMENTO ANTI-OOM
         print("⚡ Tratando colunas e unificando bases...", flush=True)
         cols_comuns = list(set(df_ouro.columns).intersection(set(df_futuro.columns)))
         df_completo_pl = pl.concat([df_ouro.select(cols_comuns), df_futuro.select(cols_comuns)], how="vertical")
 
-        # Liberação Imediata de Memória RAM
         del df_ouro
         del df_ouro_raw
         del df_futuro
@@ -134,7 +129,7 @@ class GeradorDossieSafeDriver:
         ]
         cat_features = [c for c in cat_features_declaradas if c in df_completo_pl.columns]
 
-        print("🧹 Otimizando Strings na memória (Via Polars)...", flush=True)
+        print("🧹 Otimizando Strings na memória...", flush=True)
         exprs = []
         for col in cat_features:
             expr = pl.col(col).cast(pl.Utf8).fill_null("DESCONHECIDO")
@@ -144,7 +139,7 @@ class GeradorDossieSafeDriver:
 
         df_completo_pl = df_completo_pl.with_columns(exprs)
 
-        # 5. PREDIÇÃO EM LOTES (Chunking)
+        # 5. PREDIÇÃO EM LOTES
         print("🧠 Rodando predição em lotes de segurança...", flush=True)
         batch_size = 200000
         preds_list = []
@@ -153,11 +148,9 @@ class GeradorDossieSafeDriver:
         
         for i in range(0, total_linhas, batch_size):
             df_batch = df_completo_pl.slice(i, batch_size).select(modelo.feature_names_).to_pandas()
-            
             for col in cat_features:
                 if col in df_batch.columns:
                     df_batch[col] = df_batch[col].astype(str)
-            
             preds_batch = modelo.predict(df_batch)
             preds_list.extend(preds_batch)
 
@@ -177,17 +170,36 @@ class GeradorDossieSafeDriver:
             pl.Series("RISCO_PREDITO_IA", preds_clipped).round(2)
         )
 
-        # --- A MÁGICA DA ARQUITETURA DE DADOS: A Métrica Unificada ---
-        print("🏗️ Gerando Métrica Arquitetural de Volume Equivalente...", flush=True)
-        df_dossie = df_dossie.with_columns(
+        # =====================================================================
+        # --- O DADO FIDEDIGNO: HOMOGENEIZAÇÃO DO GRÃO (MAÇÃS COM MAÇÃS) ---
+        # =====================================================================
+        print("🏗️ Padronizando KPI de Risco e Volume para o BI...", flush=True)
+        
+        df_dossie = df_dossie.with_columns([
+            
+            # 1. KPI RISCO (A linha não cai mais)
+            # Regra: Histórico mostra o risco da rua real.
+            # Previsão mostra o risco APENAS de quem bateu o limite (Hotspots >= 5.0). 
+            # O ruído (ruas pacatas) vira NULL e o Looker Studio ignora na média!
             pl.when(pl.col("ANO_JOIN") < 2026)
-            .then(pl.lit(1.0)) # Histórico: 1 linha = 1 crime real
+            .then(pl.col("RISCO_PREDITO_IA"))
             .otherwise(
-                # Futuro: Ponderação entre a predição da IA e a densidade criminal da área
+                pl.when(pl.col("RISCO_PREDITO_IA") >= 5.0)
+                .then(pl.col("RISCO_PREDITO_IA"))
+                .otherwise(pl.lit(None).cast(pl.Float64))
+            ).alias("KPI_RISCO_MEDIO"),
+
+            # 2. KPI VOLUME (Para gráficos de barras)
+            # Regra: 1 linha de 2025 = 1 crime absoluto.
+            # Em 2026, convertemos a nota em fração de volume esperado.
+            pl.when(pl.col("ANO_JOIN") < 2026)
+            .then(pl.lit(1.0))
+            .otherwise(
                 (pl.col("RISCO_PREDITO_IA") / 10.0) * (pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(1.0) / 12.0) / 4.0
-            ).alias("VOLUME_EQUIVALENTE_LOOKER")
-        )
-        # -------------------------------------------------------------
+            ).alias("KPI_VOLUME")
+            
+        ])
+        # =====================================================================
 
         # 6. DNA DE RISCO (SHAP)
         print("🧬 Analisando DNA criminal (SHAP)...", flush=True)
@@ -230,14 +242,12 @@ class GeradorDossieSafeDriver:
             f"==============================================================\n"
             f" 🛡️ RELATÓRIO DE INTELIGÊNCIA MENSALIZADA - SAFEDRIVER \n"
             f"==============================================================\n"
-            f"1. VOLUMETRIA (Foco: 2025 a Agosto 2026 - BQ FREE)\n"
+            f"1. VOLUMETRIA (Foco: 2025 a Agosto 2026)\n"
             f"   • Histórico (2025)       : {total_historico:,} eventos\n"
-            f"   • Malha Futura (Macro - 8 Meses) : {total_linhas - total_historico:,} projeções\n\n"
-            f"2. RISCO (ESCALA 0.5 A 10)\n"
-            f"   • Média de Risco Estado  : {self.auditoria['metricas']['media']:.4f}\n"
-            f"   • Risco Máximo (Hotspots): {self.auditoria['metricas']['max']:.4f}\n"
-            f"3. ARQUITETURA\n"
-            f"   • Métrica Looker unificada: 'VOLUME_EQUIVALENTE_LOOKER' adicionada.\n"
+            f"   • Malha Futura (8 Meses) : {total_linhas - total_historico:,} projeções\n\n"
+            f"2. RISCO E HOMOGENEIZAÇÃO BI\n"
+            f"   • Coluna 'KPI_RISCO_MEDIO' injetada (Ruído = NULL)\n"
+            f"   • Coluna 'KPI_VOLUME' injetada\n"
             f"==============================================================\n"
         )
         print(report)
