@@ -15,15 +15,17 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import MinMaxScaler
 import warnings
 
-# Silenciando o ruído visual
+# Silenciando o ruído visual para logs de produção
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class GeradorDossieSafeDriver:
     """
     ENGINE PREDITIVA (Totalmente Alinhada com a ABT Ouro).
-    Arquitetura de respeito à linhagem de dados estruturais (Infra, Social e População).
+    Respeita a linhagem de dados estruturais (Infra, Social e População).
+    Arquitetura: OBT (One Big Table) para BI de Alta Performance.
     """
     def __init__(self):
+        # Configurações de Cloud (R2/S3)
         self.bucket = os.getenv("R2_BUCKET_NAME", "").strip()
         endpoint = os.getenv("R2_ENDPOINT_URL", "").strip().rstrip('/')
         if endpoint.endswith(f"/{self.bucket}"):
@@ -40,6 +42,7 @@ class GeradorDossieSafeDriver:
         self.project_id = "safe-driver-fc3a9"
 
     def _notificar_discord(self, msg):
+        """Monitoramento em tempo real do pipeline via Discord."""
         if self.webhook_url:
             try: requests.post(self.webhook_url, json={"content": msg}, timeout=15)
             except Exception: pass
@@ -59,17 +62,18 @@ class GeradorDossieSafeDriver:
         obj = self.s3.get_object(Bucket=self.bucket, Key="datalake/ouro/safedriver_abt_treino.parquet")
         df_ouro = pl.read_parquet(io.BytesIO(obj['Body'].read()))
         
-        # Correção de nomenclatura de tempo (compatibilidade com ArquitetoOuro)
+        # Correção de nomenclatura de tempo (Compatibilidade com ArquitetoOuro)
         if "ANO_OCORRENCIA" in df_ouro.columns and "ANO_JOIN" not in df_ouro.columns:
             df_ouro = df_ouro.with_columns(pl.col("ANO_OCORRENCIA").alias("ANO_JOIN"))
         
+        # Filtro de biênio para focar no período de análise
         df_ouro = df_ouro.filter(pl.col("ANO_JOIN") >= 2025)
         df_ouro = df_ouro.with_columns(pl.lit(False).alias("IS_MALHA"))
 
         # 3. CONSTRUÇÃO DA MALHA FUTURA (DNA ESPACIAL COMPLETO)
-        print("🔮 Arquitetura: Clonando DNA Estrutural para Malha 2026...")
+        print("🔮 Arquitetura: Clonando DNA Estrutural (Infra + População) para Malha 2026...")
         
-        # Captura TODAS as features estruturais (Infra, FS_, População e Censo)
+        # Captura TODAS as features estruturais para garantir o contrato do modelo
         features_estruturais = [
             c for c in df_ouro.columns 
             if c.startswith("INFRA_") 
@@ -79,9 +83,10 @@ class GeradorDossieSafeDriver:
             or c in ["H3_INDEX", "LATITUDE", "LONGITUDE", "CIDADE", "BAIRRO", "LOGRADOURO"]
         ]
         
+        # Cria um dicionário de hexágonos únicos com suas características fixas
         df_dna_hex = df_ouro.select(features_estruturais).unique(subset=["H3_INDEX"])
 
-        # Cenários Operacionais
+        # Definição de Cenários Operacionais (Manhã, Tarde, Noite, Madrugada)
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"],
             "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], 
@@ -91,10 +96,11 @@ class GeradorDossieSafeDriver:
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
         ])
 
-        # Calendário Preditivo (Jan/2025 a Ago/2026)
+        # Calendário Preditivo (Janeiro/2025 até Agosto/2026)
         datas_malha = [date(2025, m, 15) for m in range(1, 13)] + [date(2026, m, 15) for m in range(1, 9)]
         df_tempo = pl.DataFrame({"DATA_REF": datas_malha})
 
+        # Expansão da Malha Geo-Temporal
         df_malha = df_dna_hex.join(df_cenarios, how="cross").join(df_tempo, how="cross")
         
         df_malha = df_malha.with_columns([
@@ -108,8 +114,8 @@ class GeradorDossieSafeDriver:
             pl.lit(0.0).alias("LABEL_PESO_RISCO")
         ]).drop("DATA_REF")
 
-        # 4. UNIFICAÇÃO
-        print("⚡ Data Wrangling: Unificando Universo...")
+        # 4. UNIFICAÇÃO DO UNIVERSO
+        print("⚡ Data Wrangling: Unificando Fatos e Projeções...")
         cols_comuns = list(set(df_ouro.columns).intersection(set(df_malha.columns)))
         df_master = pl.concat([df_ouro.select(cols_comuns), df_malha.select(cols_comuns)], how="vertical")
 
@@ -117,30 +123,32 @@ class GeradorDossieSafeDriver:
         gc.collect()
 
         # 5. INFERÊNCIA MASSIVA TWEEDIE (TRATAMENTO CIRÚRGICO DE TIPOS)
-        print("🧠 ML: Executando Inferência Massiva (Honrando Tipos de Features)...")
+        print("🧠 ML: Executando Inferência Massiva (Validação de Tipos)...")
         
-        # Filtra apenas as features que o modelo realmente pede
+        # Filtra as features exatas do contrato de treinamento do modelo
         cols_modelo = modelo.feature_names_
         
-        # Tratamento de nulos inteligente para evitar o erro de conversão float
+        # Loop de tipagem para evitar erro de conversão float -> string no CatBoost
         for col in cols_modelo:
             if col in df_master.columns:
-                # Se for numérico, nulo vira 0.0. Se for texto, nulo vira DESCONHECIDO.
+                # Se for numérico, preenche nulos com 0.0 e mantém o tipo numérico
                 if df_master[col].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64, pl.Int8]:
                     df_master = df_master.with_columns(pl.col(col).fill_null(0.0))
                 else:
+                    # Se for categórico, força Utf8 e preenche com "DESCONHECIDO"
                     df_master = df_master.with_columns(pl.col(col).cast(pl.Utf8).fill_null("DESCONHECIDO"))
 
         batch_size = 250000
         preds = []
         for i in range(0, df_master.height, batch_size):
+            # O select garante que a ordem e as colunas enviadas ao CatBoost sejam idênticas ao treino
             batch = df_master.slice(i, batch_size).select(cols_modelo).to_pandas()
-            # CatBoost recebe o DataFrame do Pandas com os tipos corretos (float onde é float)
             preds.extend(modelo.predict(batch))
 
         volume_predito = np.maximum(np.array(preds), 0.0)
         
-        # 6. ENGENHARIA DE RISCO (LOGARÍTMICA)
+        # 6. ENGENHARIA DE RISCO E KPIS DE NEGÓCIO
+        # Risco Preditivo em escala logarítmica (0.5 a 10)
         risco_log = np.log1p(volume_predito)
         p99 = np.percentile(risco_log, 99.9) or 1.0
         risco_final = np.clip(0.5 + (risco_log / p99) * 9.5, 0.5, 10.0)
@@ -150,8 +158,8 @@ class GeradorDossieSafeDriver:
             pl.Series("RISCO_IA", risco_final).round(2)
         ])
 
-        # 7. CLUSTERIZAÇÃO OPERACIONAL
-        print("🤖 Clusterização K-Means (Risco vs Volume)...")
+        # 7. CLUSTERIZAÇÃO K-MEANS PARA TAXONOMIA POLICIAL
+        print("🤖 Clusterização: Definindo Níveis de Alerta Operacional...")
         X_cluster = MinMaxScaler().fit_transform(df_master.select([
             pl.col("RISCO_IA"), 
             pl.col("FS_VOL_CRIMES_ANO_ANT").fill_null(0.0)
@@ -159,31 +167,38 @@ class GeradorDossieSafeDriver:
 
         km = KMeans(n_clusters=4, random_state=42, n_init="auto")
         clusters = km.fit_predict(X_cluster)
+        
+        # Ordenação lógica do rank (0: Baixo, 3: Crítico)
         rank = np.argsort(km.cluster_centers_[:, 0])
         map_rank = {v: i for i, v in enumerate(rank)}
         df_master = df_master.with_columns(pl.Series("CLUSTER_RANK", np.vectorize(map_rank.get)(clusters)))
 
-        # 8. KPIS DE STORYTELLING
+        # 8. KPIS DE STORYTELLING PARA BI (LOOKER / STREAMLIT)
         df_master = df_master.with_columns([
+            # Linha de Evolução: Mostra a tendência de risco em áreas de interesse
             pl.when(pl.col("CLUSTER_RANK") >= 1).then(pl.col("RISCO_IA")).otherwise(pl.lit(None)).alias("KPI_RISCO_EVOLUCAO"),
+            
+            # Volume Total: 1.0 para ocorrências reais (2025) e Volume Tweedie para projeções (2026)
             pl.when(pl.col("IS_MALHA") == False).then(pl.lit(1.0)).otherwise(
                 pl.when(pl.col("ANO_JOIN") == 2026).then(pl.col("VOLUME_TWEEDIE")).otherwise(pl.lit(0.0))
             ).alias("KPI_VOLUME_TOTAL"),
+            
+            # Classificação Operacional para mapas de calor
             pl.when(pl.col("CLUSTER_RANK") == 3).then(pl.lit("🔴 ALERTA CRÍTICO"))
             .when(pl.col("CLUSTER_RANK") == 2).then(pl.lit("🟠 RISCO ALTO"))
             .when(pl.col("CLUSTER_RANK") == 1).then(pl.lit("🟡 ATENÇÃO MÉDIA"))
             .otherwise(pl.lit("🟢 ÁREA MONITORADA")).alias("STATUS_OPERACIONAL")
         ])
 
-        # 9. EXPORTAÇÃO
-        print("📦 Cloud I/O: Sincronizando Datalake...")
+        # 9. EXPORTAÇÃO PARA O DATALAKE
+        print("📦 Cloud I/O: Sincronizando resultados com a Ouro...")
         buf = io.BytesIO()
         df_master.write_parquet(buf, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf.getvalue())
 
         tempo_total = time.time() - inicio_global
-        print(f"✅ Pipeline concluído em {tempo_total:.2f}s")
-        self._notificar_discord(f"🚀 **MOTOR SAFEDRIVER**\nMalha Inteligente gerada com sucesso. Tipagem de dados validada.")
+        print(f"✅ Sucesso: Pipeline SafeDriver finalizado em {tempo_total:.2f}s")
+        self._notificar_discord(f"🚀 **MOTOR SAFEDRIVER**\nMalha Preditiva gerada com sucesso. Tipagem e DNA estrutural validados.")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
