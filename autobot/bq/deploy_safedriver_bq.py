@@ -71,7 +71,7 @@ class DeploySafeDriverBigQuery:
         sql_matriz = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_matriz_risco` AS
         WITH Base AS (
-          SELECT H3_INDEX, COUNT(1) as VOLUME_REAL, AVG(RISCO_IA) as RISCO_MEDIO_REAL
+          SELECT H3_INDEX, COUNT(1) as VOLUME_REAL, ROUND(AVG(RISCO_IA), 2) as RISCO_MEDIO_REAL
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
           WHERE IS_MALHA = FALSE AND ANO_JOIN = 2025
           GROUP BY H3_INDEX
@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Consolidando arquitetura OBT H3-Agregada com Bounding Box SP...", flush=True)
+        print("[PROCESSAMENTO] Consolidando arquitetura OBT H3-Agregada com Bounding Box SP e Arredondamento...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -127,9 +127,9 @@ class DeploySafeDriverBigQuery:
             ANY_VALUE(GEOMETRIA_PONTO) AS GEOMETRIA_PONTO,
             
             COUNT(1) AS QTD_EVENTOS_HISTORICOS,
-            AVG(RISCO_IA) AS RISCO_IA_MEDIO,
-            SUM(VOLUME_TWEEDIE) AS SOMA_VOLUME_TWEEDIE,
-            AVG(KPI_RISCO_EVOLUCAO) AS MEDIA_RISCO_EVOLUCAO,
+            ROUND(AVG(RISCO_IA), 2) AS RISCO_IA_MEDIO,
+            ROUND(SUM(VOLUME_TWEEDIE), 2) AS SOMA_VOLUME_TWEEDIE,
+            ROUND(AVG(KPI_RISCO_EVOLUCAO), 2) AS MEDIA_RISCO_EVOLUCAO,
             
             MAX(STATUS_OPERACIONAL) AS STATUS_OPERACIONAL_PREDOMINANTE,
             MAX(CLUSTER_RANK) AS CLUSTER_RANK_PREDOMINANTE,
@@ -180,7 +180,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SISTEMA] Processo de integração finalizado. Tempo de execução: {duracao}s")
-        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT executado com sucesso em {duracao}s. Tabela tb_looker_master_final atualizada sem anomalias no mar.")
+        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT executado com sucesso em {duracao}s. Tabela tb_looker_master_final atualizada.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
