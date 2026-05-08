@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Consolidando arquitetura OBT H3-Agregada com Bounding Box SP e Arredondamento...", flush=True)
+        print("[PROCESSAMENTO] Consolidando arquitetura OBT H3-Agregada com Bounding Box SP e Exclusão Cidades Inválidas...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -116,6 +116,10 @@ class DeploySafeDriverBigQuery:
             AND lat_fix != 0.0 AND lon_fix != 0.0
             AND lat_fix BETWEEN -25.50 AND -19.50
             AND lon_fix BETWEEN -53.50 AND -44.00
+            -- Nova regra: Só aceita registros onde a cidade não seja DESCONHECIDO
+            -- e exista na nossa tabela de DNA de cidades (que é o espelho do shapefile SP)
+            AND CIDADE != 'DESCONHECIDO'
+            AND CAST(CIDADE AS STRING) IN (SELECT CAST(CIDADE AS STRING) FROM `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade`)
         ),
         Base_Agregada AS (
           SELECT 
@@ -180,7 +184,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SISTEMA] Processo de integração finalizado. Tempo de execução: {duracao}s")
-        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT executado com sucesso em {duracao}s. Tabela tb_looker_master_final atualizada.")
+        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT executado com sucesso em {duracao}s. Tabela tb_looker_master_final atualizada sem anomalias e cidades de fora.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
