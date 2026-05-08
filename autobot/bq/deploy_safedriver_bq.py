@@ -3,14 +3,12 @@ import io
 import json
 import boto3
 import polars as pl
-import pandas as pd
 import time
 import requests
-import gc
+import warnings
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from botocore.config import Config
-import warnings
 
 warnings.filterwarnings("ignore")
 
@@ -58,7 +56,14 @@ class DeploySafeDriverBigQuery:
         """Extrai artefatos gerados pelo motor preditivo."""
         print(f"[SISTEMA] Extraindo artefato do repositório: {key}", flush=True)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        return pl.read_parquet(io.BytesIO(obj['Body'].read())).to_pandas()
+        # Otimização Polars: casting forçado para string de datas corrompidas antes do pandas
+        df = pl.read_parquet(io.BytesIO(obj['Body'].read()))
+        # Tratamento preventivo de LAT/LON mal formatada no Pandas/BigQuery
+        if "LATITUDE" in df.columns:
+            df = df.with_columns(pl.col("LATITUDE").cast(pl.Float64, strict=False).fill_null(0.0))
+        if "LONGITUDE" in df.columns:
+            df = df.with_columns(pl.col("LONGITUDE").cast(pl.Float64, strict=False).fill_null(0.0))
+        return df.to_pandas()
 
     def _upload_table(self, df_pandas, table_name):
         """Carrega os dataframes temporários no data warehouse."""
@@ -73,7 +78,6 @@ class DeploySafeDriverBigQuery:
     def _construir_matriz_risco_intermediaria(self):
         """
         Gera os quadrantes de risco operacional com base nos registros históricos de 2025.
-        Utilizado para validação estatística no gráfico de dispersão.
         """
         print("[PROCESSAMENTO] Compilando matriz de risco operacional...", flush=True)
         sql_matriz = f"""
@@ -85,7 +89,8 @@ class DeploySafeDriverBigQuery:
           GROUP BY H3_INDEX
         ),
         CrimeRank AS (
-          SELECT H3_INDEX, RUBRICA, COUNT(1) as qtd, ROW_NUMBER() OVER(PARTITION BY H3_INDEX ORDER BY COUNT(1) DESC) as rnk
+          SELECT H3_INDEX, RUBRICA, COUNT(1) as qtd, 
+                 ROW_NUMBER() OVER(PARTITION BY H3_INDEX ORDER BY COUNT(1) DESC) as rnk
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
           WHERE IS_MALHA = FALSE AND ANO_JOIN = 2025
           GROUP BY H3_INDEX, RUBRICA
@@ -104,48 +109,76 @@ class DeploySafeDriverBigQuery:
 
     def _construir_obt_looker(self):
         """
-        Sintetiza a tabela final (OBT), aplicando transformações geoespaciais
-        e integrando os tensores SHAP no nível municipal.
+        Sintetiza a tabela final (OBT), aplicando transformações geoespaciais e agregando
+        os dados por H3/Ano/Mês para garantir a fluidez da apresentação do dashboard.
         """
-        print("[PROCESSAMENTO] Consolidando arquitetura OBT (One Big Table)...", flush=True)
+        print("[PROCESSAMENTO] Consolidando arquitetura OBT H3-Agregada...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
-        WITH Base_Fix AS (
-          SELECT *,
-            CASE WHEN ABS(CAST(LATITUDE AS FLOAT64)) > 90 THEN CAST(LATITUDE AS FLOAT64) / 1000000 ELSE CAST(LATITUDE AS FLOAT64) END as lat_fix,
-            CASE WHEN ABS(CAST(LONGITUDE AS FLOAT64)) > 180 THEN CAST(LONGITUDE AS FLOAT64) / 1000000 ELSE CAST(LONGITUDE AS FLOAT64) END as lon_fix
+        WITH Base_Limpa AS (
+          SELECT 
+            *,
+            -- Limpeza de coordenadas espúrias
+            CASE WHEN ABS(LATITUDE) > 90 THEN LATITUDE / 1000000 ELSE LATITUDE END as lat_fix,
+            CASE WHEN ABS(LONGITUDE) > 180 THEN LONGITUDE / 1000000 ELSE LONGITUDE END as lon_fix,
+            EXTRACT(MONTH FROM CAST(DATAOCORRENCIA AS DATE)) AS MES
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
+          WHERE LATITUDE IS NOT NULL AND LONGITUDE IS NOT NULL
+        ),
+        Base_Agregada AS (
+          SELECT 
+            H3_INDEX,
+            ANO_JOIN AS ANO,
+            MES,
+            -- Assume a primeira localização, cidade e bairro para cada agrupamento hexágono
+            ANY_VALUE(CIDADE) AS CIDADE,
+            ANY_VALUE(BAIRRO) AS BAIRRO,
+            ANY_VALUE(lat_fix) AS lat_fix,
+            ANY_VALUE(lon_fix) AS lon_fix,
+            
+            -- Métricas Quantitativas do Hexágono por Mês/Ano
+            COUNT(NUM_BO) AS QTD_EVENTOS_HISTORICOS,
+            AVG(RISCO_IA) AS RISCO_IA_MEDIO,
+            SUM(VOLUME_TWEEDIE) AS SOMA_VOLUME_TWEEDIE,
+            AVG(KPI_RISCO_EVOLUCAO) AS MEDIA_RISCO_EVOLUCAO,
+            
+            -- Categorias Predominantes
+            ANY_VALUE(STATUS_OPERACIONAL) AS STATUS_OPERACIONAL_PREDOMINANTE,
+            ANY_VALUE(CLUSTER_RANK) AS CLUSTER_RANK_PREDOMINANTE,
+            LOGICAL_OR(IS_MALHA) AS TEM_PREVISAO_MALHA
+
+          FROM Base_Limpa
+          GROUP BY H3_INDEX, ANO_JOIN, MES
         )
+        
         SELECT 
-            -- Temporalidade
-            DATE_TRUNC(CAST(e.DATAOCORRENCIA AS DATE), MONTH) AS DATA_REFERENCIA_MES,
-            e.ANO_JOIN AS ANO,
-            CASE WHEN e.IS_MALHA THEN 'PREVISAO (MALHA)' ELSE 'HISTORICO (BO)' END AS TIPO_REGISTRO,
+            -- Temporalidade Agregada
+            DATE(b.ANO, b.MES, 1) AS DATA_REFERENCIA_MES,
+            b.ANO,
+            CASE WHEN b.TEM_PREVISAO_MALHA THEN 'PREVISAO HIBRIDA' ELSE 'HISTORICO (BO)' END AS TIPO_REGISTRO,
 
             -- Geografia espacial
-            e.H3_INDEX, e.CIDADE, e.BAIRRO, e.LOGRADOURO,
-            ST_GEOGPOINT(e.lon_fix, e.lat_fix) AS GEOMETRIA_PONTO,
+            b.H3_INDEX, b.CIDADE, b.BAIRRO,
+            ST_GEOGPOINT(b.lon_fix, b.lat_fix) AS GEOMETRIA_PONTO,
 
-            -- Indicadores de modelagem (Tweedie)
-            e.RISCO_IA,
-            e.VOLUME_TWEEDIE,
-            e.KPI_RISCO_EVOLUCAO,
-            e.KPI_VOLUME_TOTAL,
-            e.STATUS_OPERACIONAL,
-            e.CLUSTER_RANK,
+            -- Indicadores Numéricos
+            b.QTD_EVENTOS_HISTORICOS,
+            b.RISCO_IA_MEDIO,
+            b.SOMA_VOLUME_TWEEDIE,
+            b.MEDIA_RISCO_EVOLUCAO,
+            b.STATUS_OPERACIONAL_PREDOMINANTE,
+            b.CLUSTER_RANK_PREDOMINANTE,
             
-            -- Contexto tático
-            COALESCE(m.QUADRANTE, 'AREA SEM REGISTRO 2025') AS QUADRANTE_RISCO,
+            -- Contexto Tático (Matriz de Risco)
+            COALESCE(m.QUADRANTE, 'AREA SEM REGISTRO HISTORICO') AS QUADRANTE_RISCO,
             m.TOP_CRIME AS CRIME_PREDOMINANTE_H3,
-            e.SAZON_PERIODO AS PERIODO_DIA,
-            e.FEAT_CONTEXTO_CRITICO AS CENARIO_ALVO,
             
             -- Explicabilidade (SHAP agregado por Cidade)
             s.* EXCEPT(CIDADE)
 
-        FROM Base_Fix e
-        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_matriz_risco` m ON e.H3_INDEX = m.H3_INDEX
-        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s ON CAST(e.CIDADE AS STRING) = CAST(s.CIDADE AS STRING) 
+        FROM Base_Agregada b
+        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_matriz_risco` m ON b.H3_INDEX = m.H3_INDEX
+        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s ON CAST(b.CIDADE AS STRING) = CAST(s.CIDADE AS STRING) 
         """
         self.bq_client.query(sql_obt).result()
 
@@ -166,7 +199,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SISTEMA] Processo de integração finalizado. Tempo de execução: {duracao}s")
-        self._notificar_webhook("[INFO] Pipeline BigQuery executado com sucesso. Tabela master estruturada e atualizada.")
+        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT executado com sucesso em {duracao}s. Tabela tb_looker_master_final atualizada.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
