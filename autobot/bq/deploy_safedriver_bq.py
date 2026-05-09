@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Consolidando OBT: Corrigindo quebra da linha do tempo e inteiros...", flush=True)
+        print("[PROCESSAMENTO] Consolidando OBT: Preparando para Comparação Semestral...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -104,7 +104,7 @@ class DeploySafeDriverBigQuery:
             *,
             CASE WHEN ABS(LATITUDE) > 90 THEN LATITUDE / 1000000 ELSE LATITUDE END as lat_fix,
             CASE WHEN ABS(LONGITUDE) > 180 THEN LONGITUDE / 1000000 ELSE LONGITUDE END as lon_fix,
-            EXTRACT(MONTH FROM CAST(DATAOCORRENCIA AS DATE)) AS MES
+            EXTRACT(MONTH FROM CAST(DATAOCORRENCIA AS DATE)) AS MES_NUM
           FROM `{self.project_id}.{self.dataset_id}.tb_dossie_eventos`
         ),
         Base_Geo_Filtrada AS (
@@ -121,33 +121,31 @@ class DeploySafeDriverBigQuery:
           SELECT 
             H3_INDEX,
             ANO_JOIN AS ANO,
-            MES,
+            MES_NUM AS MES,
             ANY_VALUE(CIDADE) AS CIDADE,
             ANY_VALUE(BAIRRO) AS BAIRRO,
             ANY_VALUE(GEOMETRIA_PONTO) AS GEOMETRIA_PONTO,
             
-            -- Só conta como evento histórico se NÃO for previsão de malha
-            SUM(CASE WHEN IS_MALHA = FALSE THEN 1 ELSE NULL END) AS QTD_EVENTOS_HISTORICOS,
-            
+            SUM(CASE WHEN IS_MALHA = FALSE THEN 1 ELSE 0 END) AS QTD_EVENTOS_HISTORICOS,
             ROUND(AVG(RISCO_IA), 2) AS RISCO_IA_MEDIO,
-            
-            -- Só soma a projeção se FOR malha, arredonda para 0 casas e converte para INTEIRO
-            CAST(ROUND(SUM(CASE WHEN IS_MALHA = TRUE THEN VOLUME_TWEEDIE ELSE NULL END), 0) AS INT64) AS SOMA_VOLUME_TWEEDIE,
-            
-            ROUND(AVG(KPI_RISCO_EVOLUCAO), 2) AS MEDIA_RISCO_EVOLUCAO,
+            CAST(ROUND(SUM(CASE WHEN IS_MALHA = TRUE THEN VOLUME_TWEEDIE ELSE 0 END), 0) AS INT64) AS SOMA_VOLUME_TWEEDIE,
             
             MAX(STATUS_OPERACIONAL) AS STATUS_OPERACIONAL_PREDOMINANTE,
-            MAX(CLUSTER_RANK) AS CLUSTER_RANK_PREDOMINANTE,
             LOGICAL_OR(IS_MALHA) AS TEM_PREVISAO_MALHA
 
           FROM Base_Geo_Filtrada
-          GROUP BY H3_INDEX, ANO_JOIN, MES
+          GROUP BY H3_INDEX, ANO_JOIN, MES_NUM
         )
         
         SELECT 
             DATE(b.ANO, b.MES, 1) AS DATA_REFERENCIA_MES,
             b.ANO,
-            CASE WHEN b.TEM_PREVISAO_MALHA THEN 'PREVISÃO HIBRIDA' ELSE 'HISTÓRICO (BO)' END AS TIPO_REGISTRO,
+            b.MES,
+            CASE 
+                WHEN b.MES <= 6 THEN '1º SEMESTRE' 
+                ELSE '2º SEMESTRE' 
+            END AS SEMESTRE,
+            CASE WHEN b.TEM_PREVISAO_MALHA THEN 'PREVISÃO IA' ELSE 'HISTÓRICO REAL' END AS TIPO_DADO,
 
             b.H3_INDEX, b.CIDADE, b.BAIRRO,
             b.GEOMETRIA_PONTO,
@@ -155,9 +153,6 @@ class DeploySafeDriverBigQuery:
             b.QTD_EVENTOS_HISTORICOS,
             b.RISCO_IA_MEDIO,
             b.SOMA_VOLUME_TWEEDIE,
-            b.MEDIA_RISCO_EVOLUCAO,
-            b.STATUS_OPERACIONAL_PREDOMINANTE,
-            b.CLUSTER_RANK_PREDOMINANTE,
             
             COALESCE(m.QUADRANTE, 'ÁREA SEM REGISTRO HISTÓRICO') AS QUADRANTE_RISCO,
             m.TOP_CRIME AS CRIME_PREDOMINANTE_H3,
@@ -186,8 +181,8 @@ class DeploySafeDriverBigQuery:
         self._construir_obt_looker()
 
         duracao = round(time.time() - inicio_deploy, 2)
-        print(f"[SISTEMA] Processo finalizado em {duracao}s. Transição temporal e Tweedie Inteiro corrigidos.")
-        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT finalizado.")
+        print(f"[SISTEMA] Processo finalizado em {duracao}s. Base preparada para comparação 2025 vs 2026.")
+        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Pronto para visualização semestral.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
