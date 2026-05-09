@@ -86,9 +86,9 @@ class DeploySafeDriverBigQuery:
         SELECT 
           b.H3_INDEX, b.VOLUME_REAL, b.RISCO_MEDIO_REAL, c.RUBRICA as TOP_CRIME,
           CASE 
-            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL >= 7.0 THEN '1 - ZONA CRITICA'
+            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL >= 7.0 THEN '1 - ZONA CRÍTICA'
             WHEN b.VOLUME_REAL < 30  AND b.RISCO_MEDIO_REAL >= 7.0 THEN '2 - RISCO VITAL'
-            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL < 7.0  THEN '3 - ATENCAO ALTA'
+            WHEN b.VOLUME_REAL >= 30 AND b.RISCO_MEDIO_REAL < 7.0  THEN '3 - ATENÇÃO ALTA'
             ELSE '4 - MONITORAMENTO'
           END AS QUADRANTE
         FROM Base b LEFT JOIN CrimeRank c ON b.H3_INDEX = c.H3_INDEX AND c.rnk = 1
@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Consolidando arquitetura OBT H3-Agregada com Bounding Box SP e Exclusão Cidades Inválidas...", flush=True)
+        print("[PROCESSAMENTO] Consolidando OBT: Aplicando Filtro Estrito de São Paulo...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -114,12 +114,9 @@ class DeploySafeDriverBigQuery:
           FROM Base_Limpa
           WHERE lat_fix IS NOT NULL AND lon_fix IS NOT NULL
             AND lat_fix != 0.0 AND lon_fix != 0.0
-            AND lat_fix BETWEEN -25.50 AND -19.50
-            AND lon_fix BETWEEN -53.50 AND -44.00
-            -- Nova regra: Só aceita registros onde a cidade não seja DESCONHECIDO
-            -- e exista na nossa tabela de DNA de cidades (que é o espelho do shapefile SP)
-            AND CIDADE != 'DESCONHECIDO'
-            AND CAST(CIDADE AS STRING) IN (SELECT CAST(CIDADE AS STRING) FROM `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade`)
+            -- Bounding Box ajustado estritamente para o contorno de SP
+            AND lat_fix BETWEEN -25.31 AND -19.78
+            AND lon_fix BETWEEN -53.11 AND -44.16
         ),
         Base_Agregada AS (
           SELECT 
@@ -146,7 +143,7 @@ class DeploySafeDriverBigQuery:
         SELECT 
             DATE(b.ANO, b.MES, 1) AS DATA_REFERENCIA_MES,
             b.ANO,
-            CASE WHEN b.TEM_PREVISAO_MALHA THEN 'PREVISAO HIBRIDA' ELSE 'HISTORICO (BO)' END AS TIPO_REGISTRO,
+            CASE WHEN b.TEM_PREVISAO_MALHA THEN 'PREVISÃO HIBRIDA' ELSE 'HISTÓRICO (BO)' END AS TIPO_REGISTRO,
 
             b.H3_INDEX, b.CIDADE, b.BAIRRO,
             b.GEOMETRIA_PONTO,
@@ -158,20 +155,23 @@ class DeploySafeDriverBigQuery:
             b.STATUS_OPERACIONAL_PREDOMINANTE,
             b.CLUSTER_RANK_PREDOMINANTE,
             
-            COALESCE(m.QUADRANTE, 'AREA SEM REGISTRO HISTORICO') AS QUADRANTE_RISCO,
+            COALESCE(m.QUADRANTE, 'ÁREA SEM REGISTRO HISTÓRICO') AS QUADRANTE_RISCO,
             m.TOP_CRIME AS CRIME_PREDOMINANTE_H3,
             
             s.* EXCEPT(CIDADE)
 
         FROM Base_Agregada b
-        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_matriz_risco` m ON b.H3_INDEX = m.H3_INDEX
-        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s ON CAST(b.CIDADE AS STRING) = CAST(s.CIDADE AS STRING) 
+        -- O segredo está aqui: INNER JOIN garante que só entram cidades oficiais de SP
+        INNER JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s 
+          ON CAST(b.CIDADE AS STRING) = CAST(s.CIDADE AS STRING)
+        LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_matriz_risco` m 
+          ON b.H3_INDEX = m.H3_INDEX
         """
         self.bq_client.query(sql_obt).result()
 
     def executar_deploy(self):
         inicio_deploy = time.time()
-        print(f"[SISTEMA] Iniciando pipeline de integração de dados - Projeto: {self.project_id}", flush=True)
+        print(f"[SISTEMA] Iniciando pipeline SafeDriver - Projeto: {self.project_id}", flush=True)
 
         df_eventos = self._ler_parquet_r2("datalake/ouro/looker_dossie_eventos.parquet")
         self._upload_table(df_eventos, "tb_dossie_eventos")
@@ -183,8 +183,8 @@ class DeploySafeDriverBigQuery:
         self._construir_obt_looker()
 
         duracao = round(time.time() - inicio_deploy, 2)
-        print(f"[SISTEMA] Processo de integração finalizado. Tempo de execução: {duracao}s")
-        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT executado com sucesso em {duracao}s. Tabela tb_looker_master_final atualizada sem anomalias e cidades de fora.")
+        print(f"[SISTEMA] Processo finalizado em {duracao}s. Mapa limpo e restrito a SP.")
+        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT finalizado. O mapa agora utiliza INNER JOIN para exclusão total de anomalias fora de SP.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
