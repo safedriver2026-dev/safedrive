@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Consolidando OBT: Aplicando Filtro Estrito de São Paulo...", flush=True)
+        print("[PROCESSAMENTO] Consolidando OBT: Corrigindo quebra da linha do tempo e inteiros...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -114,7 +114,6 @@ class DeploySafeDriverBigQuery:
           FROM Base_Limpa
           WHERE lat_fix IS NOT NULL AND lon_fix IS NOT NULL
             AND lat_fix != 0.0 AND lon_fix != 0.0
-            -- Bounding Box ajustado estritamente para o contorno de SP
             AND lat_fix BETWEEN -25.31 AND -19.78
             AND lon_fix BETWEEN -53.11 AND -44.16
         ),
@@ -127,9 +126,14 @@ class DeploySafeDriverBigQuery:
             ANY_VALUE(BAIRRO) AS BAIRRO,
             ANY_VALUE(GEOMETRIA_PONTO) AS GEOMETRIA_PONTO,
             
-            COUNT(1) AS QTD_EVENTOS_HISTORICOS,
+            -- Só conta como evento histórico se NÃO for previsão de malha
+            SUM(CASE WHEN IS_MALHA = FALSE THEN 1 ELSE NULL END) AS QTD_EVENTOS_HISTORICOS,
+            
             ROUND(AVG(RISCO_IA), 2) AS RISCO_IA_MEDIO,
-            ROUND(SUM(VOLUME_TWEEDIE), 2) AS SOMA_VOLUME_TWEEDIE,
+            
+            -- Só soma a projeção se FOR malha, arredonda para 0 casas e converte para INTEIRO
+            CAST(ROUND(SUM(CASE WHEN IS_MALHA = TRUE THEN VOLUME_TWEEDIE ELSE NULL END), 0) AS INT64) AS SOMA_VOLUME_TWEEDIE,
+            
             ROUND(AVG(KPI_RISCO_EVOLUCAO), 2) AS MEDIA_RISCO_EVOLUCAO,
             
             MAX(STATUS_OPERACIONAL) AS STATUS_OPERACIONAL_PREDOMINANTE,
@@ -161,7 +165,6 @@ class DeploySafeDriverBigQuery:
             s.* EXCEPT(CIDADE)
 
         FROM Base_Agregada b
-        -- O segredo está aqui: INNER JOIN garante que só entram cidades oficiais de SP
         INNER JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s 
           ON CAST(b.CIDADE AS STRING) = CAST(s.CIDADE AS STRING)
         LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_matriz_risco` m 
@@ -183,8 +186,8 @@ class DeploySafeDriverBigQuery:
         self._construir_obt_looker()
 
         duracao = round(time.time() - inicio_deploy, 2)
-        print(f"[SISTEMA] Processo finalizado em {duracao}s. Mapa limpo e restrito a SP.")
-        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT finalizado. O mapa agora utiliza INNER JOIN para exclusão total de anomalias fora de SP.")
+        print(f"[SISTEMA] Processo finalizado em {duracao}s. Transição temporal e Tweedie Inteiro corrigidos.")
+        self._notificar_webhook(f"[INFO] Pipeline BigQuery OBT finalizado.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
