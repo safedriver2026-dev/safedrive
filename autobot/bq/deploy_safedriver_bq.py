@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Consolidando OBT: Restaurando campos ausentes e preparando comparação...", flush=True)
+        print("[PROCESSAMENTO] Refatorando OBT: Pivotando os anos para colunas independentes...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -120,47 +120,48 @@ class DeploySafeDriverBigQuery:
         Base_Agregada AS (
           SELECT 
             H3_INDEX,
-            ANO_JOIN AS ANO,
             MES_NUM AS MES,
             ANY_VALUE(CIDADE) AS CIDADE,
             ANY_VALUE(BAIRRO) AS BAIRRO,
             ANY_VALUE(GEOMETRIA_PONTO) AS GEOMETRIA_PONTO,
             
-            SUM(CASE WHEN IS_MALHA = FALSE THEN 1 ELSE 0 END) AS QTD_EVENTOS_HISTORICOS,
-            ROUND(AVG(RISCO_IA), 2) AS RISCO_IA_MEDIO,
-            CAST(ROUND(SUM(CASE WHEN IS_MALHA = TRUE THEN VOLUME_TWEEDIE ELSE 0 END), 0) AS INT64) AS SOMA_VOLUME_TWEEDIE,
+            -- O REFACTORING (PIVOT): O passado e o futuro agora são colunas separadas na mesma linha
+            SUM(CASE WHEN ANO_JOIN = 2025 AND IS_MALHA = FALSE THEN 1 ELSE 0 END) AS HISTORICO_2025,
+            CAST(ROUND(SUM(CASE WHEN ANO_JOIN = 2026 AND IS_MALHA = TRUE THEN VOLUME_TWEEDIE ELSE 0 END), 0) AS INT64) AS PREDICAO_2026,
             
-            -- CAMPOS RESTAURADOS AQUI
+            ROUND(AVG(RISCO_IA), 2) AS RISCO_IA_MEDIO,
             ROUND(AVG(KPI_RISCO_EVOLUCAO), 2) AS MEDIA_RISCO_EVOLUCAO,
             MAX(STATUS_OPERACIONAL) AS STATUS_OPERACIONAL_PREDOMINANTE,
-            MAX(CLUSTER_RANK) AS CLUSTER_RANK_PREDOMINANTE,
+            MAX(CLUSTER_RANK) AS CLUSTER_RANK_PREDOMINANTE
             
-            LOGICAL_OR(IS_MALHA) AS TEM_PREVISAO_MALHA
-
           FROM Base_Geo_Filtrada
-          GROUP BY H3_INDEX, ANO_JOIN, MES_NUM
+          GROUP BY H3_INDEX, MES_NUM
         )
         
         SELECT 
-            DATE(b.ANO, b.MES, 1) AS DATA_REFERENCIA_MES,
-            b.ANO,
+            -- Data ancorada para o Looker reconhecer como série temporal sem quebrar
+            DATE(2026, b.MES, 1) AS DATA_REFERENCIA_MES,
+            2026 AS ANO,
             b.MES,
             CASE 
                 WHEN b.MES <= 6 THEN '1º SEMESTRE' 
                 ELSE '2º SEMESTRE' 
             END AS SEMESTRE,
             
-            -- NOME ORIGINAL RESTAURADO PARA NÃO QUEBRAR O LOOKER
-            CASE WHEN b.TEM_PREVISAO_MALHA THEN 'PREVISÃO IA' ELSE 'HISTÓRICO REAL' END AS TIPO_REGISTRO,
+            'COMPARATIVO YOY' AS TIPO_REGISTRO,
 
             b.H3_INDEX, b.CIDADE, b.BAIRRO,
             b.GEOMETRIA_PONTO,
 
-            b.QTD_EVENTOS_HISTORICOS,
-            b.RISCO_IA_MEDIO,
-            b.SOMA_VOLUME_TWEEDIE,
+            -- Mantemos os nomes antigos para não quebrar o Mapa e KPIs que você já fez
+            b.HISTORICO_2025 AS QTD_EVENTOS_HISTORICOS,
+            b.PREDICAO_2026 AS SOMA_VOLUME_TWEEDIE,
             
-            -- CAMPOS RESTAURADOS NO SELECT FINAL
+            -- Novas colunas exclusivas para o Gráfico de Comparação
+            b.HISTORICO_2025,
+            b.PREDICAO_2026,
+            
+            b.RISCO_IA_MEDIO,
             b.MEDIA_RISCO_EVOLUCAO,
             b.STATUS_OPERACIONAL_PREDOMINANTE,
             b.CLUSTER_RANK_PREDOMINANTE,
@@ -192,8 +193,8 @@ class DeploySafeDriverBigQuery:
         self._construir_obt_looker()
 
         duracao = round(time.time() - inicio_deploy, 2)
-        print(f"[SISTEMA] Processo finalizado em {duracao}s. Base corrigida e campos restaurados.")
-        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Schema 100% restaurado.")
+        print(f"[SISTEMA] Processo finalizado em {duracao}s. Base refatorada para modelo Wide.")
+        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
