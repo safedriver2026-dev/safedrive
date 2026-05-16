@@ -135,26 +135,60 @@ class IngestorSafeDriver:
     def _resgatar_espacial(self, df: pl.DataFrame):
         if self.df_lookup_vias is None: 
             return df, {"p1_exato": 0, "p2_prefixo": 0, "p3_bairro": 0}
+            
         df = df.with_columns([
             pl.col("MUNICIPIO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("MUN_NORM"),
             pl.col("BAIRRO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("BAI_NORM"),
             pl.col("LOGRADOURO").map_elements(self._normalizar_logradouro, return_dtype=pl.Utf8).alias("LOG_BASE")
         ])
         df = df.with_columns(pl.col("LOG_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("LOG_PREFIX"))
+        
+        # ---------------------------------------------------------
+        # PASSO 0: Validação de Coordenada Original (Auditoria H3)
+        # ---------------------------------------------------------
+        # Trazemos o H3 do Bairro como referência espacial segura
+        df = df.join(self.df_lookup_bairro, left_on=["MUN_NORM", "BAI_NORM"], right_on=["CID_NORM", "BAI_NORM"], how="left")
+        
+        def _validar_coordenada(row):
+            h3_origem = row["H3_INDEX"]
+            h3_referencia = row["H3_BAIRRO"]
+            
+            if not h3_origem or not h3_referencia:
+                return h3_origem # Se já for nulo, segue para o resgate normal
+                
+            try:
+                # Calcula a distância em hexágonos. Resolução 9 = ~174m por hexágono.
+                # 30 hexágonos de distância = ~5.2 km de tolerância.
+                distancia = h3.grid_distance(h3_origem, h3_referencia)
+                if distancia > 30:
+                    return None # Coordenada original é fraude/erro. Anula para forçar o resgate.
+                return h3_origem
+            except:
+                # Se houver erro no cálculo (ex: hexágonos muito distantes disparam erro no grid_distance)
+                return None
+
+        # Aplica a invalidação de GPS incorretos
+        df = df.with_columns(
+            pl.struct(["H3_INDEX", "H3_BAIRRO"]).map_elements(_validar_coordenada, return_dtype=pl.Utf8).alias("H3_INDEX")
+        )
+        # ---------------------------------------------------------
+
         count_init = df.filter(pl.col("H3_INDEX").is_not_null()).height
         
+        # Passo 1: Rua Exata
         df = df.join(self.df_lookup_vias, left_on=["MUN_NORM", "BAI_NORM", "LOG_BASE"], right_on=["CID_NORM", "BAI_NORM", "RUA_BASE"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         count_p1 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p1 = count_p1 - count_init
         
+        # Passo 2: Prefixo
         df = df.join(self.df_lookup_prefix.select(["CID_NORM", "RUA_PREFIX", "H3_INDEX"]), left_on=["MUN_NORM", "LOG_PREFIX"], right_on=["CID_NORM", "RUA_PREFIX"], how="left") \
                .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
         count_p2 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p2 = count_p2 - count_p1
         
-        df = df.join(self.df_lookup_bairro, left_on=["MUN_NORM", "BAI_NORM"], right_on=["CID_NORM", "BAI_NORM"], how="left") \
-               .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop("H3_BAIRRO")
+        # Passo 3: Centroide do Bairro
+        df = df.with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop("H3_BAIRRO")
         count_p3 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p3 = count_p3 - count_p2
         
