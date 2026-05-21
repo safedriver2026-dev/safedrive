@@ -69,15 +69,15 @@ class GeradorDossieSafeDriver:
         # Extração de localizações únicas
         df_dna_hex = df_ouro.select(features_geo + features_estruturais).unique(subset=["H3_INDEX"])
 
-        # Definição dos cenários de predição
+        # Definição dos cenários de predição (CORRIGIDO)
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"],
             "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], 
             "FEAT_PERFIL_VITIMA": ["PEDESTRE", "MOTORISTA", "MOTORISTA", "PEDESTRE"]
         }).with_columns([
-            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]),
+            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO"),
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
-        ]).rename({"SAZON_PERIODO_FEAT_PERFIL_VITIMA": "FEAT_CONTEXTO_CRITICO"})
+        ])
 
         # Geração do vetor temporal
         datas_malha = [date(2025, m, 15) for m in range(1, 13)] + [date(2026, m, 15) for m in range(1, 9)]
