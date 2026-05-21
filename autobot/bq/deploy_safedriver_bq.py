@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Refatorando OBT: Pivotando os anos para colunas independentes...", flush=True)
+        print("[PROCESSAMENTO] Refatorando OBT: Pivotando os anos e integrando granularidade por logradouro...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -123,9 +123,9 @@ class DeploySafeDriverBigQuery:
             MES_NUM AS MES,
             ANY_VALUE(CIDADE) AS CIDADE,
             ANY_VALUE(BAIRRO) AS BAIRRO,
+            ANY_VALUE(LOGRADOURO) AS LOGRADOURO,
             ANY_VALUE(GEOMETRIA_PONTO) AS GEOMETRIA_PONTO,
             
-            -- O REFACTORING (PIVOT): O passado e o futuro agora são colunas separadas na mesma linha
             SUM(CASE WHEN ANO_JOIN = 2025 AND IS_MALHA = FALSE THEN 1 ELSE 0 END) AS HISTORICO_2025,
             CAST(ROUND(SUM(CASE WHEN ANO_JOIN = 2026 AND IS_MALHA = TRUE THEN VOLUME_TWEEDIE ELSE 0 END), 0) AS INT64) AS PREDICAO_2026,
             
@@ -139,7 +139,6 @@ class DeploySafeDriverBigQuery:
         )
         
         SELECT 
-            -- Data ancorada para o Looker reconhecer como série temporal sem quebrar
             DATE(2026, b.MES, 1) AS DATA_REFERENCIA_MES,
             2026 AS ANO,
             b.MES,
@@ -150,14 +149,12 @@ class DeploySafeDriverBigQuery:
             
             'COMPARATIVO YOY' AS TIPO_REGISTRO,
 
-            b.H3_INDEX, b.CIDADE, b.BAIRRO,
+            b.H3_INDEX, b.CIDADE, b.BAIRRO, b.LOGRADOURO,
             b.GEOMETRIA_PONTO,
 
-            -- Mantemos os nomes antigos para não quebrar o Mapa e KPIs que você já fez
             b.HISTORICO_2025 AS QTD_EVENTOS_HISTORICOS,
             b.PREDICAO_2026 AS SOMA_VOLUME_TWEEDIE,
             
-            -- Novas colunas exclusivas para o Gráfico de Comparação
             b.HISTORICO_2025,
             b.PREDICAO_2026,
             
@@ -169,11 +166,14 @@ class DeploySafeDriverBigQuery:
             COALESCE(m.QUADRANTE, 'ÁREA SEM REGISTRO HISTÓRICO') AS QUADRANTE_RISCO,
             m.TOP_CRIME AS CRIME_PREDOMINANTE_H3,
             
-            s.* EXCEPT(CIDADE)
+            # Remove as colunas de join do select * para evitar duplicidade no BigQuery
+            s.* EXCEPT(CIDADE, BAIRRO, LOGRADOURO)
 
         FROM Base_Agregada b
         INNER JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s 
           ON CAST(b.CIDADE AS STRING) = CAST(s.CIDADE AS STRING)
+         AND CAST(b.BAIRRO AS STRING) = CAST(s.BAIRRO AS STRING)
+         AND CAST(b.LOGRADOURO AS STRING) = CAST(s.LOGRADOURO AS STRING)
         LEFT JOIN `{self.project_id}.{self.dataset_id}.tb_matriz_risco` m 
           ON b.H3_INDEX = m.H3_INDEX
         """
@@ -194,7 +194,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SISTEMA] Processo finalizado em {duracao}s. Base refatorada para modelo Wide.")
-        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso.")
+        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso com granularidade por rua.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
