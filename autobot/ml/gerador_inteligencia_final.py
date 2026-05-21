@@ -75,9 +75,9 @@ class GeradorDossieSafeDriver:
             "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], 
             "FEAT_PERFIL_VITIMA": ["PEDESTRE", "MOTORISTA", "MOTORISTA", "PEDESTRE"]
         }).with_columns([
-            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]).alias("FEAT_CONTEXTO_CRITICO"),
+            pl.concat_str([pl.col("SAZON_PERIODO"), pl.lit("_"), pl.col("FEAT_PERFIL_VITIMA")]),
             pl.when(pl.col("FEAT_TIPO_DIA") == "FIM_DE_SEMANA").then(pl.lit("SIM")).otherwise(pl.lit("NAO")).alias("FEAT_IS_FIM_DE_SEMANA")
-        ])
+        ]).rename({"SAZON_PERIODO_FEAT_PERFIL_VITIMA": "FEAT_CONTEXTO_CRITICO"})
 
         # Geração do vetor temporal
         datas_malha = [date(2025, m, 15) for m in range(1, 13)] + [date(2026, m, 15) for m in range(1, 9)]
@@ -99,7 +99,7 @@ class GeradorDossieSafeDriver:
         # 4. Concatenação vertical
         cols_modelo = modelo.feature_names_
         cols_comuns = list(set(df_ouro.columns).intersection(set(df_malha.columns)))
-        df_master = pl.concat([df_ouro.select(cols_comuns), df_malha.select(cols_comuns)], how="vertical")
+        df_master = pl.concat([df_ouro.select(cols_comuns), df_malha.select(cols_comuns)], how="diagonal")
 
         del df_ouro, df_malha, df_dna_hex
         gc.collect()
@@ -111,10 +111,8 @@ class GeradorDossieSafeDriver:
         pdf_master = df_master.to_pandas()
         for col in cols_modelo:
             if col in cat_features_modelo:
-                # Remoção de sufixos decimais gerados por conversões implícitas
                 pdf_master[col] = pdf_master[col].fillna('DESCONHECIDO').astype(str).str.replace(r'\.0$', '', regex=True).replace(['nan', 'NaN', 'None', '<NA>', ''], 'DESCONHECIDO').astype(object)
             else:
-                # Padronização contínua
                 pdf_master[col] = pdf_master[col].fillna(0.0).astype(float)
 
         # 6. Inferência preditiva em lotes
@@ -149,36 +147,40 @@ class GeradorDossieSafeDriver:
         status_map = {3: "ALERTA CRITICO", 2: "RISCO ALTO", 1: "ATENCAO MEDIA", 0: "AREA MONITORADA"}
         pdf_master["STATUS_OPERACIONAL"] = pdf_master["CLUSTER_RANK"].map(status_map)
 
-        # 8. Extração de explicabilidade global (SHAP) agregada por cidade
-        print("[PROCESSAMENTO] Calculando tensores SHAP e agregando dimensão espacial.")
+        # 8. Extração de explicabilidade global (SHAP) agregada por Cidade, Bairro e Logradouro
+        print("[PROCESSAMENTO] Calculando tensores SHAP e expandindo dimensões geográficas.")
         explainer = shap.TreeExplainer(modelo)
         
-        # Amostragem estratificada para otimização de processamento
+        # Amostragem estruturada
         tamanho_amostra = min(150000, len(pdf_master))
         pdf_amostra = pdf_master.sample(tamanho_amostra, random_state=42)
         
         valores_shap = explainer.shap_values(pdf_amostra[cols_modelo])
         df_shap = pd.DataFrame(np.abs(valores_shap), columns=[f"DNA_{c}" for c in cols_modelo])
-        df_shap['CIDADE'] = pdf_amostra['CIDADE'].values
         
-        # Agregação da magnitude média do impacto por município
-        df_dna_cidade = df_shap.groupby('CIDADE').mean().reset_index()
+        # Injeção das chaves geográficas completas para agrupamento
+        df_shap['CIDADE'] = pdf_amostra['CIDADE'].values
+        df_shap['BAIRRO'] = pdf_amostra['BAIRRO'].values
+        df_shap['LOGRADOURO'] = pdf_amostra['LOGRADOURO'].values
+        
+        # Agregação multidimensional: Cidade -> Bairro -> Logradouro
+        df_dna_geografico = df_shap.groupby(['CIDADE', 'BAIRRO', 'LOGRADOURO']).mean().reset_index()
 
         # 9. Integração Cloud Storage
-        print("[SISTEMA] Exportando matrizes de dados (Eventos e Dimensão SHAP).")
+        print("[SISTEMA] Exportando matrizes de dados (Eventos e Dimensão SHAP Expandida).")
         
         # Objeto principal de fatos
         buf_eventos = io.BytesIO()
         pdf_master.to_parquet(buf_eventos, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_eventos.getvalue())
 
-        # Objeto dimensional (DNA Criminal)
+        # Objeto dimensional granular (DNA Criminal por Logradouro)
         buf_dna = io.BytesIO()
-        df_dna_cidade.to_parquet(buf_dna, compression="zstd")
+        df_dna_geografico.to_parquet(buf_dna, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_dna_cidade.parquet", Body=buf_dna.getvalue())
 
         tempo_execucao = time.time() - inicio_global
-        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Tipagem garantida e SHAP dimensional extraído.")
+        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Granularidade por Logradouro adicionada à dimensão SHAP.")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
