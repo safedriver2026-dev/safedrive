@@ -64,7 +64,7 @@ class DeploySafeDriverBigQuery:
         print(f"[SISTEMA] Processando carga para tabela: {table_name}", flush=True)
         job = self.bq_client.load_table_from_dataframe(df_pandas, table_id, job_config=job_config)
         job.result()
-        print(f"[SISTEMA] Tabela {table_name} atualizada com {len(df_pandas)} registros.", flush=True)
+        print(f"[SISTEMA] Tabela {table_name} updated com {len(df_pandas)} registros.", flush=True)
 
     def _construir_matriz_risco_intermediaria(self):
         print("[PROCESSAMENTO] Compilando matriz de risco operacional...", flush=True)
@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Refatorando OBT: Pivotando os anos e integrando granularidade por logradouro...", flush=True)
+        print("[PROCESSAMENTO] Refatorando OBT: Pivotando anos e computando Top 3 SHAP dinâmico...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -136,6 +136,37 @@ class DeploySafeDriverBigQuery:
             
           FROM Base_Geo_Filtrada
           GROUP BY H3_INDEX, MES_NUM
+        ),
+        
+        # --- CÁLCULO DINÂMICO DE EXPLICABILIDADE ADAPTÁVEL (ADS ENGINE) ---
+        Unpivoted_SHAP AS (
+          SELECT 
+            CIDADE, BAIRRO, LOGRADOURO,
+            REGEXP_REPLACE(chave, r'^DNA_', '') AS fator, 
+            valor
+          FROM `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade`
+          UNPIVOT(valor FOR chave IN (
+            DNA_FEAT_CONTEXTO_CRITICO, 
+            DNA_FS_RISCO_MEDIO_ANO_ANT, 
+            DNA_FS_RISCO_MEDIO_MES_ANT
+          ))
+        ),
+        Ranked_SHAP AS (
+          SELECT 
+            *,
+            ROW_NUMBER() OVER(PARTITION BY CIDADE, BAIRRO, LOGRADOURO ORDER BY valor DESC) as rnk
+          FROM Unpivoted_SHAP
+        ),
+        Consolidated_SHAP AS (
+          SELECT 
+            CIDADE, BAIRRO, LOGRADOURO,
+            STRING_AGG(
+              CONCAT('  - ', fator, ': ', ROUND(valor * 100, 1), '%'), 
+              '\\n' ORDER BY rnk ASC
+            ) AS DNA_TOP_FATORES
+          FROM Ranked_SHAP
+          WHERE rnk <= 3
+          GROUP BY CIDADE, BAIRRO, LOGRADOURO
         )
         
         SELECT 
@@ -166,11 +197,10 @@ class DeploySafeDriverBigQuery:
             COALESCE(m.QUADRANTE, 'ÁREA SEM REGISTRO HISTÓRICO') AS QUADRANTE_RISCO,
             m.TOP_CRIME AS CRIME_PREDOMINANTE_H3,
             
-            # Remove as colunas de join do select * para evitar duplicidade no BigQuery
-            s.* EXCEPT(CIDADE, BAIRRO, LOGRADOURO)
+            COALESCE(s.DNA_TOP_FATORES, '  - Sem fatores calculados para esta localidade.') AS DNA_TOP_FATORES
 
         FROM Base_Agregada b
-        INNER JOIN `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade` s 
+        LEFT JOIN Consolidated_SHAP s 
           ON CAST(b.CIDADE AS STRING) = CAST(s.CIDADE AS STRING)
          AND CAST(b.BAIRRO AS STRING) = CAST(s.BAIRRO AS STRING)
          AND CAST(b.LOGRADOURO AS STRING) = CAST(s.LOGRADOURO AS STRING)
@@ -194,7 +224,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SISTEMA] Processo finalizado em {duracao}s. Base refatorada para modelo Wide.")
-        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso com granularidade por rua.")
+        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso com granularidade por rua e SHAP dinâmico.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
