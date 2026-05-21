@@ -54,6 +54,7 @@ class IngestorSafeDriver:
         self.df_lookup_vias = None
         self.df_lookup_prefix = None
         self.df_lookup_bairro = None
+        self.df_lookup_cidade = None
         self.audit_stats = []
 
     def _inicializar_s3(self):
@@ -79,7 +80,6 @@ class IngestorSafeDriver:
         return texto.strip() if texto.strip() != "" else "DESCONHECIDO"
 
     def _limpar_tabela_toda(self, df):
-        """Limpeza bruta em todas as colunas de texto, mas preservando barras e tracinhos para datas."""
         cols_texto = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Utf8]
         if not cols_texto:
             return df
@@ -93,7 +93,7 @@ class IngestorSafeDriver:
             .str.replace_all(r"[ÓÒÔÕÖ]", "O")
             .str.replace_all(r"[ÚÙÛÜ]", "U")
             .str.replace_all(r"Ç", "C")
-            .str.replace_all(r"[^A-Z0-9\s_/:.-]", " ") # Mantem os separadores de data/hora intactos
+            .str.replace_all(r"[^A-Z0-9\s_/:.-]", " ")
             .str.replace_all(r"\s+", " ")
             .fill_null("DESCONHECIDO")
             .alias(c)
@@ -115,7 +115,7 @@ class IngestorSafeDriver:
 
     def _carregar_malha_referencia(self):
         try:
-            logger.info("🗺️ Carregando Malha com Normalização Universal...")
+            logger.info("🗺️ Carregando Malha para Auditoria Total...")
             obj = self.s3.get_object(Bucket=self.config.NOME_BUCKET, Key=self.config.MALHA_VIAS_PATH)
             df_flat = pl.read_parquet(io.BytesIO(obj['Body'].read())).explode("BAIRROS").unnest("BAIRROS").explode("LOGRADOUROS").unnest("LOGRADOUROS")
             df_base = df_flat.with_columns([
@@ -124,11 +124,16 @@ class IngestorSafeDriver:
                 pl.col("BAIRRO").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8).alias("BAI_NORM"),
                 pl.col("RUA").map_elements(self._normalizar_logradouro, return_dtype=pl.Utf8).alias("RUA_BASE")
             ]).select(["CID_NORM", "BAI_NORM", "RUA_BASE", "H3_INDEX"])
+            
             self.df_lookup_vias = df_base.unique(subset=["CID_NORM", "BAI_NORM", "RUA_BASE"])
+            
             df_prefix = df_base.with_columns(pl.col("RUA_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("RUA_PREFIX"))
             valid_p = df_prefix.group_by(["CID_NORM", "RUA_PREFIX"]).agg(pl.col("H3_INDEX").n_unique().alias("n")).filter(pl.col("n") == 1)
             self.df_lookup_prefix = df_prefix.join(valid_p.select(["CID_NORM", "RUA_PREFIX"]), on=["CID_NORM", "RUA_PREFIX"], how="inner").unique(subset=["CID_NORM", "RUA_PREFIX"])
+            
             self.df_lookup_bairro = df_base.group_by(["CID_NORM", "BAI_NORM"]).agg(pl.col("H3_INDEX").mode().first().alias("H3_BAIRRO"))
+            self.df_lookup_cidade = df_base.group_by("CID_NORM").agg(pl.col("H3_INDEX").mode().first().alias("H3_CIDADE"))
+            
             logger.info(f"✅ Malha pronta. Vias: {self.df_lookup_vias.height} | Bairros: {self.df_lookup_bairro.height}")
         except Exception as e: logger.error(f"❌ Erro malha: {e}")
 
@@ -143,52 +148,64 @@ class IngestorSafeDriver:
         ])
         df = df.with_columns(pl.col("LOG_BASE").str.replace_all(" ", "").str.slice(0, 10).alias("LOG_PREFIX"))
         
-        # ---------------------------------------------------------
-        # PASSO 0: Validação de Coordenada Original (Auditoria H3)
-        # ---------------------------------------------------------
-        # Trazemos o H3 do Bairro como referência espacial segura
+        # --- PREPARA AS REFERÊNCIAS PARA AUDITORIA GERAL ---
+        df = df.join(self.df_lookup_vias.rename({"H3_INDEX": "H3_VIA"}), left_on=["MUN_NORM", "BAI_NORM", "LOG_BASE"], right_on=["CID_NORM", "BAI_NORM", "RUA_BASE"], how="left")
         df = df.join(self.df_lookup_bairro, left_on=["MUN_NORM", "BAI_NORM"], right_on=["CID_NORM", "BAI_NORM"], how="left")
-        
-        def _validar_coordenada(row):
-            h3_origem = row["H3_INDEX"]
-            h3_referencia = row["H3_BAIRRO"]
+        df = df.join(self.df_lookup_cidade, left_on="MUN_NORM", right_on="CID_NORM", how="left")
+
+        def _auditar_todas_coordenadas(row):
+            h3_gps = row["H3_INDEX"]
+            h3_via = row["H3_VIA"]
+            h3_bairro = row["H3_BAIRRO"]
+            h3_cidade = row["H3_CIDADE"]
             
-            if not h3_origem or not h3_referencia:
-                return h3_origem # Se já for nulo, segue para o resgate normal
+            if not h3_gps:
+                return None
                 
             try:
-                # Calcula a distância em hexágonos. Resolução 9 = ~174m por hexágono.
-                # 30 hexágonos de distância = ~5.2 km de tolerância.
-                distancia = h3.grid_distance(h3_origem, h3_referencia)
-                if distancia > 30:
-                    return None # Coordenada original é fraude/erro. Anula para forçar o resgate.
-                return h3_origem
+                # Nível 1: Rua Exata (Se a rua existe na malha, o GPS original não pode estar a mais de ~1.7km / 10 hex)
+                if h3_via:
+                    if h3.grid_distance(h3_gps, h3_via) > 10: return None
+                    return h3_gps
+                
+                # Nível 2: Bairro (Tolerância de ~5km / 30 hex)
+                if h3_bairro:
+                    if h3.grid_distance(h3_gps, h3_bairro) > 30: return None
+                    return h3_gps
+                    
+                # Nível 3: Cidade (Tolerância de ~25km / 150 hex)
+                if h3_cidade:
+                    if h3.grid_distance(h3_gps, h3_cidade) > 150: return None
+                    return h3_gps
             except:
-                # Se houver erro no cálculo (ex: hexágonos muito distantes disparam erro no grid_distance)
+                # Se a distância for tão absurda que a biblioteca H3 der erro, o GPS é falso.
                 return None
 
-        # Aplica a invalidação de GPS incorretos
-        df = df.with_columns(
-            pl.struct(["H3_INDEX", "H3_BAIRRO"]).map_elements(_validar_coordenada, return_dtype=pl.Utf8).alias("H3_INDEX")
-        )
+            return h3_gps
+
         # ---------------------------------------------------------
+        # PASSO 0: Aplica a auditoria estrita em quem JÁ TEM GPS
+        # ---------------------------------------------------------
+        df = df.with_columns(
+            pl.struct(["H3_INDEX", "H3_VIA", "H3_BAIRRO", "H3_CIDADE"]).map_elements(_auditar_todas_coordenadas, return_dtype=pl.Utf8).alias("H3_INDEX")
+        )
 
         count_init = df.filter(pl.col("H3_INDEX").is_not_null()).height
         
-        # Passo 1: Rua Exata
-        df = df.join(self.df_lookup_vias, left_on=["MUN_NORM", "BAI_NORM", "LOG_BASE"], right_on=["CID_NORM", "BAI_NORM", "RUA_BASE"], how="left") \
-               .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
+        # --- FUNIL DE RESGATE ---
+        # Passo 1: Rua Exata (Preenche quem veio nulo ou foi reprovado na auditoria)
+        df = df.with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_VIA"))).drop("H3_VIA")
         count_p1 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p1 = count_p1 - count_init
         
         # Passo 2: Prefixo
-        df = df.join(self.df_lookup_prefix.select(["CID_NORM", "RUA_PREFIX", "H3_INDEX"]), left_on=["MUN_NORM", "LOG_PREFIX"], right_on=["CID_NORM", "RUA_PREFIX"], how="left") \
-               .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_INDEX_right"))).drop("H3_INDEX_right")
+        df = df.join(self.df_lookup_prefix.select(["CID_NORM", "RUA_PREFIX", "H3_INDEX"]).rename({"H3_INDEX": "H3_PREF"}), left_on=["MUN_NORM", "LOG_PREFIX"], right_on=["CID_NORM", "RUA_PREFIX"], how="left") \
+               .with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_PREF"))).drop("H3_PREF")
         count_p2 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p2 = count_p2 - count_p1
         
         # Passo 3: Centroide do Bairro
-        df = df.with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop("H3_BAIRRO")
+        df = df.with_columns(pl.col("H3_INDEX").fill_null(pl.col("H3_BAIRRO"))).drop(["H3_BAIRRO", "H3_CIDADE"])
         count_p3 = df.filter(pl.col("H3_INDEX").is_not_null()).height
         resgatados_p3 = count_p3 - count_p2
         
@@ -198,7 +215,6 @@ class IngestorSafeDriver:
         total_entrada = df.height
         df = df.with_columns(pl.all().cast(pl.Utf8).fill_null("NAO INFORMADO"))
 
-        # Aplica a limpeza de texto bruto em todas as colunas
         df = self._limpar_tabela_toda(df)
 
         if "RUBRICA" in df.columns:
@@ -206,7 +222,6 @@ class IngestorSafeDriver:
                 pl.col("RUBRICA").map_elements(self._limpeza_extrema, return_dtype=pl.Utf8)
             )
 
-        # CORREÇÃO DA DATA: Lê diferentes formatos e ignora os quebrados
         if "DATAREGISTRO" in df.columns:
             df = df.with_columns([
                 pl.coalesce([
@@ -228,7 +243,6 @@ class IngestorSafeDriver:
                 ]).alias("DATAOCORRENCIA")
             )
 
-        # GPS Original
         df = df.with_columns([
             pl.col("LATITUDE").str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").alias("_lat_f"),
             pl.col("LONGITUDE").str.replace(",", ".").str.extract(r"(-?\d+\.\d+)").alias("_lon_f")
@@ -242,10 +256,8 @@ class IngestorSafeDriver:
         )
         bo_com_gps = df.filter(pl.col("H3_INDEX").is_not_null()).height
 
-        # Resgate Espacial 1-2-3
         df, stats_resgate = self._resgatar_espacial(df)
 
-        # GAP PERÍODO: Lógica Híbrida (Hora + Texto)
         df = df.with_columns([
             pl.col("HORAOCORRENCIA").str.extract(r"(\d{1,2})", 1).cast(pl.Int32, strict=False).alias("_hr_t"),
             pl.col("PERIODO_NATIVO").str.to_uppercase().alias("_per_txt")
@@ -263,7 +275,6 @@ class IngestorSafeDriver:
             .otherwise(pl.lit("INCERTO")).alias("SAZON_PERIODO")
         )
 
-        # Safe Drop: Remove apenas o que existe
         cols_remover = ["_lat_f", "_lon_f", "_hr_t", "_per_txt", "DATAREGISTRO", "PERIODO_NATIVO"]
         existing_cols_to_drop = [c for c in cols_remover if c in df.columns]
 
@@ -272,7 +283,6 @@ class IngestorSafeDriver:
             pl.col("_lon_f").cast(pl.Float64, strict=False).alias("LONGITUDE")
         ]).drop(existing_cols_to_drop)
 
-        # Auditoria por Período
         cp = df_trusted.group_by("SAZON_PERIODO").len().to_dicts()
         dict_periodos = {d["SAZON_PERIODO"]: d["len"] for d in cp}
 
