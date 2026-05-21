@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Refatorando OBT: Pivotando anos e computando Top 3 SHAP dinâmico...", flush=True)
+        print("[PROCESSAMENTO] Refatorando OBT: Pivotando anos e computando Top 3 SHAP traduzido...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -138,11 +138,16 @@ class DeploySafeDriverBigQuery:
           GROUP BY H3_INDEX, MES_NUM
         ),
         
-        # --- CÁLCULO DINÂMICO DE EXPLICABILIDADE ADAPTÁVEL (ADS ENGINE) ---
+        # --- CÁLCULO DINÂMICO DE EXPLICABILIDADE ADAPTÁVEL COM DICIONÁRIO DE TRADUÇÃO ---
         Unpivoted_SHAP AS (
           SELECT 
             CIDADE, BAIRRO, LOGRADOURO,
-            REGEXP_REPLACE(chave, r'^DNA_', '') AS fator, 
+            CASE 
+              WHEN chave = 'DNA_FEAT_CONTEXTO_CRITICO' THEN 'Contexto de Entorno Urbano'
+              WHEN chave = 'DNA_FS_RISCO_MEDIO_ANO_ANT' THEN 'Histórico Criminal Anual'
+              WHEN chave = 'DNA_FS_RISCO_MEDIO_MES_ANT' THEN 'Tendência Criminal Mensal'
+              ELSE REGEXP_REPLACE(chave, r'^DNA_', '')
+            END AS fator, 
             valor
           FROM `{self.project_id}.{self.dataset_id}.tb_dim_dna_cidade`
           UNPIVOT(valor FOR chave IN (
@@ -224,7 +229,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SISTEMA] Processo finalizado em {duracao}s. Base refatorada para modelo Wide.")
-        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso com granularidade por rua e SHAP dinâmico.")
+        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso com granularidade por rua e SHAP dinâmico traduzido.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
