@@ -148,39 +148,38 @@ class GeradorDossieSafeDriver:
         pdf_master["STATUS_OPERACIONAL"] = pdf_master["CLUSTER_RANK"].map(status_map)
 
         # 8. Extração de explicabilidade global (SHAP) agregada por Cidade, Bairro e Logradouro
-        print("[PROCESSAMENTO] Calculando tensores SHAP e expandindo dimensões geográficas.")
+        print("[PROCESSAMENTO] Calculando tensores SHAP preditivos para a malha total.")
         explainer = shap.TreeExplainer(modelo)
         
-        # Amostragem estruturada
-        tamanho_amostra = min(150000, len(pdf_master))
-        pdf_amostra = pdf_master.sample(tamanho_amostra, random_state=42)
+        # Inovação: Calcular SHAP sobre um lote representativo de TODA a malha preditiva
+        # Isso garante que mesmo locais sem histórico (Volume Histórico = 0) recebam a carga 
+        # explicativa de "por que a IA acha que ali vai ter crime" (ex: Contexto do Entorno, Infraestrutura).
+        tamanho_amostra_shap = min(200000, len(pdf_master))
+        pdf_amostra_shap = pdf_master.sample(tamanho_amostra_shap, random_state=42)
         
-        valores_shap = explainer.shap_values(pdf_amostra[cols_modelo])
+        valores_shap = explainer.shap_values(pdf_amostra_shap[cols_modelo])
         df_shap = pd.DataFrame(np.abs(valores_shap), columns=[f"DNA_{c}" for c in cols_modelo])
         
-        # Injeção das chaves geográficas completas para agrupamento
-        df_shap['CIDADE'] = pdf_amostra['CIDADE'].values
-        df_shap['BAIRRO'] = pdf_amostra['BAIRRO'].values
-        df_shap['LOGRADOURO'] = pdf_amostra['LOGRADOURO'].values
+        # Injeção das chaves geográficas e re-agregação
+        df_shap['CIDADE'] = pdf_amostra_shap['CIDADE'].values
+        df_shap['BAIRRO'] = pdf_amostra_shap['BAIRRO'].values
+        df_shap['LOGRADOURO'] = pdf_amostra_shap['LOGRADOURO'].values
         
-        # Agregação multidimensional: Cidade -> Bairro -> Logradouro
         df_dna_geografico = df_shap.groupby(['CIDADE', 'BAIRRO', 'LOGRADOURO']).mean().reset_index()
 
         # 9. Integração Cloud Storage
         print("[SISTEMA] Exportando matrizes de dados (Eventos e Dimensão SHAP Expandida).")
         
-        # Objeto principal de fatos
         buf_eventos = io.BytesIO()
         pdf_master.to_parquet(buf_eventos, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dossie_eventos.parquet", Body=buf_eventos.getvalue())
 
-        # Objeto dimensional granular (DNA Criminal por Logradouro)
         buf_dna = io.BytesIO()
         df_dna_geografico.to_parquet(buf_dna, compression="zstd")
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_dna_cidade.parquet", Body=buf_dna.getvalue())
 
         tempo_execucao = time.time() - inicio_global
-        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Granularidade por Logradouro adicionada à dimensão SHAP.")
+        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Cobertura SHAP estendida para malha preditiva.")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
