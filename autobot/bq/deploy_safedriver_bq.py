@@ -96,7 +96,7 @@ class DeploySafeDriverBigQuery:
         self.bq_client.query(sql_matriz).result()
 
     def _construir_obt_looker(self):
-        print("[PROCESSAMENTO] Refatorando OBT: Pivotando anos e computando Top 3 SHAP traduzido...", flush=True)
+        print("[PROCESSAMENTO] Refatorando OBT: Pivotando anos e computando Top 3 SHAP normalizado a 100%...", flush=True)
         sql_obt = f"""
         CREATE OR REPLACE TABLE `{self.project_id}.{self.dataset_id}.tb_looker_master_final` AS
         WITH Base_Limpa AS (
@@ -138,14 +138,14 @@ class DeploySafeDriverBigQuery:
           GROUP BY H3_INDEX, MES_NUM
         ),
         
-        # --- CÁLCULO DINÂMICO DE EXPLICABILIDADE ADAPTÁVEL COM DICIONÁRIO DE TRADUÇÃO ---
+        # --- CÁLCULO DINÂMICO DE EXPLICABILIDADE ADAPTÁVEL (NORMALIZADO 100%) ---
         Unpivoted_SHAP AS (
           SELECT 
             CIDADE, BAIRRO, LOGRADOURO,
             CASE 
-              WHEN chave = 'DNA_FEAT_CONTEXTO_CRITICO' THEN 'Contexto de Entorno Urbano'
-              WHEN chave = 'DNA_FS_RISCO_MEDIO_ANO_ANT' THEN 'Histórico Criminal Anual'
-              WHEN chave = 'DNA_FS_RISCO_MEDIO_MES_ANT' THEN 'Tendência Criminal Mensal'
+              WHEN chave LIKE '%CONTEXTO_CRITICO%' THEN 'Contexto de Entorno Urbano'
+              WHEN chave LIKE '%RISCO_MEDIO_ANO_ANT%' THEN 'Histórico Criminal Anual'
+              WHEN chave LIKE '%RISCO_MEDIO_MES_ANT%' THEN 'Tendência Criminal Mensal'
               ELSE REGEXP_REPLACE(chave, r'^DNA_', '')
             END AS fator, 
             valor
@@ -162,15 +162,26 @@ class DeploySafeDriverBigQuery:
             ROW_NUMBER() OVER(PARTITION BY CIDADE, BAIRRO, LOGRADOURO ORDER BY valor DESC) as rnk
           FROM Unpivoted_SHAP
         ),
+        Top3_SHAP AS (
+          SELECT * FROM Ranked_SHAP WHERE rnk <= 3
+        ),
+        Normalized_SHAP AS (
+          SELECT 
+            CIDADE, BAIRRO, LOGRADOURO, fator, rnk,
+            CASE 
+              WHEN SUM(valor) OVER(PARTITION BY CIDADE, BAIRRO, LOGRADOURO) = 0 THEN 0
+              ELSE (valor / SUM(valor) OVER(PARTITION BY CIDADE, BAIRRO, LOGRADOURO)) * 100 
+            END as valor_normalizado
+          FROM Top3_SHAP
+        ),
         Consolidated_SHAP AS (
           SELECT 
             CIDADE, BAIRRO, LOGRADOURO,
             STRING_AGG(
-              CONCAT('  - ', fator, ': ', ROUND(valor * 100, 1), '%'), 
+              CONCAT('  - ', fator, ': ', ROUND(valor_normalizado, 1), '%'), 
               '\\n' ORDER BY rnk ASC
             ) AS DNA_TOP_FATORES
-          FROM Ranked_SHAP
-          WHERE rnk <= 3
+          FROM Normalized_SHAP
           GROUP BY CIDADE, BAIRRO, LOGRADOURO
         )
         
@@ -229,7 +240,7 @@ class DeploySafeDriverBigQuery:
 
         duracao = round(time.time() - inicio_deploy, 2)
         print(f"[SISTEMA] Processo finalizado em {duracao}s. Base refatorada para modelo Wide.")
-        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso com granularidade por rua e SHAP dinâmico traduzido.")
+        self._notificar_webhook(f"[INFO] Pipeline SafeDriver executado. Dados pivotados com sucesso com SHAP normalizado a 100%.")
 
 if __name__ == "__main__":
     DeploySafeDriverBigQuery().executar_deploy()
