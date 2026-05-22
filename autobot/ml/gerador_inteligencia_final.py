@@ -69,7 +69,7 @@ class GeradorDossieSafeDriver:
         # Extração de localizações únicas
         df_dna_hex = df_ouro.select(features_geo + features_estruturais).unique(subset=["H3_INDEX"])
 
-        # Definição dos cenários de predição (CORRIGIDO)
+        # Definição dos cenários de predição
         df_cenarios = pl.DataFrame({
             "SAZON_PERIODO": ["MANHA", "TARDE", "NOITE", "MADRUGADA"],
             "FEAT_TIPO_DIA": ["DIA_UTIL", "DIA_UTIL", "FIM_DE_SEMANA", "FIM_DE_SEMANA"], 
@@ -148,23 +148,20 @@ class GeradorDossieSafeDriver:
         pdf_master["STATUS_OPERACIONAL"] = pdf_master["CLUSTER_RANK"].map(status_map)
 
         # 8. Extração de explicabilidade global (SHAP) agregada por Cidade, Bairro e Logradouro
-        print("[PROCESSAMENTO] Calculando tensores SHAP preditivos para a malha total.")
+        print("[PROCESSAMENTO] Calculando tensores SHAP para 100% da malha (Sem Amostragem).")
         explainer = shap.TreeExplainer(modelo)
         
-        # Inovação: Calcular SHAP sobre um lote representativo de TODA a malha preditiva
-        # Isso garante que mesmo locais sem histórico (Volume Histórico = 0) recebam a carga 
-        # explicativa de "por que a IA acha que ali vai ter crime" (ex: Contexto do Entorno, Infraestrutura).
-        tamanho_amostra_shap = min(200000, len(pdf_master))
-        pdf_amostra_shap = pdf_master.sample(tamanho_amostra_shap, random_state=42)
-        
-        valores_shap = explainer.shap_values(pdf_amostra_shap[cols_modelo])
+        # Inovação MLOps: Computação total. O processamento suporta a carga de toda a base.
+        # Isso garante precisão milimétrica no "DNA do Crime" de todas as ruas do estado.
+        valores_shap = explainer.shap_values(pdf_master[cols_modelo])
         df_shap = pd.DataFrame(np.abs(valores_shap), columns=[f"DNA_{c}" for c in cols_modelo])
         
         # Injeção das chaves geográficas e re-agregação
-        df_shap['CIDADE'] = pdf_amostra_shap['CIDADE'].values
-        df_shap['BAIRRO'] = pdf_amostra_shap['BAIRRO'].values
-        df_shap['LOGRADOURO'] = pdf_amostra_shap['LOGRADOURO'].values
+        df_shap['CIDADE'] = pdf_master['CIDADE'].values
+        df_shap['BAIRRO'] = pdf_master['BAIRRO'].values
+        df_shap['LOGRADOURO'] = pdf_master['LOGRADOURO'].values
         
+        # Agrupa pela média exata de todos os hexágonos que compõem aquela rua
         df_dna_geografico = df_shap.groupby(['CIDADE', 'BAIRRO', 'LOGRADOURO']).mean().reset_index()
 
         # 9. Integração Cloud Storage
@@ -179,7 +176,7 @@ class GeradorDossieSafeDriver:
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_dna_cidade.parquet", Body=buf_dna.getvalue())
 
         tempo_execucao = time.time() - inicio_global
-        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Cobertura SHAP estendida para malha preditiva.")
+        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Cobertura SHAP estendida para 100% da malha preditiva.")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
