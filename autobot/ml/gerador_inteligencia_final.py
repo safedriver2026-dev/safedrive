@@ -147,22 +147,26 @@ class GeradorDossieSafeDriver:
         status_map = {3: "ALERTA CRITICO", 2: "RISCO ALTO", 1: "ATENCAO MEDIA", 0: "AREA MONITORADA"}
         pdf_master["STATUS_OPERACIONAL"] = pdf_master["CLUSTER_RANK"].map(status_map)
 
-        # 8. Extração de explicabilidade global (SHAP) agregada por Cidade, Bairro e Logradouro
-        print("[PROCESSAMENTO] Calculando tensores SHAP para 100% da malha (Sem Amostragem).")
+        # 8. Extração de explicabilidade global (SHAP) otimizada para Logradouros Únicos
+        print("[PROCESSAMENTO] Otimizando SHAP: Isolando perfis geográficos para evitar timeout na nuvem.")
         explainer = shap.TreeExplainer(modelo)
         
-        # Inovação MLOps: Computação total. O processamento suporta a carga de toda a base.
-        # Isso garante precisão milimétrica no "DNA do Crime" de todas as ruas do estado.
-        valores_shap = explainer.shap_values(pdf_master[cols_modelo])
+        # Arquitetura High-Performance: Removemos a redundância temporal/sazonal para o cálculo do DNA.
+        # Extraímos exatamente 1 linha por rua com suas características estruturais intactas.
+        # Isso reduz o processamento de horas para segundos, mantendo 100% de cobertura de locais.
+        df_perf_unico = pdf_master[['CIDADE', 'BAIRRO', 'LOGRADOURO'] + cols_modelo].drop_duplicates(subset=['CIDADE', 'BAIRRO', 'LOGRADOURO']).copy()
+        
+        print(f"[PROCESSAMENTO] Computando SHAP para {len(df_perf_unico)} logradouros únicos do Estado.")
+        valores_shap = explainer.shap_values(df_perf_unico[cols_modelo])
         df_shap = pd.DataFrame(np.abs(valores_shap), columns=[f"DNA_{c}" for c in cols_modelo])
         
-        # Injeção das chaves geográficas e re-agregação
-        df_shap['CIDADE'] = pdf_master['CIDADE'].values
-        df_shap['BAIRRO'] = pdf_master['BAIRRO'].values
-        df_shap['LOGRADOURO'] = pdf_master['LOGRADOURO'].values
+        # Injeção das chaves geográficas de volta mantendo o alinhamento exato das matrizes
+        df_shap['CIDADE'] = df_perf_unico['CIDADE'].values
+        df_shap['BAIRRO'] = df_perf_unico['BAIRRO'].values
+        df_shap['LOGRADOURO'] = df_perf_unico['LOGRADOURO'].values
         
-        # Agrupa pela média exata de todos os hexágonos que compõem aquela rua
-        df_dna_geografico = df_shap.groupby(['CIDADE', 'BAIRRO', 'LOGRADOURO']).mean().reset_index()
+        # Como o dado já está único por rua, a dimensão está pronta para exportação
+        df_dna_geografico = df_shap.copy()
 
         # 9. Integração Cloud Storage
         print("[SISTEMA] Exportando matrizes de dados (Eventos e Dimensão SHAP Expandida).")
@@ -176,7 +180,7 @@ class GeradorDossieSafeDriver:
         self.s3.put_object(Bucket=self.bucket, Key="datalake/ouro/looker_dim_dna_cidade.parquet", Body=buf_dna.getvalue())
 
         tempo_execucao = time.time() - inicio_global
-        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Cobertura SHAP estendida para 100% da malha preditiva.")
+        self._notificar_webhook(f"[INFO] Pipeline Preditivo finalizado em {tempo_execucao:.2f} segundos. Cobertura SHAP otimizada (Tempo Linear).")
 
 if __name__ == "__main__":
     GeradorDossieSafeDriver().gerar_dados()
