@@ -37,12 +37,8 @@ Os resultados são consolidados em uma **One Big Table (OBT)** e disponibilizado
 ## Conformidade e Segurança (LGPD)
 O projeto cumpre integralmente a **Lei Geral de Proteção de Dados (LGPD)**. Todo o pipeline utiliza criptografia `SHA-256` com *Pepper* para a anonimização irreversível de identificadores sensíveis (como o Número do B.O.), garantindo a privacidade dos cidadãos sem comprometer a acurácia estatística da análise.
 
-## 👥 Autores
-* Fernando Molina
+## 👥 Autor
 * Lucas da Silva Pereira
-* Renato Cesar Izidoro
-* Guilherme Balbo Dias
-* Gustavo Nascimento Alves
 
 ---
 *Faculdade de Tecnologia (FATEC) - São Caetano do Sul (Antônio Russo)* *Orientador: Prof. Msc. Flávio Viotti*
